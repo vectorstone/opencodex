@@ -41,6 +41,16 @@ function baseConfig(): OcxConfig {
 function testDeps(overrides: Partial<ManagementApiDeps> = {}): ManagementApiDeps {
   return {
     fetchAllModels: async () => [] as never,
+    syncModelsToCodex: async () => ({
+      status: "applied",
+      ok: true,
+      added: 0,
+      catalogPath: "/tmp/opencodex-catalog.json",
+      catalogExists: true,
+      catalogWritten: true,
+      cacheSynced: true,
+      message: "fixture sync complete",
+    }),
     ...overrides,
   } as ManagementApiDeps;
 }
@@ -100,6 +110,95 @@ describe("request validation", () => {
     const result = await put(baseConfig(), {});
     expect(result.status).toBe(400);
     expect(persistedCodexIntent()).toBeUndefined();
+  });
+
+  test("an unknown mode is rejected before anything is written", async () => {
+    const result = await put(baseConfig(), { mode: "routing-only" });
+    expect(result.status).toBe(400);
+    expect(persistedCodexIntent()).toBeUndefined();
+  });
+
+  test("legacy enabled and mode cannot be supplied together", async () => {
+    const result = await put(baseConfig(), { enabled: true, mode: "catalog-only" });
+    expect(result.status).toBe(400);
+    expect(persistedCodexIntent()).toBeUndefined();
+  });
+});
+
+describe("catalog-only mode", () => {
+  test("persists and applies catalog-only without translating it to full routing", async () => {
+    let syncCalls = 0;
+    const result = await put(baseConfig(), { mode: "catalog-only" }, testDeps({
+      syncModelsToCodex: async () => {
+        syncCalls += 1;
+        return {
+          status: "applied",
+          ok: true,
+          added: 2,
+          catalogPath: "/tmp/opencodex-catalog.json",
+          catalogExists: true,
+          catalogWritten: true,
+          cacheSynced: true,
+          message: "catalog refreshed without routing writes",
+        };
+      },
+    }));
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      ok: true,
+      clientId: "codex",
+      desiredEnabled: true,
+      mode: "catalog-only",
+      state: "current",
+    });
+    expect(result.body.message).toContain("history remain user-owned");
+    expect(syncCalls).toBe(1);
+    expect(persistedCodexIntent()).toBe("catalog-only");
+  });
+
+  test("GET reloads the persisted Codex mode instead of using the startup snapshot", async () => {
+    writeFileSync(join(fixtureRoot, "config.json"), JSON.stringify({
+      ...baseConfig(),
+      clientIntegrations: { codex: "catalog-only" },
+    }, null, 2));
+
+    const response = await dispatch(baseConfig(), "/api/native-integrations");
+    expect(response!.status).toBe(200);
+    const payload = await response!.json() as { clients: Array<Record<string, unknown>> };
+    expect(payload.clients.find(row => row.clientId === "codex")).toMatchObject({
+      desiredEnabled: true,
+      mode: "catalog-only",
+      state: "current",
+    });
+  });
+
+  test("legacy enabled true still maps catalog-only back to full", async () => {
+    await put(baseConfig(), { mode: "catalog-only" });
+    expect((await put(baseConfig(), { enabled: true })).body.mode).toBe("full");
+    expect(persistedCodexIntent()).toBeUndefined();
+  });
+
+  test("a missing config cannot silently turn catalog-only into full integration", async () => {
+    rmSync(join(fixtureRoot, "config.json"));
+    let syncCalls = 0;
+    const result = await put(baseConfig(), { mode: "catalog-only" }, testDeps({
+      syncModelsToCodex: async () => {
+        syncCalls += 1;
+        throw new Error("must not sync without durable catalog-only intent");
+      },
+    }));
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      ok: true,
+      changed: false,
+      state: "absent",
+      desiredEnabled: true,
+      mode: "catalog-only",
+      reason: "not_durable",
+    });
+    expect(syncCalls).toBe(0);
   });
 });
 

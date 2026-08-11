@@ -49,6 +49,15 @@
 .integration-client-head h4 { margin: 0; }
 .integration-client-head .switch { margin-left: auto; }
 
+.codex-integration-page { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+.codex-integration-page > h3,
+.codex-integration-page > p { margin: 0; }
+.codex-mode-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; width: 100%; }
+.codex-mode-label { color: var(--muted); font-size: var(--text-control); }
+.codex-mode-segmented { display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 3px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--raised); }
+.codex-mode-segmented .btn { min-height: 32px; white-space: normal; }
+.codex-mode-description { max-width: 720px; color: var(--muted); font-size: var(--text-caption); line-height: var(--leading-body); }
+
 /* A config path is the thing a user copies when a refusal tells them to
    finish by hand, so it must never be truncated into uselessness. */
 .integration-path { font-family: var(--font-code); font-size: var(--text-caption); color: var(--muted); overflow-wrap: anywhere; margin: 4px 0; }

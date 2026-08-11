@@ -5,7 +5,7 @@ import { applyProxyEnv, loadConfig } from "../config";
 import type { OcxConfig } from "../types";
 import { collectOrcaCodexHomeDiagnostic } from "./home";
 import { summarizeComboCatalogOmissions, type ComboCatalogOmission } from "./catalog/aggregation";
-import { shouldSyncCodexOnStart } from "./desired-state";
+import { codexIntegrationMode } from "./desired-state";
 import { admitCodexWrite, type CodexAdmission } from "./admission";
 
 export interface CodexSyncResult {
@@ -67,7 +67,8 @@ export async function syncModelsToCodex(
   // durable user switch and must be read again at this production boundary: a
   // PUT OFF while provider discovery is in flight cannot be allowed to commit
   // through an older captured object.
-  if (!shouldSyncCodexOnStart(loadConfig())) {
+  const integrationMode = codexIntegrationMode(loadConfig());
+  if (integrationMode === "off") {
     return {
       status: "skipped",
       skippedReason: "desired_disabled",
@@ -99,7 +100,7 @@ export async function syncModelsToCodex(
   }
   const p = port ?? config.port ?? 10100;
   const externalProvider = (deps.currentExternalCodexModelProvider ?? currentExternalCodexModelProvider)();
-  if (externalProvider) {
+  if (externalProvider && integrationMode === "full") {
     const result = await deps.injectCodexConfig(p, config, {});
     log?.log(result.message);
     reportCodexHomeTarget(log, deps.collectCodexHomeDiagnostic ?? collectOrcaCodexHomeDiagnostic);
@@ -124,10 +125,24 @@ export async function syncModelsToCodex(
   let catalogWritten = false;
   let cacheSynced = false;
   let warning: string | undefined;
+  let catalogRefreshFailed = false;
   let comboOmissions: ComboCatalogOmission[] = [];
 
   try {
     const cat = await deps.refreshCodexModelCatalog(config);
+    if (cat.skippedReason === "desired_disabled") {
+      return {
+        status: "skipped",
+        skippedReason: "desired_disabled",
+        ok: true,
+        added: 0,
+        catalogPath: null,
+        catalogExists: false,
+        catalogWritten: false,
+        cacheSynced: false,
+        message: "Codex integration changed to OFF before the catalog commit; no Codex config, catalog, cache, or history was changed.",
+      };
+    }
     added = cat.added;
     catalogExists = cat.catalogExists;
     catalogWritten = cat.catalogWritten;
@@ -149,8 +164,26 @@ export async function syncModelsToCodex(
       warning = warning ? `${warning} ${summary}` : summary;
     }
   } catch (e) {
+    catalogRefreshFailed = true;
     warning = `catalog sync skipped: ${e instanceof Error ? e.message : String(e)}`;
     log?.error(warning);
+  }
+
+  if (integrationMode === "catalog-only") {
+    return {
+      status: "applied",
+      ok: catalogExists && !catalogRefreshFailed,
+      added,
+      catalogPath,
+      catalogExists,
+      catalogWritten,
+      cacheSynced,
+      message: catalogExists && !catalogRefreshFailed
+        ? "Codex catalog and cache were refreshed; model_provider routing and Codex config, profile, journal, history, and sessions remain user-owned."
+        : "Codex catalog-only sync did not complete; model_provider routing and Codex config, profile, journal, history, and sessions were not changed.",
+      ...(warning ? { warning } : {}),
+      ...(comboOmissions.length > 0 ? { comboOmissions } : {}),
+    };
   }
 
   const result = await deps.injectCodexConfig(p, config, { catalogPath: catalogPathForInjection });

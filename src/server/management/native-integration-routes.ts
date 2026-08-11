@@ -25,6 +25,7 @@ import { inspectGrokConfig } from "../../grok/inspect";
 import { grokConfigPath } from "../../grok/status";
 import { assertNativeTeardownOwned } from "../../integrations/native/ownership-preflight";
 import type { CodexNativeRestoreResult } from "../../codex/inject";
+import { codexIntegrationMode, type CodexIntegrationMode } from "../../codex/desired-state";
 import type { OcxConfig } from "../../types";
 import { jsonResponse } from "../auth-cors";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
@@ -49,6 +50,8 @@ export interface NativeStatus {
   installed: boolean;
   configPath: string;
   desiredEnabled: boolean;
+  /** Present only for Codex, whose integration intent is three-state. */
+  mode?: CodexIntegrationMode;
   /**
    * Set when a disable would be refused right now. ADVISORY: the file can
    * change before the PUT, which re-checks and whose answer is authoritative.
@@ -68,6 +71,8 @@ export interface NativeToggleEnvelope {
   state: NativeStatus["state"];
   message: string;
   desiredEnabled: boolean;
+  /** Present only for Codex, whose integration intent is three-state. */
+  mode?: CodexIntegrationMode;
   /** Present when the outcome needs more than success/failure to be honest. */
   reason?: string;
   artifacts?: CodexNativeRestoreResult["artifacts"];
@@ -158,13 +163,15 @@ function claudeStatus(config: ManagementContext["config"], configPath: string): 
 }
 
 function codexStatus(config: ManagementContext["config"], configPath: string): NativeStatus {
-  const desiredEnabled = config.clientIntegrations?.codex !== false;
+  const mode = codexIntegrationMode(config);
+  const desiredEnabled = mode !== "off";
   return {
     clientId: "codex",
     state: desiredEnabled ? "current" : "absent",
     installed: true,
     configPath,
     desiredEnabled,
+    mode,
     disableBlocked: null,
   };
 }
@@ -289,20 +296,41 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       "Another Codex change is already in flight. Nothing was written — try again in a moment.");
   }
   codexToggleFlight = (async (): Promise<Response> => {
-    let body: { enabled?: unknown };
+    let body: unknown;
     try {
       body = await readManagementJsonBody(req);
     } catch (error) {
       rethrowManagementBodyTooLarge(error);
       return jsonResponse({ error: "invalid JSON body" }, 400);
     }
-    if (typeof body.enabled !== "boolean") {
-      return jsonResponse({ error: "enabled must be a boolean" }, 400);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return jsonResponse({ error: "request body must be an object" }, 400);
     }
-    const enabled = body.enabled;
+    const payload = body as Record<string, unknown>;
+    const hasEnabled = Object.prototype.hasOwnProperty.call(payload, "enabled");
+    const hasMode = Object.prototype.hasOwnProperty.call(payload, "mode");
+    if (hasEnabled && hasMode) {
+      return jsonResponse({ error: "provide either enabled or mode, not both" }, 400);
+    }
 
-    const { setCodexIntegrationEnabled } = await import("../../codex/desired-state");
-    const persisted = setCodexIntegrationEnabled(enabled);
+    let mode: CodexIntegrationMode;
+    if (hasMode) {
+      if (payload.mode !== "full" && payload.mode !== "catalog-only" && payload.mode !== "off") {
+        return jsonResponse({ error: "mode must be full, catalog-only, or off" }, 400);
+      }
+      mode = payload.mode;
+    } else if (hasEnabled) {
+      if (typeof payload.enabled !== "boolean") {
+        return jsonResponse({ error: "enabled must be a boolean" }, 400);
+      }
+      mode = payload.enabled ? "full" : "off";
+    } else {
+      return jsonResponse({ error: "mode or enabled is required" }, 400);
+    }
+    const enabled = mode !== "off";
+
+    const { setCodexIntegrationMode } = await import("../../codex/desired-state");
+    const persisted = setCodexIntegrationMode(mode);
     /*
      * `missing` does not block the switch — see the Grok route for the reasoning.
      * A user with no config file yet still gets the artifact change; what they
@@ -319,19 +347,34 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
     }
     const durable = persisted.ok;
 
+    if (!durable && mode === "catalog-only") {
+      return jsonResponse({
+        ok: true,
+        clientId: "codex",
+        changed: false,
+        state: "absent",
+        desiredEnabled: true,
+        mode,
+        message: "Catalog-only was not applied because no config file exists to preserve this mode across the sync boundary.",
+        reason: "not_durable",
+      } satisfies NativeToggleEnvelope);
+    }
+
     if (enabled) {
       // The port this process actually BOUND, not what config.json last recorded.
       // A stale config port would inject a base_url pointing at nothing — the
       // same trap `runGrokApplyFlight` documents below.
       const runtime = (ctx.deps.readRuntimePort ?? readRuntimePort)(process.pid);
       const port = runtime?.port ?? ctx.config.port;
-      const { syncModelsToCodex } = await import("../../codex/sync");
-      const applied = await syncModelsToCodex(port);
+      const sync = ctx.deps.syncModelsToCodex
+        ?? (await import("../../codex/sync")).syncModelsToCodex;
+      const applied = await sync(port);
       if (applied.status === "skipped") {
         return jsonResponse({
           ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
           state: "absent",
           desiredEnabled: enabled,
+          mode,
           message: "Codex integration is OFF; enable did not change Codex.",
           reason: "apply_incomplete",
         } satisfies NativeToggleEnvelope);
@@ -340,8 +383,11 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
         ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
         state: applied.ok ? "current" : "absent",
         desiredEnabled: enabled,
+        mode,
         message: applied.ok
-          ? "Codex now routes through opencodex"
+          ? mode === "catalog-only"
+            ? "Codex model catalog is managed by opencodex; provider routing and history remain user-owned"
+            : "Codex now routes through opencodex"
           : `Codex intent saved, but applying it did not complete: ${applied.message}`,
         ...(applied.ok
           ? (durable ? {} : { reason: "not_durable" })
@@ -354,7 +400,7 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       const { classifyNativeRoutedResidue } = await import("../../codex/native-residue");
       if (classifyNativeRoutedResidue().kind === "clean") {
         return jsonResponse({
-          ok: true, clientId: "codex", changed: false, state: "absent", desiredEnabled: false,
+          ok: true, clientId: "codex", changed: false, state: "absent", desiredEnabled: false, mode,
           message: "Codex integration is already OFF and native; no Codex files changed.",
         } satisfies NativeToggleEnvelope);
       }
@@ -365,6 +411,7 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
       state: restored.success ? "absent" : "unsafe",
       desiredEnabled: enabled,
+      mode,
       message: restored.success
         ? "Codex restored to its native path; the proxy is still serving other clients"
         : `Codex intent saved, but restoring the native path did not complete: ${restored.message}`,
@@ -684,7 +731,7 @@ export async function handleNativeIntegrationRoutes(ctx: ManagementContext): Pro
   if (url.pathname === "/api/native-integrations" && req.method === "GET") {
     const { getConfigPath } = await import("../../config");
     return jsonResponse({
-      clients: [claudeStatus(config, getConfigPath()), grokStatus(config), codexStatus(config, getConfigPath()), desktopStatus(config)],
+      clients: [claudeStatus(config, getConfigPath()), grokStatus(config), codexStatus(loadConfig(), getConfigPath()), desktopStatus(config)],
     } satisfies NativeStatusListEnvelope);
   }
 

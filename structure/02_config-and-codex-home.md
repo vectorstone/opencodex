@@ -96,7 +96,7 @@ matters for maintainers is which groups exist and who resolves them:
 | Retained state | `appOwnedMemoryBudgetMb` | Process-wide eviction target for app-owned logs, caches, blobs, and continuation payloads. Default 256 MiB, valid 64..4096; pinned state may temporarily exceed the target, but every pin-capable store has a finite local cap and their documented aggregate stays below `APP_OWNED_WORST_CASE_PINNED_BYTES` (512 MiB). Neither value caps RSS or native runtime memory. |
 | Transport | stream mode, timeouts, proxy settings, `websockets` | `streamMode` persists in config.json; Windows services need a persisted input, and macOS uses it for explicit eager-relay opt-in. |
 | Credentials | `apiKeys` | Data-plane only; never admitted to `/api/*`. |
-| Lifecycle | `codexAutoStart`, shim/start behavior, resume-history sync, storage cleanup | Startup safety reads these; see [`05_gui-and-management-api.md`](05_gui-and-management-api.md). |
+| Lifecycle | `clientIntegrations.codex`, `codexAutoStart`, shim/start behavior, resume-history sync, storage cleanup | Missing/true Codex intent is `full`, `"catalog-only"` owns only catalog/cache, and false is `off`. Startup safety reads the remaining lifecycle state; see [`05_gui-and-management-api.md`](05_gui-and-management-api.md). |
 
 Env values are resolved through `src/config.ts`, so a config value naming an env var never persists
 the secret itself.
@@ -145,11 +145,12 @@ Native Codex sub-agent defaults are a separate, explicit opt-in. When
 overwritten. Disabling the option and fallback restore remove only marker-owned values; journal
 restore must preserve later user edits while stripping those managed values.
 
-If the root config selects a provider other than `openai` or `opencodex`, injection must leave the
-config byte-for-byte unchanged and skip profile creation/updates and history migration. External
-provider managers own that routing configuration, and replacing their provider id can hide
-otherwise intact Codex sessions. This ownership check must run before catalog/cache refresh,
-journal creation, and the background history migration guardian.
+In `full` mode, if the root config selects a provider other than `openai` or `opencodex`, injection
+must leave the config byte-for-byte unchanged and skip profile creation/updates, catalog/cache
+refresh, and history migration. External provider managers own that routing configuration, and
+replacing their provider id can hide otherwise intact Codex sessions. In explicit `catalog-only`
+mode, the sync boundary may refresh only the selected catalog and `models_cache.json`; it must return
+before config/profile injection, journal creation, and every history/session write.
 
 `supports_websockets = true` is appended to the provider table only when `websocketsEnabled(config)`
 returns true.

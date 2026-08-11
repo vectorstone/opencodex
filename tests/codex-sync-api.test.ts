@@ -147,6 +147,127 @@ describe("GUI/CLI Codex sync backend", () => {
     expect(injected).toBe(false);
   });
 
+  test("catalog-only refreshes catalog/cache while preserving external routing and history artifacts", async () => {
+    const sentinels = new Map<string, string>([
+      ["config.toml", [
+        'model = "gpt-5.6-sol"',
+        'model_provider = "global-infra"',
+        'model_catalog_json = "/tmp/opencodex-catalog.json"',
+        "",
+        "[model_providers.global-infra]",
+        'name = "global-infra"',
+        'base_url = "http://127.0.0.1:10100/v1"',
+        'wire_api = "responses"',
+        "",
+      ].join("\n")],
+      ["opencodex.config.toml", "profile-sentinel\n"],
+      [".opencodex-journal.json", "journal-sentinel\n"],
+      ["state_5.sqlite", "history-sentinel\n"],
+      ["sessions/session.jsonl", "session-sentinel\n"],
+    ]);
+    for (const [relative, contents] of sentinels) {
+      const path = join(TEST_CODEX_HOME, relative);
+      mkdirSync(join(path, ".."), { recursive: true });
+      writeFileSync(path, contents, "utf8");
+    }
+    writeFileSync(join(TEST_OCX_HOME, "config.json"), JSON.stringify({
+      ...config,
+      clientIntegrations: { codex: "catalog-only" },
+    }));
+
+    let injected = false;
+    let refreshed = false;
+    const result = await syncModelsToCodex(10100, config, null, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        refreshed = true;
+        writeFileSync(join(TEST_CODEX_HOME, "opencodex-catalog.json"), '{"models":[]}\n', "utf8");
+        writeFileSync(join(TEST_CODEX_HOME, "models_cache.json"), '{"models":[]}\n', "utf8");
+        return {
+          added: 2,
+          path: join(TEST_CODEX_HOME, "opencodex-catalog.json"),
+          catalogExists: true,
+          catalogWritten: true,
+          cacheSynced: true,
+          comboOmissions: [],
+        };
+      },
+      injectCodexConfig: async () => {
+        injected = true;
+        throw new Error("catalog-only must not inject");
+      },
+      currentExternalCodexModelProvider: () => "global-infra",
+    });
+
+    expect(refreshed).toBe(true);
+    expect(injected).toBe(false);
+    expect(result).toMatchObject({
+      status: "applied",
+      ok: true,
+      added: 2,
+      catalogExists: true,
+      catalogWritten: true,
+      cacheSynced: true,
+    });
+    expect(result.message).toContain("remain user-owned");
+    expect(readFileSync(join(TEST_CODEX_HOME, "opencodex-catalog.json"), "utf8")).toContain("models");
+    expect(readFileSync(join(TEST_CODEX_HOME, "models_cache.json"), "utf8")).toContain("models");
+    for (const [relative, contents] of sentinels) {
+      expect(readFileSync(join(TEST_CODEX_HOME, relative), "utf8")).toBe(contents);
+    }
+  });
+
+  test("catalog-only reports an incomplete refresh without falling through to injection", async () => {
+    writeFileSync(join(TEST_OCX_HOME, "config.json"), JSON.stringify({
+      ...config,
+      clientIntegrations: { codex: "catalog-only" },
+    }));
+    let injected = false;
+    const result = await syncModelsToCodex(10100, config, null, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        throw new Error("catalog unavailable");
+      },
+      injectCodexConfig: async () => {
+        injected = true;
+        throw new Error("catalog-only must not inject");
+      },
+      currentExternalCodexModelProvider: () => "global-infra",
+    });
+
+    expect(injected).toBe(false);
+    expect(result).toMatchObject({ status: "applied", ok: false, catalogExists: false });
+    expect(result.warning).toContain("catalog unavailable");
+  });
+
+  test("catalog-only surfaces an OFF observed by the locked catalog commit", async () => {
+    writeFileSync(join(TEST_OCX_HOME, "config.json"), JSON.stringify({
+      ...config,
+      clientIntegrations: { codex: "catalog-only" },
+    }));
+    let injected = false;
+    const result = await syncModelsToCodex(10100, config, null, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => ({
+        added: 0,
+        path: join(TEST_CODEX_HOME, "opencodex-catalog.json"),
+        catalogExists: true,
+        catalogWritten: false,
+        cacheSynced: false,
+        comboOmissions: [],
+        skippedReason: "desired_disabled",
+      }),
+      injectCodexConfig: async () => {
+        injected = true;
+        throw new Error("OFF must not inject");
+      },
+      currentExternalCodexModelProvider: () => "global-infra",
+    });
+
+    expect(injected).toBe(false);
+    expect(result).toMatchObject({ status: "skipped", skippedReason: "desired_disabled", ok: true });
+  });
+
   /**
    * The lost-transition race, with a REAL second process. The caller's config
    * snapshot says ON; while provider discovery is awaited, another process

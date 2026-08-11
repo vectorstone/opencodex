@@ -445,7 +445,7 @@ export default function IntegrationsOverview({
   };
 
   const requestToggle = (row: OverviewRow, next: boolean) => {
-    if (row.status || next || row.id === "claude" || row.toggle === null) {
+    if (row.status || next || row.id === "claude" || row.id === "codex" || row.toggle === null) {
       void toggleCard(row, next);
       return;
     }

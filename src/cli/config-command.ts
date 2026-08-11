@@ -49,6 +49,13 @@ function setPath(root: Record<string, unknown>, path: string, value: unknown, re
   const segments = pathSegments(path);
   let current = root;
   for (const segment of segments.slice(0, -1)) {
+    if (!Object.hasOwn(current, segment)) {
+      if (remove) throw new CliUsageError(`config parent path not found: ${segment}`, USAGE);
+      const next: Record<string, unknown> = {};
+      current[segment] = next;
+      current = next;
+      continue;
+    }
     const next = current[segment];
     if (!next || typeof next !== "object" || Array.isArray(next)) throw new CliUsageError(`config parent path not found: ${segment}`, USAGE);
     current = next as Record<string, unknown>;

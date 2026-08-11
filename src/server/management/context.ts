@@ -7,11 +7,14 @@ import type { injectGrokConfig } from "../../grok/inject";
 import type { removeDesktop3pStandardPivot, writeDesktop3pConfig } from "../../claude/desktop-3p";
 import type { RuntimePortState } from "../../config";
 import type { CatalogDisposition, ConvergeCodex } from "../../codex/convergence-types";
+import type { syncModelsToCodex } from "../../codex/sync";
 
 export interface ManagementApiDeps {
   toggleCodexMultiAgentV2?: (enabled: boolean) => void;
   toggleDefaultModeRequestUserInput?: (enabled: boolean) => void;
   createManagementConvergeCodex?: (config: Readonly<OcxConfig>) => ConvergeCodex;
+  /** Codex apply seam keeps native-integration route tests out of the user's Codex home. */
+  syncModelsToCodex?: typeof syncModelsToCodex;
   /**
    * Persistence seam for route-level tests. Production leaves this unset and uses
    * `saveConfigPreservingClaudeCode`; tests that pass an in-memory fixture config

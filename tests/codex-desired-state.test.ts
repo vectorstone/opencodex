@@ -16,7 +16,9 @@ import { loadConfig, saveConfig } from "../src/config";
 import {
   codexIntegrationEnabled,
   codexIntegrationEnabledNow,
+  codexIntegrationMode,
   setCodexIntegrationEnabled,
+  setCodexIntegrationMode,
   setGrokIntegrationEnabled,
   grokIntegrationEnabled,
   shouldSyncCodexOnStart,
@@ -67,6 +69,20 @@ describe("absence means ON", () => {
     expect(codexIntegrationEnabled({ ...baseConfig(), clientIntegrations: { codex: false } })).toBe(false);
   });
 
+  test("resolves the three compatible persisted forms to explicit modes", () => {
+    expect(codexIntegrationMode(baseConfig())).toBe("full");
+    expect(codexIntegrationMode({ ...baseConfig(), clientIntegrations: { codex: true } })).toBe("full");
+    expect(codexIntegrationMode({ ...baseConfig(), clientIntegrations: { codex: "catalog-only" } })).toBe("catalog-only");
+    expect(codexIntegrationMode({ ...baseConfig(), clientIntegrations: { codex: false } })).toBe("off");
+  });
+
+  test("catalog-only remains enabled for startup sync without becoming full integration", () => {
+    const catalogOnly = { ...baseConfig(), clientIntegrations: { codex: "catalog-only" as const } };
+    expect(codexIntegrationEnabled(catalogOnly)).toBe(true);
+    expect(shouldSyncCodexOnStart(catalogOnly)).toBe(true);
+    expect(codexIntegrationMode(catalogOnly)).toBe("catalog-only");
+  });
+
   /**
    * A hand edit of the wrong type must not be read as OFF. `"false"` is a string,
    * and treating any non-true value as OFF would silently unroute a user who
@@ -88,6 +104,36 @@ describe("absence means ON", () => {
 });
 
 describe("persisting the decision", () => {
+  test("catalog-only is persisted and survives a fresh read", () => {
+    saveConfig(baseConfig());
+    expect(setCodexIntegrationMode("catalog-only")).toMatchObject({
+      ok: true,
+      status: "committed",
+      mode: "catalog-only",
+      enabled: true,
+    });
+    expect(codexIntegrationMode(loadConfig())).toBe("catalog-only");
+
+    const raw = JSON.parse(readFileSync(join(testRoot, "config.json"), "utf8")) as Record<string, unknown>;
+    expect((raw.clientIntegrations as Record<string, unknown>).codex).toBe("catalog-only");
+  });
+
+  test("the legacy boolean setter maps true to full and removes catalog-only", () => {
+    saveConfig({ ...baseConfig(), clientIntegrations: { codex: "catalog-only" } });
+    expect(setCodexIntegrationEnabled(true)).toMatchObject({ ok: true, status: "committed", enabled: true });
+    expect(codexIntegrationMode(loadConfig())).toBe("full");
+
+    const raw = JSON.parse(readFileSync(join(testRoot, "config.json"), "utf8")) as Record<string, unknown>;
+    expect(raw.clientIntegrations).toBeUndefined();
+  });
+
+  test("setting full canonicalizes legacy explicit true to a missing key", () => {
+    saveConfig({ ...baseConfig(), clientIntegrations: { codex: true } });
+    expect(setCodexIntegrationMode("full")).toMatchObject({ ok: true, status: "committed", mode: "full" });
+
+    const raw = JSON.parse(readFileSync(join(testRoot, "config.json"), "utf8")) as Record<string, unknown>;
+    expect(raw.clientIntegrations).toBeUndefined();
+  });
   test("turning it off is written, and survives a fresh read", () => {
     saveConfig(baseConfig());
     expect(codexIntegrationEnabledNow()).toBe(true);

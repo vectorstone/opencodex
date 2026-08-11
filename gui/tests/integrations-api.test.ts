@@ -12,6 +12,7 @@ import {
   toggleIntegration,
   type IntegrationJournalEnvelope,
 } from "../src/pages/integrations/integration-api";
+import { setCodexIntegrationMode } from "../src/pages/integrations/native-api";
 
 const originalFetch = globalThis.fetch;
 
@@ -96,6 +97,33 @@ test("mutation adapters send the exact WP4 methods and bodies", async () => {
   expect(requests[1].init).toMatchObject({
     method: "POST",
     body: JSON.stringify({ opId: "op-2", confirmDrift: true }),
+    signal: controller.signal,
+  });
+});
+
+test("the Codex mode adapter sends the catalog-only payload", async () => {
+  const controller = new AbortController();
+  let request: { url: string; init?: RequestInit } | null = null;
+  globalThis.fetch = (async (input, init) => {
+    request = { url: String(input), init };
+    return Response.json({
+      ok: true,
+      clientId: "codex",
+      changed: true,
+      state: "current",
+      desiredEnabled: true,
+      mode: "catalog-only",
+      message: "catalog updated",
+    });
+  }) as typeof fetch;
+
+  const result = await setCodexIntegrationMode("/management", "catalog-only", controller.signal);
+
+  expect(result.mode).toBe("catalog-only");
+  expect(request).toMatchObject({ url: "/management/api/native-integrations/codex" });
+  expect(request!.init).toMatchObject({
+    method: "PUT",
+    body: JSON.stringify({ mode: "catalog-only" }),
     signal: controller.signal,
   });
 });
