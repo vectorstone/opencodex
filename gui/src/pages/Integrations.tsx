@@ -4,6 +4,7 @@ import { useT, type TKey } from "../i18n/shared";
 import ApiKeys from "./ApiKeys";
 import Claude from "./Claude";
 import Grok from "./Grok";
+import CodexIntegrationPage from "./integrations/CodexIntegrationPage";
 import IntegrationsOverview from "./integrations/IntegrationsOverview";
 import FileIntegrationPage, {
   type FileIntegrationClientId,
@@ -174,17 +175,7 @@ export default function Integrations({ apiBase }: { apiBase: string }) {
             )}
             {definition.id === "keys" && <ApiKeys apiBase={apiBase} active={active} />}
             {definition.id === "codex" && (
-              <section className="integration-native-page" aria-labelledby="codex-integration-title">
-                <h3 id="codex-integration-title">{t("integrations.codex.title")}</h3>
-                <p>{t("integrations.codex.body")}</p>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => navigateHash("startup")}
-                >
-                  {t("integrations.codex.openService")}
-                </button>
-              </section>
+              <CodexIntegrationPage apiBase={apiBase} active={active} />
             )}
             {definition.id === "claude" && <Claude apiBase={apiBase} active={active} />}
             {definition.id === "grok" && <Grok apiBase={apiBase} active={active} />}

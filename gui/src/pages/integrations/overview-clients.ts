@@ -160,7 +160,11 @@ export function isAppliedState(state: VisualIntegrationState): boolean {
  * page's question, so a `protected` status with no injected routing still
  * reads as not applied here.
  */
-function codexRow(payload: CodexRoutingPayload | null): OverviewRow {
+function codexRow(
+  payload: CodexRoutingPayload | null,
+  native: NativeStatus | undefined,
+  nativeSettled: boolean,
+): OverviewRow {
   const base = {
     id: "codex" as const,
     hash: "integrations/codex",
@@ -172,6 +176,15 @@ function codexRow(payload: CodexRoutingPayload | null): OverviewRow {
     detail: null,
     detailVars: null,
   };
+  if (nativeSettled && native) {
+    const mode = native.mode ?? (native.desiredEnabled ? "full" : "off");
+    if (mode === "off") {
+      return { ...base, state: "absent", installed: true, applied: false, toggleOn: false, detailKey: "integrations.detail.codexAbsent" };
+    }
+    if (mode === "catalog-only") {
+      return { ...base, state: "current", installed: true, applied: true, toggleOn: true, detailKey: "integrations.detail.codexCatalogOnly" };
+    }
+  }
   if (!payload) return { ...base, state: "unknown", installed: false, applied: false, detailKey: null };
   // The proxy answering at all means Codex CLI is present: it is the client
   // this product exists for, and there is no separate detection probe.
@@ -415,7 +428,7 @@ export function buildOverviewRows(sources: OverviewSources): OverviewRows {
   // One lookup table, not a find per client (react-doctor js-index-maps).
   const statusByClient = new Map(sources.clients.map(status => [status.clientId, status]));
   const rows: OverviewRow[] = [
-    codexRow(sources.codex),
+    codexRow(sources.codex, sources.native?.find(status => status.clientId === "codex"), sources.nativeSettled),
     claudeRow(sources.claude, nativeClaude, sources.nativeSettled),
     claudeDesktopRow(
       sources.claudeDesktop,

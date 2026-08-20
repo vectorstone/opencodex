@@ -231,8 +231,8 @@ export interface OcxApiKeyEntry {
  * phase claim ownership over a client it does not implement.
  */
 export interface OcxClientIntegrationsConfig {
-  /** Durable desired state for native Codex. MISSING MEANS ON. */
-  codex?: boolean;
+  /** Durable desired state for native Codex. Missing/true=full, catalog-only=catalog, false=off. */
+  codex?: boolean | "catalog-only";
   /** Durable desired state for Grok Build. MISSING MEANS ON. */
   grok?: boolean;
   /** Durable desired state for Claude Desktop. MISSING MEANS ON. */

@@ -5,7 +5,7 @@ import { applyProxyEnv, loadConfig } from "../config";
 import type { OcxConfig } from "../types";
 import { collectOrcaCodexHomeDiagnostic } from "./home";
 import { summarizeComboCatalogOmissions, type ComboCatalogOmission } from "./catalog/aggregation";
-import { shouldSyncCodexOnStart } from "./desired-state";
+import { codexIntegrationMode } from "./desired-state";
 import { admitCodexWrite, type CodexAdmission } from "./admission";
 import type { CodexCatalogSyncOptions } from "./catalog/sync";
 
@@ -84,7 +84,9 @@ export async function syncModelsToCodex(
   // durable user switch and must be read again at this production boundary: a
   // PUT OFF while provider discovery is in flight cannot be allowed to commit
   // through an older captured object.
-  const desiredDisabled = !shouldSyncCodexOnStart(loadConfig());
+  const durableConfig = loadConfig();
+  const desiredMode = codexIntegrationMode(durableConfig);
+  const desiredDisabled = desiredMode === "off";
   const catalogEvenWhenNotInjected = options.catalogEvenWhenNotInjected === true;
   if (desiredDisabled && !catalogEvenWhenNotInjected) {
     return {
@@ -118,6 +120,24 @@ export async function syncModelsToCodex(
   }
   const p = port ?? config.port ?? 10100;
   const externalProvider = (deps.currentExternalCodexModelProvider ?? currentExternalCodexModelProvider)();
+
+  if (desiredMode === "catalog-only") {
+    // Catalog-only is a durable mode, not merely the explicit-sync escape hatch:
+    // refresh the catalog/cache while leaving external provider routing, profiles,
+    // journal, and history entirely user-owned.
+    applyProxyEnv(config);
+    const refreshed = await refreshCatalogForSync(config, deps, undefined, log);
+    const message = refreshed.catalogWritten || refreshed.cacheSynced
+      ? "Codex catalog and models cache refreshed; provider routing and history remain user-owned."
+      : "Codex catalog refresh skipped; provider routing and history remain user-owned.";
+    return {
+      status: "catalog-only",
+      ok: !refreshed.warning,
+      ...refreshed,
+      message,
+      ...(refreshed.comboOmissions.length > 0 ? { comboOmissions: refreshed.comboOmissions } : {}),
+    };
+  }
 
   if (desiredDisabled && catalogEvenWhenNotInjected) {
     // Explicit `ocx sync` with the integration OFF: refresh the catalog/cache so

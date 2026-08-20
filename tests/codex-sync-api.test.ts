@@ -82,6 +82,27 @@ describe("GUI/CLI Codex sync backend", () => {
     else process.env.USERPROFILE = prevUserProfile;
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
   });
+
+  test("durable catalog-only refreshes catalog/cache without injection", async () => {
+    writeFileSync(join(TEST_OCX_HOME, "config.json"), JSON.stringify({ ...config, clientIntegrations: { codex: "catalog-only" } }));
+    let refreshed = false;
+    let injected = false;
+    const result = await syncModelsToCodex(12345, config, null, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        refreshed = true;
+        return { added: 2, path: "/tmp/opencodex-catalog.json", catalogExists: true, catalogWritten: true, cacheSynced: true, comboOmissions: [] };
+      },
+      injectCodexConfig: async () => {
+        injected = true;
+        throw new Error("catalog-only must not inject");
+      },
+      currentExternalCodexModelProvider: () => "global-infra",
+    });
+    expect(refreshed).toBe(true);
+    expect(injected).toBe(false);
+    expect(result).toMatchObject({ status: "catalog-only", ok: true, catalogWritten: true, cacheSynced: true });
+  });
   test("returns the structured sync result used by POST /api/sync", async () => {
     let injectedPort = 0;
     let injectedCatalogPath: string | null | undefined;

@@ -10,6 +10,7 @@ import { readJsonIfOk } from "../../fetch-json";
  */
 export type NativeIntegrationClientId = "claude" | "grok" | "codex" | "claude-desktop";
 export type NativeIntegrationState = "absent" | "current" | "unsafe";
+export type CodexIntegrationMode = "full" | "catalog-only" | "off";
 export type NativeRefusalReason =
   | "not_installed"
   | "orphaned_marker"
@@ -26,6 +27,7 @@ export interface NativeStatus {
   installed: boolean;
   configPath: string;
   desiredEnabled: boolean;
+  mode?: CodexIntegrationMode;
   disableBlocked: { reason: NativeRefusalReason; message: string } | null;
 }
 
@@ -40,6 +42,7 @@ export interface NativeToggleEnvelope {
   state: NativeIntegrationState;
   message: string;
   desiredEnabled: boolean;
+  mode?: CodexIntegrationMode;
   reason?: string;
 }
 
@@ -156,6 +159,21 @@ export async function toggleNativeIntegration(
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled }),
+      signal,
+    }),
+  );
+}
+
+export async function setCodexIntegrationMode(
+  apiBase: string,
+  mode: CodexIntegrationMode,
+  signal?: AbortSignal,
+) {
+  return readToggleResponse(
+    await fetch(`${apiBase}/api/native-integrations/codex`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
       signal,
     }),
   );

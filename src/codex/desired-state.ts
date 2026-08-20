@@ -26,6 +26,7 @@ import { runStartupReadinessSync, type ReadinessGate, type SyncOutcomeLike } fro
 
 /** Clients whose durable intent this module owns. */
 export type DurableIntentClientId = keyof OcxClientIntegrationsConfig;
+export type CodexIntegrationMode = "full" | "catalog-only" | "off";
 
 /** Injectable for tests; production passes the real sync. */
 /**
@@ -67,7 +68,16 @@ export function integrationEnabled(
 }
 
 export function codexIntegrationEnabled(config: Pick<OcxConfig, "clientIntegrations">): boolean {
-  return integrationEnabled(config, "codex");
+  return codexIntegrationMode(config) !== "off";
+}
+
+export function codexIntegrationMode(
+  config: Pick<OcxConfig, "clientIntegrations">,
+): CodexIntegrationMode {
+  const desired = config.clientIntegrations?.codex;
+  if (desired === false) return "off";
+  if (desired === "catalog-only") return "catalog-only";
+  return "full";
 }
 
 /** Whether a Codex sync is permitted for this admitted config snapshot. */
@@ -140,7 +150,45 @@ export function setIntegrationEnabled(
 }
 
 export function setCodexIntegrationEnabled(enabled: boolean): CodexDesiredStateResult {
-  return setIntegrationEnabled("codex", enabled);
+  return setCodexIntegrationMode(enabled ? "full" : "off");
+}
+
+export type CodexIntegrationModeResult =
+  | { readonly ok: true; readonly status: "committed" | "unchanged"; readonly mode: CodexIntegrationMode; readonly enabled: boolean }
+  | Extract<CodexDesiredStateResult, { readonly ok: false }>;
+
+export function setCodexIntegrationMode(mode: CodexIntegrationMode): CodexIntegrationModeResult {
+  const outcome = mutatePersistedConfig(config => {
+    const persisted = config.clientIntegrations?.codex;
+    const alreadyCanonical = mode === "full"
+      ? persisted === undefined
+      : mode === "catalog-only"
+        ? persisted === "catalog-only"
+        : persisted === false;
+    if (alreadyCanonical) return { changed: false, value: mode };
+
+    const integrations = { ...(config.clientIntegrations ?? {}) };
+    if (mode === "full") delete integrations.codex;
+    else integrations.codex = mode === "catalog-only" ? "catalog-only" : false;
+    if (Object.keys(integrations).length === 0) delete config.clientIntegrations;
+    else config.clientIntegrations = integrations;
+    return { changed: true, value: mode };
+  });
+
+  if (outcome.status !== "unavailable") {
+    return { ok: true, status: outcome.status, mode, enabled: mode !== "off" };
+  }
+  const retryable = outcome.reason === "conflict";
+  return {
+    ok: false,
+    reason: outcome.reason,
+    retryable,
+    message: outcome.reason === "conflict"
+      ? "Another process changed the config while this switch was being written."
+      : outcome.reason === "missing"
+        ? "No config file exists to record the switch in."
+        : "The config file is malformed; refusing to overwrite it.",
+  };
 }
 
 export function setGrokIntegrationEnabled(enabled: boolean): CodexDesiredStateResult {

@@ -14,9 +14,11 @@ import { join } from "node:path";
 
 import { loadConfig, saveConfig } from "../src/config";
 import {
+  codexIntegrationMode,
   codexIntegrationEnabled,
   codexIntegrationEnabledNow,
   setCodexIntegrationEnabled,
+  setCodexIntegrationMode,
   setGrokIntegrationEnabled,
   grokIntegrationEnabled,
   shouldSyncCodexOnStart,
@@ -67,6 +69,11 @@ describe("absence means ON", () => {
     expect(codexIntegrationEnabled({ ...baseConfig(), clientIntegrations: { codex: false } })).toBe(false);
   });
 
+  test("catalog-only is a distinct enabled mode", () => {
+    expect(codexIntegrationMode({ ...baseConfig(), clientIntegrations: { codex: "catalog-only" } })).toBe("catalog-only");
+    expect(codexIntegrationEnabled({ ...baseConfig(), clientIntegrations: { codex: "catalog-only" } })).toBe(true);
+  });
+
   /**
    * A hand edit of the wrong type must not be read as OFF. `"false"` is a string,
    * and treating any non-true value as OFF would silently unroute a user who
@@ -88,6 +95,13 @@ describe("absence means ON", () => {
 });
 
 describe("persisting the decision", () => {
+  test("catalog-only persists as a durable mode", () => {
+    writeFileSync(join(testRoot, "config.json"), JSON.stringify(baseConfig(), null, 2));
+    const result = setCodexIntegrationMode("catalog-only");
+    expect(result).toMatchObject({ ok: true, mode: "catalog-only", enabled: true });
+    expect((JSON.parse(readFileSync(join(testRoot, "config.json"), "utf8")) as { clientIntegrations?: { codex?: unknown } }).clientIntegrations?.codex).toBe("catalog-only");
+  });
+
   test("turning it off is written, and survives a fresh read", () => {
     saveConfig(baseConfig());
     expect(codexIntegrationEnabledNow()).toBe(true);

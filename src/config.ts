@@ -1216,7 +1216,7 @@ const apiKeyEntrySchema = z.object({
  * invalidating the object or, worse, the whole config.
  */
 const clientIntegrationsSchema = z.object({
-  codex: z.boolean().optional().catch(undefined),
+  codex: z.union([z.boolean(), z.literal("catalog-only")]).optional().catch(undefined),
   grok: z.boolean().optional().catch(undefined),
   "claude-desktop": z.boolean().optional().catch(undefined),
 }).passthrough();

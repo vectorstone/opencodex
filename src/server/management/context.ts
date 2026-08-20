@@ -14,6 +14,7 @@ import type {
   performCodexRestart,
   readCodexAppServerState,
 } from "../../codex/app-server-restart-service";
+import type { syncModelsToCodex } from "../../codex/sync";
 
 export interface ManagementApiDeps {
   /** Platform seam for capability projections; does not alter host-level startup behavior. */
@@ -21,6 +22,8 @@ export interface ManagementApiDeps {
   toggleCodexMultiAgentV2?: (enabled: boolean) => void;
   toggleDefaultModeRequestUserInput?: (enabled: boolean) => void;
   createManagementConvergeCodex?: (config: Readonly<OcxConfig>) => ConvergeCodex;
+  /** Codex integration sync seam keeps mode mutations isolated in route tests. */
+  syncModelsToCodex?: typeof syncModelsToCodex;
   /** Startup-health seam keeps route tests from launching platform probes. */
   getCachedStartupHealth?: (config: Pick<OcxConfig, "codexAutoStart">) => Promise<StartupHealth>;
   /**

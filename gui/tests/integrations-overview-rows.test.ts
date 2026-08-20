@@ -80,6 +80,17 @@ test("Codex reads routingInjected, not status", () => {
   expect(rowById(broken, "codex").state).toBe("stale");
 });
 
+test("Codex catalog-only is applied even when routing is owned by another provider", () => {
+  const built = buildOverviewRows(sources({
+    codex: { routingInjected: false, status: "at-risk" },
+    native: [{
+      clientId: "codex", state: "current", installed: true, configPath: "/tmp/config.json",
+      desiredEnabled: true, mode: "catalog-only", disableBlocked: null,
+    }],
+  }));
+  expect(rowById(built, "codex")).toMatchObject({ state: "current", applied: true, toggleOn: true, detailKey: "integrations.detail.codexCatalogOnly" });
+});
+
 test("Claude Desktop: applied but not the served profile reads as stale", () => {
   const desktopNative = [{
     clientId: "claude-desktop" as const,
