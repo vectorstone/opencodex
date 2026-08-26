@@ -158,6 +158,136 @@ credential is equally reachable by both the browser and the agent, so no check
 inside this process can tell them apart. The real boundary is the rule above, and
 it binds you regardless of which mechanism is within reach.
 
+## Fork-maintained behavior and upstream synchronization
+
+This repository is a fork of `https://github.com/lidge-jun/opencodex`. Upstream
+code may be merged, but the behavioral contracts in this section belong to this
+fork and must survive an upstream synchronization. Preserve the behavior, not
+necessarily the old implementation: when upstream architecture changes, port the
+contract onto the current architecture and keep its regression coverage.
+
+The initial register below was audited against the common `v2.27.0` ancestor
+(`8e01dd4e`) before the planned synchronization to upstream `v2.33.0`. Merge
+commits and changes that leave no final tree difference are history, not
+fork-maintained behavior, and do not belong in this register.
+
+### Fork delta register
+
+#### F-001 — Durable three-mode Codex integration
+
+- `clientIntegrations.codex` supports `full`, `catalog-only`, and `off`. For
+  backward compatibility, a missing value or `true` means `full`,
+  `"catalog-only"` means `catalog-only`, and `false` means `off`.
+- `catalog-only` refreshes the Codex model catalog and `models_cache.json` while
+  leaving provider routing, profiles, journal, history, and session data under
+  the user's existing ownership. It must not silently become full integration.
+- The management API reports the mode and accepts a mode change while retaining
+  the legacy boolean toggle contract. The GUI overview and Codex integration
+  page must show and change all three modes consistently.
+- Key paths currently include `src/types/config.ts`, `src/config.ts`,
+  `src/codex/desired-state.ts`, `src/codex/sync.ts`,
+  `src/server/management/native-integration-routes.ts`, and the Codex integration
+  GUI/API/i18n files.
+- Regression sentinels currently include `tests/codex-desired-state.test.ts`,
+  `tests/codex-sync-api.test.ts`, `tests/native-codex-toggle.test.ts`,
+  `gui/tests/integrations-api.test.ts`, and
+  `gui/tests/integrations-overview-rows.test.ts`.
+- Original fork implementation: `0160b8f7`. Upstream may contain other internal
+  operations described as catalog-only; they are not equivalent unless the
+  durable config, ownership boundary, management API, and GUI contract above all
+  remain true.
+
+#### F-002 — Safe Codex client-metadata forwarding in API-key mode
+
+- The OpenAI Responses adapter's API-key path forwards allowed client identity
+  metadata such as `User-Agent`, `originator`, and relevant session/thread
+  headers when supplied by the caller. This supports upstreams that validate the
+  originating Codex client.
+- The configured provider API key remains authoritative. Never forward the
+  caller's `authorization` or `chatgpt-account-id` in this mode, and retain the
+  defensive rejection of any future forwarded-header name containing `key`,
+  `token`, or `secret`.
+- The key path is `src/adapters/openai-responses.ts`; the regression sentinel is
+  `tests/codex-metadata-integrity.test.ts`.
+- Original fork implementation: `0ac0d028` and `960e2b59`. This is a credential
+  boundary: changes require explicit security review and `bun run privacy:scan`.
+
+#### F-003 — OpenCode catalog authentication and modality export
+
+- `ocx opencode` fetches the management `/api/models` catalog with the configured
+  OpenCodex admin token, not with the data-plane admission key. If the management
+  token is unavailable, fail explicitly instead of producing a partial or
+  misleading model catalog.
+- Preserve non-empty catalog `inputModalities` and export them to OpenCode as
+  `modalities.input`. Missing or empty modality arrays must omit that block so
+  OpenCode keeps its own defaults.
+- Key paths currently include `src/cli/opencode.ts` and
+  `src/clients/config-export.ts`; regression sentinels include
+  `tests/opencode-cli.test.ts` and `tests/client-config-export.test.ts`.
+- Original fork implementation: `41dfada4` and `0a558755`. Authentication changes
+  are security-boundary changes and require explicit security review.
+
+### Registering future fork-only changes
+
+Any change that intentionally differs from upstream behavior must update this
+section in the same change set. Add a new stable `F-NNN` entry, or update the
+existing entry, with all of the following:
+
+- the user-visible or operational behavior that must survive future syncs;
+- compatibility and security boundaries, including what must never happen;
+- the current key implementation paths and focused regression tests;
+- the originating fork commit or pull request once available;
+- the upstream disposition: fork-only, partially overlapping, or verified as
+  absorbed upstream.
+
+Do not register incidental refactors, formatting, generated output, merge-only
+history, or temporary conflict resolutions. A prose entry without regression
+coverage is not sufficient for runtime behavior: add or retain a focused test.
+If paths or tests move, update the register in the same change that moves them.
+
+An entry may be marked absorbed and its local implementation removed only after
+the upstream implementation is verified against the complete behavior and
+security contract, the named regression tests pass without the local patch, and
+this register is updated with the upstream commit or release that absorbed it.
+
+### Required upstream synchronization procedure
+
+Use upstream stable release tags or the upstream `main` release commit by
+default. Synchronizing from the unreleased upstream `dev` branch requires an
+explicit decision for that sync. Never update this fork's `dev` by hard reset,
+forced rebase, wholesale file replacement, or a force push that discards fork
+ancestry.
+
+For every upstream sync:
+
+1. Require a clean worktree. Fetch the intended upstream refs and record the
+   exact source and target SHAs. Create a recoverable backup ref for the current
+   fork `dev`.
+2. Create a dedicated `codex/sync-upstream-<version>` branch from the fork's
+   current `dev`. Run a three-way merge preview and record the common ancestor,
+   left/right commit counts, overlapping paths, and predicted conflicts.
+3. Merge with history preserved, normally `git merge --no-ff --no-commit
+   <upstream-tag>`. Resolve conflicts against the current upstream architecture;
+   do not resolve a fork-owned path by blindly choosing all of `ours` or
+   `theirs`.
+4. Audit every `F-NNN` entry after the merge. Confirm its contract in code and
+   run its focused regression sentinels. Review automatically merged overlapping
+   files for semantic conflicts even when Git reported no textual conflict.
+5. Because the current register touches shared config, server management, an
+   adapter, authentication, GUI, and documentation, run the focused tests plus
+   `bun run typecheck`, `bun run test`, `bun run privacy:scan`, the required GUI
+   lint/test/build gates, and the documentation build before declaring the sync
+   complete.
+6. Inspect the final range/tree diff and retain the backup ref until the merged
+   build has passed the requested operational verification. Merge the sync branch
+   back to the fork `dev` without rewriting its published history.
+
+If upstream has absorbed a fork delta, prefer its current architecture over
+maintaining a parallel implementation, but only after satisfying the absorption
+criteria above. If the upstream target advances while the sync is in progress,
+finish against the recorded SHA or restart the evidence and validation process;
+do not silently widen the synchronization scope.
+
 ## Commands
 
 ```bash
