@@ -4,7 +4,9 @@
 export type { OcxTool, OcxToolChoice } from "./types/tools";
 export {
   namespacedToolName,
+  normalizeDeclaredToolName,
   toolChoiceAliases,
+  createToolChoiceResolver,
   toolChoiceCandidates,
   toolAllowedByChoice,
   resolveToolChoiceWireName,
@@ -43,6 +45,7 @@ export type {
   OcxAssistantContentPart,
   OcxRequestOptions,
   OcxMessagePhase,
+  OcxProviderContinuationOwner,
   OcxProviderContinuationState,
   AdapterEvent,
   OcxUrlCitation,
@@ -101,4 +104,3 @@ export type {
   CodexAccountCredentials,
   CodexAccountCredentialRecord,
 } from "./types/accounts";
-

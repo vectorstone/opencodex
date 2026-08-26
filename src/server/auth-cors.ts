@@ -1,30 +1,34 @@
 import { timingSafeEqual } from "node:crypto";
 import { formatErrorResponse } from "../bridge";
 import {
+  codexAutoStartEnabled,
+  modelPreferHostedToolsConfigError,
+  providerModelCostsConfigError,
+  requestPacingConfigError,
+  retryOn429PolicyConfigError,
+  sanitizeModelCostsForDisplay,
+} from "../config";
+import {
   apiKeyTransportConfigError,
   booleanRecordConfigError,
   modelAdapterRecordConfigError,
-  modelPreferHostedToolsConfigError,
-  codexAutoStartEnabled,
   nonBlankStringArrayConfigError,
   positiveIntegerConfigError,
   positiveIntegerRecordConfigError,
   providerBaseUrlConfigError,
   providerHeadersConfigError,
-  providerModelCostsConfigError,
   reasoningSummaryDeliveryRecordConfigError,
-  retryOn429PolicyConfigError,
-  requestPacingConfigError,
-  sanitizeModelCostsForDisplay,
   upstreamHttpVersionConfigError,
-} from "../config";
+} from "../config/provider-validation";
 import { providerDestinationConfigError } from "../lib/destination-policy";
 import { redactSecretString } from "../lib/redact";
 import { effectiveGoogleMode, getProviderRegistryEntry, providerCodexAccountMode, providerMatchesRegistryTransport, registryEntryForProviderDestination } from "../providers/registry";
 import { providerConfigSeed } from "../providers/derive";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import { openRouterRoutingConfigError } from "../providers/openrouter-routing";
+import { modelAutoCompactTokenLimitsConfigError } from "../providers/auto-compact-budget";
 import { googleVertexLocationConfigError } from "../providers/google-vertex-location";
+import { xaiResponsesOptInState } from "../providers/xai-responses-opt-in";
 
 let _corsOrigin = "http://localhost:10100";
 export function setCorsOrigin(port: number): void { _corsOrigin = `http://localhost:${port}`; }
@@ -562,6 +566,8 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
     if (contextOverlayError) return contextOverlayError;
     delete canonicalCandidate.contextWindow;
     delete canonicalCandidate.modelContextWindows;
+    // User-owned soft compaction policy; it does not alter the canonical transport seed.
+    delete canonicalCandidate.modelAutoCompactTokenLimits;
     const canonical = seed && sameCanonicalProviderSeed(canonicalCandidate, seed);
     if (!canonical) {
       return `provider ${name} must equal the canonical built-in provider seed`;
@@ -604,6 +610,13 @@ export function providerManagementConfigError(name: unknown, provider: unknown):
   if (apiKeyTransportError) return `provider ${name} ${apiKeyTransportError}`;
   const maxInputError = positiveIntegerRecordConfigError(raw.modelMaxInputTokens, "modelMaxInputTokens");
   if (maxInputError) return `provider ${name} ${maxInputError}`;
+  const autoCompactError = modelAutoCompactTokenLimitsConfigError(
+    raw.modelAutoCompactTokenLimits,
+    { requireNativeIds: name === "openai" },
+  );
+  if (autoCompactError) {
+    return `provider ${JSON.stringify(redactSecretString(name))} ${autoCompactError}`;
+  }
   const reasoningSummariesError = booleanRecordConfigError(raw.modelSupportsReasoningSummaries, "modelSupportsReasoningSummaries");
   if (reasoningSummariesError) return `provider ${name} ${reasoningSummariesError}`;
   const reasoningSummaryDeliveryError = reasoningSummaryDeliveryRecordConfigError(
@@ -688,6 +701,9 @@ export function safeConfigDTO(config: OcxConfig): unknown {
       hasApiKey: !!provider.apiKey,
       hasHeaders: !!provider.headers && Object.keys(provider.headers).length > 0,
     };
+    if (name === "xai") {
+      dto.xaiResponsesOptInState = xaiResponsesOptInState(provider);
+    }
     for (const key of [
       "defaultModel",
       "disabled",
@@ -701,6 +717,7 @@ export function safeConfigDTO(config: OcxConfig): unknown {
       "models",
       "contextWindow",
       "modelContextWindows",
+      "modelAutoCompactTokenLimits",
       "defaultMaxOutputTokens",
       "modelMaxOutputTokens",
       "openRouterRouting",
@@ -742,6 +759,9 @@ export function safeConfigDTO(config: OcxConfig): unknown {
     defaultProvider: config.defaultProvider,
     codexAutoStart: codexAutoStartEnabled(config),
     websockets: config.websockets,
+    // The GUI's browser-open toggle reads and writes this; absent means the
+    // historical auto-open behavior.
+    oauthOpenBrowser: config.oauthOpenBrowser !== false,
     providers,
   };
 }

@@ -4,7 +4,7 @@ import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import type { OcxAssistantContentPart, OcxMessage, OcxToolResultMessage } from "../../types";
 import { namespacedToolName } from "../../types";
 import type { CursorRunRequest } from "./types";
-import { isCursorExternalWireModel } from "./discovery";
+import { cursorNeedsExternalToolContinuation, isCursorExternalWireModel } from "./discovery";
 import { normalizeCursorToolResultText } from "./tool-result-normalize";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import {
@@ -15,6 +15,7 @@ import {
   storeCursorBlob,
   type CursorBlobRequestScopeToken,
 } from "./native-exec";
+import { buildSelectedContext, CURSOR_VISION_IMAGE_HISTORY_MARKER } from "./images";
 import { estimateTokens } from "../../lib/token-estimate";
 import { parseDataUrl } from "../image";
 import {
@@ -25,6 +26,7 @@ import {
   ConversationActionSchema,
   ConversationStepSchema,
   ConversationStateStructureSchema,
+  type ConversationStateStructure,
   ConversationTurnStructureSchema,
   McpArgsSchema,
   McpSuccessSchema,
@@ -186,10 +188,12 @@ function assistantRootText(
 }
 
 // Cursor builds the actual model prompt from rootPromptMessagesJson (turns[] is UI/display metadata),
-// so prior history — including assistant tool calls and tool results — must be replayed here or a
-// ResumeAction has nothing model-visible to continue from. The active user message is excluded
-// because it travels in the action. Tool results are assistant-role text with a [Tool Result]
-// or [Tool Error] marker so Cursor does not wrap them as `<user_query>` (#1992). Each entry is a SHA-256 blob ID.
+// so prior history must be replayed here or a ResumeAction has nothing model-visible to continue from.
+// The active user message is excluded because it travels in the action. When the continuation cannot
+// rely on native MCP turn state, tool results stay assistant-role text with a [Tool Result] /
+// [Tool Error] marker so Cursor does not wrap them as `<user_query>` (#1992). Native resume models
+// already carry the paired MCP result on turns[], so that marker is omitted from root replay — Auto
+// few-shot-mimics it as chat text otherwise. Each entry is a SHA-256 blob ID.
 function rootPromptMessages(request: CursorRunRequest, requestScope: CursorBlobRequestScopeToken): {
   ids: Uint8Array[];
   byteLength: number;
@@ -210,6 +214,7 @@ function rootPromptMessages(request: CursorRunRequest, requestScope: CursorBlobR
   }
 
   const externalModel = isCursorExternalWireModel(request.modelId);
+  const echoToolResultInRoot = cursorNeedsExternalToolContinuation(request.modelId);
   const lastRawIsToolResult = messages.at(-1)?.role === "toolResult";
   const activeUserIndex = lastRawIsToolResult ? -1 : lastActionIndex(messages);
 
@@ -218,7 +223,7 @@ function rootPromptMessages(request: CursorRunRequest, requestScope: CursorBlobR
     const message = messages[i];
     if (!message) continue;
     if (message.role === "user" || message.role === "developer") {
-      const text = contentText(message).trim();
+      const text = historyContentText(message).trim();
       // Cursor root replay expects OpenAI-style content parts for historical user messages.
       // A bare string survives blob hydration but external workers reject the completed replay
       // before tokenization (`usedTokens: 0`, then invalid_argument).
@@ -241,6 +246,10 @@ function rootPromptMessages(request: CursorRunRequest, requestScope: CursorBlobR
       }
       // Assistant tool CALLS are intentionally NOT replayed as visible "[Tool Call]" text here.
     } else if (message.role === "toolResult") {
+      // Native resume models already receive the paired MCP result through turns[]. Replaying
+      // the same payload as assistant-role "[Tool Result]" / "[tool_result]" text teaches Auto
+      // to echo that envelope as chat instead of continuing from the structured result.
+      if (!echoToolResultInRoot) continue;
       // #1920: the prefix must reflect the NORMALIZED error state (an empty
       // node_repl result is an error even when the runtime said isError=false).
       const prefix = normalizedToolResult(message, contentToText(message.content)).isError ? "[Tool Error]" : "[Tool Result]";
@@ -335,7 +344,7 @@ function contentText(message: OcxMessage): string {
     .map(part => {
       if (part.type === "text") return part.text;
       if (part.type === "thinking") return part.thinking;
-      if (part.type === "image") return `[image produced by this tool, omitted from Cursor text replay: ${part.detail ?? "auto"}]`;
+      if (part.type === "image") return undefined;
       return undefined;
     })
     .filter((value): value is string => typeof value === "string" && value.length > 0)
@@ -345,7 +354,26 @@ function contentText(message: OcxMessage): string {
 function contentToText(content: OcxToolResultMessage["content"]): string {
   if (typeof content === "string") return content;
   return content
-    .map(part => part.type === "text" ? part.text : `[image produced by this tool, omitted from Cursor text replay: ${part.detail ?? "auto"}]`)
+    .map(part => {
+      if (part.type === "text") return part.text;
+      if (part.type === "image") return CURSOR_VISION_IMAGE_HISTORY_MARKER;
+      return undefined;
+    })
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .join("\n");
+}
+
+/** History serializer. Replayed turns are text-only; never embed image bytes. */
+function historyContentText(message: OcxMessage): string {
+  if (message.role === "toolResult" || typeof message.content === "string") return contentText(message);
+  return message.content
+    .map(part => {
+      if (part.type === "text") return part.text;
+      if (part.type === "thinking") return part.thinking;
+      if (part.type === "image") return CURSOR_VISION_IMAGE_HISTORY_MARKER;
+      return undefined;
+    })
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
     .join("\n");
 }
 
@@ -720,8 +748,10 @@ function conversationTurns(
     flush();
     current = {
       userMessage: storeCursorBlob(toBinary(UserMessageSchema, create(UserMessageSchema, {
-        text: contentText(message),
+        text: historyContentText(message),
         messageId: crypto.randomUUID(),
+        selectedContext: buildSelectedContext([], requestScope),
+        mode: 1,
       })), requestScope),
       steps: [],
     };
@@ -791,11 +821,19 @@ function buildPreparedCursorRunRequest(
     ? appendCursorGenericToolUseHint(request.tools, rawText)
     : rawText;
   const lastRawIsToolResult = request.rawMessages?.at(-1)?.role === "toolResult";
+  const selectedImages = request.selectedImages ?? [];
   // Native models resume the remembered Cursor conversation. External wire
   // models continue as userMessageAction so history-blob tool results stay
-  // visible without a ResumeAction.
-  const externalToolContinuation = lastRawIsToolResult && isCursorExternalWireModel(request.modelId);
-  const actionCase = (externalToolContinuation || (!lastRawIsToolResult && text.trim().length > 0))
+  // visible without a ResumeAction. Some native composer ids are also routed
+  // through the external continuation path (cursorNeedsExternalToolContinuation)
+  // because a bare resumeAction makes them continue exploring with native tools
+  // instead of answering (observed on composer-2.5; see discovery.ts).
+  const externalToolContinuation = lastRawIsToolResult && cursorNeedsExternalToolContinuation(request.modelId);
+  // Image-only active turns (including soft-omitted images) stay userMessageAction.
+  const actionCase = (
+    externalToolContinuation
+    || (!lastRawIsToolResult && (text.trim().length > 0 || selectedImages.length > 0))
+  )
     ? "userMessageAction"
     : "resumeAction";
   const actionText = externalToolContinuation
@@ -809,6 +847,9 @@ function buildPreparedCursorRunRequest(
             userMessage: create(UserMessageSchema, {
               text: actionText,
               messageId: crypto.randomUUID(),
+              selectedContext: buildSelectedContext(selectedImages, requestScope),
+              // OmniRoute / cursor-agent always send mode=1 on UserMessage.
+              mode: 1,
             }),
             requestContext: buildRequestContext(),
           }),
@@ -820,9 +861,70 @@ function buildPreparedCursorRunRequest(
           }),
         },
   });
-  const rootPromptMessagesState = rootPromptMessages(request, requestScope);
-  const rootPromptMessageIds = rootPromptMessagesState.ids;
-  const turnIds = conversationTurns(request, requestScope, rootPromptMessagesState.historyMessageStart);
+  let continuationMode: "full-replay" | "checkpoint" = "full-replay";
+  let checkpointInvalidationReason = request.checkpointInvalidationReason;
+  let conversationState: ConversationStateStructure | undefined;
+  let rootPromptMessagesState: ReturnType<typeof rootPromptMessages> | undefined;
+  if (request.checkpointBytes && request.checkpointBytes.byteLength > 0) {
+    try {
+      conversationState = fromBinary(ConversationStateStructureSchema, request.checkpointBytes);
+      continuationMode = "checkpoint";
+      const suffixStart = request.checkpointSuffixStart;
+      if (
+        typeof suffixStart === "number"
+        && Number.isSafeInteger(suffixStart)
+        && suffixStart >= 0
+        && request.rawMessages
+        && suffixStart < request.rawMessages.length
+      ) {
+        const suffixRequest: CursorRunRequest = {
+          ...request,
+          system: [],
+          rawMessages: request.rawMessages.slice(suffixStart),
+        };
+        const suffixRoots = rootPromptMessages(suffixRequest, requestScope);
+        const suffixTurns = conversationTurns(suffixRequest, requestScope, suffixRoots.historyMessageStart);
+        const suffixSystemCount = systemPromptBlobs(suffixRequest).length;
+        const suffixHistoryIds = suffixRoots.ids.slice(suffixSystemCount);
+        const suffixHistorySerialized = suffixRoots.serialized.slice(suffixSystemCount);
+        conversationState = create(ConversationStateStructureSchema, {
+          ...conversationState,
+          rootPromptMessagesJson: [
+            ...conversationState.rootPromptMessagesJson,
+            ...suffixHistoryIds,
+          ],
+          turns: [
+            ...conversationState.turns,
+            ...suffixTurns,
+          ],
+        });
+        rootPromptMessagesState = {
+          ids: suffixHistoryIds,
+          byteLength: suffixRoots.byteLength,
+          historyMessageStart: suffixRoots.historyMessageStart,
+          serialized: suffixHistorySerialized,
+        };
+      }
+    } catch {
+      checkpointInvalidationReason = "decode_failed";
+    }
+  }
+  if (!conversationState) {
+    rootPromptMessagesState = rootPromptMessages(request, requestScope);
+    conversationState = create(ConversationStateStructureSchema, {
+      rootPromptMessagesJson: rootPromptMessagesState.ids,
+      turns: conversationTurns(request, requestScope, rootPromptMessagesState.historyMessageStart),
+      todos: [],
+      pendingToolCalls: [],
+      previousWorkspaceUris: [],
+      fileStates: {},
+      fileStatesV2: {},
+      summaryArchives: [],
+      turnTimings: [],
+      subagentStates: {},
+      readPaths: [],
+    });
+  }
   // Hoisted out of the mcp_tools spread below so the estimate can read the same
   // filtered definitions the wire carries. Both helpers are pure.
   const visibleTools = cursorToolsForActivePrompt(request.tools, rawText, request.toolChoice);
@@ -834,9 +936,13 @@ function buildPreparedCursorRunRequest(
     turnType: lastRawIsToolResult ? "tool-continuation" : "initial",
     externalModel: isCursorExternalWireModel(request.modelId),
     rawMessages: request.rawMessages?.length ?? 0,
-    rootBlobs: rootPromptMessageIds.length,
-    rootBytes: rootPromptMessagesState.byteLength,
-    turnBlobs: turnIds.length,
+    continuationMode,
+    checkpointPresent: continuationMode === "checkpoint",
+    checkpointBytes: continuationMode === "checkpoint" ? request.checkpointBytes?.byteLength : undefined,
+    checkpointInvalidationReason,
+    rootBlobs: conversationState.rootPromptMessagesJson.length,
+    rootBytes: rootPromptMessagesState?.byteLength ?? 0,
+    turnBlobs: conversationState.turns.length,
     tools: request.tools?.length ?? 0,
   });
 
@@ -847,19 +953,7 @@ function buildPreparedCursorRunRequest(
   const hasExplicitModelParameters = (request.requestedModelParameters?.length ?? 0) > 0;
   const runRequest = create(AgentRunRequestSchema, {
     conversationId: request.conversationId,
-    conversationState: create(ConversationStateStructureSchema, {
-      rootPromptMessagesJson: rootPromptMessageIds,
-      turns: turnIds,
-      todos: [],
-      pendingToolCalls: [],
-      previousWorkspaceUris: [],
-      fileStates: {},
-      fileStatesV2: {},
-      summaryArchives: [],
-      turnTimings: [],
-      subagentStates: {},
-      readPaths: [],
-    }),
+    conversationState,
     action,
     // Explicit model-picker parameters follow current Cursor clients and use requested_model alone.
     // Keep legacy model_details for flat model ids and the already-live Router path; sending both for
@@ -906,7 +1000,7 @@ function buildPreparedCursorRunRequest(
   // Same instances that produced `bytes`, so the estimate cannot count history or
   // tools the payload dropped — the defect that blocked PR #376.
   const modelVisibleParts = [
-    ...rootPromptMessagesState.serialized,
+    ...(rootPromptMessagesState?.serialized ?? []),
     ...(actionCase === "userMessageAction" ? [actionText] : []),
     ...mcpToolDefs.map(modelVisibleToolText),
   ];

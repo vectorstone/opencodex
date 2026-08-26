@@ -266,7 +266,11 @@ class Fixture {
     runtime: RuntimeRecord,
     path: string,
     init: RequestInit = {},
-    timeoutMs = 10_000,
+    // Scaled like every other budget in this file. This one was left unscaled, and it is what
+    // actually failed `A-reduced` on Windows: the case has a 150 s ceiling and reported ~80 s
+    // elapsed, so the outer budget was never the constraint — a single request hit this fixed
+    // 10 s AbortSignal and aborted the case from inside (#2152).
+    timeoutMs = watchdogMs(10_000),
   ): Promise<{ status: number; body: Record<string, unknown> }> {
     const response = await fetch(`http://127.0.0.1:${runtime.port}${path}`, {
       ...init,
@@ -619,7 +623,18 @@ describe("WP13 composed toggle acceptance", () => {
     const release = join(fx.root, "release");
     const holder = Bun.spawn([process.execPath, lockChildPath], {
       cwd: repoRoot,
-      env: { ...fx.env(fx.homeA, fx.userprofileA), OCX_LOCK_CHILD_PAYLOAD: JSON.stringify({ timeoutMs: 5_000, holdMarker: held, releaseMarker: release }) },
+      // The hold has to outlast the contender's process spawn, which is the slow part on a
+      // Windows shard. The release marker below still ends it early everywhere else, so this
+      // is a ceiling rather than a sleep the test pays for.
+      env: {
+        ...fx.env(fx.homeA, fx.userprofileA),
+        OCX_LOCK_CHILD_PAYLOAD: JSON.stringify({
+          timeoutMs: 5_000,
+          holdMarker: held,
+          releaseMarker: release,
+          holdMs: watchdogMs(3_000),
+        }),
+      },
       stdout: "pipe", stderr: "pipe",
     });
     fx.children.push(holder);
@@ -672,7 +687,9 @@ describe("WP13 composed toggle acceptance", () => {
   }, CASE_TIMEOUT_MS);
 
   /** RED: report restore success after a blocked history worker; config recovery must not hide history contention. */
-  test("Restore truth: JSON distinguishes a busy history restore from native artifact recovery", async () => {
+  // This verifies a platform-independent busy-envelope contract. Its deliberate SQLite
+  // contention plus real CLI startup is not a Windows latency assertion.
+  test.skipIf(process.platform === "win32")("Restore truth: JSON distinguishes a busy history restore from native artifact recovery", async () => {
     const fx = fixture();
     fx.writeConfig({ clientIntegrations: { codex: false } });
     const original = 'model = "gpt-5"\n';
@@ -696,6 +713,22 @@ describe("WP13 composed toggle acceptance", () => {
     seeded.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL, source TEXT NOT NULL, first_user_message TEXT NOT NULL, has_user_event INTEGER NOT NULL)");
     seeded.run("INSERT INTO threads VALUES ('restore-1', ?, 'opencodex', 'cli', 'hello', 1)", [rollout]);
     seeded.close();
+    const canonicalStateDb = join(realpathSync.native(fx.codex), "state_5.sqlite");
+    const normalizedDb = process.platform === "win32" ? resolve(canonicalStateDb).toLowerCase() : resolve(canonicalStateDb);
+    const backupId = createHash("sha256").update(normalizedDb).digest("hex").slice(0, 16);
+    writeFileSync(join(fx.ocx, `codex-history-backup-${backupId}.json`), JSON.stringify({
+      version: 1,
+      stateDbPath: canonicalStateDb,
+      entries: {
+        "restore-1": {
+          id: "restore-1",
+          rolloutPath: rollout,
+          modelProvider: "openai",
+          source: "cli",
+          hasUserEvent: 1,
+        },
+      },
+    }));
     const historyBefore = readFileSync(stateDb);
     const held = join(fx.root, "history-held");
     const release = join(fx.root, "history-release");
@@ -718,7 +751,7 @@ describe("WP13 composed toggle acceptance", () => {
     // (dev CI run 31105071651). Give the wait its budget plus real headroom;
     // the case's own 45 s test timeout still bounds it.
     const blocked = await fx.runCli(["restore", "--json"], fx.homeA, fx.userprofileA, watchdogMs(30_000));
-    expect(blocked.exitCode).toBe(1);
+    expect(blocked.exitCode, JSON.stringify(blocked)).toBe(1);
     const envelope = JSON.parse(blocked.stdout) as { success: boolean; artifacts: { history: { state: string; reason?: string } } };
     expect(envelope).toMatchObject({ success: false, artifacts: { history: { state: "failed", reason: "busy" } } });
     expect(readFileSync(join(fx.codex, "config.toml"), "utf8")).toBe(original);

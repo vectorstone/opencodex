@@ -30,6 +30,11 @@ export interface OcxReasoningReplayIdentity {
  * the holder, so late tool-call cache writes see the active physical identity.
  */
 export interface OcxReasoningReplayScopeRef {
+  /**
+   * Conversation namespace for replay state. Historically this was always the Codex parent-thread
+   * id; headerless Responses callers use a raw sanitized thread/Cursor/session fallback, never the
+   * hashed request-log conversation id.
+   */
   readonly clientThreadId: string;
   current?: Readonly<OcxReasoningReplayIdentity>;
 }
@@ -63,8 +68,13 @@ export interface OcxParsedRequest {
   _cursorConversationId?: string;
   /** Stable upstream client thread identity, used only to derive provider-scoped continuation ids. */
   _clientThreadId?: string;
-  /** Provider/account/model-bound namespace for process-local raw-reasoning replay. */
+  /** Conversation/provider/account/model-bound namespace for reasoning replay state. */
   _reasoningReplayScope?: OcxReasoningReplayScopeRef;
+  /**
+   * Set by bindRouteReasoningReplayScope after a proven serving-identity change, or by
+   * prepareOpaqueBlobRecovery after an authoritative rejection; consumers strip replayed blobs.
+   */
+  _stripReasoningEncryptedContent?: boolean;
   /**
    * Optional authenticated tenant/operator namespace for Cursor thread→conversation derivation.
    * When absent (single-operator local proxy), derivation stays local-scoped.
@@ -79,6 +89,10 @@ export interface OcxParsedRequest {
   _kiroAuthContext?: Pick<KiroOAuthMetadata, "profileArn" | "apiRegion" | "ssoRegion">;
   /** Provider-private continuation metadata resolved from the Responses previous_response_id chain. */
   _providerContinuation?: OcxProviderContinuationState;
+  /** Persisted continuation considered only after the final physical route is known. */
+  _providerContinuationCandidate?: OcxProviderContinuationState;
+  /** Exact process-local route owner attached to newly persisted provider state. */
+  _providerContinuationOwner?: OcxProviderContinuationOwner;
   /**
    * The hosted `{type:"web_search", ...}` tool config, stashed when Codex enables web search. Routed
    * (non-OpenAI) providers can't run it server-side, so the proxy re-exposes it as a function tool and
@@ -251,16 +265,33 @@ export interface OcxRequestOptions {
 
 export type OcxMessagePhase = "commentary" | "final_answer";
 
+/** Non-secret, process-local owner fence for provider-private continuation state. */
+export interface OcxProviderContinuationOwner {
+  [field: string]: string | number;
+  version: 1;
+  providerName: string;
+  providerDestinationIdentity: string;
+  adapterName: string;
+  modelId: string;
+  credentialIdentity: string;
+}
+
 /**
  * Provider-private state that must follow a locally expanded `previous_response_id` chain.
  * Kept out of public Responses output and persisted only in the bounded local continuation cache.
  */
 export interface OcxProviderContinuationState {
+  /** Proxy-authored owner metadata; stripped before provider adapters receive the state. */
+  __ocxOwner?: OcxProviderContinuationOwner;
   cursor?: {
+    [field: string]: unknown;
     conversationId?: string;
     checkpointUsable?: boolean;
+    /** Opaque process-local Cursor ConversationStateStructure snapshot ref. Never raw protobuf. */
+    checkpointRef?: string;
   };
   kiro?: {
+    [field: string]: unknown;
     conversationId?: string;
   };
   [provider: string]: Record<string, unknown> | undefined;

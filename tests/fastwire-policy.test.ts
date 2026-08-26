@@ -128,6 +128,27 @@ describe("resolveFastPolicy matrix", () => {
     expect(resolveFastPolicy(authority, MODEL, "responses").adapter).toBe("openai-responses");
   });
 
+  test("registry defaults retain their auth-mode constraint", () => {
+    const base: FastPolicyAuthority = {
+      ...authorityForMatrix({
+        source: "provider-adapter",
+        declaration: "undefined",
+        overrideAllowed: true,
+        capability: "true",
+        chatForeignTierForward: true,
+      }),
+      providerAdapter: "openai-chat",
+      registryWireDefaults: {
+        [MODEL]: { wire: "openai-responses", inbound: ["responses"], authModes: ["oauth"] },
+      },
+    };
+    expect(resolveFastPolicy({ ...base, providerAuthMode: "oauth" }, MODEL).adapter)
+      .toBe("openai-responses");
+    expect(resolveFastPolicy({ ...base, providerAuthMode: "key" }, MODEL).adapter)
+      .toBe("openai-chat");
+    expect(resolveFastPolicy(base, MODEL).adapter).toBe("openai-chat");
+  });
+
   test("hard pins and configured overrides retain exact runtime model-key semantics", () => {
     const authority: FastPolicyAuthority = {
       ...authorityForMatrix({
@@ -233,6 +254,98 @@ describe("resolveFastPolicy matrix", () => {
     expect(captureFastPolicyAuthority("fixture", provider, false).capability.provider).toBe(true);
     provider.supportsServiceTier = false;
     expect(fastPolicyForModel(provider, MODEL, "fixture").capability).toBe(false);
+  });
+
+  test("locks the five-row xAI and DeepSeek wire/tier regression matrix", () => {
+    const rows = [
+      {
+        name: "xAI OAuth default",
+        providerName: "xai",
+        modelIds: ["grok-4.6", "grok-4.5"],
+        provider: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          authMode: "oauth" as const,
+        },
+        adapter: "openai-chat",
+        forwardCallerTier: false,
+        callerTier: undefined,
+        settledCallerTier: undefined,
+      },
+      {
+        name: "xAI OAuth Responses override",
+        providerName: "xai",
+        modelIds: ["grok-4.6", "grok-4.5"],
+        provider: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          authMode: "oauth" as const,
+          modelAdapters: { "grok-4.6": "openai-responses", "grok-4.5": "openai-responses" },
+        },
+        adapter: "openai-responses",
+        forwardCallerTier: false,
+        callerTier: "flex",
+        settledCallerTier: undefined,
+      },
+      {
+        // B2: key-auth Chat Completions is a documented Priority Processing transport.
+        name: "xAI API-key default",
+        providerName: "xai",
+        modelIds: ["grok-4.6", "grok-4.5"],
+        provider: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          authMode: "key" as const,
+        },
+        adapter: "openai-chat",
+        forwardCallerTier: true,
+        callerTier: undefined,
+        settledCallerTier: undefined,
+      },
+      {
+        name: "xAI API-key Responses override",
+        providerName: "xai",
+        modelIds: ["grok-4.6", "grok-4.5"],
+        provider: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          authMode: "key" as const,
+          modelAdapters: { "grok-4.6": "openai-responses", "grok-4.5": "openai-responses" },
+        },
+        adapter: "openai-responses",
+        forwardCallerTier: true,
+        callerTier: "flex",
+        settledCallerTier: "flex",
+      },
+      {
+        name: "DeepSeek V4 defaults",
+        providerName: "deepseek",
+        modelIds: ["deepseek-v4-flash", "deepseek-v4-pro"],
+        provider: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.deepseek.com",
+          authMode: "key" as const,
+        },
+        adapter: "openai-responses",
+        forwardCallerTier: false,
+        callerTier: undefined,
+        settledCallerTier: undefined,
+      },
+    ] as const;
+
+    for (const row of rows) {
+      for (const modelId of row.modelIds) {
+        const policy = fastPolicyForModel(row.provider, modelId, row.providerName);
+        expect(policy.adapter).toBe(row.adapter);
+        expect(policy.forwardCallerTier).toBe(row.forwardCallerTier);
+        expect(tierValueAfterDecision(decideTier(policy, undefined, undefined), undefined))
+          .toBeUndefined();
+        if (row.callerTier !== undefined) {
+          expect(tierValueAfterDecision(decideTier(policy, undefined, row.callerTier), row.callerTier))
+            .toBe(row.settledCallerTier);
+        }
+      }
+    }
   });
 
   test("prototype-named providers and models use only own wire-policy rows", () => {

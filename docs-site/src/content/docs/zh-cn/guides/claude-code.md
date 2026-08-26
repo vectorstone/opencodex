@@ -37,7 +37,9 @@ shell 不受影响，必须重新打开。
 
 `ocx stop` 和代理关闭操作会**取消设置已注入的键**（不会恢复之前的值——只会移除 opencodex
 注入的键）。代理还会写入 `~/.opencodex/claude-env.sh`；`ocx start` 会安装一个 `.zshrc`
-source hook，以自动加载该文件。
+source hook，以自动加载该文件，但仅限 `PATH` 中存在可执行的 Claude Code CLI。Claude Code
+不存在或系统环境集成未启用时，启动过程和 `ocx ensure` 会移除 OpenCodex 自己写入的 hook。
+Claude Desktop 使用独立 profile，不会触发 shell hook 安装。
 
 可以在配置中设置 `claudeCode.systemEnv: false`，或使用 GUI 开关来禁用。此功能仅适用于
 macOS；在其他平台上，请使用 `ocx claude`。
@@ -143,7 +145,7 @@ v1 别名按字面解码（历史上 model ID 中包含的两字符序列 `~s` /
 
 ## 名册代理（injectAgents）
 
-`ocx claude`（以及系统环境守护进程）会把你的精选子代理名册（Subagents 标签页，最多 5 个模型）
+代理启动/ensure、`ocx claude` 和相关的控制面板保存会把你的精选子代理名册（Subagents 标签页，最多 5 个模型）
 和 `ocx-self` 同步到 `~/.claude/agents/ocx-*.md`。
 
 - **`ocx-self`** 固定你在 `/model` 选择器中的默认模型（回退到 `claudeCode.model`）；两者均

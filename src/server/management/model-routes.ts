@@ -129,6 +129,7 @@ import type { PersistedUsageAttempt } from "../../usage/log";
 import { isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO, corsHeaders } from "../auth-cors";
 import { applySystemEnvToggle } from "../system-env";
 import {
+  ClientPathError,
   EXPORT_CLIENTS,
   EXPORT_CLIENT_IDS,
   OPENCODE_PROVIDER_ID,
@@ -204,6 +205,27 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       );
     }
     const spec = EXPORT_CLIENTS[requested];
+    // Resolved before the catalog load on purpose. A refused override is a
+    // property of the request, not of the catalog: validating it afterwards
+    // let a busy or failing catalog answer 503 first, so a user with a
+    // relative override never saw the message that says how to fix it — and
+    // the route did the enumeration work anyway for input it was going to
+    // reject.
+    let destination: string;
+    try {
+      destination = spec.destination(process.env);
+    } catch (error) {
+      // A client's own environment override can name a path the resolver
+      // refuses — a relative value, which this process and the client would
+      // resolve against different working directories. That is a
+      // user-correctable configuration error, not a server fault, so it leaves
+      // this boundary as a bounded 400 instead of escaping handleManagementAPI
+      // as a generic 500 and stripping the message that says how to fix it.
+      // `integrations/state.ts` and `integrations/writer.ts` already catch the
+      // same error on their paths; this route was the one that did not.
+      if (!(error instanceof ClientPathError)) throw error;
+      return jsonResponse({ error: error.message }, 400, req, config);
+    }
     let models: ExportModel[];
     try {
       // The ONE loader every export surface uses. It carries the visibility
@@ -231,7 +253,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     return jsonResponse({
       client: spec.id,
       filename: spec.filename,
-      destination: spec.destination(process.env),
+      destination,
       apiKeyEnv: spec.apiKeyEnv,
       exportHint: spec.exportHint,
       // The client's own format and the exact bytes for it. The GUI previously
@@ -372,8 +394,10 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
   }
 
   if (url.pathname === "/api/custom-models" && req.method === "POST") {
-    let body: { provider?: unknown; modelId?: unknown; displayName?: unknown; contextWindow?: unknown; inputModalities?: unknown; reasoningEfforts?: unknown; defaultReasoningEffort?: unknown };
-    try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    let parsedBody: unknown;
+    try { parsedBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(parsedBody)) return jsonResponse({ error: "invalid JSON body" }, 400);
+    const body = parsedBody;
     const provider = typeof body.provider === "string" ? body.provider.trim() : "";
     const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
     if (!provider || !modelId) return jsonResponse({ error: "provider and modelId are required" }, 400);
@@ -419,8 +443,10 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
   if (customPutMatch && req.method === "PUT") {
     let id: string;
     try { id = decodeURIComponent(customPutMatch[1]); } catch { return jsonResponse({ error: "invalid id encoding" }, 400); }
-    let body: { displayName?: unknown; contextWindow?: unknown; inputModalities?: unknown; modelId?: unknown; reasoningEfforts?: unknown; defaultReasoningEffort?: unknown };
-    try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    let parsedBody: unknown;
+    try { parsedBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(parsedBody)) return jsonResponse({ error: "invalid JSON body" }, 400);
+    const body = parsedBody;
     const list = config.customModels ?? [];
     const idx = list.findIndex(cm => cm.id === id);
     if (idx === -1) return jsonResponse({ error: "not found" }, 404);

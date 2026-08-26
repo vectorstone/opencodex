@@ -108,7 +108,7 @@ Windows에서 Orca shell은 `CODEX_HOME`과 `ORCA_CODEX_HOME`을 Orca의 번들 
 
 ## 스레드 식별자와 대화 기록
 
-기본 loopback 형식은 새 thread에 네이티브 `openai` provider 태그를 유지하므로 일반적인 resume history는 다시 매핑할 필요가 없습니다. 첫 sync 때는 더 오래된 opencodex 빌드가 태그를 붙인 thread도 `openai`로 이관합니다. non-loopback 전용 provider 모드는 활성 상태일 때만 history를 `opencodex` provider 아래로 미러링하고, 종료할 때는 백업된 메타데이터를 복원합니다. history를 건드리지 않으려면 `syncResumeHistory: false`로 설정하세요.
+기본 loopback 형식은 새 thread에 네이티브 `openai` provider 태그를 유지하므로 일반적인 resume history는 다시 매핑할 필요가 없습니다. sync와 restore는 일치하는 백업 manifest만 적용하여 각 thread의 원래 provider, source, event marker를 정확히 복원합니다. manifest가 없는 `opencodex` row는 변경하지 않으며, legacy 재태깅을 명시적으로 강제하려는 경우에만 `ocx recover-history --legacy-openai --yes`를 사용합니다. 이 명령은 의도적으로 범위가 넓습니다. 사용자 메시지가 있고 현재 `opencodex`로 표시된 모든 thread를 `openai`로 바꾸고, `exec`를 `cli`로 정규화하며 event marker를 설정합니다. 정상적인 dedicated-provider history도 포함됩니다. 상태를 백업하고 이 전체 범위를 의도한 경우에만 사용하세요. non-loopback 전용 provider 모드는 활성 상태일 때만 history를 `opencodex` provider 아래로 미러링하고, 종료할 때는 백업된 메타데이터를 복원합니다. history를 건드리지 않으려면 `syncResumeHistory: false`로 설정하세요.
 
 ## 모델 카탈로그 동기화
 
@@ -172,7 +172,7 @@ ocx sync-cache
 
 ### 외부 provider manager
 
-기본 `full` 모드에서 `config.toml`이 이미 `openai`나 `opencodex`가 아닌 provider를 선택하고 있으면, OpenCodex는 그 파일을 그대로 두고 profile write, catalog/cache refresh, 즉시 및 background Codex history migration을 건너뜁니다. custom provider를 관리하는 도구는 기존 session에 그 provider id를 붙이는 경우가 많고, 활성 id를 바꾸면 그 온전한 session이 Codex의 history view에서 사라질 수 있습니다. 이 보호는 legacy root profile이 선택한 외부 provider에도 동일하게 적용됩니다.
+기본 `full` 모드에서 `config.toml`이 이미 `openai`나 `opencodex`가 아닌 provider를 선택하고 있으면, OpenCodex는 그 파일을 그대로 두고 profile write, catalog/cache refresh, 즉시 및 background Codex history metadata 복원을 건너뜁니다. custom provider를 관리하는 도구는 기존 session에 그 provider id를 붙이는 경우가 많고, 활성 id를 바꾸면 그 온전한 session이 Codex의 history view에서 사라질 수 있습니다. 이 보호는 legacy root profile이 선택한 외부 provider에도 동일하게 적용됩니다.
 
 외부 provider id를 유지하면서 표준 모델 선택기를 갱신하려면 `ocx config set clientIntegrations.codex catalog-only`를 실행한 다음 `ocx sync`를 실행하세요. 이 모드는 `model_catalog_json`의 catalog와 `models_cache.json`만 갱신하며 `config.toml`, `opencodex.config.toml`, journal, history database 또는 session JSONL을 변경하지 않습니다. 외부 provider는 Responses passthrough(`wire_api = "responses"`)로 로컬 proxy를 가리켜야 합니다.
 
