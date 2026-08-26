@@ -12,6 +12,19 @@ import { readFileSync } from "node:fs";
  */
 const ALLOWED_INPUT_MODALITIES = new Set(["text", "image", "audio"]);
 
+function readPositiveSafeInteger(
+  raw: unknown,
+  field: string,
+  options: { allowNull?: boolean } = {},
+): { value?: number; error?: string } {
+  if (raw === undefined) return {};
+  if (raw === null && options.allowNull === true) return { value: undefined };
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw <= 0) {
+    return { error: `${field} must be a positive safe integer` };
+  }
+  return { value: raw };
+}
+
 function readInputModalities(raw: unknown): { values?: string[]; error?: string } {
   if (raw === undefined) return {};
   if (!Array.isArray(raw)) return { error: "inputModalities must be an array" };
@@ -406,6 +419,8 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     const displayName = typeof body.displayName === "string" && body.displayName.trim() ? body.displayName.trim() : undefined;
     if (displayName?.includes("/")) return jsonResponse({ error: "displayName must not contain /" }, 400);
     const contextWindow = typeof body.contextWindow === "number" && body.contextWindow > 0 ? Math.floor(body.contextWindow) : undefined;
+    const maxOutput = readPositiveSafeInteger(body.maxOutputTokens, "maxOutputTokens");
+    if (maxOutput.error) return jsonResponse({ error: maxOutput.error }, 400);
     const modalities = readInputModalities(body.inputModalities);
     if (modalities.error) return jsonResponse({ error: modalities.error }, 400);
     const inputModalities = modalities.values;
@@ -428,6 +443,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       modelId,
       ...(displayName ? { displayName } : {}),
       ...(contextWindow ? { contextWindow } : {}),
+      ...(maxOutput.value !== undefined ? { maxOutputTokens: maxOutput.value } : {}),
       ...(inputModalities && inputModalities.length > 0 ? { inputModalities } : {}),
       ...(reasoning.values !== undefined ? { reasoningEfforts: reasoning.values } : {}),
       ...(defaultEffort.value ? { defaultReasoningEffort: defaultEffort.value } : {}),
@@ -461,6 +477,11 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     }
     if (body.contextWindow !== undefined) {
       cm.contextWindow = typeof body.contextWindow === "number" && body.contextWindow > 0 ? Math.floor(body.contextWindow) : undefined;
+    }
+    if (body.maxOutputTokens !== undefined) {
+      const edited = readPositiveSafeInteger(body.maxOutputTokens, "maxOutputTokens", { allowNull: true });
+      if (edited.error) return jsonResponse({ error: edited.error }, 400);
+      cm.maxOutputTokens = edited.value;
     }
     if (body.inputModalities !== undefined) {
       const edited = readInputModalities(body.inputModalities);

@@ -128,14 +128,10 @@ Nothing to undo — no generated config file is written under `~/.opencodex`. Ru
 
 ## Model limits
 
-`limit.context` is written only when the catalog reports an authoritative context window; when it
-does not, the whole `limit` block is omitted and opencode keeps its own defaults.
-
-opencode's schema rejects a `limit` block carrying `context` without `output`, and the catalog has
-no authoritative per-model output field, so an `output` budget of `32000` is emitted alongside it,
-clamped down to the context window so a small-context model is never given `output > context`.
-That figure exists to satisfy the schema — it is not a claim about any specific model's true
-maximum.
+opencode's schema requires `limit.context` and `limit.output` as a pair. OpenCodex emits the block
+only when both values are authoritative, using exact provider metadata or an explicit custom-model
+output value. If either value is unknown, the whole block is omitted and opencode keeps its own
+defaults. The retired `32000` schema placeholder is never emitted.
 
 The `opencodex` provider block is regenerated on every launch, so per-model tweaks made inside it
 will not survive. Keep custom entries under a provider key of your own instead.

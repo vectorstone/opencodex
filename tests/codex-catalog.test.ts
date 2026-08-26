@@ -172,6 +172,7 @@ describe("combo catalog capability intersection", () => {
     id: "m1",
     contextWindow: 200_000,
     maxInputTokens: 180_000,
+    maxOutputTokens: 64_000,
     inputModalities: ["text", "image"],
     reasoningEfforts: ["low", "medium", "high"],
     parallelToolCalls: true,
@@ -181,6 +182,7 @@ describe("combo catalog capability intersection", () => {
     id: "m2",
     contextWindow: 128_000,
     maxInputTokens: 100_000,
+    maxOutputTokens: 32_000,
     inputModalities: ["text"],
     reasoningEfforts: ["low", "medium"],
     parallelToolCalls: false,
@@ -199,11 +201,23 @@ describe("combo catalog capability intersection", () => {
       owned_by: "combo",
       contextWindow: 128_000,
       maxInputTokens: 100_000,
+      maxOutputTokens: 32_000,
       autoCompactTokenLimit: 100_000,
       inputModalities: ["text"],
       reasoningEfforts: ["low", "medium"],
       defaultReasoningEffort: "medium",
     });
+  });
+
+  test("derives max output only when every combo member has authoritative metadata", () => {
+    expect(deriveComboCatalogModel("known-output", normalizedCombo(), [
+      memberA,
+      memberB,
+    ])?.maxOutputTokens).toBe(32_000);
+    expect(deriveComboCatalogModel("unknown-output", normalizedCombo(), [
+      memberA,
+      { ...memberB, maxOutputTokens: undefined },
+    ])).not.toHaveProperty("maxOutputTokens");
   });
 
   test("never advertises combo max-input or compaction above its smallest final window", () => {
@@ -1932,6 +1946,7 @@ describe("configured CatalogModel displayName -> catalog display_name", () => {
         provider: "custom-budget",
         modelId: "renamed",
         contextWindow: 321_000,
+        maxOutputTokens: 96_000,
       }, {
         id: "custom-budget-contextless",
         provider: "custom-budget",
@@ -1942,6 +1957,7 @@ describe("configured CatalogModel displayName -> catalog display_name", () => {
     expect(model).toMatchObject({
       contextWindow: 321_000,
       maxInputTokens: 60_000,
+      maxOutputTokens: 96_000,
       autoCompactTokenLimit: 60_000,
     });
     expect(buildCatalogEntries(nativeTemplate(), [], models)
@@ -4219,6 +4235,7 @@ describe("Codex catalog routed normalization", () => {
     expect(slugs.has("deepseek/deepseek-v4-pro")).toBe(true);
     for (const model of models) {
       expect(model.contextWindow).toBe(1_048_576);
+      expect(model.maxOutputTokens).toBe(384_000);
       expect(model.inputModalities).toEqual(["text"]);
     }
 
@@ -4359,6 +4376,45 @@ describe("Codex catalog routed normalization", () => {
     expect(routed?.max_context_window).toBe(1_000_000);
     expect(routed?.auto_compact_token_limit).toBe(900_000);
     expect(getModelMetadata("anthropic", "claude-sonnet-4-6")?.contextWindow).toBe(1_000_000);
+  });
+
+  test("exact generated output metadata reaches provider and custom replacement rows", async () => {
+    const baseConfig = {
+      port: 10100,
+      defaultProvider: "anthropic",
+      providers: {
+        anthropic: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          liveModels: false,
+          models: ["claude-opus-5"],
+        },
+      },
+    } as OcxConfig;
+
+    const providerRows = await gatherRoutedModels(baseConfig);
+    expect(providerRows.find(row => row.id === "claude-opus-5")?.maxOutputTokens).toBe(128_000);
+
+    const inheritedRows = await gatherRoutedModels({
+      ...baseConfig,
+      customModels: [{
+        id: "custom-inherit-output",
+        provider: "anthropic",
+        modelId: "claude-opus-5",
+      }],
+    });
+    expect(inheritedRows.find(row => row.id === "claude-opus-5")?.maxOutputTokens).toBe(128_000);
+
+    const explicitRows = await gatherRoutedModels({
+      ...baseConfig,
+      customModels: [{
+        id: "custom-explicit-output",
+        provider: "anthropic",
+        modelId: "claude-opus-5",
+        maxOutputTokens: 64_000,
+      }],
+    });
+    expect(explicitRows.find(row => row.id === "claude-opus-5")?.maxOutputTokens).toBe(64_000);
   });
 
   test("routed entries resolve jawcode provider aliases", () => {

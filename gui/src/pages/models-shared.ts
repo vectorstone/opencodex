@@ -36,6 +36,7 @@ export interface ModelRow {
   displayName?: string;
   inputModalities?: string[];
   contextWindow?: number;
+  maxOutputTokens?: number;
   contextCap?: number;
   contextCapped?: boolean;
   /** Stored custom-row override (not the inherited ladder); only present on custom rows. */

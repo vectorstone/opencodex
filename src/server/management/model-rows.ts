@@ -99,6 +99,7 @@ export async function listManagementModelRows(config: OcxConfig): Promise<Manage
       customId: cm.id,
       displayName: cm.displayName,
       ...(cm.contextWindow ? { contextWindow: cm.contextWindow } : {}),
+      ...(cm.maxOutputTokens ? { maxOutputTokens: cm.maxOutputTokens } : {}),
       ...(cm.inputModalities ? { inputModalities: cm.inputModalities } : {}),
       // Stored override, not the inherited ladder: the edit dialog must show what the user
       // set (including an explicit empty "no reasoning" ladder), not what the provider row
@@ -114,7 +115,21 @@ export async function listManagementModelRows(config: OcxConfig): Promise<Manage
   const comboNamespaced = new Set(
     publicModels.filter(model => model.provider === "combo").map(catalogModelSlug),
   );
-  const visibleCustomModels = customModels.filter(model => !comboNamespaced.has(model.namespaced));
+  const effectiveMaxOutputBySlug = new Map(
+    publicModels.flatMap(model => (
+      model.maxOutputTokens !== undefined
+        ? [[catalogModelSlug(model), model.maxOutputTokens] as const]
+        : []
+    )),
+  );
+  const visibleCustomModels = customModels
+    .filter(model => !comboNamespaced.has(model.namespaced))
+    .map(model => {
+      const inherited = effectiveMaxOutputBySlug.get(model.namespaced);
+      return model.maxOutputTokens === undefined && inherited !== undefined
+        ? { ...model, maxOutputTokens: inherited }
+        : model;
+    });
   // Custom metadata wins when a physical live/static row resolves to the same Codex-facing
   // slug, while a combo keeps the same precedence it has in routing and /v1/models.
   const customNamespaced = new Set(visibleCustomModels.map(c => c.namespaced));
@@ -145,6 +160,7 @@ export function toExportModel(row: ManagementModelRow): ExportModel {
     ...(row.native ? { native: true } : {}),
     ...(row.displayName ? { displayName: row.displayName } : {}),
     ...(row.contextWindow !== undefined ? { contextWindow: row.contextWindow } : {}),
+    ...(row.maxOutputTokens !== undefined ? { maxOutputTokens: row.maxOutputTokens } : {}),
     ...(row.inputModalities ? { inputModalities: row.inputModalities } : {}),
     ...(row.reasoningEfforts ? { reasoningEfforts: row.reasoningEfforts } : {}),
     ...(row.defaultReasoningEffort ? { defaultReasoningEffort: row.defaultReasoningEffort } : {}),

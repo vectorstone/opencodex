@@ -64,6 +64,7 @@ export interface OpencodeCatalogModel {
   provider?: string;
   id?: string;
   contextWindow?: number;
+  maxOutputTokens?: number;
   displayName?: string;
   /** Input modalities declared by the model (e.g. `["text","image"]`). */
   inputModalities?: string[];
@@ -146,20 +147,6 @@ export const GAJAE_API_KEY_ENV = "OPENCODEX_GAJAE_API_KEY";
 
 /** Pi's wire-dialect selector for an OpenAI-compatible endpoint. */
 const PI_API_DIALECT = "openai-completions";
-
-/**
- * opencode's config schema rejects a `limit` block that carries `context` without
- * `output`, but CatalogModel has no authoritative per-model output field. Dropping
- * `limit` entirely would also throw away the authoritative context window we DO have,
- * so the block is emitted with this budget standing in for the missing half.
- *
- * The value matches REASONING_MAX_TOKENS_CEILING in src/adapters/anthropic.ts — the
- * project's existing "safe ceiling across current models" figure. It is a ceiling for
- * schema validity, NOT a claim about any specific model's true maximum, and it is
- * clamped to the context window so a small-context model can never be emitted with
- * output > context. Pi's `maxTokens` uses the same stand-in and the same clamp.
- */
-export const SCHEMA_REQUIRED_OUTPUT_BUDGET = 32_000;
 
 /** Deterministic loopback default for exported provider-block helpers in tests. */
 export const OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG: OcxConfig = {
@@ -497,6 +484,7 @@ export interface ExportModel {
   native?: boolean;
   displayName?: string;
   contextWindow?: number;
+  maxOutputTokens?: number;
   inputModalities?: string[];
   /** Optional effort ladder exported only to clients that support it. */
   reasoningEfforts?: string[];
@@ -580,9 +568,15 @@ function authoritativeContextWindow(contextWindow: number | undefined): number |
   return undefined;
 }
 
-/** Schema-required output budget for a known context window. */
-function outputBudgetFor(context: number): number {
-  return Math.min(SCHEMA_REQUIRED_OUTPUT_BUDGET, context);
+/** Authoritative output-token capability, optionally clamped to a known context window. */
+function authoritativeMaxOutputTokens(
+  maxOutputTokens: number | undefined,
+  context?: number,
+): number | undefined {
+  if (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+    return undefined;
+  }
+  return context === undefined ? maxOutputTokens : Math.min(maxOutputTokens, context);
 }
 
 /**
@@ -675,10 +669,8 @@ function opencodeProviderOptions(baseURL: string, config: OcxConfig): OpencodePr
 /**
  * `opencodex` provider block for a resolved base URL.
  *
- * `limit.context` is emitted ONLY from an authoritative context window — never guessed.
- * When none is available the whole `limit` block is dropped and opencode keeps its own
- * defaults; when one is present, `limit.output` rides along (opencode's schema requires
- * the pair) clamped to the context window.
+ * OpenCode requires `limit.context` and `limit.output` as a pair. Emit the block only
+ * when both capability values are authoritative; otherwise keep OpenCode's own defaults.
  */
 function opencodeProviderBlock(
   baseURL: string,
@@ -691,8 +683,9 @@ function opencodeProviderBlock(
     if (models[key]) continue; // first entry wins; native rows lead /api/models
     const entry: OpencodeModelEntry = { name: exportModelLabel(model) };
     const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.limit = { context, output: outputBudgetFor(context) };
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined && output !== undefined) {
+      entry.limit = { context, output };
     }
     if (Array.isArray(model.inputModalities) && model.inputModalities.length > 0) {
       entry.modalities = { input: [...model.inputModalities] };
@@ -1039,10 +1032,9 @@ function buildPiClientConfig(ctx: ExportContext): PiGeneratedConfig {
       };
     }
     const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.contextWindow = context;
-      entry.maxTokens = outputBudgetFor(context);
-    }
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined) entry.contextWindow = context;
+    if (output !== undefined) entry.maxTokens = output;
     models.push(entry);
   }
   return {
@@ -1074,10 +1066,9 @@ function buildOmpClientConfig(ctx: ExportContext): OmpGeneratedConfig {
       ...(model.native && model.provider === "openai" ? { api: "openai-responses" } : {}),
     };
     const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.contextWindow = context;
-      entry.maxTokens = outputBudgetFor(context);
-    }
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined) entry.contextWindow = context;
+    if (output !== undefined) entry.maxTokens = output;
     const efforts = ompEfforts(model);
     if (efforts.length > 0) {
       const defaultLevel = model.defaultReasoningEffort?.trim().toLowerCase();
@@ -1195,10 +1186,9 @@ function buildGajaeClientConfig(ctx: ExportContext): GajaeGeneratedConfig {
       input,
     };
     const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.contextWindow = context;
-      entry.maxTokens = outputBudgetFor(context);
-    }
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined) entry.contextWindow = context;
+    if (output !== undefined) entry.maxTokens = output;
     models.push(entry);
   }
   return {
@@ -1352,14 +1342,10 @@ function buildZcodeClientConfig(ctx: ExportContext): ZcodeGeneratedConfig {
       name: exportModelLabel(model),
       modalities: { input, output: ["text"] },
     };
-    // `limit.context` follows the authoritative-window rule. `output` is
-    // deliberately absent: ZCode's schema makes it optional and we have no
-    // authoritative output budget to assert (reviewer finding: an emitted
-    // stand-in would be a guessed capability, exactly what "no metadata is
-    // guessed" forbids).
     const context = authoritativeContextWindow(model.contextWindow);
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
     if (context !== undefined) {
-      entry.limit = { context };
+      entry.limit = { context, ...(output !== undefined ? { output } : {}) };
     }
     models[model.namespaced] = entry;
   }
@@ -1394,12 +1380,12 @@ function summarizeOpencode(document: unknown): { modelCount: number; modelsWitho
 
 function summarizePi(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = (document as PiGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined || model.maxTokens === undefined).length };
 }
 
 function summarizeOmp(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = (document as OmpGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined || model.maxTokens === undefined).length };
 }
 
 function summarizeHermes(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
@@ -1422,7 +1408,7 @@ function summarizeKimi(document: unknown): { modelCount: number; modelsWithoutLi
 
 function summarizeGajae(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = (document as GajaeGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined || model.maxTokens === undefined).length };
 }
 
 function summarizeDsh(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
@@ -1437,7 +1423,7 @@ function summarizeMcode(document: unknown): { modelCount: number; modelsWithoutL
 
 function summarizeZcode(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = Object.values((document as ZcodeGeneratedConfig | undefined)?.provider?.[OPENCODE_PROVIDER_ID]?.models ?? {});
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => !model.limit).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.limit?.output === undefined).length };
 }
 
 /** One fragment at `path`, built from this client's own document. */

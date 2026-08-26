@@ -94,9 +94,7 @@ loopback 绑定（`127.0.0.1`，默认值）不会进行任何认证，所以 `{
 
 ## 模型限制
 
-只有当目录报告了权威的 context window 时，才会写入 `limit.context`；如果没有报告，整个 `limit` block 会被省略，opencode 则继续使用自己的默认值。
-
-opencode 的 schema 会拒绝一个包含 `context` 但不包含 `output` 的 `limit` block，而目录没有按模型粒度提供权威的 output 字段，因此会同时写入一个 `32000` 的 `output` budget，并将其钳制到 context window 以内，确保不会给小 context 模型分配 `output > context`。这个数值只是为了满足 schema - 它并不是对任何具体模型真实上限的声明。
+opencode 的 schema 要求 `limit.context` 与 `limit.output` 成对出现。只有两个值都来自权威元数据时，OpenCodex 才会输出该 block；output 可以来自精确的 provider 元数据或 custom model 的显式配置。任一值未知时会省略整个 block，让 opencode 使用自己的默认值。旧的 `32000` schema 占位值不再输出。
 
 `opencodex` provider block 会在每次启动时重新生成，所以在其中做的逐模型调整不会保留。若要自定义条目，请把它们放到你自己的 provider key 下。
 

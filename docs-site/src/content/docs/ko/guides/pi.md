@@ -32,8 +32,8 @@ ocx export --client pi
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
-          "contextWindow": 200000,
-          "maxTokens": 32000
+          "contextWindow": 1000000,
+          "maxTokens": 128000
         }
       ]
     }
@@ -95,13 +95,12 @@ export OPENCODEX_API_KEY=<your key>
 
 ## 모델 메타데이터
 
-`contextWindow`와 `maxTokens`는 카탈로그가 확정된 context window를 보고할 때만
-출력됩니다. 그렇지 않으면 두 필드 모두 해당 모델에서 생략되고, Pi는 자체 기본값을
-적용합니다. `ocx export`는 그 경우가 몇 줄이었는지도 함께 출력합니다.
+`contextWindow`와 `maxTokens`는 서로 독립적인 확정 capability입니다. 각 값이 알려진
+경우에만 출력되며, 누락된 값에는 Pi 자체 기본값이 적용됩니다. `ocx export`는 완전한
+limit 조합이 없는 모델 수도 보고합니다.
 
-`maxTokens`는 스키마를 만족시키기 위한 `32000` 예산이며, context window보다 더 크게
-잡히지 않도록 아래로 잘립니다. 즉, 작은 context 모델에 그보다 많은 출력을 주겠다는
-의미가 아닙니다.
+`maxTokens`는 정확한 provider metadata 또는 custom model의 명시적 설정에서 가져옵니다.
+context도 알려진 경우 그 이하로 제한하며, 이전의 `32000` placeholder는 사용하지 않습니다.
 
 의도적으로 빠진 필드도 두 개 있습니다. `cost`는 네 개의 가격 필드가 모두 있어야
 하는데, opencodex는 라우팅된 모델의 가격 데이터를 갖고 있지 않습니다. 0을 넣으면

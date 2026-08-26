@@ -133,13 +133,10 @@ export OPENCODEX_OPENCODE_API_KEY=<your key>
 ## 모델 제한
 
 카탈로그가 공식 context window를 보고할 때만 `limit.context`를 씁니다. 그렇지 않으면
-`limit` 블록 전체를 생략하고 opencode는 자체 기본값을 유지합니다.
-
-opencode의 스키마는 `output` 없이 `context`만 있는 `limit` 블록을 거부합니다. 카탈로그에는
-모델별로 공인된 `output` 필드가 없으므로, 이를 맞추기 위해 `32000`의 `output`
-예산을 함께 내보내고, 작은 context 모델에 `output > context`가 되지 않도록 context
-window에 맞춰 낮춥니다. 그 수치는 스키마를 만족시키기 위한 값일 뿐이며, 어떤 특정
-모델의 실제 최대치를 뜻하지는 않습니다.
+opencode 스키마는 `limit.context`와 `limit.output`을 함께 요구합니다. OpenCodex는 두 값이
+모두 확정된 경우에만 블록을 출력합니다. output은 정확한 provider metadata 또는 custom
+model의 명시적 설정에서 가져옵니다. 어느 하나라도 알 수 없으면 전체 블록을 생략하며,
+이전의 `32000` placeholder는 더 이상 출력하지 않습니다.
 
 `opencodex` provider 블록은 실행할 때마다 다시 생성되므로, 그 안에서 한 모델별
 조정은 유지되지 않습니다. 대신 사용자만의 provider 키 아래에 사용자 정의 항목을

@@ -325,6 +325,10 @@ not context-window metadata. They are applied only when a Responses request omit
 `max_output_tokens`; an explicit request value wins, then a model-specific configured value, then
 the provider default, then the adapter omits `max_tokens`.
 
+Client-export capability is deliberately separate: `CatalogModel.maxOutputTokens` comes from an
+exact generated metadata bundle or `OcxCustomModel.maxOutputTokens`. Exporters must never read the
+wire-default fields above as a model maximum.
+
 Both fields must stay positive finite integers at disk-config and management validation boundaries.
 Registry entries may seed them through `providerConfigSeed`, key-login derivation, OAuth reconcile,
 and `routeModel`, but user config overrides registry defaults per field/key.

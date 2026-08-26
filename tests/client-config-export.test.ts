@@ -9,7 +9,6 @@ import {
   OPENCODE_API_KEY_ENV,
   OPENCODE_API_KEY_ENV_REF,
   LOOPBACK_API_KEY_PLACEHOLDER,
-  SCHEMA_REQUIRED_OUTPUT_BUDGET,
   buildClientConfig,
   buildClientConfigText,
   isExportClientId,
@@ -26,14 +25,14 @@ import type { OcxConfig } from "../src/types";
 
 /**
  * Fixture covering the four rows that exercise every emission branch: native,
- * routed-with-displayName, missing context window, and a context window below the
- * schema output budget (which must clamp).
+ * routed-with-authoritative-output, missing limits, and an output capability above
+ * the context window (which must clamp).
  */
 const FIXTURE: ExportModel[] = [
   { namespaced: "gpt-5.6-luna", native: true, provider: "openai", id: "gpt-5.6-luna", contextWindow: 272_000 },
-  { namespaced: "anthropic/claude-opus-5", provider: "anthropic", id: "claude-opus-5", contextWindow: 200_000, displayName: "Claude Opus 5" },
+  { namespaced: "anthropic/claude-opus-5", provider: "anthropic", id: "claude-opus-5", contextWindow: 200_000, maxOutputTokens: 128_000, displayName: "Claude Opus 5" },
   { namespaced: "custom/no-context", provider: "custom", id: "no-context" },
-  { namespaced: "tiny/small-ctx", provider: "tiny", id: "small-ctx", contextWindow: 8_000 },
+  { namespaced: "tiny/small-ctx", provider: "tiny", id: "small-ctx", contextWindow: 8_000, maxOutputTokens: 12_000 },
 ];
 
 const BASE_URL = "http://127.0.0.1:10100/v1";
@@ -53,15 +52,11 @@ function cfg(extra?: Partial<OcxConfig>): OcxConfig {
 }
 
 /**
- * Captured from `buildOpencodeProviderBlockFromCatalog` BEFORE the serializer moved to
- * src/clients/config-export.ts, for the fixture above at port 10100 / 127.0.0.1. Inlined
- * rather than read from a file so the assertion survives without scratch state.
- *
- * The relocated builder must reproduce this byte-for-byte; the client-config path adds a
- * dedupe+sort precondition, so it is compared entry-by-entry against the same truth.
+ * Expected OpenCode provider block for the authoritative-output contract. Inlined rather
+ * than read from a file so the assertion survives without scratch state.
  */
 const GOLDEN_OPENCODE_BLOCK = JSON.parse(
-  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)","limit":{"context":272000,"output":32000}},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":32000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
+  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)"},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":128000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
 ) as {
   npm: string;
   name: string;
@@ -82,8 +77,8 @@ function dshConfig(context: ExportContext = ctx()): DshGeneratedConfig {
 }
 
 
-describe("relocated OpenCode serializer (accept criterion 1)", () => {
-  test("the moved builder reproduces the pre-refactor golden byte-for-byte", () => {
+describe("OpenCode serializer (accept criterion 1)", () => {
+  test("the launcher helper follows the authoritative-output golden byte-for-byte", () => {
     const block = buildOpencodeProviderBlockFromCatalog(10100, FIXTURE, "127.0.0.1");
     expect(JSON.stringify(block)).toBe(JSON.stringify(GOLDEN_OPENCODE_BLOCK));
   });
@@ -144,11 +139,11 @@ describe("relocated OpenCode serializer (accept criterion 1)", () => {
     expect(block.models["acme/only-namespaced"]!.name).toBe("acme/only-namespaced (acme)");
   });
 
-  test("a non-positive or non-finite context window drops the limit block entirely", () => {
+  test("a missing or invalid context/output value drops the paired limit block entirely", () => {
     const block = buildOpencodeProviderBlockFromCatalog(10100, [
-      { namespaced: "a/zero", provider: "a", id: "zero", contextWindow: 0 },
-      { namespaced: "b/negative", provider: "b", id: "negative", contextWindow: -1 },
-      { namespaced: "c/nan", provider: "c", id: "nan", contextWindow: Number.NaN },
+      { namespaced: "a/no-output", provider: "a", id: "no-output", contextWindow: 100_000 },
+      { namespaced: "b/no-context", provider: "b", id: "no-context", maxOutputTokens: 8_000 },
+      { namespaced: "c/invalid-output", provider: "c", id: "invalid-output", contextWindow: 100_000, maxOutputTokens: Number.NaN },
     ], "127.0.0.1");
     for (const entry of Object.values(block.models)) {
       expect(entry.limit).toBeUndefined();
@@ -249,18 +244,21 @@ describe("Pi serializer (accept criterion 2)", () => {
     expect(models.find(model => model.id === "c/plain")).not.toHaveProperty("reasoning");
   });
 
-  test("contextWindow and maxTokens are omitted when the context window is unknown", () => {
+  test("contextWindow and maxTokens remain independently optional", () => {
     const entry = piConfig().providers.opencodex!.models.find(model => model.id === "custom/no-context")!;
     expect(entry).not.toHaveProperty("contextWindow");
     expect(entry).not.toHaveProperty("maxTokens");
     expect(entry).toEqual({ id: "custom/no-context", name: "no-context (custom)", input: ["text"] });
+    const contextOnly = piConfig().providers.opencodex!.models.find(model => model.id === "gpt-5.6-luna")!;
+    expect(contextOnly.contextWindow).toBe(272_000);
+    expect(contextOnly.maxTokens).toBeUndefined();
   });
 
-  test("maxTokens uses the schema budget and clamps to a smaller context window", () => {
+  test("maxTokens uses authoritative metadata and clamps to a smaller context window", () => {
     const models = piConfig().providers.opencodex!.models;
-    const large = models.find(model => model.id === "gpt-5.6-luna")!;
-    expect(large.contextWindow).toBe(272_000);
-    expect(large.maxTokens).toBe(SCHEMA_REQUIRED_OUTPUT_BUDGET);
+    const large = models.find(model => model.id === "anthropic/claude-opus-5")!;
+    expect(large.contextWindow).toBe(200_000);
+    expect(large.maxTokens).toBe(128_000);
     const small = models.find(model => model.id === "tiny/small-ctx")!;
     expect(small.contextWindow).toBe(8_000);
     expect(small.maxTokens).toBe(8_000);
@@ -537,12 +535,8 @@ describe("EXPORT_CLIENTS registry", () => {
     expect(isExportClientId("grok")).toBe(false);
   });
 
-  /**
-   * Full-text goldens, not field spot-checks. Adding four clients must not move
-   * a single byte for the two that already shipped — indentation and the one
-   * trailing newline included — and only a fixed expected string proves that.
-   */
-  test("opencode bytes are unchanged, to the last newline", () => {
+  /** Full-text goldens pin indentation, field omission, and the trailing newline. */
+  test("opencode authoritative-output bytes are stable to the last newline", () => {
     const built = buildClientConfigText("opencode", ctx({ config: cfg() }));
     expect(built.format).toBe("json");
     expect(built.text).toBe(`{
@@ -560,18 +554,14 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "Claude Opus 5 (anthropic)",
           "limit": {
             "context": 200000,
-            "output": 32000
+            "output": 128000
           }
         },
         "custom/no-context": {
           "name": "no-context (custom)"
         },
         "gpt-5.6-luna": {
-          "name": "gpt-5.6-luna (native)",
-          "limit": {
-            "context": 272000,
-            "output": 32000
-          }
+          "name": "gpt-5.6-luna (native)"
         },
         "tiny/small-ctx": {
           "name": "small-ctx (tiny)",
@@ -587,7 +577,7 @@ describe("EXPORT_CLIENTS registry", () => {
 `);
   });
 
-  test("pi bytes are unchanged, to the last newline", () => {
+  test("pi authoritative-output bytes are stable to the last newline", () => {
     const built = buildClientConfigText("pi", ctx({ config: cfg() }));
     expect(built.format).toBe("json");
     expect(built.text).toBe(`{
@@ -604,7 +594,7 @@ describe("EXPORT_CLIENTS registry", () => {
             "text"
           ],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         },
         {
           "id": "custom/no-context",
@@ -619,8 +609,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "input": [
             "text"
           ],
-          "contextWindow": 272000,
-          "maxTokens": 32000
+          "contextWindow": 272000
         },
         {
           "id": "tiny/small-ctx",

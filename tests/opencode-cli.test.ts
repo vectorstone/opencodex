@@ -9,7 +9,6 @@ import {
   OPENCODE_API_KEY_ENV_REF,
   OPENCODE_CONFIG_CONTENT_ENV,
   OPENCODE_PROVIDER_ID,
-  SCHEMA_REQUIRED_OUTPUT_BUDGET,
   buildOpencodeConfig,
   buildOpencodeEnv,
   buildOpencodeProviderBlock,
@@ -97,35 +96,37 @@ describe("ocx opencode provider block", () => {
     expect(Object.keys(block.models).sort()).toEqual(["gpt-5.6-sol", "kiro/glm-5"]);
   });
 
-  test("limit.context is emitted only from an authoritative contextWindow — never guessed", () => {
+  test("limit is emitted only when context and output capabilities are both authoritative", () => {
     const block = buildOpencodeProviderBlock(10100, [], [
-      { provider: "kiro", id: "with-window", contextWindow: 200_000 },
+      { provider: "kiro", id: "with-both", contextWindow: 200_000, maxOutputTokens: 64_000 },
+      { provider: "kiro", id: "context-only", contextWindow: 200_000 },
       { provider: "kiro", id: "no-window" },
       { provider: "kiro", id: "zero-window", contextWindow: 0 },
     ]);
-    expect(block.models["kiro/with-window"]?.limit?.context).toBe(200_000);
+    expect(block.models["kiro/with-both"]?.limit).toEqual({ context: 200_000, output: 64_000 });
+    expect(block.models["kiro/context-only"]?.limit).toBeUndefined();
     expect(block.models["kiro/no-window"]?.limit).toBeUndefined();
     expect(block.models["kiro/zero-window"]?.limit).toBeUndefined();
   });
 
-  test("limit.output rides along with context because opencode's schema requires the pair", () => {
+  test("limit.output uses the authoritative model capability", () => {
     const block = buildOpencodeProviderBlock(10100, [], [
-      { provider: "kiro", id: "m", contextWindow: 200_000 },
+      { provider: "kiro", id: "m", contextWindow: 200_000, maxOutputTokens: 128_000 },
     ]);
-    expect(block.models["kiro/m"]?.limit).toEqual({ context: 200_000, output: SCHEMA_REQUIRED_OUTPUT_BUDGET });
+    expect(block.models["kiro/m"]?.limit).toEqual({ context: 200_000, output: 128_000 });
   });
 
   test("limit.output is clamped to the context window for small-context models", () => {
     const block = buildOpencodeProviderBlock(10100, [], [
-      { provider: "local", id: "tiny", contextWindow: 8_192 },
+      { provider: "local", id: "tiny", contextWindow: 8_192, maxOutputTokens: 12_000 },
     ]);
     expect(block.models["local/tiny"]?.limit).toEqual({ context: 8_192, output: 8_192 });
   });
 
-  test("native slugs pick up authoritative context windows from the resolver", () => {
+  test("native context alone does not invent an output capability", () => {
     const block = buildOpencodeProviderBlock(10100, ["gpt-5.4", "unknown-native"], [], slug =>
       slug === "gpt-5.4" ? 1_000_000 : undefined);
-    expect(block.models["gpt-5.4"]?.limit).toEqual({ context: 1_000_000, output: SCHEMA_REQUIRED_OUTPUT_BUDGET });
+    expect(block.models["gpt-5.4"]?.limit).toBeUndefined();
     expect(block.models["unknown-native"]?.limit).toBeUndefined();
   });
 
@@ -288,7 +289,9 @@ describe("ocx opencode proxy model catalog", () => {
       expect(catalog.map(m => m.namespaced)).toContain(`${PROVIDER}/live-via-proxy-env`);
 
       const block = buildOpencodeProviderBlockFromCatalog(10100, catalog, undefined, config);
-      expect(block.models[`${PROVIDER}/live-via-proxy-env`]?.limit?.context).toBe(128_000);
+      // The live row reports context only. OpenCode requires context/output as a pair, so
+      // the launcher must not recreate the retired 32k output stand-in.
+      expect(block.models[`${PROVIDER}/live-via-proxy-env`]?.limit).toBeUndefined();
       expect(block.models[`${PROVIDER}/live-via-proxy-env`]?.name).toBe("live-via-proxy-env (proxyenv)");
 
       const fetched = await fetchOpencodeProxyModels(

@@ -227,6 +227,28 @@ fork-maintained behavior, and do not belong in this register.
 - Original fork implementation: `41dfada4` and `0a558755`. Authentication changes
   are security-boundary changes and require explicit security review.
 
+#### F-004 — Authoritative client-export output-token limits
+
+- Client integrations must export a per-model output limit only from authoritative
+  capability metadata. Exact generated provider/model metadata and an explicit custom-model
+  `maxOutputTokens` are valid sources; unknown capability remains omitted.
+- Never reinterpret `defaultMaxOutputTokens` or `modelMaxOutputTokens` as catalog
+  capability: those fields remain request defaults used by the OpenAI Chat adapter. Never
+  restore the retired uniform `32000` schema stand-in.
+- OpenCode emits `limit` only when authoritative context and output values are both known.
+  Pi, OMP, Prime, and Gajae preserve either known field independently; ZCode emits optional
+  `limit.output`. Combo output capability is the minimum only when every target is known.
+- Key paths include `src/types/config.ts`, `src/codex/catalog/parsing.ts`,
+  `src/codex/catalog/provider-fetch.ts`, `src/codex/catalog/aggregation.ts`,
+  `src/server/management/model-rows.ts`, `src/server/management/model-routes.ts`,
+  `src/clients/config-export.ts`, `src/cli/opencode.ts`, and the Models GUI/API/i18n files.
+- Regression sentinels include `tests/codex-catalog.test.ts`,
+  `tests/catalog-input-modality-enum.test.ts`, `tests/client-config-export.test.ts`,
+  `tests/opencode-cli.test.ts`, `tests/management-client-config-route.test.ts`, and the
+  relevant GUI model tests.
+- Original fork implementation: this change (commit/PR pending). Upstream disposition:
+  fork-only as of upstream v2.33.0 (`ec51e42d`).
+
 ### Registering future fork-only changes
 
 Any change that intentionally differs from upstream behavior must update this

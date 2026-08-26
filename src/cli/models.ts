@@ -16,7 +16,7 @@ import { knownModelIdsForProvider } from "../router";
 import { findLiveProxy } from "../server/proxy-liveness";
 import { modelInList, type OcxConfig, type OcxCustomModel } from "../types";
 
-const ADD_USAGE = "Usage: ocx models add <provider> <modelId> [--display-name <name>] [--context-window <tokens>] [--modalities text,image,audio] [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra>] [--default-reasoning-effort <level>]";
+const ADD_USAGE = "Usage: ocx models add <provider> <modelId> [--display-name <name>] [--context-window <tokens>] [--max-output-tokens <tokens>] [--modalities text,image,audio] [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra>] [--default-reasoning-effort <level>]";
 const REMOVE_USAGE = "Usage: ocx models remove <customId|provider/modelId> [--yes]";
 const LIST_CUSTOM_USAGE = "Usage: ocx models list-custom [--json]";
 const ALLOWED_MODALITIES = new Set(["text", "image", "audio"]);
@@ -191,6 +191,7 @@ async function handleCustomAdd(args: string[]): Promise<void> {
   const modelId = rest.shift()?.trim() ?? "";
   const displayNameValue = consumeFlagValue(rest, "--display-name");
   const contextWindowValue = consumeFlagValue(rest, "--context-window");
+  const maxOutputTokensValue = consumeFlagValue(rest, "--max-output-tokens");
   const modalitiesValue = consumeFlagValue(rest, "--modalities");
   const reasoningEffortsValue = consumeFlagValue(rest, "--reasoning-efforts");
   const defaultEffortValue = consumeFlagValue(rest, "--default-reasoning-effort");
@@ -212,6 +213,14 @@ async function handleCustomAdd(args: string[]): Promise<void> {
     contextWindow = Number(contextWindowValue);
     if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
       fail("context window must be a positive integer");
+    }
+  }
+
+  let maxOutputTokens: number | undefined;
+  if (maxOutputTokensValue !== undefined) {
+    maxOutputTokens = Number(maxOutputTokensValue);
+    if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+      fail("maximum output tokens must be a positive safe integer");
     }
   }
 
@@ -244,6 +253,7 @@ async function handleCustomAdd(args: string[]): Promise<void> {
     modelId,
     ...(displayName ? { displayName } : {}),
     ...(contextWindow ? { contextWindow } : {}),
+    ...(maxOutputTokens ? { maxOutputTokens } : {}),
     ...(inputModalities ? { inputModalities } : {}),
     ...(parsed.reasoningEfforts ? { reasoningEfforts: parsed.reasoningEfforts } : {}),
     ...(parsed.defaultReasoningEffort ? { defaultReasoningEffort: parsed.defaultReasoningEffort } : {}),
@@ -307,6 +317,7 @@ function customModelCells(model: OcxCustomModel): string[] {
     model.modelId,
     model.displayName ?? "-",
     model.contextWindow ? `${Math.round(model.contextWindow / 1000)}k` : "-",
+    model.maxOutputTokens ? `${Math.round(model.maxOutputTokens / 1000)}k` : "-",
     model.inputModalities?.join(",") ?? "-",
     model.reasoningEfforts?.join(",") ?? "-",
     model.defaultReasoningEffort ?? "-",
@@ -315,7 +326,7 @@ function customModelCells(model: OcxCustomModel): string[] {
 
 function printCustomModelGroup(provider: string, models: OcxCustomModel[]): void {
   const rows = models.map(customModelCells);
-  const headers = ["ID", "MODEL", "DISPLAY NAME", "CONTEXT", "MODALITIES", "EFFORTS", "DEFAULT EFFORT"];
+  const headers = ["ID", "MODEL", "DISPLAY NAME", "CONTEXT", "MAX OUTPUT", "MODALITIES", "EFFORTS", "DEFAULT EFFORT"];
   const widths = headers.map((header, column) => Math.max(header.length, ...rows.map(row => row[column].length)));
   const line = (cells: string[]) => cells.map((cell, column) => cell.padEnd(widths[column])).join("  ");
   console.log(`${provider}:`);

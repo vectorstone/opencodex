@@ -32,8 +32,8 @@ d’exportation de la variable d’environnement et le nombre de modèles dotés
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
-          "contextWindow": 200000,
-          "maxTokens": 32000
+          "contextWindow": 1000000,
+          "maxTokens": 128000
         }
       ]
     }
@@ -94,13 +94,12 @@ refuse de démarrer sans jeton — voir [Accès à distance](/fr/reference/confi
 
 ## Métadonnées du modèle
 
-`contextWindow` et `maxTokens` sont émis uniquement lorsque le catalogue fournit une fenêtre de contexte
-faisant autorité. Dans le cas contraire, les deux champs sont omis pour ce modèle et Pi applique ses propres valeurs par défaut ;
-`ocx export` affiche le nombre de lignes concernées.
+`contextWindow` et `maxTokens` sont deux capacités indépendantes faisant autorité. Chaque champ n’est
+émis que lorsque sa valeur est connue ; Pi applique sa propre valeur par défaut pour le champ absent.
+`ocx export` indique combien de modèles n’ont pas une paire de limites complète.
 
-`maxTokens` est un budget de `32000` destiné à satisfaire le schéma. Il est plafonné à la fenêtre de contexte, de sorte qu’un
-modèle doté d’un petit contexte ne reçoive jamais davantage de sortie que de contexte. Cette valeur ne constitue pas une affirmation sur la
-limite maximale réelle d’un modèle donné.
+`maxTokens` provient des métadonnées exactes du provider ou d’une valeur explicite du custom model.
+Il est plafonné à la fenêtre de contexte lorsque les deux sont connues. L’ancien substitut `32000` n’est plus utilisé.
 
 Le champ `cost` est volontairement absent. Il exige les quatre champs de prix, alors qu’OpenCodex ne possède
 aucune donnée tarifaire pour les modèles routés ; émettre des zéros reviendrait à affirmer que tous les

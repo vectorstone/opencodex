@@ -54,7 +54,6 @@ export {
   OPENCODE_API_KEY_ENV_REF,
   OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG,
   OPENCODE_PROVIDER_ID,
-  SCHEMA_REQUIRED_OUTPUT_BUDGET,
   buildOpencodeProviderBlockFromCatalog,
   opencodeGlobalConfigPath,
   opencodeProxyBaseUrl,
@@ -73,6 +72,8 @@ export interface OpencodeRoutedModel {
   id: string;
   /** Authoritative context window (CatalogModel.contextWindow); optional. */
   contextWindow?: number;
+  /** Authoritative maximum output capability (CatalogModel.maxOutputTokens); optional. */
+  maxOutputTokens?: number;
   /** Authoritative display label (CatalogModel.displayName); optional. */
   displayName?: string;
 }
@@ -86,6 +87,7 @@ export interface OpencodeProxyModelRow {
   disabled?: boolean;
   displayName?: string;
   contextWindow?: number;
+  maxOutputTokens?: number;
   inputModalities?: string[];
 }
 
@@ -221,6 +223,7 @@ export function buildOpencodeProviderBlock(
       provider: model.provider,
       id: model.id,
       contextWindow: model.contextWindow,
+      maxOutputTokens: model.maxOutputTokens,
       displayName: model.displayName,
     })),
   ];
@@ -316,6 +319,7 @@ export function opencodeCatalogFromProxyRows(
       provider: row.provider,
       id: row.id,
       contextWindow: row.contextWindow,
+      maxOutputTokens: row.maxOutputTokens,
       displayName: row.displayName,
       ...(Array.isArray(row.inputModalities) && row.inputModalities.length > 0
         ? { inputModalities: row.inputModalities }

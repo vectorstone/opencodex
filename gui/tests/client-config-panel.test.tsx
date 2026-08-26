@@ -456,7 +456,7 @@ test("one client's failure isolates to its row, with no partial JSON and the bas
   await act(async () => { root.unmount(); });
 });
 
-test("degraded line appears only when models ship without context limits", async () => {
+test("degraded line appears only when models ship without complete supported limits", async () => {
   // Retargeted into the dialog; the line must stay reachable, not stay put.
   stubRoute(client => Response.json(client === "pi" ? PI_ENVELOPE : OPENCODE_ENVELOPE));
   const { root, container } = await mountPanel();
@@ -467,7 +467,7 @@ test("degraded line appears only when models ship without context limits", async
 
   await act(async () => { rowButton(container, "Pi", "Details").click(); });
   expect(container.querySelector(".awi-clientconfig-degraded")?.textContent)
-    .toBe("1 of 2 model(s) ship without a context limit; the client applies its own defaults.");
+    .toBe("1 of 2 model(s) ship without complete supported limit metadata; the client applies its own defaults.");
 
   await act(async () => { root.unmount(); });
 });

@@ -16,7 +16,7 @@ import {
 const USAGE = `Usage:
   ocx models live [--provider <name>] [--json]
   ocx models edit <custom-id> [--model-id <id>] [--display-name <name|->]
-      [--context-window <tokens|0>] [--modalities <text,image,audio|->]
+      [--context-window <tokens|0>] [--max-output-tokens <tokens|0>] [--modalities <text,image,audio|->]
       [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra|->]
       [--default-reasoning-effort <level|->] [--json]
   ocx models <enable|disable> <provider/model|native-model> [--native] [--json]
@@ -58,6 +58,7 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const modelId = takeOption(args, "--model-id");
   const displayName = takeOption(args, "--display-name");
   const contextRaw = takeOption(args, "--context-window");
+  const maxOutputRaw = takeOption(args, "--max-output-tokens");
   const modalitiesRaw = takeOption(args, "--modalities");
   const reasoningEffortsRaw = takeOption(args, "--reasoning-efforts");
   const defaultEffortRaw = takeOption(args, "--default-reasoning-effort");
@@ -68,6 +69,13 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
     const value = Number(contextRaw.replace(/[_,]/g, ""));
     if (!Number.isInteger(value) || value < 0) throw new CliUsageError("--context-window must be an integer >= 0", USAGE);
     patch.contextWindow = value === 0 ? null : value;
+  }
+  if (maxOutputRaw !== undefined) {
+    const value = Number(maxOutputRaw.replace(/[_,]/g, ""));
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new CliUsageError("--max-output-tokens must be a safe integer >= 0", USAGE);
+    }
+    patch.maxOutputTokens = value === 0 ? null : value;
   }
   if (modalitiesRaw !== undefined) patch.inputModalities = modalitiesRaw === "-" ? [] : csv(modalitiesRaw);
   // "-" restores inheritance by clearing the stored ladder (null); "" stores an explicit

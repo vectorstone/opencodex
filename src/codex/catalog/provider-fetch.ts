@@ -638,6 +638,19 @@ export function configuredAutoCompactTokenLimit(
     : undefined;
 }
 
+function generatedMaxOutputTokens(provider: string, modelId: string): number | undefined {
+  const metadataProvider = resolveMetadataProvider(provider);
+  if (!metadataProvider) return undefined;
+  const metadata = getModelMetadata(metadataProvider, modelId)
+    ?? (shouldCaseFoldMetadataModelId(provider)
+      ? getModelMetadataCaseInsensitive(metadataProvider, modelId)
+      : undefined);
+  const value = metadata?.maxTokens;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
 function configuredReasoningSummarySupport(prov: OcxProviderConfig | undefined, id: string): boolean | undefined {
   if (!prov) return undefined;
   const explicit = modelRecordValue(prov.modelSupportsReasoningSummaries, id);
@@ -646,7 +659,6 @@ function configuredReasoningSummarySupport(prov: OcxProviderConfig | undefined, 
 }
 
 export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, model: CatalogModel, providerCap?: number): CatalogModel {
-  void name;
   const configuredCap = configuredContextWindow(prov, model.id);
   const configuredMaxInput = configuredMaxInputTokens(prov, model.id);
   const configuredAutoCompact = configuredAutoCompactTokenLimit(prov, model.id);
@@ -664,6 +676,7 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
   const supportsReasoningSummaries = configuredReasoningSummarySupport(prov, model.id);
   const fastPolicy = fastPolicyForModel(prov, model.id, name);
   const supportsServiceTier = serviceTierSupportFromPolicy(fastPolicy);
+  const metadataMaxOutput = generatedMaxOutputTokens(name, model.id);
   const {
     supportsServiceTier: _staleServiceTier,
     fastTierDescription: _staleFastTierDescription,
@@ -687,6 +700,9 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
           ? Math.min(model.maxInputTokens, configuredMaxInput)
           : configuredMaxInput,
       }
+      : {}),
+    ...(model.maxOutputTokens === undefined && metadataMaxOutput !== undefined
+      ? { maxOutputTokens: metadataMaxOutput }
       : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
     ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
@@ -1965,6 +1981,11 @@ async function gatherRoutedModelsUncached(
         : codexForwardNativeCapabilityAlias ? { displayName: "Daybreak Blue" } : {}),
       ...(customContextWindow !== undefined ? { contextWindow: customContextWindow } : {}),
       ...(customMaxInputTokens !== undefined ? { maxInputTokens: customMaxInputTokens } : {}),
+      ...(typeof cm.maxOutputTokens === "number"
+        && Number.isSafeInteger(cm.maxOutputTokens)
+        && cm.maxOutputTokens > 0
+        ? { maxOutputTokens: cm.maxOutputTokens }
+        : {}),
       ...(customAutoCompactTokenLimit !== undefined ? { autoCompactTokenLimit: customAutoCompactTokenLimit } : {}),
       ...(cm.inputModalities
         ? { inputModalities: cm.inputModalities }
@@ -2020,6 +2041,9 @@ async function gatherRoutedModelsUncached(
       ...base,
       ...(base.contextWindow === undefined && replaced.contextWindow !== undefined ? { contextWindow: replaced.contextWindow } : {}),
       ...(mergedMaxInput !== undefined ? { maxInputTokens: mergedMaxInput } : {}),
+      ...(base.maxOutputTokens === undefined && replaced.maxOutputTokens !== undefined
+        ? { maxOutputTokens: replaced.maxOutputTokens }
+        : {}),
       ...(base.autoCompactTokenLimit === undefined && replaced.autoCompactTokenLimit !== undefined
         ? { autoCompactTokenLimit: replaced.autoCompactTokenLimit }
         : {}),
@@ -2187,6 +2211,9 @@ export function augmentRoutedModelsWithMetadata(
         id: meta.id,
         owned_by: provider,
         ...(typeof meta.contextWindow === "number" && meta.contextWindow > 0 ? { contextWindow: meta.contextWindow } : {}),
+        ...(typeof meta.maxTokens === "number" && Number.isSafeInteger(meta.maxTokens) && meta.maxTokens > 0
+          ? { maxOutputTokens: meta.maxTokens }
+          : {}),
         ...(Array.isArray(meta.input) && meta.input.length > 0 ? { inputModalities: [...meta.input] } : {}),
       };
       out.push({

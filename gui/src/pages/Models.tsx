@@ -239,6 +239,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
   const [customFormModelId, setCustomFormModelId] = useState("");
   const [customFormDisplayName, setCustomFormDisplayName] = useState("");
   const [customFormContextWindow, setCustomFormContextWindow] = useState("");
+  const [customFormMaxOutputTokens, setCustomFormMaxOutputTokens] = useState("");
   const [customFormShowCustomCtx, setCustomFormShowCustomCtx] = useState(false);
   const [customFormModalities, setCustomFormModalities] = useState<string[]>(["text"]);
   const [customFormReasoning, setCustomFormReasoning] = useState(false);
@@ -923,6 +924,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
     modelId: string,
     displayName?: string,
     contextWindow?: number,
+    maxOutputTokens?: number,
     inputModalities?: string[],
     reasoningEfforts?: string[],
   ) => {
@@ -932,7 +934,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
       const r = await fetch(`${apiBase}/api/custom-models`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, modelId, displayName, contextWindow, inputModalities, reasoningEfforts }),
+        body: JSON.stringify({ provider, modelId, displayName, contextWindow, maxOutputTokens, inputModalities, reasoningEfforts }),
       });
       try {
         await readJsonOrThrow(r, t("models.customSaveFailed"));
@@ -1109,6 +1111,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                    setCustomFormModelId("");
                    setCustomFormDisplayName("");
                    setCustomFormContextWindow("");
+                   setCustomFormMaxOutputTokens("");
                    setCustomFormShowCustomCtx(false);
                    setCustomFormModalities(["text"]);
                    setCustomFormReasoning(false);
@@ -1241,6 +1244,12 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                                <span className="model-tip-val">{fmtK(m.contextWindow ?? m.contextCap ?? 0)}</span>
                              </>
                            )}
+                           {m.maxOutputTokens && (
+                             <>
+                               <span className="model-tip-key">{t("models.tipMaxOutput")}</span>
+                               <span className="model-tip-val">{fmtK(m.maxOutputTokens)}</span>
+                             </>
+                           )}
                            {m.inputModalities && m.inputModalities.length > 0 && (
                              <>
                                <span className="model-tip-key">{t("models.tipModalities")}</span>
@@ -1262,6 +1271,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                                  setCustomFormModelId(m.id);
                                  setCustomFormDisplayName(m.displayName ?? "");
                                  setCustomFormContextWindow(m.contextWindow ? String(m.contextWindow) : "");
+                                 setCustomFormMaxOutputTokens(m.maxOutputTokens ? String(m.maxOutputTokens) : "");
                                  setCustomFormShowCustomCtx(false);
                                  setCustomFormModalities(m.inputModalities ?? ["text"]);
                                  // Only a STORED ladder counts as "configured": an inherited one
@@ -1719,6 +1729,19 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                 </div>
               </label>
 
+              <label className="text-label models-field">
+                {t("models.customFieldMaxOutput")}
+                <input
+                  className="input"
+                  inputMode="numeric"
+                  value={customFormMaxOutputTokens}
+                  onChange={e => setCustomFormMaxOutputTokens(e.target.value)}
+                  disabled={customSaving}
+                  placeholder={t("models.customFieldMaxOutputPlaceholder")}
+                  aria-label={t("models.customFieldMaxOutput")}
+                />
+              </label>
+
               <div className="text-label models-field">
                 {t("models.customFieldModalities")}
                 <div className="row models-field-row">
@@ -1804,6 +1827,11 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                   const displayName = customFormDisplayName.trim();
                   const ctxVal = customFormContextWindow ? Number(customFormContextWindow.replace(/[_,\s]/g, "")) : undefined;
                   const contextWindow = ctxVal && ctxVal > 0 ? Math.floor(ctxVal) : undefined;
+                  const maxOutputTokens = parseContextWindowDraft(customFormMaxOutputTokens);
+                  if (maxOutputTokens === undefined) {
+                    setCustomError(t("models.customFieldMaxOutputInvalid"));
+                    return;
+                  }
                   if (customModalMode === "add") {
                     const reasoningEfforts = customFormReasoning ? customFormReasoningEfforts : undefined;
                     void addCustomModel(
@@ -1811,6 +1839,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                       modelId,
                       displayName || undefined,
                       contextWindow,
+                      maxOutputTokens ?? undefined,
                       customFormModalities.length > 0 ? customFormModalities : undefined,
                       reasoningEfforts,
                     );
@@ -1821,6 +1850,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                       modelId,
                       displayName,
                       contextWindow: contextWindow ?? null,
+                      maxOutputTokens,
                       inputModalities: customFormModalities,
                       reasoningEfforts: customFormReasoning ? customFormReasoningEfforts : null,
                     });

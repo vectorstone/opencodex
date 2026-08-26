@@ -190,6 +190,8 @@ export interface OcxCustomModel {
   displayName?: string;
   /** 컨텍스트 윈도우 (토큰) */
   contextWindow?: number;
+  /** Authoritative maximum output-token capability for this exact custom route. */
+  maxOutputTokens?: number;
   /** 입력 모달리티 (선택, 기본 ["text"]) */
   inputModalities?: string[];
   /**

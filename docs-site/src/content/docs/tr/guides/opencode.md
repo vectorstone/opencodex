@@ -148,12 +148,9 @@ yapılandırmanızı tam olarak eskisi gibi okur.
 yazılır; bildirmediğinde tüm `limit` bloğu atlanır ve opencode kendi
 varsayılanlarını korur.
 
-opencode'un şeması `output` olmadan `context` taşıyan bir `limit` bloğunu
-reddeder ve kataloğun yetkili bir model başına çıktı alanı yoktur; bu nedenle
-yanında `32000`'lik bir `output` bütçesi yayınlanır ve küçük bağlamlı bir modele
-asla `output > context` verilmemesi için bağlam penceresine doğru sabitlenir. Bu
-rakam şemayı karşılamak için vardır — belirli bir modelin gerçek maksimumu
-hakkında bir iddia değildir.
+opencode şeması `limit.context` ve `limit.output` alanlarını birlikte ister. OpenCodex bloğu yalnızca
+iki değer de kesin provider metadata'sı veya açık bir custom model ayarıyla doğrulandığında üretir.
+Değerlerden biri bilinmiyorsa blok tamamen atlanır ve eski `32000` placeholder kullanılmaz.
 
 `opencodex` sağlayıcı bloğu her başlatmada yeniden oluşturulur, bu nedenle
 içinde yapılan model başına ince ayarlar hayatta kalmaz. Bunun yerine özel
@@ -166,5 +163,4 @@ opencode kurulu olmalı ve `PATH` üzerinde bulunmalıdır:
 ```bash
 npm install -g opencode-ai
 ```
-
 

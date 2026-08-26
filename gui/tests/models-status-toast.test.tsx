@@ -175,3 +175,59 @@ test("success toast expires after 6s and a repeated action re-arms it", async ()
   await fireTimers(6000);
   expect(container.querySelector(".action-toast")).toBeNull();
 });
+
+test("custom-model dialog submits authoritative maximum output tokens", async () => {
+  const posts: unknown[] = [];
+  const baseFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/api/custom-models") && init?.method === "POST") {
+      posts.push(typeof init.body === "string" ? JSON.parse(init.body) : init.body);
+      return Response.json({ id: "custom-output" }, { status: 201 });
+    }
+    return baseFetch(input, init);
+  }) as typeof fetch;
+
+  const { createRoot } = await import("react-dom/client");
+  await act(async () => {
+    root = createRoot(container);
+    root.render(
+      <LanguageProvider>
+        <Models apiBase="http://localhost" />
+      </LanguageProvider>,
+    );
+  });
+  await act(async () => {
+    await new Promise(resolve => testWindow.setTimeout(resolve, 0));
+    await Promise.resolve();
+  });
+
+  const open = container.querySelector<HTMLButtonElement>('button[aria-label="Add custom model"]')!;
+  await act(async () => { open.click(); });
+  const dialog = container.querySelector<HTMLElement>('[role="dialog"]')!;
+  const modelId = dialog.querySelector<HTMLInputElement>('input[placeholder="e.g. qwen4-max-preview"]')!;
+  const maxOutput = dialog.querySelector<HTMLInputElement>('input[aria-label="Maximum output tokens"]')!;
+  const setValue = async (input: HTMLInputElement, value: string) => {
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(testWindow.HTMLInputElement.prototype, "value")!.set!.call(input, value);
+      input.dispatchEvent(new testWindow.Event("input", { bubbles: true }));
+    });
+  };
+  await setValue(modelId, "claude-opus-5.1");
+  await setValue(maxOutput, "128000");
+
+  const submit = [...dialog.querySelectorAll<HTMLButtonElement>("button")]
+    .find(button => button.textContent?.trim() === "Add")!;
+  await act(async () => {
+    submit.click();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(posts).toEqual([{
+    provider: "anthropic",
+    modelId: "claude-opus-5.1",
+    maxOutputTokens: 128_000,
+    inputModalities: ["text"],
+  }]);
+});

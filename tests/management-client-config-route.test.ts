@@ -45,6 +45,7 @@ interface ModelRow {
   native?: boolean;
   displayName?: string;
   contextWindow?: number;
+  maxOutputTokens?: number;
   inputModalities?: string[];
   reasoningEfforts?: string[];
   defaultReasoningEffort?: string;
@@ -52,8 +53,8 @@ interface ModelRow {
 
 /**
  * Static provider catalogs (`liveModels: false`) so the model list is deterministic and no
- * test ever reaches the network. `b/no-context` carries no context window, which is what
- * makes `modelsWithoutLimits` non-zero and therefore actually assertable.
+ * test ever reaches the network. The rows intentionally omit output capability metadata,
+ * which makes `modelsWithoutLimits` non-zero and therefore actually assertable.
  */
 function baseConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
   return {
@@ -114,6 +115,7 @@ function toExportModel(row: ModelRow): ExportModel {
     ...(row.native ? { native: true } : {}),
     ...(row.displayName ? { displayName: row.displayName } : {}),
     ...(row.contextWindow !== undefined ? { contextWindow: row.contextWindow } : {}),
+    ...(row.maxOutputTokens !== undefined ? { maxOutputTokens: row.maxOutputTokens } : {}),
     ...(row.inputModalities ? { inputModalities: row.inputModalities } : {}),
     ...(row.reasoningEfforts ? { reasoningEfforts: row.reasoningEfforts } : {}),
     ...(row.defaultReasoningEffort ? { defaultReasoningEffort: row.defaultReasoningEffort } : {}),
@@ -122,7 +124,15 @@ function toExportModel(row: ModelRow): ExportModel {
 
 describe("GET /api/client-config", () => {
   test("opencode envelope carries the shared builder's exact bytes", async () => {
-    const config = baseConfig();
+    const config = baseConfig({
+      customModels: [{
+        id: "custom-output",
+        provider: "a",
+        modelId: "known-output",
+        contextWindow: 128_000,
+        maxOutputTokens: 64_000,
+      }],
+    });
     const response = await clientConfigApi(config, "?client=opencode");
     expect(response.status).toBe(200);
     const body = await response.json() as ClientConfigEnvelope;
@@ -147,8 +157,39 @@ describe("GET /api/client-config", () => {
     const document = body.config as OpencodeGeneratedConfig;
     expect(document.$schema).toBe(OPENCODE_CONFIG_SCHEMA);
     const models = document.provider[OPENCODE_PROVIDER_ID].models;
-    expect(models["a/m1"]).toEqual({ name: "m1 (a)", limit: { context: 128_000, output: 32_000 } });
+    expect(models["a/m1"]).toEqual({ name: "m1 (a)" });
+    expect(models["a/known-output"]).toEqual({
+      name: "known-output (a)",
+      limit: { context: 128_000, output: 64_000 },
+    });
     expect(models["b/no-context"]).toEqual({ name: "no-context (b)" });
+  }, 15_000);
+
+  test("a custom replacement inherits exact provider output metadata through /api/models", async () => {
+    const config = baseConfig({
+      defaultProvider: "anthropic",
+      providers: {
+        anthropic: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          liveModels: false,
+          models: ["claude-opus-5"],
+        },
+      },
+      customModels: [{
+        id: "custom-inherited-output",
+        provider: "anthropic",
+        modelId: "claude-opus-5",
+        contextWindow: 200_000,
+      }],
+    });
+    const rows = await modelRows(config);
+    expect(rows.find(row => row.namespaced === "anthropic/claude-opus-5")?.maxOutputTokens).toBe(128_000);
+
+    const response = await clientConfigApi(config, "?client=opencode");
+    const body = await response.json() as ClientConfigEnvelope;
+    const models = (body.config as OpencodeGeneratedConfig).provider[OPENCODE_PROVIDER_ID].models;
+    expect(models["anthropic/claude-opus-5"]?.limit).toEqual({ context: 200_000, output: 128_000 });
   }, 15_000);
 
   test("pi returns a models ARRAY under the same provider id", async () => {
@@ -238,7 +279,9 @@ describe("GET /api/client-config", () => {
     const pi = await (await clientConfigApi(config, "?client=pi")).json() as ClientConfigEnvelope;
     const piModels = (pi.config as PiGeneratedConfig).providers[OPENCODE_PROVIDER_ID].models;
     expect(pi.modelCount).toBe(piModels.length);
-    expect(pi.modelsWithoutLimits).toBe(piModels.filter(model => model.contextWindow === undefined).length);
+    expect(pi.modelsWithoutLimits).toBe(piModels.filter(model => (
+      model.contextWindow === undefined || model.maxTokens === undefined
+    )).length);
   }, 15_000);
 
   test("disabled models are filtered before the config is built", async () => {

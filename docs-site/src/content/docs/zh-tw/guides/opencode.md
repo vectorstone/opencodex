@@ -99,9 +99,7 @@ Loopback 範例：
 
 ## 模型限制
 
-只有在目錄回報具權威性的 context window 時，才會寫入 `limit.context`；若沒有，會省略整個 `limit` 區塊，opencode 沿用自己的預設值。
-
-opencode 的 schema 會拒絕只有 `context`、沒有 `output` 的 `limit` 區塊，而目錄又沒有具權威性的 per-model output 欄位，因此會一併發出 `output` 預算 `32000`，並向下 clamp 到 context window，避免小 context 模型出現 `output > context`。這個數字是為了滿足 schema——並非宣稱任何特定模型的真實上限。
+opencode 的 schema 要求 `limit.context` 與 `limit.output` 成對出現。只有兩個值都來自權威中繼資料時，OpenCodex 才會輸出該區塊；output 可以來自精確的 provider 中繼資料或 custom model 的明確設定。任一值未知時會省略整個區塊，讓 opencode 使用自己的預設值。舊的 `32000` schema 佔位值不再輸出。
 
 `opencodex` provider 區塊每次啟動都會重新產生，因此在裡面做的 per-model 調整不會保留。請把自訂項目放在你自己的 provider 鍵底下。
 

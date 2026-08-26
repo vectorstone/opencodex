@@ -158,6 +158,13 @@ export function deriveComboCatalogModel(
     contextWindow,
     ...members.map(member => member.maxInputTokens ?? member.contextWindow!),
   );
+  const maxOutputTokens = members.every(member => (
+    typeof member.maxOutputTokens === "number"
+    && Number.isSafeInteger(member.maxOutputTokens)
+    && member.maxOutputTokens > 0
+  ))
+    ? Math.min(...members.map(member => member.maxOutputTokens!))
+    : undefined;
   const autoCompactTokenLimit = Math.min(
     ...members.map(member => clampAutoCompactTokenLimit(
       member.contextWindow!,
@@ -176,6 +183,7 @@ export function deriveComboCatalogModel(
     owned_by: COMBO_NAMESPACE,
     contextWindow,
     maxInputTokens,
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
     autoCompactTokenLimit,
     ...(hasLimitingContextCapMetadata ? { contextCapped } : {}),
     inputModalities,
@@ -220,6 +228,7 @@ export function comboCatalogWarningSignature(
       key,
       contextWindow: member?.contextWindow ?? null,
       maxInputTokens: member?.maxInputTokens ?? null,
+      maxOutputTokens: member?.maxOutputTokens ?? null,
       autoCompactTokenLimit: member?.autoCompactTokenLimit ?? null,
       inputModalities: [...new Set(member?.inputModalities ?? [])].sort(),
       reasoningEfforts: [...new Set(member?.reasoningEfforts ?? [])].sort(),
@@ -310,6 +319,7 @@ export function normalizedOpenAiApiSignature(model: CatalogModel): string {
     id: model.id,
     contextWindow: model.contextWindow ?? null,
     maxInputTokens: model.maxInputTokens ?? null,
+    maxOutputTokens: model.maxOutputTokens ?? null,
     autoCompactTokenLimit: model.autoCompactTokenLimit ?? null,
     inputModalities: [...new Set(model.inputModalities ?? [])].sort(),
     reasoningEfforts: [...new Set(model.reasoningEfforts ?? [])].sort(),
