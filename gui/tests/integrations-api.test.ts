@@ -19,7 +19,7 @@ const originalFetch = globalThis.fetch;
 
 test("DSH is a file integration client", () => {
   expect(FILE_INTEGRATION_CLIENTS).toEqual([
-    "opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode",
+    "opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime",
   ]);
 });
 

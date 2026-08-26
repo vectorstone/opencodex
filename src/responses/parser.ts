@@ -11,15 +11,16 @@ import type {
   OcxToolCall,
   OcxReasoningReplayScopeRef,
 } from "../types";
-import { namespacedToolName, toolChoiceCandidates } from "../types";
+import { createToolChoiceResolver, namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
 import { providerMetadataFromResponsesFunctionCall } from "./provider-opaque-metadata";
 import { lookupReplayThoughtSignature } from "./thought-signature-replay";
-import { compactionItemToText } from "./compaction";
+import { compactionItemToText, isCompactionItemType } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";
 import { extractHostedImageGeneration, IMAGE_GEN_TOOL_NAME } from "../images/synthetic-tool";
+import { toolSearchDescription, toolSearchParameters } from "./tool-search-compat";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -214,15 +215,8 @@ function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
       // Expose as a function so chat models can call it; the bridge relays it as a tool_search_call.
       out.push({
         name: "tool_search",
-        description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
-        parameters: (isObj(t.parameters) ? t.parameters : {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Search query for tools to load." },
-            limit: { type: "number", description: "Maximum number of tools to return." },
-          },
-          required: ["query"],
-        }) as Record<string, unknown>,
+        description: toolSearchDescription(t),
+        parameters: normalizeParameters(toolSearchParameters(t)),
         toolSearch: true,
       });
     }
@@ -440,7 +434,7 @@ export function parseRequest(
         continue;
       }
 
-      if (effectiveType === "compaction" || effectiveType === "compaction_summary" || effectiveType === "context_compaction") {
+      if (isCompactionItemType(effectiveType)) {
         // A stored summary from a previous compaction. Decode our ocx1 envelope into plain text so
         // the routed model keeps the compacted context; real OpenAI-encrypted blobs degrade to a note.
         // `context_compaction` (encrypted_content optional) is codex-rs's local-compaction marker;
@@ -764,8 +758,9 @@ export function parseRequest(
   const tc = mapToolChoice(data.tool_choice);
   if (tc && typeof tc === "object") {
     const selectors = "allowedTools" in tc ? tc.allowedTools : [tc.name];
+    const resolver = createToolChoiceResolver(mergedTools);
     for (const selector of selectors) {
-      if (toolChoiceCandidates(mergedTools, selector).length > 1) {
+      if (resolver.candidateCount(selector) > 1) {
         throw new Error(`ambiguous tool_choice name: ${selector}`);
       }
     }

@@ -46,7 +46,7 @@ import {
   mergeSidecarSetting,
   readDashboardSectionFromHash,
   requireJson,
-  sidecarModelOptions,
+  webSearchModelOptionsForPicker,
   visionModelOptions,
   useModalDialog,
 } from "./dashboard-shared";
@@ -465,14 +465,17 @@ export function useDashboardData(apiBase: string) {
     return out;
   }, [grouped, modelQuery]);
   const sidecarModels = useMemo(() => {
-    const opts = sidecarModelOptions(models);
-    for (const id of [sidecar?.webSearch.model, sidecar?.vision.model]) {
-      if (id && !opts.some(option => option.value === id)) {
-        opts.unshift({ value: id, label: id });
-      }
-    }
-    return opts;
-  }, [models, sidecar]);
+    // Server-computed runnable set when present (#2188); legacy union otherwise.
+    // The shared SidecarSetting type admits vision's "routed", which the
+    // web-search picker cannot carry — narrow it away for this card.
+    const webBackend = sidecar?.webSearch.backend;
+    return webSearchModelOptionsForPicker(
+      sidecar?.webSearchModels,
+      models,
+      sidecar?.webSearch.model,
+      webBackend === "routed" ? undefined : webBackend,
+    );
+  }, [models, sidecar?.webSearchModels, sidecar?.webSearch]);
   const visionModels = useMemo(
     () => visionModelOptions(sidecar?.visionModels, models, sidecar?.vision?.model, sidecar?.vision?.backend),
     [sidecar?.visionModels, models, sidecar?.vision],
@@ -485,6 +488,7 @@ export function useDashboardData(apiBase: string) {
       webSearch: mergeSidecarSetting(sidecar.webSearch, patch.webSearch),
       vision: mergeSidecarSetting(sidecar.vision, patch.vision),
       ...(sidecar.visionModels ? { visionModels: sidecar.visionModels } : {}),
+      ...(sidecar.webSearchModels ? { webSearchModels: sidecar.webSearchModels } : {}),
     };
     setSidecarSaving(true);
     setSidecar(next);
@@ -499,6 +503,7 @@ export function useDashboardData(apiBase: string) {
         webSearch: data.webSearch,
         vision: data.vision,
         ...(data.visionModels ? { visionModels: data.visionModels } : {}),
+        ...(data.webSearchModels ? { webSearchModels: data.webSearchModels } : {}),
       });
       const prev = readSessionListCache<CachedControls>(controlsCacheKey(apiBase)) ?? {};
       writeSessionListCache(controlsCacheKey(apiBase), {
@@ -507,6 +512,7 @@ export function useDashboardData(apiBase: string) {
           webSearch: data.webSearch,
           vision: data.vision,
           ...(data.visionModels ? { visionModels: data.visionModels } : {}),
+          ...(data.webSearchModels ? { webSearchModels: data.webSearchModels } : {}),
         },
       });
     } catch {

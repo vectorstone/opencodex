@@ -1090,7 +1090,14 @@ select.input { appearance: none; }
 .select-dropdown {
   position: absolute; top: calc(100% + 4px); left: 0; z-index: var(--z-popover);
   min-width: 100%; max-height: 280px; overflow-y: auto;
-  background: color-mix(in oklab, canvas 84%, transparent);
+  /*
+    Opaque fill, not glass. A portaled menu opens over rows beneath its trigger
+    (Subagents → Settings: Preferred model covers the Tell Codex switch). A
+    translucent canvas mix let those controls show through and look like they
+    floated above every layer. Keep backdrop-filter for edge refraction only —
+    the fill itself must hide what sits behind the panel.
+  */
+  background: var(--surface);
   backdrop-filter: blur(20px) saturate(1.4);
   -webkit-backdrop-filter: blur(20px) saturate(1.4);
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -1152,6 +1159,7 @@ select.input { appearance: none; }
   -webkit-appearance: none;
 }
 .switch.on { background: var(--toggle-on-bg); border-color: var(--toggle-on-bg); }
+.switch.mixed { background: var(--amber-soft); border-color: var(--amber); }
 .switch:disabled { opacity: 0.6; cursor: default; }
 .switch .knob {
   width: 14px;
@@ -1172,6 +1180,7 @@ select.input { appearance: none; }
   background: var(--toggle-dot-color);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12);
 }
+.switch.mixed .knob { transform: translateX(7px); }
 
 /* ---- misc ---- */
 .muted { color: var(--muted); }
@@ -1284,12 +1293,14 @@ select.input { appearance: none; }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .sidebar { background: var(--rail); }
   .lang-toggle .select-dropdown { background: var(--rail); }
+  .select-dropdown { background: var(--surface); }
   .modal-card { background: var(--surface); }
 }
 @media (prefers-reduced-transparency: reduce) {
   body::before { display: none; }
   .sidebar { background: var(--rail); backdrop-filter: none; -webkit-backdrop-filter: none; }
   .lang-toggle .select-dropdown { background: var(--rail); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .select-dropdown { background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
   .modal-card { background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
   .modal-overlay { backdrop-filter: none; -webkit-backdrop-filter: none; }
 }
@@ -1721,7 +1732,8 @@ dialog.modal-overlay::backdrop {
 .account-pool-strategy-card > strong { display: block; margin: 0; }
 .account-pool-strategy-card > .card-sub,
 .account-pool-strategy-controls > .card-sub,
-.account-pool-strategy-controls .field .card-sub {
+.account-pool-strategy-controls .field .card-sub,
+.anthropic-pool-card__field .card-sub {
   /* Already inside the padded card — don't double-indent like account-card subs. */
   margin: 0;
   padding: 0;
@@ -1743,6 +1755,30 @@ dialog.modal-overlay::backdrop {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+/*
+ * Claude account-pool card — the same inset `.account-pool-strategy-card` above already
+ * fixes, on the card that still had it. `.card` has no padding, so each child brings its
+ * own 16px: `.card-row`, `.card-sub` and `.setting-row` do, the warning box and the
+ * threshold field do not, so those two rendered flush against the card border.
+ *
+ * The warning takes margin, not padding: it is a bordered box, so its own padding insets
+ * the text and leaves the border itself on the card edge. The field takes padding — the
+ * `.input` inside is full-width, so the field owns the inset for the whole group.
+ */
+.anthropic-pool-card { margin-top: 12px; }
+.anthropic-pool-card__notice {
+  margin: 10px 16px 0;
+  padding: 10px 16px;
+  border: 1px solid var(--border, #c9a227);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--warn, #c9a227) 12%, transparent);
+}
+.anthropic-pool-card__field {
+  display: block;
+  margin-top: 12px;
+  padding: 0 16px;
 }
 .api-active-keys-skeleton {
   min-height: 96px;

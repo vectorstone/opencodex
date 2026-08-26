@@ -128,9 +128,9 @@ export interface OcxClaudeCodeConfig {
    */
   subagentEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** Claude-originated web-search override. Unset fields inherit the global sidecar settings. */
-  webSearchSidecar?: { backend?: "openai" | "anthropic"; model?: string };
+  webSearchSidecar?: { backend?: "openai" | "anthropic" | "xai" | "gemini" | "exa"; model?: string };
   /** Claude-originated vision override. Unset fields inherit the global sidecar settings. */
-  visionSidecar?: { backend?: "openai" | "anthropic"; model?: string };
+  visionSidecar?: { backend?: "openai" | "anthropic" | "routed"; model?: string };
   /** Persisted Claude Desktop four-family routing profile. */
   desktopProfile?: OcxClaudeDesktopProfile;
   /** Auto-reconcile Desktop 3P config when provider catalog changes. Default: enabled. */
@@ -243,6 +243,19 @@ export interface OcxConfig {
   port: number;
   /** Opt in to one identical-turn retry when a Responses completion has no text or tool call. */
   emptyCompletionRetry?: boolean;
+  /**
+   * Whether a login may open a browser on the machine running the proxy.
+   *
+   * Absent and `true` both mean "open", which is what every existing install
+   * already does. Only an explicit `false` declines — for an operator who wants
+   * to paste the authorization URL into a different browser profile, or who is
+   * driving the dashboard from a different machine than the proxy.
+   *
+   * Deliberately a boolean and not an "auto" mode: inferring headlessness from
+   * SSH_CONNECTION or a missing DISPLAY breaks a working login silently when
+   * the guess is wrong.
+   */
+  oauthOpenBrowser?: boolean;
   /** Maximum usage-log bytes read for one management snapshot. */
   managementUsageMaxReadBytes?: number;
   providers: Record<string, OcxProviderConfig>;
@@ -774,8 +787,14 @@ export interface OcxSearchConfig {
 export interface OcxVisionSidecarConfig {
   /** Master switch. Default: enabled when the selected backend has a usable credential. */
   enabled?: boolean;
-  /** Description backend. Unset prefers a usable stored Anthropic OAuth credential, else OpenAI. */
-  backend?: "openai" | "anthropic";
+  /**
+   * Description backend. Unset prefers a usable stored Anthropic OAuth credential, else OpenAI —
+   * the historical default order, deliberately unchanged by the union widening (#2188 roadmap
+   * 170/180 revised): "routed" describes through the proxy's OWN routing (loopback
+   * /v1/chat/completions) with a NAMESPACED "provider/model" describer, is explicit-only, and is
+   * never auto-selected from credential availability.
+   */
+  backend?: "openai" | "anthropic" | "routed";
   /** Vision model that describes images. */
   model?: string;
   /** Max description cache misses admitted in one main-model turn. Zero disables description calls. */
@@ -790,12 +809,33 @@ export interface OcxWebSearchSidecarConfig {
   /**
    * Which backend actually runs the server-side search. "openai" replays the hosted web_search via
    * the ChatGPT forward provider (gpt-mini sidecar); "anthropic" runs web_search_20250305 on a Claude
-   * model authenticated by the STORED anthropic OAuth credential. Unset resolves to "anthropic" when a
-   * usable anthropic OAuth credential exists, else "openai".
+   * model authenticated by the STORED anthropic OAuth credential. "xai" runs Grok hosted web_search
+   * and optional x_search through stored Grok OAuth. "gemini" (google_search grounding via the
+   * Antigravity CCA transport) and "exa" (non-LLM search JSON via an operator key) are explicit-only
+   * and stay inactive until their executors ship. Unset ALWAYS resolves to "openai"; no backend is ever
+   * auto-selected from credential availability (that once sent incompatible models to the
+   * Anthropic API — see resolveSidecarBackend).
    */
-  backend?: "openai" | "anthropic";
+  backend?: "openai" | "anthropic" | "xai" | "gemini" | "exa";
   /** Sidecar model that runs the real server-side web_search (must be a native ChatGPT model). */
   model?: string;
+  /**
+   * Operator-supplied Exa API key for the "exa" backend. Management GET responses never echo it,
+   * and src/lib/redact.ts strips it from any logged structure or error string.
+   */
+  exaApiKey?: string;
+  /**
+   * Opt-in X (Twitter) search for the xai backend: adds the hosted x_search tool next to
+   * web_search. Limits are doc-validated at the management layer AND in the executor:
+   * handles <=20 per list, allow XOR exclude, ISO-8601 dates.
+   */
+  xSearch?: {
+    enabled?: boolean;
+    allowedXHandles?: string[];
+    excludedXHandles?: string[];
+    fromDate?: string;
+    toDate?: string;
+  };
   /** Reasoning effort for the sidecar — "minimal" (non-thinking) keeps it fast/cheap. */
   reasoning?: string;
   /** Max searches executed per main-model turn (loop guard). */

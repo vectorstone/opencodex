@@ -205,6 +205,11 @@ export interface OcxProviderConfig {
    */
   preserveResponsesReasoningContent?: boolean;
   /**
+   * Explicit opt-in for a relay that genuinely fronts OpenAI and can decode native
+   * compaction blobs. Absent or false degrades foreign blobs to an opaque note.
+   */
+  decodesNativeCompactionBlobs?: boolean;
+  /**
    * Explicit opt-in for non-registry private-network destinations such as localhost, RFC1918,
    * link-local, or unique-local upstreams. Metadata endpoints remain blocked.
    */
@@ -269,6 +274,11 @@ export interface OcxProviderConfig {
   modelInputModalities?: Record<string, string[]>;
   /** Model-specific max input token limits. Values cap auto_compact_token_limit. */
   modelMaxInputTokens?: Record<string, number>;
+  /**
+   * Per-model soft compaction budgets. Values may only lower the effective
+   * context/max-input envelope; they never raise hard admission limits.
+   */
+  modelAutoCompactTokenLimits?: Record<string, number>;
   /**
    * Provider-wide fallback for chat-completions `max_tokens` when the caller omits
    * Responses `max_output_tokens`. Adapters still let an explicit request win.
@@ -342,6 +352,18 @@ export interface OcxProviderConfig {
    */
   modelPreferHostedTools?: Record<string, string[]>;
   /**
+   * Whether the Responses upstream accepts OpenAI's extended hosted web_search fields.
+   * Set false only for a provider whose native contract rejects them; absence preserves
+   * passthrough compatibility for OpenAI and unclassified gateways.
+   */
+  supportsOpenAiWebSearchToolFields?: boolean;
+  /**
+   * Whether the Responses upstream accepts native custom tools and custom_tool_call items.
+   * Set false only for a provider whose native contract rejects them; absence preserves
+   * apply_patch passthrough compatibility for OpenAI and unclassified gateways.
+   */
+  supportsResponsesCustomTools?: boolean;
+  /**
    * Provider-local repair for Responses gateways whose lifecycle snapshots omit canonical
    * fields or closing events (#893). Disabled by default and applied only to client-facing
    * SSE/JSON; raw inspection state remains authoritative.
@@ -400,6 +422,13 @@ export interface OcxProviderConfig {
    * mid-work; non-`openai-chat` adapters ignore this flag.
    */
   terminalContinuationGuard?: boolean;
+  /**
+   * Opt-in for OpenAI-compatible chat gateways that may close after emitting a complete
+   * tool-call delta without `finish_reason` or `[DONE]`. The adapter accepts that EOF only
+   * when every pending call has a non-empty name and complete JSON-object arguments;
+   * incomplete JSON, missing arguments, and empty streams remain truncation errors.
+   */
+  openaiChatEofTolerance?: boolean;
   /**
    * Opt-in: forward `prompt_cache_key` to the upstream `/chat/completions` body.
    * OpenAI-specific extension; strict backends (Groq, Cerebras, etc.) reject unknown

@@ -18,16 +18,83 @@ import {
 } from "../../oauth-health-display";
 import CodexAccountPool from "../CodexAccountPool";
 import AnthropicAccountPoolSettings from "./AnthropicAccountPoolSettings";
-import { LoginUrlBlock } from "../login-url-block";
+import { LoginHint as LoginHintView } from "../login-url-block";
+import { OpenBrowserPrefToggle } from "../open-browser-pref-toggle";
 import QuotaBars from "../QuotaBars";
-import { useCopyFeedback } from "../use-copy-feedback";
 import type { CodexAccountPoolController } from "../../hooks/useCodexAccountPool";
-import type { AccountLoadState, OAuthAccountRow, ApiKeyRow, LoginHint, ProviderAuthHandlers } from "./types";
+import { Switch } from "../../ui";
+import type {
+  AccountLoadState,
+  OAuthAccountRow,
+  ApiKeyRow,
+  LoginHint,
+  ProviderAuthHandlers,
+  ProviderUpdatePatch,
+  ProviderUpdateResult,
+} from "./types";
 
 const QUOTA_ENRICH_RESERVE_MS = 4_000;
 const COCKPIT_IMPORT_MAX_BYTES = 256 * 1024;
 const EMPTY_OAUTH_ACCOUNTS: OAuthAccountRow[] = [];
 const EMPTY_API_KEYS: ApiKeyRow[] = [];
+
+function XaiResponsesOptInControl({
+  initialState,
+  onUpdateProvider,
+}: {
+  initialState: NonNullable<WorkspaceItem["xaiResponsesOptInState"]>;
+  onUpdateProvider?: (name: string, patch: ProviderUpdatePatch) => Promise<ProviderUpdateResult>;
+}) {
+  const t = useT();
+  const [state, setState] = useState(initialState);
+  const [seenInitialState, setSeenInitialState] = useState(initialState);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  if (initialState !== seenInitialState) {
+    setSeenInitialState(initialState);
+    setState(initialState);
+  }
+  const mixed = state === "mixed";
+
+  const toggle = async () => {
+    if (!onUpdateProvider || saving) return;
+    const next = state !== true;
+    setSaving(true);
+    setError("");
+    try {
+      const result = await onUpdateProvider("xai", { xaiResponsesOptIn: next });
+      if (!result.ok) {
+        setError(result.error ?? t("prov.updateFail"));
+        return;
+      }
+      setState(result.xaiResponsesOptInState ?? next);
+    } catch {
+      setError(t("prov.networkError"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="pwi-auth-optin-row">
+      <div className="pwi-auth-optin-copy">
+        <span className="pwi-auth-optin-label">{t("pws.xaiResponsesOptIn")}</span>
+        <span className="pwi-auth-row-secondary">
+          {t("pws.xaiResponsesOptInDesc")}
+          {mixed && <span className="pwi-auth-optin-mixed"> {t("pws.xaiResponsesOptInMixed")}</span>}
+        </span>
+        {error && <span className="pwi-auth-optin-error" role="alert">{error}</span>}
+      </div>
+      <Switch
+        on={state === true}
+        mixed={mixed}
+        onClick={() => { void toggle(); }}
+        disabled={!onUpdateProvider || saving}
+        label={t("pws.xaiResponsesOptIn")}
+      />
+    </div>
+  );
+}
 
 type CockpitImportResult = {
   importedCount: number;
@@ -99,7 +166,7 @@ function safeCockpitImportResult(value: unknown): CockpitImportResult | null {
 export default function ProviderAuthPanel({
   item, apiBase, oauth, accounts = EMPTY_OAUTH_ACCOUNTS, keys = EMPTY_API_KEYS, accountLoadState = "ready",
   switchingAccountId = null, busy = false, loginHint, authHandlers, onCodexActiveNeedsReauthChange,
-  codexController,
+  codexController, onUpdateProvider,
 }: {
   item: WorkspaceItem;
   apiBase: string;
@@ -112,6 +179,7 @@ export default function ProviderAuthPanel({
   loginHint?: LoginHint | null;
   authHandlers?: ProviderAuthHandlers;
   onCodexActiveNeedsReauthChange?: (needs: boolean) => void;
+  onUpdateProvider?: (name: string, patch: ProviderUpdatePatch) => Promise<ProviderUpdateResult>;
   /** Shared Codex account state owned by Providers (WP3). */
   codexController?: CodexAccountPoolController;
 }) {
@@ -124,7 +192,10 @@ export default function ProviderAuthPanel({
   const [importResult, setImportResult] = useState<CockpitImportResult | null>(null);
   const [reserveQuotaSlots, setReserveQuotaSlots] = useState(false);
   const importFileRef = useRef<HTMLInputElement>(null);
-  const deviceCodeCopy = useCopyFeedback<string>();
+  const [manualCode, setManualCode] = useState("");
+  const [manualCodeBusy, setManualCodeBusy] = useState(false);
+  const [manualCodeMsg, setManualCodeMsg] = useState("");
+  const [manualCodeOk, setManualCodeOk] = useState(true);
 
   // Soft &quota=1 enrichment lands after the local account list. Reserve stacked
   // bar height briefly so bars don't shove rows when WHAM returns.
@@ -172,13 +243,36 @@ export default function ProviderAuthPanel({
   if (!surface || !authHandlers) return null;
 
   const hintForThis = loginHint?.provider === item.name ? loginHint : null;
-  const deviceCode = hintForThis?.deviceCode ?? "";
-  const deviceCodeOutcome = deviceCodeCopy.outcomeFor(deviceCode);
-  const deviceCodeCopyLabel = deviceCodeOutcome === "copied"
-    ? t("prov.codeCopied")
-    : deviceCodeOutcome === "unavailable"
-      ? t("prov.linkCopyUnavailable")
-      : t("prov.copyCode");
+  // Paste fallback for when the browser cannot reach the loopback callback
+  // (remote dashboard, SSH, blocked localhost). A rejected paste reports why and
+  // leaves the flow running, so the user can correct it and try again.
+  const submitManualCode = async () => {
+    const input = manualCode.trim();
+    if (!input || manualCodeBusy) return;
+    setManualCodeBusy(true);
+    setManualCodeMsg("");
+    try {
+      const res = await fetch(`${apiBase}/api/oauth/login/code`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: item.name, input }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({})) as { error?: string };
+        setManualCodeOk(false);
+        setManualCodeMsg(t("prov.pasteFail", { error: data.error || res.statusText }));
+        return;
+      }
+      setManualCode("");
+      setManualCodeOk(true);
+      setManualCodeMsg(t("prov.pasteOk"));
+    } catch {
+      setManualCodeOk(false);
+      setManualCodeMsg(t("modal.networkError"));
+    } finally {
+      setManualCodeBusy(false);
+    }
+  };
   const loggedIn = accounts.length > 0 || oauth?.loggedIn === true;
   const activeReauthAccount = accounts.find(a => a.active && a.needsReauth);
   const activeNeedsReauth = Boolean(activeReauthAccount);
@@ -248,6 +342,12 @@ export default function ProviderAuthPanel({
     <section className="pwi-section pwi-auth-section" aria-label={isOauth ? t("pws.availableAccounts") : t("pws.apiKeys")}>
       <h3 className="pwi-section-title">{isOauth ? t("pws.availableAccounts") : t("pws.apiKeys")}</h3>
       <div className="pwi-auth-body">
+        {item.name === "xai" && (
+          <XaiResponsesOptInControl
+            initialState={item.xaiResponsesOptInState ?? false}
+            onUpdateProvider={onUpdateProvider}
+          />
+        )}
         {isOauth && (
           <>
             {item.name === "anthropic" && (
@@ -310,22 +410,27 @@ export default function ProviderAuthPanel({
                 )}
               </span>
             </div>
+            {!busy && <OpenBrowserPrefToggle />}
             {busy && hintForThis && (
               <div className="pwi-auth-wait">
                 <span className="pwi-spin-inline" aria-hidden="true" />
                 <div className="pwi-auth-wait-copy">
                   <div className="pwi-auth-wait-title">{t("prov.waitingBrowser")}</div>
-                  {hintForThis.deviceCode && (
-                    <div className="pwi-device-code-wrap">
-                      <span>{t("prov.deviceCode")}</span>
-                      <code className="pwi-device-code">{hintForThis.deviceCode}</code>
-                      <button type="button" className="btn btn-primary btn-sm"
-                        onClick={() => deviceCodeCopy.copy(deviceCode, deviceCode)}>
-                        <span aria-live="polite">{deviceCodeCopyLabel}</span>
-                      </button>
-                    </div>
-                  )}
-                  <LoginUrlBlock url={hintForThis.url ?? ""} />
+                  <LoginHintView
+                    hint={{
+                      url: hintForThis.url,
+                      deviceCode: hintForThis.deviceCode,
+                      instructions: hintForThis.instructions,
+                    }}
+                    paste={{
+                      value: manualCode,
+                      busy: manualCodeBusy,
+                      message: manualCodeMsg,
+                      ok: manualCodeOk,
+                      onChange: setManualCode,
+                      onSubmit: () => { void submitManualCode(); },
+                    }}
+                  />
                   {authHandlers.onCancelLogin && (
                     <button type="button" className="btn btn-ghost btn-sm" onClick={() => void authHandlers.onCancelLogin?.(item.name)}>
                       {t("common.cancel")}

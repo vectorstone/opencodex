@@ -138,6 +138,31 @@ describe("usage log", () => {
     expect(readUsageEntries()[0]?.attempts?.[0]?.recoveryKinds).toEqual(["empty-completion"]);
   });
 
+  test("persists the opaque-blob rejection recovery kind on attempts", () => {
+    const entry: PersistedUsageEntry = {
+      requestId: "ocx-opaque-blob-kind",
+      timestamp: 1,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      status: 200,
+      durationMs: 4,
+      usageStatus: "reported",
+      attempts: [{
+        ordinal: 1,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        adapter: "openai-responses",
+        status: 200,
+        durationMs: 4,
+        sendCount: 2,
+        recoveryKinds: ["opaque-blob-rejection", "opaque-blob-rejection"],
+        usageStatus: "reported",
+      }],
+    };
+    appendUsageEntry(entry);
+    expect(readUsageEntries()[0]?.attempts?.[0]?.recoveryKinds).toEqual(["opaque-blob-rejection"]);
+  });
+
   /** Build one minimal persisted-usage JSONL line for the given request id. */
   const persistedLine = (requestId: string) => JSON.stringify({
     requestId,
@@ -201,7 +226,7 @@ describe("usage log", () => {
   test("usage byte-prefix truncation and entry-count truncation report independent metadata", async () => {
     writeFileSync(
       usageLogPath(),
-      `${Array.from({ length: 500_001 }, (_, index) => JSON.stringify({ requestId: String(index) })).join("\n")}\n`,
+      `${Array.from({ length: 500_001 }, (_, index) => JSON.stringify({ requestId: String(index), provider: "p" })).join("\n")}\n`,
     );
     const snapshot = await readUsageSnapshotForManagement();
     expect(snapshot.entries).toHaveLength(500_000);
@@ -714,14 +739,26 @@ describe("usage log", () => {
     }]);
   });
 
-  test("skips malformed JSONL lines while keeping valid entries", () => {
+  test("skips malformed JSONL and rows without string usage identities", async () => {
     writeFileSync(usageLogPath(), [
-      "{\"requestId\":\"a\",\"timestamp\":1,\"provider\":\"p\",\"model\":\"m\",\"status\":200,\"durationMs\":1,\"usageStatus\":\"unreported\"}",
+      persistedLine("a"),
       "{not-json",
-      "{\"requestId\":\"b\",\"timestamp\":2,\"provider\":\"p\",\"model\":\"m\",\"status\":200,\"durationMs\":1,\"usageStatus\":\"reported\",\"usage\":{\"inputTokens\":1,\"outputTokens\":2},\"totalTokens\":3}",
+      "null",
+      "42",
+      "[]",
+      "{}",
+      JSON.stringify({ provider: "p", timestamp: 2 }),
+      JSON.stringify({ requestId: 42, provider: "p", timestamp: 2 }),
+      JSON.stringify({ requestId: "missing-provider", timestamp: 2 }),
+      JSON.stringify({ requestId: "null-provider", provider: null, timestamp: 2 }),
+      JSON.stringify({ requestId: "number-provider", provider: 42, timestamp: 2 }),
+      JSON.stringify({ requestId: "object-provider", provider: {}, timestamp: 2 }),
+      JSON.stringify({ requestId: "array-provider", provider: [], timestamp: 2 }),
+      persistedLine("b"),
     ].join("\n"));
 
     expect(readUsageEntries().map(entry => entry.requestId)).toEqual(["a", "b"]);
+    expect((await readUsageEntriesForManagement()).map(entry => entry.requestId)).toEqual(["a", "b"]);
   });
 
   test("keeps missing usage distinct from zero usage", () => {

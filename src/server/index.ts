@@ -22,10 +22,11 @@ import {
 import { reconcileOAuthProviders } from "../oauth";
 import { withCatalogWriteSerialization } from "../codex/catalog-write-serialization";
 import { invalidateCodexModelsCacheWithPermit } from "../codex/catalog/sync";
-import { getCodexHome } from "../codex/paths";
+import { currentServiceHomes, serviceStatePathsForOpenCodexHome } from "../service";
 import { shouldSyncCodexOnStart } from "../codex/desired-state";
 import {
   inspectNativeCodexOwnership,
+  type NativeCodexOwnership,
   type OwnershipInspection,
 } from "../integrations/native/ownership-preflight";
 import { registerCodexCooldownRecoveryProbeWorker } from "../codex/auth-api";
@@ -58,6 +59,12 @@ import {
   cooldownErrorMessage,
 } from "../codex/auth-context";
 import { codexAccountNamespaceForModel } from "../codex/account-namespace-match";
+import { codexAccountNamespaceEntries, isMainCodexAccountTarget } from "../codex/account-namespaces";
+import { MAIN_CODEX_ACCOUNT_ID } from "../codex/main-account";
+import {
+  availableAccountGatedNativeModels,
+  resolveCodexModelEntitlements,
+} from "../codex/model-entitlements";
 export {
   clearThreadAccountMap,
   formatCodexProviderForLog,
@@ -168,8 +175,8 @@ import { runClaudeAuthModeMigration } from "../claude/auth-mode-migration";
 import {
   bindNativeMainStartupLifecycle,
   blockNativeMainStartupForUnownedServiceHome,
+  prepareNativeMainStartupLifecycle,
   releaseNativeMainStartupLifecycle,
-  startNativeMainStartupLifecycle,
   type NativeMainStartupGateDeps,
   type NativeMainStartupLifecycle,
 } from "../codex/native-profile-startup";
@@ -437,6 +444,8 @@ export interface StartServerDeps {
   nativeMainStartup?: NativeMainStartupGateDeps;
   /** Test-only ownership evidence; production inspects the installed service state. */
   inspectNativeCodexOwnership?: typeof inspectNativeCodexOwnership;
+  /** Test-only service-home resolver; production resolves the current homes directly. */
+  resolveServiceHomes?: typeof currentServiceHomes;
   /** Test-only seam for an upstream that cannot complete its WebSocket close handshake. */
   liveSidebandWebSocketFactory?: LiveSidebandWebSocketFactory;
   /** Test-only seam; production derives a fresh local-attestation secret per process. */
@@ -445,9 +454,22 @@ export interface StartServerDeps {
   readinessGate?: ReadinessGate;
 }
 
-function inspectStartupOwnership(deps: StartServerDeps): OwnershipInspection {
+function inspectStartupOwnership(
+  deps: StartServerDeps,
+  currentHomes: ReturnType<typeof currentServiceHomes> | null,
+  statePaths: readonly string[] | null,
+): OwnershipInspection {
   try {
-    return (deps.inspectNativeCodexOwnership ?? inspectNativeCodexOwnership)();
+    if (currentHomes === null || statePaths === null) {
+      return {
+        ownership: "unknown",
+        reason: "startup service-home resolution failed",
+      };
+    }
+    if (deps.inspectNativeCodexOwnership) {
+      return deps.inspectNativeCodexOwnership({ currentHomes, statePaths });
+    }
+    return inspectNativeCodexOwnership({ currentHomes, statePaths });
   } catch {
     return {
       ownership: "unknown",
@@ -534,15 +556,27 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // journal, or credential path. Both positive foreign evidence and an unprovable
   // ownership state are non-authority.
   startupCacheInvalidationWrote = false;
-  const startupCacheOwnership = inspectStartupOwnership(deps);
+  const resolveServiceHomes = deps.resolveServiceHomes ?? currentServiceHomes;
+  let startupOwnershipHomes: ReturnType<typeof currentServiceHomes> | null = null;
+  let startupOwnershipStatePaths: readonly string[] | null = null;
+  try {
+    const homes = resolveServiceHomes();
+    const statePaths = serviceStatePathsForOpenCodexHome(homes.opencodexHome);
+    startupOwnershipHomes = homes;
+    startupOwnershipStatePaths = statePaths;
+  } catch { /* inspection below stays unknown */ }
+  const startupCacheOwnership = inspectStartupOwnership(
+    deps,
+    startupOwnershipHomes,
+    startupOwnershipStatePaths,
+  );
   // Startup cache invalidation is best-effort and must never block the server from
-  // serving. It now takes K so it cannot race a convergence commit, but both the
-  // home resolution and the acquisition can fail on a machine with no Codex home —
-  // `getCodexHome()` THROWS when CODEX_HOME names a missing directory, which would
-  // otherwise turn "no Codex installed" into "proxy will not start".
-  if (startupCacheOwnership.ownership === "owned") {
+  // serving. It now takes K so it cannot race a convergence commit. Use the home
+  // paired with the ownership inspection; re-reading ambient CODEX_HOME here could
+  // invalidate a different installation after an environment or mount change.
+  if (startupCacheOwnership.ownership === "owned" && startupOwnershipHomes !== null) {
     try {
-      const startupCodexHome = getCodexHome();
+      const startupCodexHome = startupOwnershipHomes.codexHome;
       // #1046: record whether this actually rewrote the cache. `handleStart` ORs this
       // with the later startup sync and warns ONCE about stale app-servers; warning
       // here instead would read a catalog mtime the sync is about to move.
@@ -699,18 +733,71 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   // clients; no Codex request can use this lifecycle in that state.
   // Re-probe here instead of trusting the earlier cache decision: startup work
   // between the two sites must not widen the service-install race.
-  const nativeOwnership = inspectStartupOwnership(deps);
+  const nativeOwnership = inspectStartupOwnership(deps, startupOwnershipHomes, startupOwnershipStatePaths);
+  const preparedNativeMainLifecycle = nativeOwnership.ownership !== "foreign"
+    && startupOwnershipHomes !== null
+    ? prepareNativeMainStartupLifecycle(
+      deps.nativeMainStartup,
+      { codexHome: startupOwnershipHomes.codexHome, configDir: startupOwnershipHomes.opencodexHome },
+    )
+    : null;
+  let retryOwnershipHomes = startupOwnershipHomes;
+  let retryOwnershipStatePaths = startupOwnershipStatePaths;
+  let retryPreparedNativeMainLifecycle = preparedNativeMainLifecycle;
+  const reprobeNativeOwnership = (): NativeCodexOwnership => {
+    // If startup could not resolve the homes at all, preserve a bounded retry
+    // without guessing an authority. The first successful resolution is pinned
+    // together with its service-state paths before ownership is inspected.
+    if (retryOwnershipHomes === null || retryOwnershipStatePaths === null) {
+      try {
+        const homes = resolveServiceHomes();
+        const statePaths = serviceStatePathsForOpenCodexHome(homes.opencodexHome);
+        retryOwnershipHomes = homes;
+        retryOwnershipStatePaths = statePaths;
+      } catch {
+        return "unknown";
+      }
+    }
+    const homes = retryOwnershipHomes;
+    const statePaths = retryOwnershipStatePaths;
+    const answer = inspectStartupOwnership(deps, homes, statePaths).ownership;
+    if (answer !== "owned") return answer;
+    retryPreparedNativeMainLifecycle ??= prepareNativeMainStartupLifecycle(
+      deps.nativeMainStartup,
+      { codexHome: homes.codexHome, configDir: homes.opencodexHome },
+    );
+    // An ownership verdict without a lifecycle bound to that same home is not
+    // enough to reopen native-main admission.
+    return retryPreparedNativeMainLifecycle ? "owned" : "unknown";
+  };
+  const ownershipRetryOptions = {
+    reprobe: reprobeNativeOwnership,
+    expectedHomeId: () => retryPreparedNativeMainLifecycle?.homeId ?? null,
+    startOwnedLifecycle: () => {
+      if (!retryPreparedNativeMainLifecycle) {
+        throw new Error("Native-main ownership became known before its startup lifecycle was prepared.");
+      }
+      return retryPreparedNativeMainLifecycle.start();
+    },
+  };
   const nativeMainLifecycle: NativeMainStartupLifecycle = shouldSyncCodexOnStart(config)
     ? nativeOwnership.ownership === "owned"
-      ? startNativeMainStartupLifecycle(deps.nativeMainStartup)
-      : blockNativeMainStartupForUnownedServiceHome(
-        nativeOwnership.ownership === "foreign" ? "foreign-ownership" : "ownership-unknown",
-        // #2108: an `unknown` verdict means the probe could not answer, not that this host
-        // is unownable. Hand the fence a way to re-ask so a host that becomes answerable
-        // after boot reopens on its own instead of needing `ocx restart`. A `foreign`
-        // verdict ignores this by design — that one is a fact, not a question.
-        { reprobe: () => inspectStartupOwnership(deps).ownership },
-      )
+      ? preparedNativeMainLifecycle
+        ? preparedNativeMainLifecycle.start()
+        : blockNativeMainStartupForUnownedServiceHome(
+          "ownership-unknown",
+          ownershipRetryOptions,
+        )
+      : nativeOwnership.ownership === "foreign"
+        ? blockNativeMainStartupForUnownedServiceHome("foreign-ownership")
+        : blockNativeMainStartupForUnownedServiceHome(
+          "ownership-unknown",
+          // #2108: an `unknown` verdict means the probe could not answer, not that this host
+          // is unownable. Hand the fence a way to re-ask so a host that becomes answerable
+          // after boot reopens on its own instead of needing `ocx restart`. A `foreign`
+          // verdict ignores this by design — that one is a fact, not a question.
+          ownershipRetryOptions,
+        )
     : {
       homeId: null,
       settled: Promise.resolve({ status: "ready", homeId: null }),
@@ -899,8 +986,12 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           return withCors(formatErrorResponse(403, "origin_rejected", "cross-origin data-plane request blocked"), req, policy);
         }
         let goModels;
+        let modelEntitlements;
         try {
-          goModels = await fetchAllModels(config);
+          [goModels, modelEntitlements] = await Promise.all([
+            fetchAllModels(config),
+            resolveCodexModelEntitlements(config),
+          ]);
         } catch (error) {
           if (error instanceof CatalogGatherBusyError) {
             return withCors(new Response(JSON.stringify({ error: { type: "server_error", code: "catalog_busy", message: error.message } }), {
@@ -911,24 +1002,57 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           throw error;
         }
         const { accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, buildCatalogEntries, configuredNativeAliasSlugs, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, exactComboCatalogSlugs, loadCatalogTemplate, NATIVE_OPENAI_MODELS, nativeContextLimits, nativeOpenAiSlugs, nativeReasoningEfforts, nativeDefaultReasoningEffort, orderForSubagents, filterCatalogVisibleModels, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, uniqueCatalogModelsForRawPublicList, visibleCodexAccountSelectors, visibleNativeSlugs, desktopVisibleNativeSlugs } = await import("../codex/catalog");
+        const { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } = await import("../codex/catalog/native-models");
         const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
         const includeAccountBoundNativeOpenAi = shouldIncludeAccountBoundNativeOpenAi(config);
+        const bareEligibleAccountIds = providerCodexAccountMode(
+          OPENAI_CODEX_PROVIDER_ID,
+          config.providers[OPENAI_CODEX_PROVIDER_ID],
+        ) === "direct" ? new Set([MAIN_CODEX_ACCOUNT_ID]) : undefined;
+        const availableBareGatedNativeSlugs = availableAccountGatedNativeModels(
+          modelEntitlements,
+          bareEligibleAccountIds,
+        );
+        const availableAccountGatedNativeSlugs = availableAccountGatedNativeModels(modelEntitlements);
+        const availableBareNativeSlugs = NATIVE_OPENAI_MODELS.filter(slug => (
+          !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
+        ));
+        const availableAccountNativeSlugs = NATIVE_OPENAI_MODELS.filter(slug => (
+          !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableAccountGatedNativeSlugs.has(slug)
+        ));
         const nativeSlugs = includeNativeOpenAi
-          ? nativeOpenAiSlugs()
+          ? nativeOpenAiSlugs().filter(slug => (
+              !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
+            ))
           : [];
         const disabledNatives = disabledNativeSlugs(config);
         const disabledModels = new Set(config.disabledModels ?? []);
         const shadowedNativeSlugs = configuredNativeAliasSlugs(config);
-        const suppressedBareNativeSlugs = desktopAllowlistSuppressedNativeSlugs(config);
+        const suppressedBareNativeSlugs = new Set([
+          ...desktopAllowlistSuppressedNativeSlugs(config),
+          ...[...ACCOUNT_GATED_NATIVE_OPENAI_MODELS].filter(slug => !availableBareGatedNativeSlugs.has(slug)),
+        ]);
         const accountSelectors = includeAccountBoundNativeOpenAi
           ? visibleCodexAccountSelectors(config)
           : [];
+        const accountTargets = new Map(codexAccountNamespaceEntries(config));
         const accountNativeSlugsBySelector = includeAccountBoundNativeOpenAi
-          ? accountBoundNativeOpenAiSlugsBySelector(config)
+          ? new Map([...accountBoundNativeOpenAiSlugsBySelector(config)].map(([selector, slugs]) => {
+            const target = accountTargets.get(selector);
+            const accountId = target && isMainCodexAccountTarget(target) ? MAIN_CODEX_ACCOUNT_ID : target;
+            const entitled = accountId ? modelEntitlements.modelsByAccount.get(accountId) : undefined;
+            const confirmed = accountId ? modelEntitlements.confirmedAccountIds.has(accountId) : false;
+            return [selector, slugs.filter(slug => (
+              !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || (confirmed && entitled?.has(slug) === true)
+            ))] as const;
+          }))
           : new Map<string, readonly string[]>();
         const accountNativeSlugs = [...new Set(
           [...accountNativeSlugsBySelector.values()].flatMap(slugs => [...slugs]),
         )];
+        const desktopNativeSlugs = desktopVisibleNativeSlugs(config).filter(slug => (
+          !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
+        ));
         const goEnabled = filterCatalogVisibleModels(goModels, config);
         const goOrdered = orderForSubagents(goEnabled, config.subagentModels);
         // Claude Code / Claude Desktop gateway model discovery (GET /v1/models with
@@ -945,7 +1069,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           if (config.claudeCode?.enabled === false) return jsonResponse({ data: [] }, 200, req, policy);
           // Build Desktop 3P registry so inbound alias resolution works for subsequent requests.
           buildDesktop3pRegistry(
-            [...desktopVisibleNativeSlugs(config)],
+            desktopNativeSlugs,
             goOrdered.map(m => ({ provider: m.provider, id: m.id, contextWindow: m.contextWindow })),
             config.claudeCode?.desktopProfile,
           );
@@ -962,7 +1086,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             : idsParam === "desktop"
               ? "desktop3p" as const
               : (/^claude-code\//i.test(req.headers.get("user-agent") ?? "") ? "readable" as const : "desktop3p" as const);
-          const data = buildAnthropicModelInfos([...desktopVisibleNativeSlugs(config)], goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias, nativeContextLimits(config));
+          const data = buildAnthropicModelInfos(desktopNativeSlugs, goOrdered, resolveAutoContext(config.claudeCode), idStyle, activeDesktop3pAlias, nativeContextLimits(config));
           return jsonResponse({ data }, 200, req, policy);
         }
         if (url.searchParams.has("client_version")) {
@@ -976,7 +1100,10 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           // newly re-enabled native reappear under each selector before the next sync, while the
           // no-selector path keeps nativeOpenAiSlugs()'s existing visibility-sensitive behavior.
           const catalogNativeSlugs = accountSelectors.length > 0
-            ? [...new Set([...NATIVE_OPENAI_MODELS, ...accountNativeSlugs])]
+            ? [...new Set([
+              ...availableAccountNativeSlugs,
+              ...accountNativeSlugs,
+            ])]
             : nativeSlugs;
           const entries = buildCatalogEntries(
             loadCatalogTemplate(),
@@ -1043,7 +1170,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         // for both bare and qualified rows. Without selectors, the live catalog continues to own
         // bare availability.
         const selectorNativeSlugs = accountSelectors.length > 0
-          ? NATIVE_OPENAI_MODELS.filter(slug => !disabledNatives.has(slug))
+          ? availableBareNativeSlugs.filter(slug => !disabledNatives.has(slug))
           : [];
         const bareSelectorNativeSlugs = accountSelectors.length > 0
           ? selectorNativeSlugs
