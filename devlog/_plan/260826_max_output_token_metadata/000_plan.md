@@ -189,6 +189,7 @@ Implemented against the synchronized v2.33.0 tree on 2026-08-26: canonical metad
 configuration and CLI/GUI controls, management/export propagation, client-specific omission rules,
 tests, documentation, and fork register F-004 are present in the working tree. Focused runtime and
 GUI tests, typecheck, privacy scan, GUI lint/build, and docs build pass.
+The implementation commit is `6272fc3f4`.
 
 The repository-wide Bun 1.4 single-process suite completed with 14,692 passes, 11 skips, and 18
 failures. The first failure is the pre-existing `key-login-live-update.test.ts` `modelCosts` live

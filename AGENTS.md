@@ -246,7 +246,7 @@ fork-maintained behavior, and do not belong in this register.
   `tests/catalog-input-modality-enum.test.ts`, `tests/client-config-export.test.ts`,
   `tests/opencode-cli.test.ts`, `tests/management-client-config-route.test.ts`, and the
   relevant GUI model tests.
-- Original fork implementation: this change (commit/PR pending). Upstream disposition:
+- Original fork implementation: `6272fc3f4`. Upstream disposition:
   fork-only as of upstream v2.33.0 (`ec51e42d`).
 
 ### Registering future fork-only changes
