@@ -251,6 +251,52 @@ describe("apply", () => {
     expect(after.provider.opencodex!.models["mystery/model"]!.limit).toBeUndefined();
   });
 
+  test("ZCode key-order normalization remains refreshable across catalog drift", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, {
+        name: string;
+        kind: string;
+        enabled: boolean;
+        source: string;
+        options: Record<string, unknown>;
+        models: Record<string, Record<string, unknown>>;
+      }>;
+    };
+    const provider = document.provider.opencodex!;
+    const reorderedModels: Record<string, Record<string, unknown>> = {};
+    for (const [modelId, model] of Object.entries(provider.models)) {
+      const reordered: Record<string, unknown> = {};
+      for (const key of ["name", "reasoning", "limit", "modalities"]) {
+        if (model[key] !== undefined) reordered[key] = model[key];
+      }
+      if (modelId === "anthropic/claude-opus-4-8") {
+        reordered.reasoning = { enabled: true };
+      }
+      reorderedModels[modelId] = reordered;
+    }
+    provider.models = reorderedModels;
+    const reorderedProvider: Record<string, unknown> = {};
+    for (const key of ["name", "kind", "options", "enabled", "source", "models"]) {
+      reorderedProvider[key] = provider[key as keyof typeof provider];
+    }
+    document.provider.opencodex = reorderedProvider as typeof provider;
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const changedCatalog = input({
+      clientId: "zcode",
+      models: [...MODELS, { namespaced: "new/model", provider: "new", id: "model" }],
+    });
+    expect(readIntegrationState(changedCatalog).state).toBe("stale");
+    const refreshed = applyIntegration(changedCatalog);
+    expect(refreshed.ok).toBe(true);
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as typeof document;
+    expect(after.provider.opencodex!.models["new/model"]).toBeDefined();
+  });
+
   test("a legacy ZCode record accepts derived drift only while its generated catalog is unchanged (#2389)", () => {
     const configPath = installZcode();
     const request = input({ clientId: "zcode" });

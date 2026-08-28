@@ -53,6 +53,50 @@ function cloneFragment(fragment: ManagedFragment): ManagedFragment {
 }
 
 /**
+ * Rebuild the key order emitted by the ZCode serializer.
+ *
+ * ZCode persists the provider block after normalizing it and does not retain
+ * the insertion order OpenCodex used. Ownership hashes must therefore compare
+ * the document's meaning, not an incidental JSON key order. Keep this scoped
+ * to ZCode and to the known generated schema: unknown fields remain in their
+ * observed order and are still protected by the fingerprint.
+ */
+function canonicalizeZcodeValue(value: unknown, path: readonly string[] = []): unknown {
+  if (Array.isArray(value)) return value.map(item => canonicalizeZcodeValue(item, path));
+  if (!isObject(value)) return value;
+
+  const keys = Object.keys(value);
+  let orderedKeys = keys;
+  if (path.length === 0) {
+    orderedKeys = orderKnownKeys(keys, ["name", "kind", "enabled", "source", "options", "models"]);
+  } else if (path.length === 1 && path[0] === "options") {
+    orderedKeys = orderKnownKeys(keys, ["apiKey", "baseURL", "apiKeyRequired"]);
+  } else if (path.length === 1 && path[0] === "models") {
+    orderedKeys = [...keys].sort();
+  } else if (path.length === 2 && path[0] === "models") {
+    orderedKeys = orderKnownKeys(keys, ["name", "modalities", "limit"]);
+  } else if (path.length === 3 && path[0] === "models" && path[2] === "modalities") {
+    orderedKeys = orderKnownKeys(keys, ["input", "output"]);
+  } else if (path.length === 3 && path[0] === "models" && path[2] === "limit") {
+    orderedKeys = orderKnownKeys(keys, ["context", "output"]);
+  }
+
+  const result: JsonObject = {};
+  for (const key of orderedKeys) {
+    result[key] = canonicalizeZcodeValue(value[key], [...path, key]);
+  }
+  return result;
+}
+
+function orderKnownKeys(keys: readonly string[], preferred: readonly string[]): string[] {
+  const present = new Set(keys);
+  return [
+    ...preferred.filter(key => present.has(key)),
+    ...keys.filter(key => !preferred.includes(key)),
+  ];
+}
+
+/**
  * Paths a client is documented to derive after OpenCodex writes its block.
  *
  * ZCode 3.8.1 persists reasoning and output defaults for every generated
@@ -129,7 +173,12 @@ export function protectedContributionFingerprint(
   contribution: ManagedContribution,
   refreshablePaths: readonly (readonly string[])[],
 ): string {
-  const fragments = contribution.fragments.map(cloneFragment);
+  const fragments = contribution.fragments.map(fragment => {
+    const cloned = cloneFragment(fragment);
+    return contribution.clientId === "zcode"
+      ? { ...cloned, value: canonicalizeZcodeValue(cloned.value) }
+      : cloned;
+  });
   for (const refreshablePath of refreshablePaths) {
     for (const fragment of fragments) {
       if (!pathStartsWith(refreshablePath, fragment.path)) continue;
