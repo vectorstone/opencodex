@@ -249,6 +249,27 @@ fork-maintained behavior, and do not belong in this register.
 - Original fork implementation: `6272fc3f4`. Upstream disposition:
   fork-only as of upstream v2.33.0 (`ec51e42d`).
 
+#### F-005 — ZCode semantic ownership canonicalization
+
+- ZCode may rewrite the managed `provider.opencodex` block after OpenCodex
+  writes it: documented runtime metadata such as `reasoning` and derived limit
+  defaults are refreshable, and ZCode may reorder JSON object keys while doing
+  so. Such key-order drift must classify as `stale`, allowing a later provider
+  or model catalog update to refresh the block instead of becoming a permanent
+  `conflict` that requires deleting `~/.zcode/v2/config.json`.
+- Canonicalization is scoped to ZCode's protected ownership fingerprint and the
+  known generated schema. It must not weaken protection for provider identity,
+  connection options (including `options.baseURL`), model membership, names,
+  modalities, or authoritative context limits. The whole-file fingerprint stays
+  byte-exact for restore and unrelated clients retain their existing semantics.
+- Key paths are `src/integrations/ownership-policy.ts`,
+  `src/integrations/state.ts`, and `src/integrations/writer.ts`; the focused
+  regression sentinel is `tests/integrations-writer.test.ts`, including the
+  key-reorder plus catalog-drift refresh case and the protected connection-edit
+  conflict case.
+- Original fork implementation: `2780fc291`. Upstream disposition:
+  fork-only as of upstream v2.33.0 (`ec51e42d`).
+
 ### Registering future fork-only changes
 
 Any change that intentionally differs from upstream behavior must update this
