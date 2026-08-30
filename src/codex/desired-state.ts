@@ -170,7 +170,7 @@ export function setCodexIntegrationMode(mode: CodexIntegrationMode): CodexIntegr
     const integrations = { ...(config.clientIntegrations ?? {}) };
     if (mode === "full") delete integrations.codex;
     else integrations.codex = mode === "catalog-only" ? "catalog-only" : false;
-    if (Object.keys(integrations).length === 0) delete config.clientIntegrations;
+    if (Object.keys(integrations).length === 0) deleteConfigTopLevelKey(config, "clientIntegrations");
     else config.clientIntegrations = integrations;
     return { changed: true, value: mode };
   });
