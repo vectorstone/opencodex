@@ -38,7 +38,7 @@ import {
   serviceTierSupportFromPolicy,
 } from "../../providers/service-tier";
 import type { FastPolicyAuthority } from "../../providers/fastwire";
-import { effectiveGoogleMode, getProviderRegistryEntry, providerMatchesRegistryTransport } from "../../providers/registry";
+import { effectiveGoogleMode, getProviderRegistryEntry, providerMatchesRegistryTransport, registryEntryForProviderDestination } from "../../providers/registry";
 import { parseAntigravityAvailableModels, registerAntigravityDiscoveredWireModels } from "../../providers/antigravity-models";
 import { applyProviderContextCap, providerContextCap, resolveUnknownRoutedContextWindow } from "../../providers/context-cap";
 import { clampAutoCompactTokenLimit } from "../../providers/auto-compact-budget";
@@ -46,6 +46,7 @@ import { routedSlug, slugEquals, slugEquivalenceKey, slugsEquivalent } from "../
 import { CODEX_GPT5_IDENTITY_LINE } from "../../adapters/identity";
 import { filterCursorConfiguredModelsByLiveDiscovery } from "../../adapters/cursor/discovery";
 import { fetchCursorUsableModels } from "../../adapters/cursor/live-models";
+import { recordLiveCursorMaxModeModels } from "../../adapters/cursor/catalog";
 import { isCanonicalOpenAiForwardProvider, OPENAI_API_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import {
   COMBO_NAMESPACE,
@@ -577,6 +578,7 @@ function providerCatalogFingerprint(name: string, prov: OcxProviderConfig): Reco
     re: prov.modelReasoningEfforts ?? null,
     defRe: prov.modelDefaultReasoningEfforts ?? null,
     rsSum: prov.modelSupportsReasoningSummaries ?? null,
+    verbosity: prov.modelSupportsVerbosity ?? null,
     rsDel: prov.modelReasoningSummaryDelivery ?? null,
     serviceTier: prov.modelSupportsServiceTier ?? null,
     noVis: [...(prov.noVisionModels ?? [])].sort(),
@@ -658,6 +660,22 @@ function configuredReasoningSummarySupport(prov: OcxProviderConfig | undefined, 
   return modelRecordValue(prov.modelReasoningSummaryDelivery, id) !== undefined ? true : undefined;
 }
 
+function configuredVerbositySupport(name: string, prov: OcxProviderConfig | undefined, id: string): boolean | undefined {
+  const explicit = prov ? modelRecordValue(prov.modelSupportsVerbosity, id) : undefined;
+  if (explicit !== undefined) return explicit;
+  if (!prov) return undefined;
+  void name;
+  // Provider-wide fallback for ids the per-model map does not enumerate — a live-discovered
+  // model would otherwise re-advertise a control the upstream accepts and ignores.
+  //
+  // Read from the PROVIDER CONFIG, never from PROVIDER_REGISTRY. A gather flight captures its
+  // registry authority up front and forbids any later registry read, so consulting the registry
+  // here made a custom-destination flight fall back to "configured" instead of serving its own
+  // discovery result (tests/codex-gather-authority.test.ts). `applyVerbosityDefaults` in
+  // providers/derive.ts materializes the registry default into the config at seed/enrich time.
+  return prov.supportsVerbosity;
+}
+
 export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, model: CatalogModel, providerCap?: number): CatalogModel {
   const configuredCap = configuredContextWindow(prov, model.id);
   const configuredMaxInput = configuredMaxInputTokens(prov, model.id);
@@ -674,6 +692,7 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
   const reasoningEfforts = configuredReasoningEfforts(prov, model.id);
   const defaultReasoningEffort = modelRecordValue(prov.modelDefaultReasoningEfforts, model.id) ?? model.defaultReasoningEffort;
   const supportsReasoningSummaries = configuredReasoningSummarySupport(prov, model.id);
+  const supportsVerbosity = configuredVerbositySupport(name, prov, model.id);
   const fastPolicy = fastPolicyForModel(prov, model.id, name);
   const supportsServiceTier = serviceTierSupportFromPolicy(fastPolicy);
   const metadataMaxOutput = generatedMaxOutputTokens(name, model.id);
@@ -706,11 +725,11 @@ export function applyProviderConfigHints(name: string, prov: OcxProviderConfig, 
       : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
     ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
+    ...(typeof supportsVerbosity === "boolean" ? { supportsVerbosity } : {}),
     ...(typeof supportsServiceTier === "boolean" ? { supportsServiceTier } : {}),
     ...(supportsServiceTier === true && fastPolicy.fastTierDescription !== undefined
       ? { fastTierDescription: fastPolicy.fastTierDescription }
       : {}),
-    ...(prov.adapter === "kiro" ? { supportsVerbosity: false } : {}),
     // Default-on for openai-chat providers (explicit false opts out); other adapters
     // advertise only on explicit opt-in.
     ...(prov.parallelToolCalls === true || (prov.adapter === "openai-chat" && prov.parallelToolCalls !== false)
@@ -1308,6 +1327,9 @@ async function fetchProviderModelsWithAuth(
     });
     if (liveResult.ok) {
       const available = filterCursorConfiguredModelsByLiveDiscovery(configured, liveResult.models);
+      // Live Max-Mode evidence feeds the umbrella resolver's ultra gate
+      // (devlog 260828_cursor_umbrella_catalog; union with static evidence).
+      recordLiveCursorMaxModeModels(liveResult.maxModeModels ?? []);
       const result = available.length > 0 ? available : configured;
       // Cache the discovery-filtered roster without combo retention so a later
       // gather can re-apply the current capture's retain set on read.

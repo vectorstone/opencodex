@@ -62,6 +62,14 @@ subagent-fallback chain has nowhere to await, so an `await` added before the
 activation block would silently reroute subagents to a different model than the
 operator configured.
 
+That one is enforced too, in the same file: a scan reads the window between the
+`Bun.serve` call and the `labActivationRequired` check and fails on any `await`
+that would suspend `startServer` itself, plus on `startServer` being declared
+`async`. It has to ignore comments, string bodies, and nested functions to be
+usable, because the window legitimately contains three awaits inside the
+`server.stop` closure and two comments that mention the word. Until it existed,
+this paragraph was the only thing holding the guarantee.
+
 Design and audit history: `devlog/_fin/260814_lab_core_decoupling/`.
 
 ## The `devlog` directory
@@ -341,6 +349,19 @@ bun run lint:gui       # GUI eslint
 bun run privacy:scan   # credential/privacy scan used by CI
 bun run build:gui      # Vite GUI build
 ```
+
+`skills/ocx/` is the operating reference for the CLI — what an agent reads to *drive* a running
+proxy, as opposed to [`AGENTS_INSTALL.md`](./AGENTS_INSTALL.md) (installing and operating consent)
+or this file (changing the codebase). Its surface map is generated:
+
+```bash
+bun run skill:surface        # regenerate after adding a capability
+bun run skill:surface:check  # what CI asserts
+```
+
+`tests/skill-ocx.test.ts` fails if the committed map drifts from `src/cli/capabilities.ts`, and
+also if the hand-written pages name a command the registry does not have. That second check is not
+hypothetical: it caught a documented `ocx request-history` that never existed.
 
 During implementation, use the smallest focused checks that directly cover the
 changed subsystem. Do not run repository-wide `bun run typecheck` or

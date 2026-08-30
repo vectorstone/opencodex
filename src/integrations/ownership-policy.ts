@@ -12,7 +12,7 @@ import {
   type ManagedContribution,
   type ManagedFragment,
 } from "../clients/config-export";
-import { canonicalContribution, fingerprint } from "./ownership";
+import { canonicalContribution, fingerprint, semanticContribution } from "./ownership";
 
 type JsonObject = Record<string, unknown>;
 
@@ -168,11 +168,10 @@ export function validRefreshablePaths(
   });
 }
 
-/** Fingerprint a contribution after removing only its explicitly refreshable paths. */
-export function protectedContributionFingerprint(
+function contributionWithoutRefreshablePaths(
   contribution: ManagedContribution,
   refreshablePaths: readonly (readonly string[])[],
-): string {
+): ManagedContribution {
   const fragments = contribution.fragments.map(fragment => {
     const cloned = cloneFragment(fragment);
     return contribution.clientId === "zcode"
@@ -186,5 +185,26 @@ export function protectedContributionFingerprint(
       break;
     }
   }
-  return fingerprint(canonicalContribution({ ...contribution, fragments }));
+  return { ...contribution, fragments };
+}
+
+/** Fingerprint a contribution after removing only its explicitly refreshable paths. */
+export function protectedContributionFingerprint(
+  contribution: ManagedContribution,
+  refreshablePaths: readonly (readonly string[])[],
+): string {
+  return fingerprint(canonicalContribution(
+    contributionWithoutRefreshablePaths(contribution, refreshablePaths),
+  ));
+}
+
+
+/** Semantic protected fingerprint that ignores JSON object-key order only. */
+export function semanticProtectedContributionFingerprint(
+  contribution: ManagedContribution,
+  refreshablePaths: readonly (readonly string[])[],
+): string {
+  return fingerprint(semanticContribution(
+    contributionWithoutRefreshablePaths(contribution, refreshablePaths),
+  ));
 }

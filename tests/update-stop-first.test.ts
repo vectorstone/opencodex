@@ -1,10 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runNpmCachePreflight } from "../src/update/npm-cache-preflight.mjs";
-import { killProxy } from "../src/lib/process-control";
+import { isProcessAlive, killProxy } from "../src/lib/process-control";
 
 const repoRoot = join(import.meta.dir, "..");
 
@@ -20,14 +20,31 @@ function freePort(): Promise<number> {
   return promise;
 }
 
+/**
+ * Budget for the whole recovery case, and the arithmetic that keeps it honest.
+ *
+ * A cold detached proxy takes ~2s locally, but this test runs inside a CI batch of twelve files
+ * on a shared runner where the same boot has blown a 15s budget. Raising the readiness wait to
+ * 45s fixed that and introduced a worse failure: the case ALSO spawns `node launcher update`
+ * (up to 30s) before the wait even starts, and `node launcher stop` (up to 30s) after it. With
+ * a 60s Bun timeout, a 45s wait leaves the readiness probe unable to finish inside the case at
+ * all — observed failing at 46-47s on macOS, which reads as a product defect and is not one.
+ *
+ * So the budget is derived from the timeout rather than guessed against it: the wait gets what
+ * remains after the spawns, and the Bun timeout is stated as the sum of its parts. The deadline
+ * exists to stop a HUNG proxy, not to assert a boot deadline the suite never intended to
+ * enforce — a slow-but-live proxy must still pass.
+ */
+const UPDATE_SPAWN_TIMEOUT_MS = 30_000;
+// 45s exhausted repeatedly on loaded shared runners (46-47s failures recorded
+// on at least four unrelated PRs; the detached Bun proxy can take >45s to
+// serve /healthz there). 90s keeps the derived case budget honest below.
+const PROXY_READY_TIMEOUT_MS = 90_000;
+/** Spawn + readiness + teardown spawn, plus headroom for fixture IO on a loaded runner. */
+const RECOVERY_CASE_TIMEOUT_MS = UPDATE_SPAWN_TIMEOUT_MS + PROXY_READY_TIMEOUT_MS + UPDATE_SPAWN_TIMEOUT_MS + 15_000;
+
 async function waitForProxy(port: number): Promise<boolean> {
-  // A cold detached proxy takes ~2s locally, but this test runs inside a CI
-  // batch of twelve files on a shared runner, where the same boot has been
-  // observed to blow a 15s budget and fail the whole shard. The test's own
-  // Bun timeout is 60s, so the readiness wait may use most of that: this
-  // deadline exists to stop a hung proxy, not to assert a boot deadline the
-  // suite never intended to enforce.
-  const deadline = Date.now() + 45_000;
+  const deadline = Date.now() + PROXY_READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
@@ -49,6 +66,16 @@ const serverSource = readFileSync(join(import.meta.dir, "..", "src", "server", "
 const dispatchSource = readFileSync(join(import.meta.dir, "..", "src", "cli", "dispatch.ts"), "utf8");
 
 describe("update stops the running proxy before replacing files", () => {
+  // The recovery case starts a real detached proxy, and its own result says nothing about
+  // whether cleanup reaped it — it stayed green while an escapee spun on a deleted tree for
+  // hours. Auditing the pid once the suite is done turns a silent leak back into a red test.
+  let auditedRecoveryPid: number | undefined;
+
+  afterAll(() => {
+    if (auditedRecoveryPid === undefined) return;
+    expect(isProcessAlive(auditedRecoveryPid)).toBe(false);
+  });
+
   test("a failed cache pre-flight aborts before the stop callback can run", () => {
     let stopped = false;
     const malformedSpawn = (() => ({ status: 0, signal: null, stdout: "not-json", stderr: "" })) as never;
@@ -200,7 +227,7 @@ esac
           env,
           stdout: "pipe",
           stderr: "pipe",
-          timeout: 30_000,
+          timeout: UPDATE_SPAWN_TIMEOUT_MS,
         });
         const output = result.stdout.toString() + result.stderr.toString();
 
@@ -213,28 +240,65 @@ esac
         expect(runtime.pid).toBeGreaterThan(0);
         recoveredPid = runtime.pid;
       } finally {
-        const stopped = existsSync(launcher)
-          ? Bun.spawnSync(["node", launcher, "stop"], {
-              cwd: root,
-              env,
-              stdout: "ignore",
-              stderr: "ignore",
-              timeout: 30_000,
-            })
-          : null;
-        if (stopped?.exitCode !== 0) {
-          if (!recoveredPid) {
-            try {
-              recoveredPid = JSON.parse(readFileSync(join(opencodexHome, "runtime-port.json"), "utf8")).pid;
-            } catch { /* the proxy never wrote runtime state */ }
-          }
-          if (Number.isSafeInteger(recoveredPid) && recoveredPid! > 0) killProxy(recoveredPid!);
+        // Resolve the pid FIRST. `stop` rewrites runtime-port.json and the rmSync below
+        // deletes it outright, so this is the last moment the detached proxy the recovery
+        // path started can still be identified at all.
+        if (!recoveredPid) {
+          try {
+            recoveredPid = JSON.parse(readFileSync(join(opencodexHome, "runtime-port.json"), "utf8")).pid;
+          } catch { /* the proxy never wrote runtime state */ }
         }
-        rmSync(root, { recursive: true, force: true });
+        auditedRecoveryPid = Number.isSafeInteger(recoveredPid) && recoveredPid! > 0
+          ? recoveredPid
+          : undefined;
+        if (existsSync(launcher)) {
+          Bun.spawnSync(["node", launcher, "stop"], {
+            cwd: root,
+            env,
+            stdout: "ignore",
+            stderr: "ignore",
+            timeout: UPDATE_SPAWN_TIMEOUT_MS,
+          });
+        }
+        try {
+          // `stop` exiting 0 is a claim, not proof: it also reports success when it finds no
+          // live runtime to stop, which is indistinguishable here from one it failed to stop.
+          // Gating the reap on that exit code let a detached proxy survive, get reparented to
+          // init, and then spin on a fixture tree this same block had already deleted — one
+          // escapee burned a full core for hours. Verify liveness and reap regardless.
+          // bin/ocx.mjs mirrors its Bun child's exit, so reaping the recorded child pid takes
+          // the node launcher with it.
+          if (Number.isSafeInteger(recoveredPid) && recoveredPid! > 0 && isProcessAlive(recoveredPid!)) {
+            killProxy(recoveredPid!);
+          }
+        } finally {
+          // Ordered after the reap on purpose: deleting the tree out from under a live
+          // detached proxy is what turned a missed kill into a permanently spinning orphan.
+          rmSync(root, { recursive: true, force: true });
+        }
       }
     },
-    60_000,
+    RECOVERY_CASE_TIMEOUT_MS,
   );
+
+  /**
+   * The budget arithmetic itself, pinned.
+   *
+   * The recovery case spawns `update`, waits for readiness, then spawns `stop`. A wait budget
+   * chosen independently of the Bun timeout is how this test became flaky: 45s of readiness
+   * inside a 60s case that also spends up to 60s on two spawns cannot finish, and it failed at
+   * 46-47s on macOS while the product was healthy.
+   *
+   * This asserts the relationship rather than the numbers, so raising any single budget in
+   * future cannot silently recreate the impossible one.
+   */
+  test("the recovery case timeout can actually contain its own spawns and readiness wait", () => {
+    // Both spawns plus the readiness wait must fit, with room left for fixture IO.
+    const consumed = UPDATE_SPAWN_TIMEOUT_MS * 2 + PROXY_READY_TIMEOUT_MS;
+    expect(RECOVERY_CASE_TIMEOUT_MS).toBeGreaterThanOrEqual(consumed);
+    expect(RECOVERY_CASE_TIMEOUT_MS - consumed).toBeGreaterThanOrEqual(10_000);
+  });
+
 
   test("both update paths surface an incomplete manifest-backed history restore after the stop", () => {
     // A codex-history-backup-*.json surviving `ocx stop` means exact metadata restoration
