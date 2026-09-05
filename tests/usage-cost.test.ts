@@ -176,6 +176,34 @@ describe("resolveMatchedPrice", () => {
     expect(price!.cost4).toEqual({ input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 });
   });
 
+  // Claude Fable 5.1 (2026-09-02): 10 / 50 / 12.50 cache write, and a cache-hit rate of
+  // 0.025x base input (0.25) rather than the 0.1x every other family uses. There is no
+  // jawcode row yet, so both Anthropic surfaces resolve from the shipped overlay; an
+  // account-pool log label must collapse onto the same price.
+  test("claude-fable-5-1 resolves to the official Fable 5.1 price on both Anthropic surfaces", () => {
+    const COST4 = { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 };
+    for (const provider of ["anthropic", "anthropic-apikey"]) {
+      const price = resolveMatchedPrice(provider, "claude-fable-5-1");
+      expect(price, provider).toMatchObject({
+        provider,
+        modelId: "claude-fable-5-1",
+        cost4: COST4,
+        source: "expected",
+        status: "verified",
+      });
+      expect(price?.sourceRef).toContain("platform.claude.com");
+      expect(price?.sourceRef).toContain("0.025x");
+    }
+    expect(resolveMatchedPrice("anthropic-pb51d9b", "claude-fable-5-1")?.cost4).toEqual(COST4);
+    // Cursor accepts all three spellings but pricing stores one canonical overlay row.
+    for (const spelling of ["claude-fable-5-1", "claude-fable-5.1", "claude-5.1-fable"]) {
+      expect(resolveMatchedPrice("cursor", spelling), spelling).toMatchObject({ cost4: COST4, source: "expected", status: "verified-derived" });
+      expect(findExpectedPriceOverlay("cursor", spelling)?.modelId, spelling).toBe("claude-fable-5-1");
+    }
+    // The cheaper cache-hit rate must not leak onto Fable 5, which stays at 0.1x.
+    expect(resolveMatchedPrice("anthropic", "claude-fable-5")?.cost4.cacheRead).toBe(1);
+  });
+
   test("17b. model-level fallback: openai provider gets gpt prices from the openai bundle", () => {
     const price = resolveMatchedPrice("openai", "gpt-5.5");
     expect(price).not.toBeNull();
@@ -269,11 +297,14 @@ describe("resolveMatchedPrice", () => {
     expect(resolveMatchedPrice("openrouter", "anthropic-claude-3.5-sonnet")).toBeNull();
   });
 
-  test("16. shipped overlay membership: 56 keys, including Opus 5 and compatibility prices", () => {
-    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(56);
+  test("16. shipped overlay membership: 68 keys, including canonical Fable 5.1, Opus 5 and compatibility prices", () => {
+    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(68);
     expect(EXPECTED_PRICE_OVERLAYS.some(row => row.status === "unverified")).toBe(false);
     const keys = new Set(EXPECTED_PRICE_OVERLAYS.map(row => `${row.provider}/${row.modelId}`));
     for (const expected of [
+      "anthropic/claude-fable-5-1",
+      "anthropic-apikey/claude-fable-5-1",
+      "cursor/claude-fable-5-1",
       "anthropic/claude-opus-5",
       "cursor/claude-opus-5",
       "kiro/claude-opus-5",
@@ -284,6 +315,19 @@ describe("resolveMatchedPrice", () => {
       "minimax-cn/MiniMax-M2.1-highspeed",
       "deepseek/deepseek-chat",
       "deepseek/deepseek-reasoner",
+      "google-antigravity/gemini-3.8-flash",
+      "google-antigravity/gemini-3.8-flash-low",
+      "google-antigravity/gemini-3.8-flash-medium",
+      // meta-model has no jawcode alias, so these exact overlays are the only price
+      // source for the direct Meta provider.
+      "meta-model/muse-spark-1.3",
+      "meta-model/muse-spark-1.3-contributor",
+      // meta-muse reaches the same endpoint with the CLI credential; overlays resolve by
+      // exact provider id, so it needs its own rows or its cost column stays empty.
+      "meta-muse/muse-spark-1.3",
+      "meta-muse/muse-spark-1.3-contributor",
+      "google-antigravity/gemini-3.8-flash-high",
+      "google/gemini-3.8-flash",
       "google-antigravity/gemini-3.1-pro-low",
       "google-antigravity/gemini-3.1-pro-high",
       "google-antigravity/gemini-pro-agent",
@@ -332,6 +376,8 @@ describe("resolveMatchedPrice", () => {
       "openai/daybreak-blue-latest",
       "openai/daybreak-red-latest",
       "openai-apikey/gpt-daybreak-blue-latest",
+      "cursor/claude-fable-5.1",
+      "cursor/claude-5.1-fable",
     ]) {
       expect(keys.has(impossible)).toBe(false);
     }
@@ -1197,5 +1243,49 @@ describe("provider cost overlay (user-configured)", () => {
     expect(activeUserCostOverlays()[0].provider).toBe("sk-provider-789");
     // Leave the registry empty for the rest of the file.
     refreshUserCostOverlays({ providers: {} } as unknown as OcxConfig);
+  });
+});
+
+describe("aggregator vendor-prefixed model ids (#3136)", () => {
+  // CommandCode serves "deepseek/deepseek-v4-flash"; the cost catalog stores the bare id.
+  // The exact lookup missed a price that is present, so every request through such a
+  // provider reported no cost at all.
+  test("a vendor-prefixed id resolves to the same price as its bare id", () => {
+    const bare = resolveMatchedPrice("deepseek", "deepseek-v4-flash");
+    const prefixed = resolveMatchedPrice("commandcode-api", "deepseek/deepseek-v4-flash");
+    expect(bare?.cost4).toBeDefined();
+    expect(prefixed?.cost4).toEqual(bare!.cost4);
+    // Derived, not claimed as an exact catalog row for that provider.
+    expect(prefixed?.status).toBe("verified-derived");
+    expect(prefixed?.jawcodeProvider).toBe("deepseek");
+  });
+
+  test("the vendor prefix is compared after normalization, so x-ai matches xai", () => {
+    // The same vendor is spelled differently across catalogs. Dashes and case are the
+    // only variance this normalizes; anything further stays a miss.
+    expect(resolveMatchedPrice("openrouter", "x-ai/grok-4.6")?.cost4).toBeDefined();
+  });
+
+  test("a prefix that disagrees with the matched vendor stays unpriced", () => {
+    // This is the assertion that keeps the fix from becoming a mispricing.
+    // findVendorCostByModelId returns whichever vendor COST_VENDOR_PRIORITY reaches
+    // first, so an unchecked strip would price a Claude model from Anthropic's row while
+    // the caller named OpenAI - a number that looks authoritative and is wrong.
+    expect(resolveMatchedPrice("openrouter", "openai/claude-opus-4-6")).toBeNull();
+  });
+
+  test("an unknown tail is still unpriced rather than guessed", () => {
+    expect(resolveMatchedPrice("openrouter", "google/gemini-3.6-pro")).toBeNull();
+  });
+
+  test("unprefixed ids are unchanged", () => {
+    expect(resolveMatchedPrice("deepseek", "deepseek-v4-flash")?.cost4).toBeDefined();
+    expect(resolveMatchedPrice("deepseek", "not-a-real-model-xyz")).toBeNull();
+  });
+
+  test("a doubly-slashed id is not treated as a vendor prefix", () => {
+    // Only one prefix segment is understood; deeper paths are left alone rather than
+    // being peeled until something matches.
+    expect(resolveMatchedPrice("openrouter", "a/deepseek/deepseek-v4-flash")).toBeNull();
   });
 });

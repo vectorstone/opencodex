@@ -24,7 +24,7 @@ ocx start --port 8080
 
 ### `ocx stop`
 
-Arrête le proxy actif à partir de son PID, supprime le fichier de PID et rétablit le fonctionnement natif de Codex. Si un service d’arrière-plan géré est installé, `ocx stop` l’arrête d’abord afin qu’il ne puisse pas relancer le proxy. La même opération est disponible avec le bouton **Stop** du tableau de bord Web (`POST /api/stop`).
+Arrête le proxy actif à partir de son PID, supprime le fichier de PID et rétablit le fonctionnement natif de Codex. Si un service d’arrière-plan géré est installé, `ocx stop` l’arrête d’abord afin qu’il ne puisse pas relancer le proxy. Le bouton **Stop** du tableau de bord Web exécute la même opération (`POST /api/stop`) sur tous les backends, sauf le Planificateur de tâches Windows : le wrapper peut y relancer le proxy après la fin de la tâche, donc le tableau de bord refuse avec `respawnable_service`, ne modifie rien et vous demande d'exécuter `ocx stop`.
 
 ### `ocx restart`
 
@@ -122,7 +122,7 @@ Vérifie l’identité du proxy actif. La sortie destinée aux utilisateurs indi
 
 ### `ocx ready [--json] [--wait [--timeout <seconds>]]`
 
-Vérifie l’état de préparation après synchronisation au moyen du point de terminaison non authentifié `GET /readyz`. Il renvoie `200` lorsque le service est prêt, ou `503` avec `Retry-After: 1` pour les états `pending` et terminal `failed`. Son identité HTTP expurgée est `{service, version, uptime, pid, port, status}`. Les anciens proxys dépourvus de `/readyz` échouent de manière sûre avec l’état `unreachable` ; `/healthz` mesure la disponibilité du processus, et non son état de préparation.
+Vérifie l’état de préparation après synchronisation au moyen du point de terminaison non authentifié `GET /readyz`. Il renvoie `200` lorsque le service est prêt, ou `503` avec `Retry-After: 1` pour les états `pending` et terminal `failed`. Son identité HTTP expurgée est `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}`. `protocol` est la version courante du protocole distant du hub, `minimumClientProtocol` la plus ancienne version cliente compatible et `managementUrl` l’origine canonique de gestion visible par le navigateur. Les anciens proxys dépourvus de `/readyz` échouent de manière sûre avec l’état `unreachable` ; `/healthz` mesure la disponibilité du processus, et non son état de préparation.
 
 Par défaut, la commande effectue une seule sonde. Avec `--wait`, elle interroge le service jusqu’à ce qu’il soit prêt ou jusqu’à l’expiration du délai, mais s’arrête immédiatement si elle observe l’état terminal `failed`. Le délai par défaut est de 45 secondes. `--timeout <seconds>` exige `--wait` et accepte un entier positif compris entre 1 et 300. La sortie JSON de la CLI est `{ready, status, pid, port}`, où `status` vaut `ready`, `pending`, `failed` ou `unreachable`. Les codes de sortie sont 0 si le service est prêt ; 1 s’il n’est pas prêt, reste en attente, échoue, dépasse le délai ou est inaccessible ; et 64 si les arguments sont invalides.
 
@@ -154,9 +154,9 @@ Exécute opencodex comme service d’arrière-plan géré à l’ouverture de se
 
 | Sous-commande | Action |
 | --- | --- |
-| aucune | Installe et démarre le service s’il est absent ; sinon, actualise et redémarre le service existant sans le réenregistrer. |
+| aucune | Installe et démarre le service s’il est absent ; sinon, actualise et redémarre le service existant. Une définition Task Scheduler Windows saine est réutilisée ; une définition obsolète peut être réenregistrée et nécessiter une élévation. |
 | `install` | Crée et démarre le service. L’enregistrement exige une élévation sous Windows. |
-| `repair` | Actualise sur place un service installé et le redémarre, sans le réenregistrer. |
+| `repair` | Actualise sur place un service installé et le redémarre. Une définition Task Scheduler Windows saine est réutilisée ; une définition obsolète peut être réenregistrée et nécessiter une élévation. |
 | `restart` | Alias de `repair`. |
 | `start` | Démarre un service installé. |
 | `stop` | Arrête le service et rétablit le fonctionnement natif de Codex. |
@@ -233,7 +233,7 @@ Pendant une mise à niveau, un shim Unix installé qui ne contient pas la garde 
 
 L’installation du lanceur ne prouve pas à elle seule que les requêtes Codex passeront par OpenCodex. Après une installation saine, la commande examine le routage Codex actuel et affiche un avertissement plutôt qu’un résultat positif lorsque le routage est externe, appartient à l’utilisateur ou ne peut pas être vérifié. Elle avertit aussi lorsque des variables de proxy sortant n’existent que dans le processus actuel alors que `config.proxy` est absent ou non résolu, car les lanceurs Codex et les services d’arrière-plan peuvent ne pas hériter de cet environnement. Ces contrôles sont en lecture seule et n’affichent jamais la valeur du proxy. Corrigez le transfert signalé et exécutez `ocx doctor` avant de compter sur le démarrage automatique.
 
-Si une mise à jour externe achevée de Codex remplace un shim installé, la prochaine commande `ocx` ordinaire sauvegarde le nouveau lanceur stable et rétablit le shim avant de répartir la commande. Un lanceur encore en cours de modification reste intact et sera réexaminé plus tard. Un échec de réparation produit un avertissement sans faire échouer la commande demandée. Repli manuel : `ocx codex-shim install`. Définissez `codexShimAutoRestore` sur `false`, ou `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` pour désactiver ce comportement au niveau du processus.
+Si une mise à jour externe achevée de Codex remplace un shim installé, la prochaine commande `ocx` ordinaire sauvegarde le nouveau lanceur stable et rétablit le shim avant de répartir la commande. La commande d’inspection sans effet `ocx system codex-cli-update check` et les invocations mal formées de son espace de noms réservé `ocx system codex-cli-update` n’effectuent jamais cette réparation. Un lanceur encore en cours de modification reste intact et sera réexaminé plus tard. Un échec de réparation produit un avertissement sans faire échouer la commande demandée. Repli manuel : `ocx codex-shim install`. Définissez `codexShimAutoRestore` sur `false`, ou `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` pour désactiver ce comportement au niveau du processus.
 
 | Sous-commande | Action |
 | --- | --- |
@@ -264,6 +264,8 @@ Ouvre le [tableau de bord Web](/fr/guides/web-dashboard/) à l’adresse `http:/
 
 ## Mise à jour
 
+`ocx update` met à jour OpenCodex lui-même, et non la CLI Codex. Utilisez `ocx system codex-cli-update check` parmi les [commandes d’inspection système](/fr/reference/cli/agents/) pour vérifier, de façon bornée et en lecture seule, la provenance du candidat Codex CLI configuré. Cette commande n’interroge aucun registre de paquets et n’installe aucune mise à jour.
+
 ### `ocx update [--tag latest|preview]`
 
 Met à jour opencodex depuis npm. Les installations stables utilisent `@latest` ; les préversions restent sur `@preview`, sauf si vous indiquez `--tag latest|preview`. La commande détecte un dépôt de sources et vous invite alors à exécuter `git pull && bun install`. Elle ne fait rien si la version la plus récente correspondant à cette balise est déjà installée.
@@ -276,3 +278,7 @@ ocx update --tag preview
 ```
 
 Les nouvelles versions deviennent disponibles lorsque le [workflow de publication](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml) les publie sur npm.
+
+## Cycle de vie du client Remote Hub
+
+Utilisez `ocx connect <url> --pairing-code-stdin`, `ocx connect status`, `ocx sync` et `ocx connect rotate --pairing-code-stdin`. `ocx disconnect` restaure l'état local hors ligne sans révoquer la clé du hub. Tant que le client est connecté, `ocx connect revoke --admin-token-stdin` révoque l'`apiKeyId` enregistré; après déconnexion, utilisez **Integrations → API Keys** sur le hub. Les secrets passent uniquement par stdin, jamais par argv.

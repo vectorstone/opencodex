@@ -157,6 +157,34 @@ Hidden` inside an already-running PowerShell script, nor to .NET/VBS process-win
 - 다른 대안 대신 이 방식을 선택한 이유: Names and environment paths are caller-controlled, required secret writes must not silently skip ACLs, and elevation has a larger authority boundary that should remain FFI-only.
 - 장점, 단점 및 영향: Default Windows ARM64 installations can start and harden secrets; non-default Windows roots continue to fail closed until Bun exposes a trustworthy native system-directory API without FFI.
 
+The durable response-spill directory `~/.opencodex/responses-state-spill/` is bounded in
+aggregate, not only per file. Continuation state demoted out of the in-memory cap
+(`MAX_STORED_RESPONSE_BYTES`) is written there, and eviction past
+`MAX_SPILLED_RESPONSE_BYTES` removes oldest-first through the same deletion point that serves
+TTL and count eviction, so an evicted entry unlinks its file. One function owns that ceiling and
+three callers drive it: mutation pruning, the lazy load that follows a restart, and the periodic
+sweep. The periodic caller is not redundant — the mutation path runs only when traffic arrives, so a
+process that comes up over budget from a snapshot written under a larger ceiling would otherwise
+stay over it while idle.
+
+The ceiling bounds what the store can account for, which is every entry in the map plus the
+superseded generations queued for unlink, and deliberately not the directory as a whole. Spill files
+orphaned by a crash are absent from the map, so this accounting can neither see nor price them; they
+remain with the `recoverOrphanedResponseSpills` grace sweep described below, which is the only
+mechanism that reclaims them. A host that crashes repeatedly can therefore hold spill bytes above
+this ceiling for up to `RESPONSE_SPILL_ORPHAN_GRACE_MS` past each crash. Without that aggregate bound the
+directory was limited only per file (256 MiB) and per entry (1000) — a 250 GiB product — which
+left `RESPONSE_TTL_MS` as the only effective limit and made disk use a function of client
+request rate rather than of anything the process controls.
+
+[Decision Log]
+- 목적과 의도: Bound the durable spill directory in aggregate so demoted continuation state cannot consume the host disk.
+- 기존 구현 및 제약 조건: The resident map has an unconditional byte cap and demotes past it, but the disk it demotes onto had only a per-file ceiling and the shared 1000-entry count cap. Retention itself worked — the hour-long TTL did evict — so the gap was a missing budget, not a leak.
+- 검토한 주요 대안: Lower the per-file ceiling; shorten the TTL; sweep the directory on a timer; add a configurable budget key; carry a running byte counter.
+- 선택한 방식: A constant aggregate ceiling checked at the end of the existing prune, evicting oldest-first, with the total recomputed per prune rather than carried as a counter.
+- 다른 대안 대신 이 방식을 선택한 이유: Per-file or TTL changes alter retention semantics other bounds depend on; a timer adds a second owner for eviction; a config key would surface a knob the sibling bounds (count, TTL, per-file) do not have; and a running counter could silently disable the cap if any of the several insertion paths missed an increment, where a walk over at most 1000 entries cannot drift.
+- 장점, 단점 및 영향: Disk use stops tracking client request rate. Ordinary traffic is unaffected because the count cap binds at a comparable point for median-sized payloads; a workload of unusually large continuations loses its oldest spills earlier than the TTL would, surfacing as the existing `previous_response_not_found` continuation miss.
+
 Response-state loading performs a bounded recovery pass for interrupted snapshot writes. It only
 matches regular files named `responses-state.json.ocx.<pid>.<sequence>.tmp`, waits at least 15
 minutes, and skips the current or any live PID. Eligible files are truncated before unlinking so a
@@ -172,6 +200,50 @@ are consumed incrementally and at most 512 stale files are attempted per process
 - 선택한 방식: Run a capped, best-effort, unlink-only sweep on lazy response-state startup.
 - 다른 대안 대신 이 방식을 선택한 이유: It repairs known remnants without broad authority over unrelated temp files or active writers.
 - 장점, 단점 및 영향: Old dead-PID files are reclaimed automatically; locked or conservatively classified files remain for a later retry.
+
+Windows runtime response spills never wait on `icacls` through `Bun.spawnSync`. Linux and macOS
+retain the immediate synchronous publication path. On Windows, the resident continuation enters one
+serialized publication queue and remains replayable while `hardenSecretDirAsync` and
+`hardenSecretPathAsync` run. Publication installs a spill stub only when the map still contains the
+same resident object; a superseded job deletes its newly published file instead of overwriting newer
+state. Pending payloads are pinned and capped at 256 MiB, so an ACL outage cannot grow an unbounded
+queue or be misreported as evictable memory. One caller-owned retry is allowed after a real
+`ETIMEDOUT`; the first timeout does not install a `spill-failed` tombstone. Required ACL failures
+remain fail-closed after that bounded recovery. Optional config-directory hardening uses a separate
+per-directory async single-flight, while required config mutation writers retain their existing
+awaited or synchronous fail-closed boundary.
+
+Each ordinary async spill write attempt owns one 30-second ACL budget shared across directory, temp,
+and exclusive-copy destination hardening; the single timeout retry receives one fresh whole-attempt
+budget. No harden step may reopen an independent 30-second window inside either attempt.
+Both icacls and effective-principal subprocess waits are settlement-bounded: at deadline the child is
+killed, unref'd, and abandoned without awaiting `proc.exited`. The caller-level deadline also bounds
+injected/shared runners, so a child that ignores termination cannot pin the serialized spill queue.
+
+Graceful shutdown drains that serialized publication queue to a stable fixed point before snapshot
+serialization. The drain has a wall-clock cap with a reserved synchronous fallback budget; expiry
+supersedes the async writer, claims and removes any temp or destination it still owns, and only then
+starts fallback publication. The writer rechecks supersession before no-replace publication, while
+the fallback splits its reserve across the directory and file ACL hardens. This ordering is
+load-bearing because resident entries over 2 MiB are deliberately excluded from
+`responses-state.json`: serializing first could omit the resident before its durable spill stub
+exists, losing the continuation on restart. Cleanup is attempted for every abandoned writer; any
+failure is retained while fallback and snapshot persistence continue, then returned through the
+shutdown status so process exit is non-zero without sacrificing unrelated replay state.
+If the fallback reserve expires, every remaining resident candidate is terminalized as a bounded
+`spill-failed` tombstone before pruning, so no payload remains eligible for shutdown requeue and the
+snapshot flush always regains control.
+The terminalization pass itself is hard-capped at `MAX_STORED_RESPONSES + 1`; exceeding that
+structural bound records a bounded failure, fail-closes every remaining resident, and returns control
+to snapshot persistence instead of relying on the progress argument alone.
+
+[Decision Log]
+- 목적과 의도: Keep `/healthz` and unrelated requests responsive during intermittent Windows ACL stalls without publishing an unhardened continuation.
+- 기존 구현 및 제약 조건: Response demotion called the synchronous spill writer from request-time state mutations; `Bun.spawnSync(icacls)` could block the only Bun event loop for the full timeout and immediately replace replayable state with a tombstone.
+- 검토한 주요 대안: Increase the ACL timeout, weaken required ACL checks, publish before hardening, move every platform to async state mutation, or isolate only the Windows ACL-dependent publication boundary.
+- 선택한 방식: Preserve non-Windows behavior; serialize Windows publications through async ACL APIs, retain the exact resident generation until compare-before-swap succeeds, cap pending bytes, and retry one proven timeout.
+- 다른 대안 대신 이 방식을 선택한 이유: Longer waits worsen liveness, early publication weakens secret-file ACLs, and a cross-platform async rewrite would disturb mature immediate memory and crash-ordering contracts that do not cause this incident.
+- 장점, 단점 및 영향: Windows health stays schedulable and transient ACL stalls retain continuation replay; pending payloads can temporarily exceed the 64 MiB resident target but are pinned under a 256 MiB local ceiling and remain inside the documented 512 MiB process-owned worst case.
 
 ## Config surface
 
@@ -208,7 +280,7 @@ matters for maintainers is which groups exist and who resolves them:
 | --- | --- | --- |
 | Listener | `port`, `hostname` | The listener owns the port; `runtime-port.json` reports where it actually landed. |
 | Routing | `defaultProvider`, `providers`, per-provider `selectedModels` | Explicit `provider/model` wins over `defaultProvider`. |
-| Catalog | `disabledModels`, `customModels`, `modelCacheTtlMs`, `providerContextCaps`, `contextCapValue`, `codexAccountNamespaces`, `codexAccountPickerEnabled` | Catalog state is derived; config only records intent. The picker flag is an explicit visibility override, while selector mappings remain the durable exact-routing contract. |
+| Catalog | `disabledModels`, `customModels`, `modelCacheTtlMs`, `providerContextCaps`, `contextCapValue`, per-provider `modelDisplayNames`, `codexAccountNamespaces`, `codexAccountPickerEnabled` | Catalog state is derived; config only records intent. Exact provider model display names are durable display only overlays. The picker flag is an explicit visibility override, while selector mappings remain the durable exact-routing contract. |
 | Retained state | `appOwnedMemoryBudgetMb` | Process-wide eviction target for app-owned logs, caches, blobs, and continuation payloads. Default 256 MiB, valid 64..4096; pinned state may temporarily exceed the target, but every pin-capable store has a finite local cap and their documented aggregate stays below `APP_OWNED_WORST_CASE_PINNED_BYTES` (512 MiB). Neither value caps RSS or native runtime memory. |
 | Transport | stream mode, timeouts, proxy settings, `websockets`, `emptyCompletionRetry` | `streamMode` persists in config.json; Windows services need a persisted input, and macOS uses it for explicit eager-relay opt-in. Empty-completion replay is an explicit top-level opt-in because its second upstream request may be billable. |
 | Credentials | `apiKeys` | Data-plane only; never admitted to `/api/*`. |
@@ -368,3 +440,7 @@ uninstall with their exact paths.
 Legacy nonempty config directories are deliberately not retroactively claimed. If either ownership
 file is missing, malformed, or bound to another root, uninstall refuses config deletion and reports
 the residual directory for manual review; there is no recursive-delete fallback.
+
+## Remote client key files
+
+Client connection metadata stores a stable `apiKeyId` and a non-secret rotation `pendingOperation`. The current data secret remains only in `service-api-token`; a bounded rotation temporarily keeps the old secret in owner-only `service-api-token.prev`. Commit or recovery clears the marker before orphan cleanup. `ocx disconnect` is local-only and leaves remote revocation to the hub's **Integrations → API Keys** page. Hub and local usage stores are not mirrored.

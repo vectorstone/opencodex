@@ -28,6 +28,11 @@ import {
   awaitThoughtSignatureDurability,
 } from "./responses/thought-signature-replay";
 import { resolveStallTimeoutSec } from "./stall-timeout";
+import {
+  createCitationMarkerFilter,
+  stripCitationMarkers,
+  type CitationMarkerFilter,
+} from "./responses/citation-markers";
 import { normalizeDeclaredToolName } from "./types";
 import { usageDisplayTotalTokens } from "./usage/totals";
 import { appendSafeWebSearchSource, safeWebSearchSources } from "./web-search/sources";
@@ -54,6 +59,10 @@ function sseEvent(name: string, data: Record<string, unknown>): string {
   return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function responsesUsage(usage: OcxUsage | undefined): Record<string, unknown> {
   // input_tokens_details / output_tokens_details are ALWAYS emitted (zero defaults):
   // strict Responses clients deserialize them as required fields — grok-build's pinned
@@ -75,7 +84,24 @@ function responsesUsage(usage: OcxUsage | undefined): Record<string, unknown> {
   const inputTokens = usage.contextTotalTokens !== undefined
     ? Math.max(0, usage.contextTotalTokens - usage.outputTokens)
     : usage.inputTokens;
+  // openai/codex#41980 parity: unknown upstream usage fields (subscription metadata, future
+  // counters) pass through the rebuild. Normalized values stay authoritative for the known
+  // keys (they are derived from the same raw values, so this never disagrees with upstream).
+  const raw: Record<string, unknown> = usage.rawUsage ?? {};
+  // cache_write_tokens is a KNOWN key: it is emitted only from the validated normalized
+  // value below, never copied through raw (an unknown-shaped value must not leak into the
+  // normalized contract).
+  const rawInputDetails = isRecord(raw.input_tokens_details)
+    ? Object.fromEntries(Object.entries(raw.input_tokens_details as Record<string, unknown>)
+      .filter(([key]) => key !== "cache_write_tokens"))
+    : {} as Record<string, unknown>;
+  const rawOutputDetails = isRecord(raw.output_tokens_details)
+    ? raw.output_tokens_details as Record<string, unknown>
+    : {} as Record<string, unknown>;
   const out: Record<string, unknown> = {
+    ...Object.fromEntries(Object.entries(raw).filter(([key]) =>
+      key !== "input_tokens" && key !== "output_tokens" && key !== "total_tokens"
+      && key !== "input_tokens_details" && key !== "output_tokens_details")),
     input_tokens: inputTokens,
     output_tokens: usage.outputTokens,
     total_tokens: usage.contextTotalTokens !== undefined
@@ -85,18 +111,19 @@ function responsesUsage(usage: OcxUsage | undefined): Record<string, unknown> {
   // cached_tokens carries cache READS only, matching OpenAI semantics, and is always present
   // (zero default) for strict clients. Clamp to inputTokens so a provider's absolute
   // checkpoint can never report more cache reads than input.
-  const inputDetails: Record<string, number> = {
+  const inputDetails: Record<string, unknown> = {
+    ...rawInputDetails,
     cached_tokens: Math.min(usage.cachedInputTokens ?? 0, inputTokens),
   };
   if (usage.cacheCreationInputTokens !== undefined) {
-    const cacheRead = inputDetails.cached_tokens ?? 0;
+    const cacheRead = typeof inputDetails.cached_tokens === "number" ? inputDetails.cached_tokens : 0;
     inputDetails.cache_write_tokens = Math.min(
       usage.cacheCreationInputTokens,
       Math.max(0, inputTokens - cacheRead),
     );
   }
   out.input_tokens_details = inputDetails;
-  out.output_tokens_details = { reasoning_tokens: usage.reasoningOutputTokens ?? 0 };
+  out.output_tokens_details = { ...rawOutputDetails, reasoning_tokens: usage.reasoningOutputTokens ?? 0 };
   return out;
 }
 
@@ -146,27 +173,27 @@ export { adapterFailureFromMessage } from "./lib/errors";
 /**
  * Build the native `WebSearchAction::Search` payload from the queries that ran.
  *
- * Single query → `{ query, queries: [query] }`. Batch → `{ queries }` with NO singular
- * `query`. Empty → `{ query: "", queries: [""] }`.
+ * Every action carries BOTH keys: `{ query, queries }`, where `query` is the first
+ * member. Empty → `{ query: "", queries: [""] }`.
  *
- * The asymmetry is load-bearing in both directions. codex-rs prefers a non-empty `query`
- * for the cell label and renders "<first> ..." only when `query` is ABSENT and
- * `queries.len() > 1`, so adding `query` to a batch would collapse the plural ellipsis.
- * Meanwhile DeepSeek's native Responses parser makes `queries` a required field, so a
- * replayed one-term `web_search_call` — carried in the history of every subsequent turn
- * — fails deserialization with `missing field 'queries'` and 400s the rest of the
- * conversation (#930). Carrying both keys in the single case satisfies the strict parser
- * without changing what codex-rs displays.
+ * Carrying both is load-bearing in both directions. DeepSeek's native Responses parser
+ * makes `queries` a required field, and Console Go's upstream validator makes `query` a
+ * required field — so a replayed `web_search_call` carried in the history of every
+ * subsequent turn fails deserialization with `missing field 'queries'` (#930) or 400s
+ * with `missing required field 'query'` unless both keys are present. Carrying both keys
+ * in every case satisfies both strict parsers; the trade-off is that a multi-query batch
+ * loses the "<first> ..." ellipsis in codex-rs and shows the first query as the label.
+ *
+ * That trade is deliberate: a cosmetic label against a conversation that 400s on every
+ * subsequent turn. Do not restore the old batch-omits-`query` shape to win the ellipsis
+ * back — it reopens #3071.
  *
  * This fixes items created from here on. History recorded before it is repaired at the
  * replay boundary by `backfillWebSearchQueries()` in the Responses adapter.
  */
 function webSearchAction(queries: string[]): Record<string, unknown> {
-  if (queries.length <= 1) {
-    const query = queries[0] ?? "";
-    return { type: "search", query, queries: [query] };
-  }
-  return { type: "search", queries };
+  const first = queries[0] ?? "";
+  return { type: "search", query: first, queries: queries.length > 0 ? queries : [first] };
 }
 
 interface OutputItem {
@@ -435,7 +462,14 @@ export function bridgeToResponsesSSE(
       const stallSec = resolveStallTimeoutSec(options?.stallTimeoutSec);
       const maxStallTicks = Math.ceil((stallSec * 1000) / heartbeatMs);
 
-      let currentMsg: { itemId: string; outputIndex: number; text: string; textBytes: number; phase?: OcxMessagePhase } | null = null;
+      let currentMsg: {
+        itemId: string;
+        outputIndex: number;
+        text: string;
+        textBytes: number;
+        citationFilter: CitationMarkerFilter;
+        phase?: OcxMessagePhase;
+      } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string; textBytes: number } | null = null;
       let currentRawReasoning: { itemId: string; outputIndex: number; text: string; textBytes: number } | null = null;
       // Anthropic extended-thinking round-trip state: the signature signs the CURRENT thinking
@@ -565,6 +599,17 @@ export function bridgeToResponsesSSE(
 
       const closeCurrentMessage = (inferredPhase?: OcxMessagePhase) => {
         if (!currentMsg) return;
+        // Release anything the citation filter was holding for this message, then strip the
+        // accumulated text: closeCurrentMessage re-sends it in output_text.done and
+        // output_item.done, so filtering only the deltas would leave the markers in both.
+        const trailing = currentMsg.citationFilter.flush();
+        if (trailing) {
+          emit("response.output_text.delta", {
+            item_id: currentMsg.itemId, output_index: currentMsg.outputIndex,
+            content_index: 0, delta: trailing,
+          });
+        }
+        const messageText = stripCitationMarkers(currentMsg.text);
         // Chat Completions has no message-phase field. Keep its live item provisional, then
         // classify it only when the next adapter event proves whether this text led into more
         // work or completed the turn. Explicit adapter phases always outrank this inference.
@@ -574,15 +619,15 @@ export function bridgeToResponsesSSE(
         // Finalize the text part (Responses protocol). Without these .done events Codex never
         // commits the content part and renders the message as truncated / cut off.
         emit("response.output_text.done", {
-          item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0, text: currentMsg.text,
+          item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0, text: messageText,
         });
         emit("response.content_part.done", {
           item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0,
-          part: { type: "output_text", text: currentMsg.text, annotations },
+          part: { type: "output_text", text: messageText, annotations },
         });
         const item = {
           type: "message", id: currentMsg.itemId, status: "completed", role: "assistant",
-          content: [{ type: "output_text", text: currentMsg.text, annotations }],
+          content: [{ type: "output_text", text: messageText, annotations }],
           ...(phase ? { phase } : {}),
         };
         emit("response.output_item.done", { output_index: currentMsg.outputIndex, item });
@@ -936,7 +981,11 @@ export function bridgeToResponsesSSE(
                   item_id: itemId, output_index: outputIndex, content_index: 0,
                   part: { type: "output_text", text: "", annotations: [] },
                 });
-                currentMsg = { itemId, outputIndex, text: "", textBytes: 0, ...(event.phase ? { phase: event.phase } : {}) };
+                currentMsg = {
+                  itemId, outputIndex, text: "", textBytes: 0,
+                  citationFilter: createCitationMarkerFilter(),
+                  ...(event.phase ? { phase: event.phase } : {}),
+                };
               }
               ({ value: currentMsg.text, bytes: currentMsg.textBytes } = appendString(
                 currentMsg.text,
@@ -944,10 +993,16 @@ export function bridgeToResponsesSSE(
                 event.text,
                 "retained_collectors",
               ));
-              emit("response.output_text.delta", {
-                item_id: currentMsg.itemId, output_index: currentMsg.outputIndex,
-                content_index: 0, delta: event.text,
-              });
+              // A citation span can straddle a delta boundary, so the filter withholds an
+              // unterminated tail and releases it at close (#3150). The accumulator above
+              // keeps the raw text; it is stripped once in closeCurrentMessage.
+              const visible = currentMsg.citationFilter.push(event.text);
+              if (visible) {
+                emit("response.output_text.delta", {
+                  item_id: currentMsg.itemId, output_index: currentMsg.outputIndex,
+                  content_index: 0, delta: visible,
+                });
+              }
               break;
             }
             case "thinking_delta": {
@@ -1223,10 +1278,12 @@ export function bridgeToResponsesSSE(
                 // Exactly one compaction item per turn; codex-rs takes the first and fatals on 0.
                 const item = {
                   type: "compaction", id: `cmp_${uuid()}`,
-                  encrypted_content: encodeCompactionSummary(compactionText),
+                  encrypted_content: event.compactionEncryptedContent ?? encodeCompactionSummary(compactionText),
                 };
                 emit("response.output_item.done", { output_index: outputIndex, item });
-                retainFinishedItem(item as OutputItem, compactionTextBytes);
+                retainFinishedItem(item as OutputItem, event.compactionEncryptedContent
+                  ? bytesOf(event.compactionEncryptedContent)
+                  : compactionTextBytes);
                 outputIndex++;
               }
               // Recognize every adapter's truncation vocabulary, not just the canonical pair.
@@ -1574,6 +1631,7 @@ function buildResponseJSONWithBudget(
   let sawTerminal = false;
   let compactionText = "";
   let compactionTextBytes = 0;
+  let compactionEncryptedContent: string | undefined;
 
   let currentText = "";
   let currentTextBytes = 0;
@@ -1618,6 +1676,10 @@ function buildResponseJSONWithBudget(
   const flushText = (inferredPhase?: OcxMessagePhase) => {
     if (!currentText) return;
     const phase = currentTextPhase ?? inferredPhase;
+    // ChatGPT-backend citation markers arrive as literal private-use characters that the
+    // Codex TUI prints verbatim (#3150). Strip them here rather than at the accumulator so
+    // the retained byte accounting above still describes what the upstream actually sent.
+    const text = stripCitationMarkers(currentText);
     const sourceBytes = pendingWebSources.reduce((sum, source) => sum + bytesOf(JSON.stringify(source)), 0);
     const annotations = pendingWebSources.map(s => ({
       type: "url_citation", url: s.url, ...(s.title ? { title: s.title } : {}), start_index: 0, end_index: 0,
@@ -1625,7 +1687,7 @@ function buildResponseJSONWithBudget(
     pendingWebSources = [];
     const item = {
       type: "message", id: `msg_${uuid()}`, role: "assistant", status: "completed",
-      content: [{ type: "output_text", text: currentText, annotations }],
+      content: [{ type: "output_text", text, annotations }],
       ...(phase ? { phase } : {}),
     } as OutputItem;
     pushOutput(item, currentTextBytes);
@@ -1915,6 +1977,7 @@ function buildResponseJSONWithBudget(
         break;
       case "done":
         usage = e.usage;
+        compactionEncryptedContent = e.compactionEncryptedContent;
         sawTerminal = true;
         endTurn = e.endTurn;
         cleanDone = e.stopReason === undefined;
@@ -1967,7 +2030,11 @@ function buildResponseJSONWithBudget(
     && sawTerminal
     && !isTruncatedStopReason(rawStopReason)
   ) {
-    pushOutput({ type: "compaction", id: `cmp_${uuid()}`, encrypted_content: encodeCompactionSummary(compactionText) }, compactionTextBytes);
+   const item = {
+      type: "compaction", id: `cmp_${uuid()}`,
+      encrypted_content: compactionEncryptedContent ?? encodeCompactionSummary(compactionText),
+    };
+    pushOutput(item, compactionEncryptedContent ? bytesOf(compactionEncryptedContent) : compactionTextBytes);
   }
 
   const failure = errorEvent ? adapterFailureFromEvent(errorEvent) : undefined;

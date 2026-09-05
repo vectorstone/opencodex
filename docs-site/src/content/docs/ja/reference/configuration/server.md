@@ -24,7 +24,7 @@ description: リスナー、リモート アクセス、アドミッション �
 | `codexAutoStart?` | `boolean` | `true` | Codex を起動する前に、Codex シムで `ocx ensure` を実行させます。 False を指定すると、操作が行われないことが保証されます。 |
 | `codexShimAutoRestore?` | `boolean` | `true` |完了した外部 Codex アップデートによってインストールされたシムが置き換えられた後、インストールされているシムを復元します。環境オプトアウト: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`。 |
 | `syncResumeHistory?` | `boolean` | `true` | Codex App 履歴の互換性を元に戻すことができます。元のメタデータは `ocx stop` / `ocx restore` によってバックアップおよび復元されます。 |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` |オフ |認識された Codex ヘルパー/シャドウ呼び出しを、少ない労力で選択したモデルにリダイレクトします。デフォルトのソースプレフィックスは `gpt-5.6-luna` です。0.144.x 以前のクライアントでは `gpt-5.4-mini` が使われており、`sourceModels` で復元できます。 |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` |オフ |認識された Codex ヘルパー/シャドウ呼び出しを、リクエストに設定された推論エフォートを維持したまま選択したモデルにリダイレクトします。デフォルトのソースプレフィックスは `gpt-5.6-luna` です。0.144.x 以前のクライアントでは `gpt-5.4-mini` が使われており、`sourceModels` で復元できます。 |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` |使用可能な場合はオン | Web 検索サイドカー オプション。 |
 | `visionSidecar?` | `OcxVisionSidecarConfig` |使用可能な場合はオン |画像説明サイドカー オプション。 |
 | `images?` | `OcxImagesConfig` | OpenAI の自動選択 | Codex `image_gen` のスタンドアロン イメージ リレー オプション。 |
@@ -106,7 +106,7 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 
 ## シャドウコール
 
-Codex は、タイトルやコミット メッセージなどのタスクに小さなヘルパー モデルを使用します。 `shadowCallIntercept` を有効にして、認識されたソース モデル プレフィックスを別の構成済みモデルにリダイレクトします。交換作業は少ない労力で実行されます。クライアントが異なるヘルパー ID を使用する場合にのみ、`sourceModels` を設定します。
+Codex は、タイトルやコミット メッセージなどのタスクに小さなヘルパー モデルを使用します。 `shadowCallIntercept` を有効にして、認識されたソース モデル プレフィックスを別の構成済みモデルにリダイレクトします。置換後も、リクエストに設定された推論エフォートは維持されます。クライアントが異なるヘルパー ID を使用する場合にのみ、`sourceModels` を設定します。
 
 ```json
 {
@@ -161,3 +161,9 @@ OpenAI バックエンドには、ChatGPT ログインと有効な ChatGPT `forw
 対応するレベルは、上流プロバイダーの能力と選択したモデルが公表する推論ラダーによって制限されます。 Vision は、プロバイダーの `noVisionModels` のモデルに送信された画像に対してのみアクティブになります。 OpenAI には、検索と同じログイン/転送要件があります。明示的に選択された Anthropic は、使用可能な認証情報がないと失敗します。成功した `data:` 記述では、バックエンド、モデル、詳細、画像バイト、および正規化されたメッセージ コンテキストをキーとした境界付きキャッシュが使用されます。OpenAI のキーには推論負荷も含まれます（Anthropic のキーには含まれません）。ヒットと同じターンの重複は制限を消費しません。リモート `https:` イメージと失敗した説明、または空の説明はキャッシュされません。
 
 Anthropic OAuth サイドカーは、opencodex の既存のクロード コード OAuth フィンガープリントを再利用します。対象のアカウントとワークロードをソークテストします。
+
+## Remote Hub のキーと既定値
+
+`runtimeRole` の既定値は `standalone` です。hub は `hub.managementPublicOrigin`、loopback 限定の `hub.managementIngress`（未設定時 `enabled:false`）、正確な `remoteGui.allowedTailscaleUsers`（未設定時は空）を使います。クライアントキーは `config.json` ではなく `service-api-token` に保存され、更新中だけ `service-api-token.prev` が存在する場合があります。使用量はミラーリングされません。
+
+`remoteGui.allowInsecureHttp` は、古い strict-schema 設定を読み込むためだけに残された非推奨の no-op です。設定から削除してください。pairing grant は loopback または認証済み HTTPS でのみ受け付けられ、この値を `true` にしても平文 HTTP pairing は再び有効になりません。

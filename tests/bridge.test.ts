@@ -1075,7 +1075,7 @@ describe("Responses bridge web_search_call native item", () => {
     });
   });
 
-  test("a batched (plural) search emits action.search.queries without a singular query", () => {
+  test("a batched (plural) search carries both query and queries for Console Go (#3071)", () => {
     const json = buildResponseJSON([
       { type: "web_search_call_begin", id: "ws_3" },
       { type: "web_search_call_end", id: "ws_3", queries: ["rust async", "tokio runtime"] },
@@ -1085,9 +1085,9 @@ describe("Responses bridge web_search_call native item", () => {
 
     const output = json.output as Record<string, unknown>[];
     const action = (output[0] as Record<string, unknown>).action as Record<string, unknown>;
-    // Native renders "<first> ..." only when `query` is absent and queries.len() > 1.
-    expect(action).toEqual({ type: "search", queries: ["rust async", "tokio runtime"] });
-    expect(action.query).toBeUndefined();
+    // Console Go's upstream validator requires singular `query` on the search action,
+    // and DeepSeek native Responses requires `queries` — so a batch carries both now.
+    expect(action).toEqual({ type: "search", query: "rust async", queries: ["rust async", "tokio runtime"] });
   });
 
   test("a single-query search also carries queries so strict parsers accept the replay (#930)", () => {
@@ -1250,6 +1250,59 @@ describe("Responses bridge web_search_call native item", () => {
     } finally {
       budget.dispose();
     }
+  });
+});
+
+describe("citation markers never reach the client (#3150)", () => {
+  const S = "\uE200";
+  const P = "\uE202";
+  const E = "\uE201";
+
+  test("a span split across text deltas is absent from every emitted event", async () => {
+    // End-to-end through the real bridge, not just the filter. closeCurrentMessage re-sends
+    // the accumulated text in output_text.done, content_part.done and output_item.done, so
+    // filtering only the deltas would still leak the markers into the saved transcript.
+    const events = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "text_delta", text: `The setting is supported. ${S}cite${P}` },
+      { type: "text_delta", text: `turn1view0${P}turn1view1${E}` },
+      { type: "text_delta", text: " Next sentence." },
+      { type: "done" },
+    ]), "routed/model"));
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(S);
+    expect(serialized).not.toContain(P);
+    expect(serialized).not.toContain(E);
+    expect(serialized).not.toContain("turn1view0");
+
+    const streamed = events
+      .filter(e => e.event === "response.output_text.delta")
+      .map(e => e.data.delta as string)
+      .join("");
+    expect(streamed).toBe("The setting is supported.  Next sentence.");
+
+    const done = events.find(e => e.event === "response.output_text.done");
+    expect(done?.data.text).toBe("The setting is supported.  Next sentence.");
+  });
+
+  test("a stream ending inside a span still delivers the held text", async () => {
+    // Withhold, not drop: an unterminated marker is malformed input, and swallowing it
+    // would delete words the model actually produced.
+    const events = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "text_delta", text: `partial ${S}cite${P}turn1` },
+      { type: "done" },
+    ]), "routed/model"));
+    const done = events.find(e => e.event === "response.output_text.done");
+    expect(done?.data.text).toContain("partial ");
+  });
+
+  test("ordinary text is untouched", async () => {
+    const events = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "text_delta", text: "plain answer" },
+      { type: "done" },
+    ]), "routed/model"));
+    const done = events.find(e => e.event === "response.output_text.done");
+    expect(done?.data.text).toBe("plain answer");
   });
 });
 

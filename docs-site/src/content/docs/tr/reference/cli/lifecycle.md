@@ -37,8 +37,7 @@ ocx start --port 8080
 
 Çalışan proxy'yi (PID'ye göre) durdurun, PID dosyasını kaldırın ve yerel Codex'i
 geri yükleyin. Yönetilen bir arka plan servisi kuruluysa `ocx stop` proxy'yi
-yeniden oluşturamaması için önce onu da durdurur. Aynı eylem web kontrol
-panelinin **Durdur** düğmesinden de (`POST /api/stop`) kullanılabilir.
+yeniden oluşturamaması için önce onu da durdurur. Web kontrol panelinin **Durdur** düğmesi aynı eylemi (`POST /api/stop`) Windows Görev Zamanlayıcı dışındaki tüm arka uçlarda çalıştırır: orada görev bittikten sonra sarmalayıcı proxy'yi yeniden başlatabilir, bu yüzden panel `respawnable_service` ile reddeder, hiçbir şeyi değiştirmez ve `ocx stop` çalıştırmanızı ister.
 
 ### `ocx restart`
 
@@ -178,7 +177,7 @@ takdirde 1 ile çıkar, bu da onu servis probları için uygun hale getirir.
 Kimliği doğrulanmamış `GET /readyz` uç noktası aracılığıyla senkronizasyon
 sonrası hazırlığı kontrol edin. Hazır olduğunda `200` veya `pending` ve terminal
 `failed` için `Retry-After: 1` ile `503` döndürür. Temizlenmiş HTTP kimliği
-`{service, version, uptime, pid, port, status}` şeklindedir. `/readyz` içermeyen
+`{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}` şeklindedir. `protocol` hub'ın güncel uzak protokolünü, `minimumClientProtocol` uyumlu en düşük istemci protokolünü ve `managementUrl` tarayıcıya görünen kanonik yönetim origin'ini belirtir. `/readyz` içermeyen
 eski proxy'ler `unreachable` olarak kapalı başarısız olur; `/healthz` hazırlık
 değil, ayrı bir canlılıktır. Komut varsayılan olarak bir prob gerçekleştirir;
 `--wait`, hazır olana veya zaman aşımına kadar yoklar, ancak terminal `failed`
@@ -247,9 +246,9 @@ yapılandırmasını dalgalandırmaz.
 
 | Alt komut | Eylem |
 | --- | --- |
-| none | Servis yoksa kurup başlatın; varsa yeniden kaydetmeden yenileyip yeniden başlatın. |
+| none | Servis yoksa kurup başlatın; varsa yenileyip yeniden başlatın. Sağlıklı bir Windows Task Scheduler tanımı yeniden kullanılır; eski bir tanım yeniden kaydedilebilir ve yükseltme gerektirebilir. |
 | `install` | Servisi oluşturun ve başlatın. Kaydeder, bu da Windows'ta yükseltme gerektirir. |
-| `repair` | Kurulu bir servisi yerinde yenileyin ve yeniden kaydetmeden yeniden başlatın. |
+| `repair` | Kurulu bir servisi yerinde yenileyin ve yeniden başlatın. Sağlıklı bir Windows Task Scheduler tanımı yeniden kullanılır; eski bir tanım yeniden kaydedilebilir ve yükseltme gerektirebilir. |
 | `restart` | `repair` komutunun takma adıdır. |
 | `start` | Kurulu bir servisi başlatın. |
 | `stop` | Servisi durdurun ve yerel Codex'i geri yükleyin. |
@@ -379,7 +378,8 @@ doctor` çalıştırın.
 
 Tamamlanan harici bir Codex güncellemesi kurulu bir dolgunun üzerine yazarsa
 sonraki sıradan `ocx` komutu kararlı yeni başlatıcıyı yedekler ve dağıtımdan
-önce dolguyu geri yükler. Hala değişmekte olan bir başlatıcı dokunulmadan
+önce dolguyu geri yükler. Sıfır etkili `ocx system codex-cli-update check` denetim
+komutu ile ayrılmış `ocx system codex-cli-update` ad alanındaki hatalı çağrılar bu onarımı asla yapmaz. Hala değişmekte olan bir başlatıcı dokunulmadan
 bırakılır ve daha sonra yeniden denenir. Onarım arızaları talep edilen komutu
 başarısız kılmadan uyarır; manuel geri dönüş: `ocx codex-shim install`. Süreç
 düzeyinde bir vazgeçme için `codexShimAutoRestore`'u `false` olarak ayarlayın
@@ -420,6 +420,8 @@ adresindeki [web kontrol panelini](/tr/guides/web-dashboard/) açın.
 
 ## Güncelleme
 
+`ocx update`, Codex CLI'yi değil OpenCodex'in kendisini günceller. Yapılandırılmış Codex CLI adayının provenance bilgisini sınırlı ve salt okunur biçimde denetlemek için [sistem denetim komutları](/tr/reference/cli/agents/) arasındaki `ocx system codex-cli-update check` komutunu kullanın. Komut package registry'ye istek göndermez ve güncelleme kurmaz.
+
 ### `ocx update [--tag latest|preview]`
 
 opencodex'i npm'den kendi kendine güncelleyin. Kararlı kurulumlar `@latest`
@@ -444,3 +446,7 @@ ocx update --tag preview
 Yeni sürümler, [Sürüm iş
 akışı](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml)
 bunları npm'de yayınladığında kullanılabilir hale gelir.
+
+## Remote Hub istemci yaşam döngüsü
+
+`ocx connect <url> --pairing-code-stdin`, `ocx connect status`, `ocx sync` ve `ocx connect rotate --pairing-code-stdin` kullanın. `ocx disconnect` yerel durumu çevrimdışı geri yükler ancak hub anahtarını iptal etmez. Bağlıyken `ocx connect revoke --admin-token-stdin` kayıtlı `apiKeyId` değerini iptal eder; bağlantıdan sonra hub üzerindeki **Integrations → API Keys** kullanılmalıdır. Sırlar yalnızca stdin üzerinden geçer, argv'ye yazılmaz.

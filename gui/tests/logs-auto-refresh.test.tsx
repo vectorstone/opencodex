@@ -136,15 +136,17 @@ async function flushMicrotasks(): Promise<void> {
   });
 }
 
-async function advanceSilentRefresh(): Promise<void> {
-  await act(async () => {
-    jest.advanceTimersByTime(2000);
-  });
-  await flushMicrotasks();
-  await act(async () => {
-    jest.advanceTimersByTime(0);
-    await Promise.resolve();
-  });
+async function advanceSilentRefresh(ms = 2000): Promise<void> {
+  for (let elapsed = 0; elapsed < ms; elapsed += 2000) {
+    await act(async () => {
+      jest.advanceTimersByTime(Math.min(2000, ms - elapsed));
+    });
+    await flushMicrotasks();
+    await act(async () => {
+      jest.advanceTimersByTime(0);
+      await Promise.resolve();
+    });
+  }
 }
 
 function clickRetry(container: HTMLElement): void {
@@ -159,6 +161,33 @@ function expectTableLoaded(container: HTMLElement, model: string): void {
   expect(container.textContent).not.toContain("Could not load request logs.");
   expect(container.textContent).toContain(model);
 }
+
+test("Logs: renders the ordered ten-column layout schema", async () => {
+  globalThis.fetch = (async (input) => {
+    if (!String(input).includes("/api/logs")) return new Response(null, { status: 404 });
+    return jsonResponse([sampleLog]);
+  }) as typeof fetch;
+
+  const { root, container } = await mountLogs();
+  await flushMicrotasks();
+
+  const colgroup = container.querySelector(".logs-table > colgroup");
+  expect(colgroup).not.toBeNull();
+  expect([...colgroup!.children].map(column => column.className)).toEqual([
+    "logs-col-time",
+    "logs-col-tokens",
+    "logs-col-rate",
+    "logs-col-cost",
+    "logs-col-model",
+    "logs-col-effort",
+    "logs-col-provider",
+    "logs-col-status",
+    "logs-col-request",
+    "logs-col-duration",
+  ]);
+
+  await act(async () => { root.unmount(); });
+});
 
 test("Logs: initial failure shows error; silent failure keeps it; retry then recovers", async () => {
   const calls: string[] = [];
@@ -181,7 +210,7 @@ test("Logs: initial failure shows error; silent failure keeps it; retry then rec
   const initialCalls = calls.filter(u => u.includes("/api/logs")).length;
   expect(initialCalls).toBeGreaterThanOrEqual(1);
 
-  await advanceSilentRefresh();
+  await advanceSilentRefresh(6000);
   expect(container.textContent).toContain("Could not load request logs.");
   expect(container.textContent).not.toContain("No requests yet.");
   expect(calls.filter(u => u.includes("/api/logs")).length).toBeGreaterThan(initialCalls);
@@ -228,7 +257,7 @@ test("Logs: silent failure after successful load keeps the table and does not to
   expect(/\bLoading\b/.test(container.textContent ?? "")).toBe(false);
 
   mode = "updated";
-  await advanceSilentRefresh();
+  await advanceSilentRefresh(6000);
   expectTableLoaded(container, "gpt-updated");
 
   await act(async () => { root.unmount(); });
@@ -249,7 +278,7 @@ test("Logs: silent success clears a previous error; later silent failure keeps t
   expect(container.textContent).toContain("Could not load request logs.");
 
   mode = "ok";
-  await advanceSilentRefresh();
+  await advanceSilentRefresh(6000);
   expectTableLoaded(container, "gpt-test");
 
   mode = "fail-again";
@@ -263,10 +292,12 @@ test("Logs: silent success clears a previous error; later silent failure keeps t
 // recovers must not leave stale rows reading as current forever. Three consecutive failures
 // is the point where silence becomes a lie.
 test("Logs: a sustained poll outage says the rows are stale, and a recovery clears it", async () => {
+  const calls: string[] = [];
   let mode: "ok" | "fail" = "ok";
 
   globalThis.fetch = (async (input) => {
     const url = String(input);
+    calls.push(url);
     if (!url.includes("/api/logs")) return new Response(null, { status: 404 });
     if (mode === "fail") return jsonResponse({ error: "down" }, 503);
     return jsonResponse([sampleLog]);
@@ -280,11 +311,14 @@ test("Logs: a sustained poll outage says the rows are stale, and a recovery clea
   // Below the limit the rows stay quiet: a single dropped tick is not worth an alarm.
   await advanceSilentRefresh();
   expect(container.textContent).not.toContain("Could not load request logs.");
+  const afterFirstFailure = calls.filter(u => u.includes("/api/logs")).length;
   await advanceSilentRefresh();
+  expect(calls.filter(u => u.includes("/api/logs"))).toHaveLength(afterFirstFailure);
+  await advanceSilentRefresh(4000);
   expect(container.textContent).not.toContain("Could not load request logs.");
 
   // Third consecutive failure: the outage is not transient, so say so while keeping the rows.
-  await advanceSilentRefresh();
+  await advanceSilentRefresh(10000);
   expect(container.textContent).toContain("Could not load request logs.");
   expect(container.querySelector(".logs-table")).not.toBeNull();
   expect(container.textContent).toContain("gpt-test");
@@ -292,7 +326,7 @@ test("Logs: a sustained poll outage says the rows are stale, and a recovery clea
 
   // A recovered poll must retract the notice rather than leaving a permanent scar.
   mode = "ok";
-  await advanceSilentRefresh();
+  await advanceSilentRefresh(20000);
   expectTableLoaded(container, "gpt-test");
 
   await act(async () => { root.unmount(); });
@@ -437,8 +471,11 @@ test("Logs: attempt details render exact reasoning wire values without legacy pl
   await flushMicrotasks();
   const overviewReasoning = container.querySelector<HTMLElement>(".log-reasoning-cell");
   expect(overviewReasoning?.textContent).toContain("max → high");
-  expect(overviewReasoning?.textContent).toContain("reasoning_effort=high");
   expect(overviewReasoning?.textContent).not.toContain("max → high → high");
+  // The wire field left the table cell (it repeated the label and overflowed the column);
+  // it stays on the cell title and in the attempt rows below.
+  expect(overviewReasoning?.textContent).not.toContain("reasoning_effort=high");
+  expect(overviewReasoning?.getAttribute("title")).toBe("reasoning_effort=high");
   await act(async () => {
     container.querySelector<HTMLButtonElement>(".log-detail-btn")!.click();
   });
@@ -533,4 +570,3 @@ test("Logs: an intercepted helper row is badged and filterable", async () => {
 
   await act(async () => { root.unmount(); });
 });
-

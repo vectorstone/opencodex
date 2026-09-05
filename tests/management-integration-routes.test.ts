@@ -17,6 +17,7 @@ import {
 } from "../src/server/management/integration-routes";
 import type { OcxConfig } from "../src/types";
 import { catalogConvergenceFactory } from "./helpers/catalog-convergence";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * Route contract for devlog/_fin/260802_client_toggle_api/040 §6-§7.
@@ -104,7 +105,7 @@ beforeEach(() => {
 afterEach(() => {
   setIntegrationMutationFlightTestHooks(null);
   setIntegrationPathTestHooks(null);
-  rmSync(base, { recursive: true, force: true });
+  removeTreeWithRetry(base);
 });
 
 /** Hermes: installed by creating its home directory; YAML on disk. */
@@ -159,6 +160,15 @@ function put(clientId: string, enabled: boolean): Promise<Response> {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled }),
+  });
+}
+
+/** A toggle that also waives the conflict refusal. */
+function putOverwrite(clientId: string, body: Record<string, unknown>): Promise<Response> {
+  return api(`/api/client-integrations/${clientId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 
@@ -566,6 +576,68 @@ describe("refusals", () => {
     );
     expect(readFileSync(configPath, "utf8")).toBe(edited);
     expect(store.listOperations()).toHaveLength(journalBefore);
+  });
+
+  test("the same conflict is resolvable when the caller waives it by name", async () => {
+    const configPath = installHermes();
+    expect((await put("hermes", true)).status).toBe(200);
+    const edited = readFileSync(configPath, "utf8").replace(
+      "api_mode: chat_completions",
+      "api_mode: user_edited",
+    );
+    writeFileSync(configPath, edited);
+
+    // The plain enable is still refused: that is what makes the flag the only door.
+    expect((await put("hermes", true)).status).toBe(409);
+    expect(readFileSync(configPath, "utf8")).toBe(edited);
+
+    const forced = await putOverwrite("hermes", { enabled: true, overwriteConflict: true });
+    expect(forced.status).toBe(200);
+    expect(await forced.json()).toMatchObject({ ok: true, clientId: "hermes", state: "current" });
+    expect(readFileSync(configPath, "utf8")).not.toContain("api_mode: user_edited");
+
+    // Journaled under its own kind, so the rollback list does not call this an apply.
+    const operations = store.listOperations("hermes");
+    expect(operations[0]!.kind).toBe("overwrite");
+  });
+
+  test("an explicit false waiver is exactly a plain apply, and still refuses", async () => {
+    const configPath = installHermes();
+    expect((await put("hermes", true)).status).toBe(200);
+    const edited = readFileSync(configPath, "utf8").replace(
+      "api_mode: chat_completions",
+      "api_mode: user_edited",
+    );
+    writeFileSync(configPath, edited);
+
+    const response = await putOverwrite("hermes", { enabled: true, overwriteConflict: false });
+    expect(response.status).toBe(409);
+    expect(readFileSync(configPath, "utf8")).toBe(edited);
+  });
+
+  test("a non-boolean waiver is rejected, and disable can never carry one", async () => {
+    installHermes();
+    const nonBoolean = await putOverwrite("hermes", { enabled: true, overwriteConflict: "yes" });
+    expect(nonBoolean.status).toBe(400);
+    expect(await nonBoolean.json()).toEqual({
+      error: "overwriteConflict must be a boolean",
+      code: "invalid_overwrite_conflict",
+    });
+
+    /*
+     * Rejected rather than ignored. Forcing a DISABLE over a conflict is the
+     * deletion of unowned work this whole subsystem exists to prevent, so a
+     * caller sending the combination has misunderstood the field; answering 200
+     * would confirm an intent we refused.
+     */
+    const forcedDisable = await putOverwrite("hermes", { enabled: false, overwriteConflict: true });
+    expect(forcedDisable.status).toBe(400);
+    expect(await forcedDisable.json()).toEqual({
+      error: "overwriteConflict applies only to enabling an integration",
+      code: "invalid_overwrite_conflict",
+    });
+
+    expect(store.listOperations()).toHaveLength(0);
   });
 
   test("a write failure in a non-failure state keeps its own envelope", async () => {

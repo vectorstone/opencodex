@@ -30,7 +30,7 @@ import {
   clearAntigravityReplay,
   observeAntigravityReplay,
 } from "./google-antigravity-replay";
-import { resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
+import { canonicalAntigravityUsageModel, resolveAntigravityEffortWireModel } from "../providers/antigravity-models";
 import { googleVertexLocationConfigError } from "../providers/google-vertex-location";
 import { forgetThoughtSignatureForReplay, lookupReplayThoughtSignature } from "../responses/thought-signature-replay";
 import {
@@ -53,6 +53,53 @@ const GOOGLE_BREVITY_INSTRUCTION = [
   "- Prefer taking the next tool action over explaining; keep calling tools until the task is complete.",
   "- This applies only to intermediate progress text. Your final answer after the work is done is exempt: write it in full and at whatever length the task requires.",
 ].join("\n");
+
+const ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH =
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+/**
+ * CCA Flash generations that reject the Claude-Agent identity paragraph.
+ *
+ * Membership is probe-established per generation, never assumed: 3.7 and 3.8 both answer
+ * 429 RESOURCE_EXHAUSTED when this paragraph survives into `systemInstruction`, and 200 with
+ * it stripped — same account, seconds apart. A policy rejection wearing a quota error's
+ * clothing sends users hunting a quota problem that does not exist, so a new generation is
+ * added here only after the probe, and never dropped on the assumption that Google fixed it.
+ */
+const ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS = new Set([
+  "gemini-3.7-flash",
+  "gemini-3.8-flash",
+]);
+
+/**
+ * Whether CCA rejects the Claude-Agent identity paragraph for this request.
+ *
+ * Judged on the ROUTED WIRE id, not the selector, because three different selectors reach the
+ * same rejecting generation:
+ *
+ * - the collapsed base (`gemini-3.8-flash`);
+ * - a raw suffix id (`gemini-3.8-flash-high`), which the picker publishes whenever discovery
+ *   returns a PARTIAL ladder;
+ * - a RETIRED id (`gemini-3.6-flash`), which rule 0 redirects onto `gemini-3.7-flash-tiered`.
+ *
+ * That last one is why a selector-keyed test is not enough: retired ids deliberately keep their
+ * own identity for usage accounting, so they never canonicalize into the generation they
+ * actually call. A saved 3.6 selection was probed at 429 with the paragraph intact for exactly
+ * this reason. Matching on the wire id also means a future generation is covered by naming its
+ * wire spelling once, rather than every selector that can reach it.
+ */
+function rejectsClaudeSdkParagraph(modelId: string, wireModelId: string): boolean {
+  const canonicalWire = canonicalAntigravityUsageModel(wireModelId.replace(/-tiered$/, ""));
+  return ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS.has(canonicalWire)
+    || ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS.has(canonicalAntigravityUsageModel(modelId));
+}
+
+function stripAntigravityRejectedClaudeSdkParagraph(systemText: string): string {
+  return systemText
+    .split("\n\n")
+    .filter(paragraph => paragraph !== ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH)
+    .join("\n\n");
+}
 
 /**
  * Documented output ceiling for a Google-surface model, or `undefined` when the id is not
@@ -227,15 +274,19 @@ function geminiOrphanToolResultParts(msg: OcxToolResultMessage): unknown[] {
 function messagesToGeminiFormat(
   parsed: OcxParsedRequest,
   identityModelId: string,
+  stripRejectedClaudeSdkParagraph = false,
 ): { systemInstruction?: unknown; contents: unknown[]; replayedCallIds: string[] } {
   // Neutralize Codex's GPT-5 identity line (Gemini/Antigravity share this path) so a routed model
   // never misreports as GPT-5/OpenAI, and never leaks the proxy identity upstream.
   const toolCatalogNudge = buildNonOpenAIToolCatalogNudgeForTools(parsed.context.tools, parsed.options.toolChoice);
-  const systemText = identifyRoutedModel([
+  const identifiedSystemText = identifyRoutedModel([
     ...(parsed.context.systemPrompt ?? []),
     ...(toolCatalogNudge ? [toolCatalogNudge] : []),
     GOOGLE_BREVITY_INSTRUCTION,
   ].join("\n\n"), identityModelId);
+  const systemText = stripRejectedClaudeSdkParagraph
+    ? stripAntigravityRejectedClaudeSdkParagraph(identifiedSystemText)
+    : identifiedSystemText;
   const systemInstruction = { parts: [{ text: systemText }] };
 
   const contents: unknown[] = [];
@@ -733,7 +784,13 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           : resolveDirectGeminiWireModelId(parsed.modelId, provider.directGeminiWireRenames !== false);
       // AI Studio's `-tiered` spelling is wire-only; CCA aliases may migrate to another generation.
       const identityModelId = provider.googleMode === "cloud-code-assist" ? routedModelId : parsed.modelId;
-      const { systemInstruction, contents, replayedCallIds } = messagesToGeminiFormat(parsed, identityModelId);
+      const stripRejectedClaudeSdkParagraph = provider.googleMode === "cloud-code-assist"
+        && rejectsClaudeSdkParagraph(parsed.modelId, routedModelId);
+      const { systemInstruction, contents, replayedCallIds } = messagesToGeminiFormat(
+        parsed,
+        identityModelId,
+        stripRejectedClaudeSdkParagraph,
+      );
       lastInjectedCallIds = [...replayedCallIds];
       lastReasoningReplayScope = parsed._reasoningReplayScope;
       const tools = toolsToGeminiFormat(parsed);

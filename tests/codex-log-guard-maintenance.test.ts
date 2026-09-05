@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const roots: string[] = [];
 
@@ -37,7 +38,23 @@ function createLogsSchema(db: Database): void {
   `);
 }
 
-function fixture(options: { incremental?: boolean; withFreelist?: boolean } = {}) {
+/**
+ * A Codex home with a reclaimable logs database.
+ *
+ * `reclaimable: false` skips the 180 x 8 KiB blob fill and its checkpoint. That
+ * data exists so a reclaim has real freelist pages to move, which the refusal
+ * cases never reach: `compactCodexLogs` rejects on the process check before it
+ * opens the database for maintenance at all. Paying for it there is incidental
+ * cost, and it was the expensive kind -- the refusal case builds TWO fixtures and
+ * timed out at 71s against the 60s Windows ceiling while its siblings, which
+ * build one, finished in ~2s. Locally the same case takes 21ms, which is why the
+ * cost was invisible until the shard ran it under contention.
+ *
+ * Removing the dependency rather than raising the budget: the schema and the
+ * `auto_vacuum=INCREMENTAL` setting are what those tests actually need, and both
+ * stay.
+ */
+function fixture(options: { incremental?: boolean; withFreelist?: boolean; reclaimable?: boolean } = {}) {
   const root = makeRoot();
   const codexHome = join(root, "codex-home");
   mkdirSync(codexHome);
@@ -53,6 +70,10 @@ function fixture(options: { incremental?: boolean; withFreelist?: boolean } = {}
   );
   for (let i = 0; i < 12; i += 1) {
     logInsert.run(i + 1, i % 2 === 0 ? "INFO" : "TRACE", `target-${i % 3}`, `PRIVATE-${i}`, 32 + i);
+  }
+  if (options.reclaimable === false) {
+    db.close();
+    return { codexHome, databasePath };
   }
   const fill = db.query("INSERT INTO reclaim_fixture (id, body) VALUES (?, zeroblob(8192))");
   for (let i = 0; i < 180; i += 1) fill.run(i + 1);
@@ -96,7 +117,7 @@ function testDeps(codexHome: string, overrides: Record<string, unknown> = {}) {
 }
 
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) removeTreeWithRetry(root);
 });
 
 describe("Codex Log Guard reclaim", () => {
@@ -174,12 +195,13 @@ describe("Codex Log Guard reclaim", () => {
     expect(mod).not.toBeNull();
     if (!mod) return;
 
-    const running = fixture();
+    // Refused before any maintenance runs, so neither fixture needs reclaimable pages.
+    const running = fixture({ reclaimable: false });
     expect(mod.compactCodexLogs(testDeps(running.codexHome, {
       processCheck: () => ({ state: "ok" as const, processes: [{ pid: 42, commandLine: "codex exec" }] }),
     }))).toEqual({ ok: false, error: "codex_running" });
 
-    const unknown = fixture();
+    const unknown = fixture({ reclaimable: false });
     expect(mod.compactCodexLogs(testDeps(unknown.codexHome, {
       processCheck: () => ({ state: "unknown" as const, reason: "enumeration_failed" as const }),
     }))).toEqual({ ok: false, error: "process_enumeration_failed" });

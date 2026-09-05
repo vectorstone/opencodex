@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleManagementAPI } from "../src/server/management-api";
@@ -7,6 +7,7 @@ import { setIntegrationEnabled } from "../src/codex/desired-state";
 import { MANAGEMENT_JSON_BODY_MAX_BYTES } from "../src/server/management/body";
 import type { ManagementApiDeps } from "../src/server/management/context";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let root = "";
 let library = "";
@@ -87,7 +88,7 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousHome;
   if (previousLibrary === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
   else process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = previousLibrary;
-  rmSync(root, { recursive: true, force: true });
+  removeTreeWithRetry(root);
 });
 
 test("the native route advertises Claude Desktop and OFF persists intent before removal", async () => {
@@ -179,6 +180,26 @@ test("status reports leftover owned drift as not stale when the durable switch i
     drift: true,
     driftReason: "desired_off_gateway_selected",
   });
+});
+
+test("status reports a managed policy conflict as warning health and drift", async () => {
+  const response = await dispatch("/api/claude-desktop/status", undefined, {
+    probeClaudeDesktopPolicy: () => "present",
+  });
+  const body = await response!.json() as {
+    drift: boolean;
+    driftReason: string | null;
+    health: { ok: boolean; status: string; policy: { state: string; action: string } };
+  };
+
+  expect(body.health).toMatchObject({
+    ok: false,
+    status: "warning",
+    policy: { state: "present" },
+  });
+  expect(body.health.policy.action.length).toBeGreaterThan(0);
+  expect(body.drift).toBe(true);
+  expect(body.driftReason).toBe("managed_policy_present");
 });
 
 test("post-commit unsafe and incomplete refusals disclose desired OFF without contents", async () => {

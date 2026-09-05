@@ -24,7 +24,7 @@ ocx start --port 8080
 
 ### `ocx stop`
 
-停止正在运行的代理（按 PID），移除 PID 文件，并恢复原生 Codex。如果安装了受管后台服务，`ocx stop` 还会先停止该服务，这样它就无法重新拉起代理。Web 仪表盘中的 **Stop** 按钮也提供同样的操作（`POST /api/stop`）。
+停止正在运行的代理（按 PID），移除 PID 文件，并恢复原生 Codex。如果安装了受管后台服务，`ocx stop` 还会先停止该服务，这样它就无法重新拉起代理。Web 仪表盘的 **Stop** 按钮在多数后端执行同样的操作（`POST /api/stop`），但 Windows 任务计划程序除外：任务结束后包装器仍可能重新拉起代理，只有运行在代理之外的 stop 才能在恢复客户端配置前确认这个重启窗口，因此仪表盘会以 `respawnable_service` 拒绝、不做任何更改，并提示改用 `ocx stop`。
 
 ### `ocx restart`
 
@@ -123,7 +123,7 @@ ocx status --json
 
 通过无需认证的 `GET /readyz` 端点检查同步后的就绪状态。就绪时返回 `200`；状态为 `pending` 或
 终态 `failed` 时返回 `503`，并带有 `Retry-After: 1`。HTTP 仅返回经脱敏的身份字段
-`{service, version, uptime, pid, port, status}`。不支持 `/readyz` 的旧代理会按 `unreachable` 失败关闭；
+`{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}`。`protocol` 是 Hub 当前的远程协议版本，`minimumClientProtocol` 是兼容的最低客户端协议版本，`managementUrl` 是浏览器可见的规范管理 origin。不支持 `/readyz` 的旧代理会按 `unreachable` 失败关闭；
 `/healthz` 是独立的存活检查，不是就绪检查。默认只探测一次；`--wait` 会轮询到就绪或超时，但遇到终态
 `failed` 会立即退出。默认超时为 45 秒；`--timeout <seconds>` 必须与 `--wait` 一起使用，取值范围为 1–300 秒的正整数。CLI JSON
 输出 `{ready, status, pid, port}`，其中 `status` 为 `ready`、`pending`、`failed` 或
@@ -155,9 +155,9 @@ ocx status --json
 
 | 子命令 | 操作 |
 | --- | --- |
-| none | 服务不存在时安装并启动；已存在时不重新注册，直接刷新并重启。 |
+| none | 服务不存在时安装并启动；已存在时刷新并重启。正常的 Windows 任务计划程序定义会复用；过时定义可能会重新注册并需要提升权限。 |
 | `install` | 创建并启动服务。 |
-| `repair` | 就地刷新已安装的服务并重启，不重新注册。 |
+| `repair` | 就地刷新已安装的服务并重启。正常的 Windows 任务计划程序定义会复用；过时定义可能会重新注册并需要提升权限。 |
 | `restart` | `repair` 的别名。 |
 | `start` | 启动已安装的服务。 |
 | `stop` | 停止服务并恢复原生 Codex。 |
@@ -190,7 +190,7 @@ ocx service uninstall
 
 仅安装启动器并不能证明 Codex 请求会经过 OpenCodex。完成健康安装后，命令会检查当前 Codex 路由；当路由由外部配置、用户自有网关管理或无法验证时，会显示警告而不是绿色成功。若出站代理变量只存在于当前进程，而 `config.proxy` 未设置或无法解析，也会给出警告，因为 Codex 启动器和后台服务未必继承该环境。这些检查只读且绝不会打印代理值；在依赖自动启动前，请先处理提示的交接配置并运行 `ocx doctor`。
 
-如果已完成的外部 Codex 更新覆盖了已安装的 shim，下一次普通的 `ocx` 命令会先备份稳定的新启动器，再在分发前恢复 shim。仍在变动中的启动器会保持不动，并在稍后重试。修复失败只会警告，不会让所请求的命令失败；手动回退：`ocx codex-shim install`。将 `codexShimAutoRestore` 设为 `false`，或设置 `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`，即可在进程级别关闭自动恢复。
+如果已完成的外部 Codex 更新覆盖了已安装的 shim，下一次普通的 `ocx` 命令会先备份稳定的新启动器，再在分发前恢复 shim。零副作用的检查命令 `ocx system codex-cli-update check` 和保留的 `ocx system codex-cli-update` 命名空间中的无效调用都不会执行这项修复。仍在变动中的启动器会保持不动，并在稍后重试。修复失败只会警告，不会让所请求的命令失败；手动回退：`ocx codex-shim install`。将 `codexShimAutoRestore` 设为 `false`，或设置 `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`，即可在进程级别关闭自动恢复。
 
 | 子命令 | 操作 |
 | --- | --- |
@@ -221,6 +221,8 @@ ocx codex-shim uninstall
 
 ## 更新
 
+`ocx update` 更新的是 OpenCodex 本身，而不是 Codex CLI。请使用 [system 检查命令](/zh-cn/reference/cli/agents/)中的 `ocx system codex-cli-update check`，对已配置的 Codex CLI 候选项进行有界、只读的 provenance 检查。该命令不会查询 package registry，也不会安装更新。
+
 ### `ocx update [--tag latest|preview]`
 
 从 npm 自更新 opencodex。稳定版安装使用 `@latest`；预览版安装保持在 `@preview`，除非你传入 `--tag latest|preview`。它会检测源码检出，并提示你改为运行 `git pull && bun install`；如果你已经是该标签的最新版本，则不会执行任何操作。对于 npm 安装，它会在停止任何进程之前，对 Unix 缓存的所有权和访问权限执行有界检查。嵌套符号链接会通过 `lstat` 检查但不会跟随；Windows 会明确跳过这项仅适用于 Unix 的检查。检查失败时，更新会在托盘和代理仍运行的情况下中止。随后才会在替换文件之前停止正在运行的代理；已安装的服务会自动重建并启动，而前台安装则会打印 `ocx start` 作为下一步。持久化前，仪表板更新记录会隐去用户配置文件/缓存路径以及 UID/GID 值。
@@ -231,3 +233,7 @@ ocx update --tag preview
 ```
 
 当 [Release workflow](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml) 将新版本发布到 npm 时，这些新版本就会变得可用。
+
+## Remote Hub 客户端生命周期
+
+使用 `ocx connect <url> --pairing-code-stdin`、`ocx connect status`、`ocx sync` 和 `ocx connect rotate --pairing-code-stdin`。`ocx disconnect` 可离线恢复本地状态，但不会吊销 hub 密钥。仍连接时，`ocx connect revoke --admin-token-stdin` 会吊销已保存的 `apiKeyId`；断开后请使用 hub 的 **Integrations → API Keys**。密钥只能通过 stdin 传递，不能放入 argv。

@@ -1,4 +1,5 @@
 import type { AdapterEvent, OcxConfig, OcxUsage } from "../../types";
+import { sanitizeLogMetadataString } from "../../lib/redact";
 
 /**
  * Empty-completion guard for Responses turns (port of codex-router's
@@ -20,6 +21,21 @@ import type { AdapterEvent, OcxConfig, OcxUsage } from "../../types";
  * the previous relay behavior without editing the persisted config.
  */
 export const EMPTY_COMPLETION_RETRY_ENV = "OCX_EMPTY_COMPLETION_RETRY";
+
+/**
+ * The observability notice for a turn that ended empty with the retry guard off.
+ *
+ * Both labels are caller-supplied: the request names its provider and model. Interpolated raw,
+ * a model name carrying newlines or terminal escapes writes additional lines into whatever
+ * reads this warning, so a caller could forge log records it never produced. Both are reduced
+ * to bounded single-line metadata first.
+ */
+export function emptyCompletionNotice(providerName: unknown, modelId: unknown): string {
+  const provider = sanitizeLogMetadataString(providerName) ?? "unknown";
+  const model = sanitizeLogMetadataString(modelId) ?? "unknown";
+  return `[opencodex] ${provider}/${model} completed with no output text and no tool call. `
+    + "Set \"emptyCompletionRetry\": true to retry such turns once.";
+}
 
 /** Retained pre-content events are bounded independently by count and encoded size. */
 export const EMPTY_COMPLETION_MAX_BUFFERED_EVENTS = 1_024;
@@ -160,6 +176,9 @@ export function mergeUsage(
   const contextTotalTokens = second.contextTotalTokens ?? first.contextTotalTokens;
   const inputTokens = first.inputTokens + second.inputTokens;
   const outputTokens = first.outputTokens + second.outputTokens;
+  // The attempt that produced the content owns the raw wire usage (openai/codex#41980);
+  // an empty first attempt may still be the only one that saw it.
+  const rawUsage = second.rawUsage ?? first.rawUsage;
   return {
     inputTokens,
     outputTokens,
@@ -170,6 +189,7 @@ export function mergeUsage(
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
     ...(first.estimated || second.estimated ? { estimated: true } : {}),
+    ...(rawUsage !== undefined ? { rawUsage } : {}),
   };
 }
 

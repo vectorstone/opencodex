@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach, setDefaultTimeout } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -10,6 +10,7 @@ import {
   MANAGED_SUBAGENT_DEFAULT_MARKER,
 } from "../src/codex/subagent-defaults";
 import { SPAWN_BUDGET_MS } from "./helpers/test-budget";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 
@@ -48,6 +49,12 @@ function runRestore(codexHome: string, ocxHome: string): { stdout: string; statu
 }
 
 describe("injectCodexConfig integration (Design B)", () => {
+  const DESIGN_B_BLOCK = [
+    "# Auto-injected by opencodex",
+    'openai_base_url = "http://127.0.0.1:10100/v1"',
+    "# Auto-injected by opencodex",
+    'experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"',
+  ].join("\n");
   let codexHome: string;
   let ocxHome: string;
 
@@ -57,8 +64,57 @@ describe("injectCodexConfig integration (Design B)", () => {
   });
 
   afterEach(() => {
-    rmSync(codexHome, { recursive: true, force: true });
-    rmSync(ocxHome, { recursive: true, force: true });
+    removeTreeWithRetry(codexHome);
+    removeTreeWithRetry(ocxHome);
+  });
+
+  test("remote target validate-only writes nothing; commit journals client ownership and restores exact preimage", () => {
+    const original = '# remote baseline\nmodel_provider = "openai"\n';
+    writeFileSync(join(codexHome, "config.toml"), original, "utf8");
+    const script = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { injectCodexConfig } = require("./src/codex/inject");
+      const { journalOwner, restoreJournalState } = require("./src/codex/journal");
+      const target = { baseUrl: "https://hub.example.test/v1", requiresAdmissionToken: true, tokenEnv: "OPENCODEX_API_AUTH_TOKEN" };
+      (async () => {
+        const configPath = path.join(process.env.CODEX_HOME, "config.toml");
+        const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+        const before = fs.readFileSync(configPath, "utf8");
+        const preflight = await injectCodexConfig(10100, { syncResumeHistory: false }, {
+          validateOnly: true, routingTarget: target, catalogPath: null,
+          journalOwner: { kind: "client", apiKeyId: "client-key-1" },
+        });
+        const afterPreflight = fs.readFileSync(configPath, "utf8");
+        const journalAfterPreflight = fs.existsSync(journalPath);
+        const committed = await injectCodexConfig(10100, { syncResumeHistory: false }, {
+          routingTarget: target, catalogPath: null,
+          journalOwner: { kind: "client", apiKeyId: "client-key-1" },
+        });
+        const injected = fs.readFileSync(configPath, "utf8");
+        const owner = journalOwner();
+        const restored = restoreJournalState();
+        console.log(JSON.stringify({ preflight, committed, before, afterPreflight, journalAfterPreflight, injected, owner, restored, final: fs.readFileSync(configPath, "utf8") }));
+      })();
+    `;
+    const result = spawnSync(process.execPath, ["--eval", script], {
+      cwd: repoRoot,
+      env: { ...process.env, CODEX_HOME: codexHome, OPENCODEX_HOME: ocxHome },
+      encoding: "utf8",
+      timeout: SPAWN_BUDGET_MS - 5_000,
+    });
+    expect(result.status).toBe(0);
+    const value = JSON.parse(result.stdout.trim());
+    expect(value.preflight.success).toBe(true);
+    expect(value.before).toBe(original);
+    expect(value.afterPreflight).toBe(original);
+    expect(value.journalAfterPreflight).toBe(false);
+    expect(value.committed.success).toBe(true);
+    expect(value.injected).toContain('base_url = "https://hub.example.test/v1"');
+    expect(value.injected).toContain('env_key = "OPENCODEX_API_AUTH_TOKEN"');
+    expect(value.owner).toEqual({ kind: "client", apiKeyId: "client-key-1" });
+    expect(value.restored.complete).toBe(true);
+    expect(value.final).toBe(original);
   });
 
   test("upgrade path: a legacy-injected config converts to the Design B form in one inject", () => {
@@ -88,8 +144,9 @@ describe("injectCodexConfig integration (Design B)", () => {
     expect(config).not.toContain("[model_providers.opencodex]");
     expect(config).not.toContain('model_provider = "opencodex"');
     expect(config).toContain('model = "gpt-5.5"');
-    // Exactly one marker survives (the Design B one) — no duplicate accumulation.
-    expect(config.match(/Auto-injected by opencodex/g)?.length).toBe(1);
+    // Exactly the Design B markers survive (routing + realtime sideband) — no accumulation.
+    expect(config.match(/Auto-injected by opencodex/g)?.length).toBe(2);
+    expect(config).toContain(DESIGN_B_BLOCK);
   });
 
   test("upgrade path: a non-loopback legacy env_http_headers config converts to env_key (#2073)", () => {
@@ -126,8 +183,135 @@ describe("injectCodexConfig integration (Design B)", () => {
     const second = readFileSync(join(codexHome, "config.toml"), "utf8");
 
     expect(second.match(/openai_base_url/g)?.length).toBe(1);
-    expect(second.match(/Auto-injected by opencodex/g)?.length).toBe(1);
+    expect(second.match(/Auto-injected by opencodex/g)?.length).toBe(2);
     expect(second).toBe(first);
+    // Voice sideband override rides along with the routing override (#35830 regression).
+    expect(second.match(/experimental_realtime_ws_base_url/g)?.length).toBe(1);
+    expect(second).toContain('experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"');
+  });
+
+  describe("realtime sideband override (openai/codex #35830 regression)", () => {
+    const proxyUrl = "http://127.0.0.1:10100/v1";
+
+    test("inject writes it under the marker block, journals it, and restore removes both keys", () => {
+      writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      const config = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(config).toContain(DESIGN_B_BLOCK);
+      const journal = JSON.parse(readFileSync(join(codexHome, "opencodex-journal.json"), "utf8"));
+      expect(journal.injectedOpenaiBaseUrl).toBe(proxyUrl);
+      expect(journal.injectedRealtimeWsBaseUrl).toBe(proxyUrl);
+
+      expect(runRestore(codexHome, ocxHome).status).toBe(0);
+      const restored = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(restored).not.toContain("openai_base_url");
+      expect(restored).not.toContain("experimental_realtime_ws_base_url");
+      expect(restored).toContain('model = "gpt-5.5"');
+    });
+
+    test("a user-owned override survives injection and restore, even when it equals the proxy URL", () => {
+      const original = [
+        `experimental_realtime_ws_base_url = "${proxyUrl}"`,
+        'model = "gpt-5.5"',
+        "",
+      ].join("\n");
+      writeFileSync(join(codexHome, "config.toml"), original, "utf8");
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      const config = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(config).toContain(`openai_base_url = "${proxyUrl}"`);
+      expect(config.match(/experimental_realtime_ws_base_url/g)?.length).toBe(1);
+      const journal = JSON.parse(readFileSync(join(codexHome, "opencodex-journal.json"), "utf8"));
+      expect(journal.injectedOpenaiBaseUrl).toBe(proxyUrl);
+      expect(journal.injectedRealtimeWsBaseUrl).toBeNull();
+
+      // Simulate the Codex app reserializing config.toml (values kept, comments dropped) so
+      // restore has to rely on journaled value evidence: the routing URL is ours, the
+      // realtime override is not, even though the two strings are identical.
+      const rewritten = readFileSync(join(codexHome, "config.toml"), "utf8")
+        .split("\n").filter(line => !line.startsWith("#")).join("\n");
+      writeFileSync(join(codexHome, "config.toml"), rewritten, "utf8");
+      expect(runRestore(codexHome, ocxHome).status).toBe(0);
+      const restored = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(restored).not.toContain("openai_base_url");
+      expect(restored).toContain(`experimental_realtime_ws_base_url = "${proxyUrl}"`);
+    });
+
+    test("an app-reserialized routed config is not mistaken for the user's native baseline on re-inject", () => {
+      writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      const journalPath = join(codexHome, "opencodex-journal.json");
+      const firstSnapshot = JSON.parse(readFileSync(journalPath, "utf8")).originalConfig;
+
+      const rewritten = readFileSync(join(codexHome, "config.toml"), "utf8")
+        .split("\n").filter(line => !line.startsWith("#")).join("\n");
+      writeFileSync(join(codexHome, "config.toml"), rewritten, "utf8");
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      expect(JSON.parse(readFileSync(journalPath, "utf8")).originalConfig).toBe(firstSnapshot);
+      const config = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(config.match(/openai_base_url/g)?.length).toBe(1);
+      expect(config.match(/experimental_realtime_ws_base_url/g)?.length).toBe(1);
+
+      expect(runRestore(codexHome, ocxHome).status).toBe(0);
+      expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe('model = "gpt-5.5"\n');
+    });
+
+    test("a user-owned openai_base_url means no realtime override is injected either", () => {
+      const original = 'openai_base_url = "https://my-own-gateway.example/v1"\nmodel = "gpt-5.5"\n';
+      writeFileSync(join(codexHome, "config.toml"), original, "utf8");
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      expect(readFileSync(join(codexHome, "config.toml"), "utf8")).not.toContain("experimental_realtime_ws_base_url");
+    });
+
+    test("provider-table forms (non-loopback admission, authless Desktop) do not write it", () => {
+      writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+      expect(runInject(codexHome, ocxHome, JSON.stringify({ hostname: "192.168.1.20" })).status).toBe(0);
+      expect(readFileSync(join(codexHome, "config.toml"), "utf8")).not.toContain("experimental_realtime_ws_base_url");
+      expect(runRestore(codexHome, ocxHome).status).toBe(0);
+
+      writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+      expect(runInject(codexHome, ocxHome, JSON.stringify({ codexDesktopAuthless: true })).status).toBe(0);
+      expect(readFileSync(join(codexHome, "config.toml"), "utf8")).not.toContain("experimental_realtime_ws_base_url");
+    });
+
+    test("an app-reserialized Design B config switching to a provider-table form drops our root URLs", () => {
+      // Comment-dropping rewrite, then the operator turns on authless Desktop (provider-table
+      // form). Our old root URLs must not survive as if the user had written them.
+      writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      const rewritten = readFileSync(join(codexHome, "config.toml"), "utf8")
+        .split("\n").filter(line => !line.startsWith("#")).join("\n");
+      writeFileSync(join(codexHome, "config.toml"), rewritten, "utf8");
+
+      expect(runInject(codexHome, ocxHome, JSON.stringify({ codexDesktopAuthless: true })).status).toBe(0);
+      const table = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(table).toContain("requires_openai_auth = false");
+      expect(table).not.toContain("openai_base_url");
+      expect(table).not.toContain("experimental_realtime_ws_base_url");
+
+      expect(runRestore(codexHome, ocxHome).status).toBe(0);
+      expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe('model = "gpt-5.5"\n');
+    });
+
+    test("CRLF config: re-inject keeps both keys single and CRLF-pure; restore removes both", () => {
+      writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\r\n\r\n[features]\r\nfast_mode = true\r\n', "utf8");
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      expect(runInject(codexHome, ocxHome).status).toBe(0);
+      const config = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(config).not.toContain("\n\n\n");
+      expect(config.match(/openai_base_url/g)?.length).toBe(1);
+      expect(config.match(/experimental_realtime_ws_base_url/g)?.length).toBe(1);
+      expect(config.match(/Auto-injected by opencodex/g)?.length).toBe(2);
+      expect(config).toContain('openai_base_url = "http://127.0.0.1:10100/v1"');
+      expect(config).toContain('experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"');
+      expect(config.includes("\r\n")).toBe(true);
+      expect(config.replace(/\r\n/g, "").includes("\n")).toBe(false);
+
+      expect(runRestore(codexHome, ocxHome).status).toBe(0);
+      const restored = readFileSync(join(codexHome, "config.toml"), "utf8");
+      expect(restored).not.toContain("openai_base_url");
+      expect(restored).not.toContain("experimental_realtime_ws_base_url");
+      expect(restored).toContain("fast_mode = true");
+    });
   });
 
   test.each([
@@ -650,6 +834,60 @@ describe("injectCodexConfig integration (Design B)", () => {
     expect(message).toContain("http://192.168.1.20:10100/v1");
     expect(message).toContain("x-opencodex-api-key from OPENCODEX_API_AUTH_TOKEN");
     expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe(original);
+  });
+
+  test("authless Desktop opt-in (#1107): loopback injects the table with requires_openai_auth = false, idempotently", () => {
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+
+    const r = runInject(codexHome, ocxHome, JSON.stringify({ codexDesktopAuthless: true }));
+    expect(r.status).toBe(0);
+    const payload = JSON.parse(r.stdout);
+    expect(payload.success).toBe(true);
+    expect(String(payload.message)).toContain("authless Desktop mode");
+
+    const first = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(first).toContain('model_provider = "opencodex"');
+    expect(first).toContain("[model_providers.opencodex]");
+    expect(first).toContain('base_url = "http://127.0.0.1:10100/v1"');
+    expect(first).toContain("requires_openai_auth = false");
+    expect(first).not.toContain("env_key");
+    expect(first).not.toContain("openai_base_url");
+
+    expect(runInject(codexHome, ocxHome, JSON.stringify({ codexDesktopAuthless: true })).status).toBe(0);
+    expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe(first);
+    expect(readFileSync(join(codexHome, "opencodex.config.toml"), "utf8")).toContain("requires_openai_auth = false");
+  });
+
+  test("authless Desktop opt-in: turning it off restores Design B on the next inject, and restore strips it", () => {
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+
+    expect(runInject(codexHome, ocxHome, JSON.stringify({ codexDesktopAuthless: true })).status).toBe(0);
+    expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toContain("requires_openai_auth = false");
+
+    expect(runInject(codexHome, ocxHome).status).toBe(0);
+    const back = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(back).toContain('openai_base_url = "http://127.0.0.1:10100/v1"');
+    expect(back).not.toContain("[model_providers.opencodex]");
+    expect(back).not.toContain('model_provider = "opencodex"');
+    expect(back.match(/Auto-injected by opencodex/g)?.length).toBe(2);
+    expect(back).toContain(DESIGN_B_BLOCK);
+
+    expect(runInject(codexHome, ocxHome, JSON.stringify({ codexDesktopAuthless: true })).status).toBe(0);
+    expect(runRestore(codexHome, ocxHome).status).toBe(0);
+    const restored = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(restored).not.toContain("opencodex");
+    expect(restored).toContain('model = "gpt-5.5"');
+  });
+
+  test("authless Desktop opt-in never weakens non-loopback admission", () => {
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+
+    const r = runInject(codexHome, ocxHome, JSON.stringify({ hostname: "192.168.1.20", codexDesktopAuthless: true }));
+    expect(r.status).toBe(0);
+    const config = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(config).toContain("requires_openai_auth = true");
+    expect(config).toContain('env_key = "OPENCODEX_API_AUTH_TOKEN"');
+    expect(config).not.toContain("requires_openai_auth = false");
   });
 
   test("non-loopback hostname still uses the legacy provider-table injection", () => {

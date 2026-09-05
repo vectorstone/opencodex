@@ -8,14 +8,29 @@
 /*
   The catalog wants a wider column than the 980px default.
 
-  Scoped to a VISIBLE catalog panel, not merely a present one: panels mount lazily and
-  then stay mounted so drafts survive a tab hop, so a bare `:has(.models-workspace-shell)`
-  keeps matching after the catalog has been opened once. Routing would then render at
-  980px on a direct visit and 1200px afterwards — a width that depends on browsing
-  history. No surface renders the shell outside a tabpanel any more, so the old
-  direct-child arm is gone with the standalone pages it served.
+  Scoped to the VISIBLE catalog panel by its id: `#models-panel-catalog:not([hidden])` is
+  true only while catalog is the active tab (an inactive panel carries `hidden`), so this
+  never leaks onto another tab even though panels stay mounted after their first visit.
+
+  It deliberately does NOT also require `.models-workspace-shell`: the shell is absent
+  while the catalog is loading (skeleton) or after a cold failure (error notice), so gating
+  on it dropped the width back to 980px in those states and snapped it to 1200px only once
+  data arrived — the catalog tab's size was not fixed. The panel-id test alone holds the
+  width steady across load, empty, and error, matching the routing rule below.
 */
-.main-inner:has(#models-panel-catalog:not([hidden]) .models-workspace-shell) {
+.main-inner:has(#models-panel-catalog:not([hidden])) {
+  max-width: 1200px;
+}
+
+/*
+  Routing shares the catalog/compatibility 1200px column so hopping between the Models
+  tabs never resizes the page. Scoped to the VISIBLE routing panel for the same reason
+  the catalog rule is: panels stay mounted after their first visit, so an unscoped `:has`
+  would leak this width onto whatever tab is open. Without this rule routing fell back to
+  the 980px `.main-inner` default — a visible width jump on every hop to it, and one that
+  only appeared once the compatibility tab's own `:has(.lab-page)` had leaked 1200px in.
+*/
+.main-inner:has(#models-panel-routing:not([hidden])) {
   max-width: 1200px;
 }
 
@@ -274,6 +289,31 @@
   min-width: 0;
 }
 
+/* Every child, not an enumerated list. Four earlier designs bounded this row by naming
+   the children that could overflow it (name, then alias chip, then the count and
+   badge), and each revision found another one; a child added later would have
+   reintroduced the defect silently. Quantifying over the children instead: min-width:0
+   removes the automatic min-content floor that stops a flex child shrinking, and the
+   ellipsis makes that shrink legible instead of clipped. Covers every ELEMENT child; a
+   bare interpolated string would become an anonymous flex item no selector can reach,
+   so keep this button's children element-wrapped. */
+.models-provider-toggle > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The one exemption, and not a return to enumerating children: every other child is
+   TEXT, whose overflow the ellipsis makes legible. The chevron is an icon at a fixed
+   14px with nothing to truncate, so shrinking it destroys the collapse affordance
+   instead of abbreviating it. Selected by element TYPE, so a future icon child inherits
+   it without being named. Measured: without this, the adversarial stress row rendered
+   the chevron at 2.5px while the containment check still reported success. */
+.models-provider-toggle > svg {
+  flex: none;
+}
+
 .models-provider-actions {
   margin-left: auto;
   flex-wrap: wrap;
@@ -282,6 +322,69 @@
   gap: var(--space-2);
   min-width: 0;
   max-width: 100%;
+}
+
+/* ── Cap cluster (040) ──
+   The provider-wide context window is one setting wearing three sibling controls.
+   This groups them visually: the gap is tighter than the row own var(--space-2),
+   which is what makes the trio read as one control instead of three.
+
+   Grouping only, never a functional merge. The per-model overrides button opens a
+   different SCOPE than the switch and select, which are the provider-wide default,
+   so all three keep their own tab stop.
+
+   flex-wrap is load-bearing, not tidiness. As one flex item of a wrapping actions
+   row the cluster can be squeezed, and its children do not shrink: the labeled
+   switch is flex: 0 0 auto, .btn is white-space: nowrap, the Select is inline-block.
+   A nowrap cluster would overflow, and .models-provider-card is overflow: hidden, so
+   the clip would be swallowed silently while a page-level scrollWidth === clientWidth
+   assertion still passed. Wrapping prevents that; a min-width floor would be the
+   child-floor design 011 killed. */
+.models-cap-cluster {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* ── Alias-edit emphasis (050) ──
+   The user asked for a hover affordance. Two independent audits rejected the first
+   reading of that — hover that GATES, controls hidden until the pointer arrives —
+   because it deletes the pencil, the alias-defaults switch and custom-add from the
+   default visual inventory and worsens the exact opacity 020 exists to fix. What is
+   left is emphasis on the ONE genuinely secondary control: a provider alias is set
+   once and then left alone.
+
+   Every state below is written at the SAME 0,3,0 specificity as the resting rule.
+   The audit caught the earlier draft writing the overrides at 0,2,0, which meant a
+   (hover: none) device kept the dim forever and :focus-visible was a no-op — the two
+   failures those rules exist to prevent.
+
+   Rest is 0.75, not the drafted 0.65: .btn:disabled is opacity 0.55, so a deeper dim
+   reads as maybe-disabled. Contrast is not the constraint — 0.65 already cleared
+   1.4.11's 3:1 in both themes — legibility of INTENT is. */
+.models-provider-actions .btn-ghost.models-alias-edit {
+  opacity: 0.75;
+  transition: opacity var(--motion-fast);
+}
+.models-provider-head:hover .models-provider-actions .btn-ghost.models-alias-edit,
+.models-provider-head:focus-within .models-provider-actions .btn-ghost.models-alias-edit,
+.models-provider-actions .btn-ghost.models-alias-edit:focus-visible {
+  opacity: 1;
+}
+/* A pointer that cannot hover never triggers the emphasis rule, so the resting dim
+   would be permanent. Full contrast is the resting state there. */
+@media (hover: none) {
+  .models-provider-actions .btn-ghost.models-alias-edit {
+    opacity: 1;
+  }
+}
+/* Reduced motion removes the ANIMATION, never the emphasis: the contrast change is
+   information, the fade is decoration. */
+@media (prefers-reduced-motion: reduce) {
+  .models-provider-actions .btn-ghost.models-alias-edit {
+    transition: none;
+  }
 }
 
 /* ── Spacing rhythm (tight within clusters, loose between sections) ──

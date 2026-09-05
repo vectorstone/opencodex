@@ -12,7 +12,7 @@ import { CLI_COMMANDS } from "./registry";
 import { isValidProviderName } from "../config/provider-name";
 import type { CliHead } from "./root";
 import type { ReadyArgs } from "./ready";
-import type { LiveProxy } from "../server/proxy-liveness";
+import type { LivenessIo, LiveProxy } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 import { hasHelpFlag, printSubcommandUsage, printUsage } from "./help";
 import { setIntegrationEnabled, shouldSyncCodexOnStart } from "../codex/desired-state";
@@ -23,13 +23,14 @@ import { stripGrokConfig } from "../grok/inject";
 import { afterCatalogWriteHandleAppServers } from "../codex/app-server-processes";
 import { normalizeUpdateChannel, runGuiUpdateWorker } from "../update/job";
 import { isJsonOption, takeFlag } from "./runtime-api";
+import type { ClientConnectionState } from "../client/state";
 
 export interface CliDispatchDeps {
   args: string[];
   command: string | undefined;
   head: CliHead;
   loadConfig: () => OcxConfig;
-  findLiveProxy: () => Promise<LiveProxy | null>;
+  findLiveProxy: (io?: LivenessIo) => Promise<LiveProxy | null>;
   probeHostname: (hostname: string | undefined) => string;
   waitForProxy: (timeoutMs?: number) => Promise<LiveProxy | null>;
   startArgv: (port?: number) => string[];
@@ -59,6 +60,13 @@ const commandRunners: Record<string, CommandRunner> = {
     return Number(process.exitCode ?? 0);
   },
   start: async deps => {
+    const { readClientConnectionState } = await import("../client/state");
+    const clientState = readClientConnectionState();
+    await reconcileClientJournalBeforeLifecycle(clientState);
+    if (clientState.kind === "invalid" || clientState.kind === "mismatched") {
+      console.error(`Client state is ${clientState.kind}: ${clientState.reason}`);
+      return 1;
+    }
     await deps.handleStart();
     return Number(process.exitCode ?? 0);
   },
@@ -121,14 +129,31 @@ const commandRunners: Record<string, CommandRunner> = {
     if (desired.status === "unchanged") {
       const { classifyNativeRoutedResidue } = await import("../codex/native-residue");
       if (classifyNativeRoutedResidue().kind === "clean") {
-        const alreadyOff = "Codex integration is already OFF and native; no Codex files changed.";
+        // The Codex half being a no-op says nothing about the Grok half. Returning here
+        // without stripping the fence meant `ocx restore` could report success while Grok
+        // still pointed at a stopped proxy — and the deferred-teardown recovery path
+        // (#3008) tells operators to run exactly this command before deleting a receipt,
+        // so the incomplete teardown would be signed off and the obligation erased.
+        let grokNote = "";
+        let grokCode = 0;
+        try {
+          const g = stripGrokConfig();
+          if (g.changed) grokNote = ` ${g.message}`;
+          else if (!g.ok) { grokNote = ` Grok config cleanup failed: ${g.message}`; grokCode = 1; }
+        } catch (err) {
+          grokNote = ` Grok config cleanup failed: ${err instanceof Error ? err.message : String(err)}`;
+          grokCode = 1;
+        }
+        const alreadyOff = `Codex integration is already OFF and native; no Codex files changed.${grokNote}`;
         if (restoreJson) {
           const { skippedRestoreEnvelope } = await import("../codex/inject");
-          console.log(JSON.stringify(skippedRestoreEnvelope(true, alreadyOff)));
-        } else {
+          console.log(JSON.stringify(skippedRestoreEnvelope(grokCode === 0, alreadyOff)));
+        } else if (grokCode === 0) {
           console.log(alreadyOff);
+        } else {
+          console.error(alreadyOff);
         }
-        return 0;
+        return grokCode;
       }
     }
     let r: { success: boolean; message: string };
@@ -137,26 +162,40 @@ const commandRunners: Record<string, CommandRunner> = {
     } catch (err) {
       r = { success: false, message: err instanceof Error ? err.message : String(err) };
     }
+    // Grok BEFORE either output. The JSON path used to return here, so `ocx restore --json`
+    // (and `ocx eject --json`, the same runner) could report success while the fence still
+    // pointed at the stopped proxy — and the deferred-teardown recovery on this branch
+    // tells operators to run exactly this before deleting a receipt (#3008).
+    let grokFailure: string | null = null;
+    let grokChangedMessage: string | null = null;
+    try {
+      const g = stripGrokConfig();
+      if (g.changed) grokChangedMessage = g.message;
+      else if (!g.ok) grokFailure = g.message;
+    } catch (err) {
+      grokFailure = err instanceof Error ? err.message : String(err);
+    }
     if (restoreJson) {
       // Spawned callers need the artifact-level result to distinguish a busy
       // history worker from a successful native restore. Keep stdout machine
-      // readable; human framing remains the default command contract.
-      console.log(JSON.stringify(r));
-      return r.success ? 0 : 1;
+      // readable — the Codex artifact schema is unchanged; the Grok outcome is
+      // folded into success/message so a caller cannot read a half teardown as done.
+      const message = grokFailure
+        ? `${r.message} Grok config cleanup failed: ${grokFailure}`
+        : grokChangedMessage ? `${r.message} ${grokChangedMessage}` : r.message;
+      console.log(JSON.stringify({ ...r, success: r.success && !grokFailure, message }));
+      return r.success && !grokFailure ? 0 : 1;
     }
     if (r.success) console.log(`✅ ${r.message}`);
     else {
       console.error(`⚠️  ${r.message}`);
     }
     let code = r.success ? 0 : 1;
-    try {
-      const g = stripGrokConfig();
-      if (g.changed) console.log(`✅ ${g.message}`);
-      else if (!g.ok) {
-        console.error(`⚠️  ${g.message}`);
-        code = 1;
-      }
-    } catch { /* best-effort */ }
+    if (grokChangedMessage) console.log(`✅ ${grokChangedMessage}`);
+    if (grokFailure) {
+      console.error(`⚠️  ${grokFailure}`);
+      code = 1;
+    }
     if (r.success) {
       console.log("Codex integration is OFF and plain `codex` now runs natively. Switch back with: ocx restore back");
     } else {
@@ -214,6 +253,15 @@ const commandRunners: Record<string, CommandRunner> = {
     return 0;
   },
   ensure: async deps => {
+    const { readClientConnectionState } = await import("../client/state");
+    const clientState = readClientConnectionState();
+    await reconcileClientJournalBeforeLifecycle(clientState);
+    if (clientState.kind !== "disconnected") {
+      console.error(clientState.kind === "connected"
+        ? "Client mode does not start a local provider proxy; use 'ocx sync'."
+        : `Client state is ${clientState.kind}: ${clientState.reason}`);
+      return 1;
+    }
     await deps.handleEnsure();
     return Number(process.exitCode ?? 0);
   },
@@ -286,6 +334,31 @@ const commandRunners: Record<string, CommandRunner> = {
     // Separate flag on purpose: --restart-codex promises app-server-only scope,
     // and quitting the desktop app ends live conversations.
     const restartDesktopApp = syncArgs.includes("--restart-desktop-app");
+    const { readClientConnectionState } = await import("../client/state");
+    const clientState = readClientConnectionState();
+    if (clientState.kind === "invalid" || clientState.kind === "mismatched") {
+      console.error(`Client state is ${clientState.kind}: ${clientState.reason}`);
+      return 1;
+    }
+    if (clientState.kind === "connected") {
+      try {
+        const { syncConnectedClient } = await import("../client/connect");
+        const result = await syncConnectedClient({ restartCodex });
+        console.log(result.stale
+          ? "Hub unavailable; retained and applied the last-known-good remote catalog (stale)."
+          : "Remote hub catalog synchronized.");
+        await handleConnectedSyncCatalogWrite(result, restartCodex, restartDesktopApp);
+        // `process.exitCode` rather than a literal 0, for the same reason every other
+        // runner does it (tests/cli-transport-honesty.test.ts): the catalog-write helper
+        // drives app-server restarts, and one of those recording a failure must not be
+        // erased by the value this runner returns. It reads 0 on the ordinary path. Node
+        // types it as `number | string`; only a numeric code means anything here.
+        return typeof process.exitCode === "number" ? process.exitCode : 0;
+      } catch (error) {
+        console.error(`Connected sync failed without local fallback: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+    }
     const live = await deps.findLiveProxy();
     const synced = await syncModelsToCodex(
       live?.port,
@@ -340,6 +413,14 @@ const commandRunners: Record<string, CommandRunner> = {
   v2: async deps => {
     const { cmdV2 } = await import("./v2");
     return await cmdV2(deps.args.slice(1), {}, async () => (await deps.findLiveProxy())?.port);
+  },
+  connect: async deps => {
+    const { handleConnectCommand } = await import("./connect");
+    return await handleConnectCommand(deps.args.slice(1));
+  },
+  disconnect: async deps => {
+    const { handleDisconnectCommand } = await import("./connect");
+    return await handleDisconnectCommand(deps.args.slice(1));
   },
   "sync-cache": async deps => {
     const cacheArgs = deps.args.slice(1);
@@ -420,27 +501,34 @@ const commandRunners: Record<string, CommandRunner> = {
     return ok ? 0 : 1;
   },
   gui: async deps => {
-    const config = deps.loadConfig();
-    // Identity-checked liveness (not the pid file + a fixed sleep): finds a fallback-port
-    // proxy and waits until the spawned one actually answers before opening the browser.
-    let live = await deps.findLiveProxy();
-    if (!live) {
-      console.log("Proxy not running. Starting...");
-      deps.spawnDetached(deps.startArgv((config.port ?? 10100) > 0 ? (config.port ?? 10100) : undefined));
-      live = await deps.waitForProxy();
-      if (!live) {
-        console.error("❌ Proxy did not become healthy after starting. Not opening the GUI.");
-        return 1;
-      }
-    }
-    // Open the host the proxy actually binds — `localhost` only answers for
-    // loopback/wildcard binds, not a concrete LAN/IPv6 hostname.
-    const guiHost = deps.probeHostname(live?.hostname ?? config.hostname);
-    const guiUrl = `http://${guiHost === "127.0.0.1" ? "localhost" : guiHost}:${live?.port ?? config.port}`;
-    console.log(`Opening ${guiUrl}`);
-    const { openUrl } = await import("../lib/open-url");
-    openUrl(guiUrl);
-    return 0;
+    const { runGuiCommand } = await import("./gui");
+    return runGuiCommand(deps.args.slice(1), {
+      loadConfig: deps.loadConfig,
+      findLiveProxy: deps.findLiveProxy,
+      openDefaultGui: async () => {
+        const config = deps.loadConfig();
+        // Identity-checked liveness (not the pid file + a fixed sleep): finds a fallback-port
+        // proxy and waits until the spawned one actually answers before opening the browser.
+        let live = await deps.findLiveProxy();
+        if (!live) {
+          console.log("Proxy not running. Starting...");
+          deps.spawnDetached(deps.startArgv((config.port ?? 10100) > 0 ? (config.port ?? 10100) : undefined));
+          live = await deps.waitForProxy();
+          if (!live) {
+            console.error("❌ Proxy did not become healthy after starting. Not opening the GUI.");
+            return 1;
+          }
+        }
+        // Open the host the proxy actually binds — `localhost` only answers for
+        // loopback/wildcard binds, not a concrete LAN/IPv6 hostname.
+        const guiHost = deps.probeHostname(live?.hostname ?? config.hostname);
+        const guiUrl = `http://${guiHost === "127.0.0.1" ? "localhost" : guiHost}:${live?.port ?? config.port}`;
+        console.log(`Opening ${guiUrl}`);
+        const { openUrl } = await import("../lib/open-url");
+        openUrl(guiUrl);
+        return 0;
+      },
+    });
   },
   service: async deps => {
     process.exitCode = 0;
@@ -542,7 +630,12 @@ const commandRunners: Record<string, CommandRunner> = {
   health: async deps => {
     const healthArgs = deps.args.slice(1);
     const wantsHealthJson = healthArgs.includes("--json");
-    const live = await deps.findLiveProxy();
+    // A proxy that has only just bound can miss a single probe while its event loop
+    // is still settling startup work — the same just-started race the stop paths
+    // already retry for (#764, SERVICE_STOP_LIVENESS). Without this, `ocx health`
+    // run seconds after a service restart reports a false negative on a proxy that
+    // is in fact serving.
+    const live = await deps.findLiveProxy({ attempts: 3 });
     if (wantsHealthJson) {
       console.log(JSON.stringify({ ok: !!live, pid: live?.pid ?? null, port: live?.port ?? null }));
     } else {
@@ -743,6 +836,34 @@ export const DISPATCH_ALIASES: ReadonlyMap<string, string> = aliasTargets;
 
 /** Resolve the runner key for a command, following registry aliases to the
  * canonical runner. Returns undefined when the command is unknown. */
+/** What `handleStart` does about a live proxy it found before binding. */
+export type StartOwnerDecision = "refuse" | "service-stay-out" | "sibling";
+
+/**
+ * Pure decision for `handleStart` when the pre-bind probe found a live proxy.
+ *
+ * The #3106 guard exists so a bare `start` cannot shadow a healthy configured-port
+ * proxy with an ephemeral-port copy. An interactive `--port X` naming a DIFFERENT
+ * port than the live proxy's is an explicit sibling request, not that shadow — and
+ * refusing it also broke every spawned-launcher test on a machine running a real
+ * proxy, because the probe reaches the machine-global port across sandbox homes.
+ * The service wrapper always passes the configured port and keeps its exact
+ * stay-out-of-the-way semantics: it never takes the sibling path.
+ */
+export function decideStartWithLiveOwner(input: {
+  livePort: number;
+  requestedPort: number | undefined;
+  ocxService: string | undefined;
+}): StartOwnerDecision {
+  const sibling = input.requestedPort !== undefined
+    && input.requestedPort !== input.livePort
+    // Only the exact "1" sentinel is service context — the same check syncCleanup
+    // uses — so an env value like "0" or "false" cannot reach the stay-out path.
+    && input.ocxService !== "1";
+  if (sibling) return "sibling";
+  return input.ocxService === "1" ? "service-stay-out" : "refuse";
+}
+
 export function resolveDispatchCommand(command: string | undefined): string | undefined {
   if (command === undefined) return undefined;
   if (Object.prototype.hasOwnProperty.call(commandRunners, command)) return command;
@@ -810,4 +931,24 @@ async function handleDesktopAppRestart(log: Pick<Console, "log" | "error">): Pro
         log.log("Codex desktop app restarted; its model picker will re-read the catalog.");
       }
   }
+}
+
+async function handleConnectedSyncCatalogWrite(
+  result: { catalogWritten: boolean; cacheSynced: boolean },
+  restartCodex: boolean,
+  restartDesktopApp: boolean,
+): Promise<void> {
+  if (!result.catalogWritten && !result.cacheSynced) return;
+  afterCatalogWriteHandleAppServers({ restart: restartCodex, log: console });
+  if (restartDesktopApp) await handleDesktopAppRestart(console);
+}
+
+async function reconcileClientJournalBeforeLifecycle(
+  state: ClientConnectionState,
+): Promise<void> {
+  if (state.kind === "disconnected") return;
+  const { reconcileJournal } = await import("../codex/journal");
+  reconcileJournal(state.kind === "connected"
+    ? { activeClientApiKeyId: state.value.apiKeyId }
+    : undefined);
 }

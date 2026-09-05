@@ -32,6 +32,14 @@ function bcp47(locale: Locale): string {
   }
 }
 
+// `Intl.DateTimeFormat.format()` throws a RangeError on a time value outside ±8.64e15 ms.
+// These timestamps come from provider APIs and persisted cache, so one unrepresentable value
+// would take down the whole capacity panel. Resolve to null and omit the line instead.
+function asDate(value: number): Date | null {
+  const date = new Date(value > 10_000_000_000 ? value : value * 1000);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
 export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuotaReportView; pending: boolean }) {
   const t = useT();
   const { locale } = useI18n();
@@ -56,18 +64,23 @@ export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuo
     ...(aggregation.customWindows ?? []).map((window, index) => ({ key: index + 3, label: window.label, window })),
   ] : [];
   const formatPercent = (value: number) => new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value);
-  const formatRecoveryAt = (value: number) => new Intl.DateTimeFormat(locale, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(value > 10_000_000_000 ? value : value * 1000));
+  const formatRecoveryAt = (value: number) => {
+    const date = asDate(value);
+    return date === null ? null : new Intl.DateTimeFormat(locale, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(date);
+  };
   const localeTag = bcp47(locale);
   const formatCredits = (value: number) => new Intl.NumberFormat(localeTag, {
     style: "currency",
     currency: "USD",
   }).format(value);
-  const formatPeriodEnd = (value: number) => new Intl.DateTimeFormat(localeTag, {
-    dateStyle: "medium",
-  }).format(new Date(value > 10_000_000_000 ? value : value * 1000));
+  const formatPeriodEnd = (value: number) => {
+    const date = asDate(value);
+    return date === null ? null : new Intl.DateTimeFormat(localeTag, { dateStyle: "medium" }).format(date);
+  };
+  const periodEnd = credits?.expiresAt === undefined ? null : formatPeriodEnd(credits.expiresAt);
 
   return (
     <>
@@ -91,19 +104,20 @@ export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuo
               <strong>{formatCredits(credits.remaining)}</strong>
             </div>
           )}
-          {credits?.expiresAt !== undefined && (
+          {periodEnd !== null && (
             <div className="pws-capacity-recovery">
-              <span>{t("quota.creditsPeriodEnds", { date: formatPeriodEnd(credits.expiresAt) })}</span>
+              <span>{t("quota.creditsPeriodEnds", { date: periodEnd })}</span>
             </div>
           )}
-          {recoveryRows.flatMap(({ key, label, window }) => (
-            window.nextRecoveryAt !== undefined && window.nextRecoveryPercent !== undefined
+          {recoveryRows.flatMap(({ key, label, window }) => {
+            const recoveryAt = window.nextRecoveryAt === undefined ? null : formatRecoveryAt(window.nextRecoveryAt);
+            return recoveryAt !== null && window.nextRecoveryPercent !== undefined
               ? [<div className="pws-capacity-recovery" key={key}>
-                  <span>{t("pws.capacity.nextRecovery")} · {label} · {formatRecoveryAt(window.nextRecoveryAt)}</span>
+                  <span>{t("pws.capacity.nextRecovery")} · {label} · {recoveryAt}</span>
                   <strong>{t("pws.capacity.recoveryShare", { percent: formatPercent(window.nextRecoveryPercent) })}</strong>
                 </div>]
-              : []
-          ))}
+              : [];
+          })}
           {showsAggregate && aggregation && aggregation.currentAccount?.quota && (
             <div className="pws-capacity-current">
               <span className="pws-capacity-label">
@@ -117,8 +131,18 @@ export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuo
             <div className="pws-capacity-incomplete">
               {t("pws.capacity.incomplete", {
                 excluded: aggregation.excludedAccounts,
-                unknown: aggregation.unknownPlanAccounts,
               })}
+            </div>
+          )}
+          {/*
+            Separate from the exclusion notice on purpose (#3155). An uncalibrated plan is
+            COUNTED, at the baseline seat weight, so folding it into "excluded" told an
+            operator their Premium seat was missing from a report that in fact included it.
+            What is true is narrower: the estimate is conservative for that seat.
+          */}
+          {aggregation && aggregation.unknownPlanAccounts > 0 && (
+            <div className="pws-capacity-incomplete">
+              {t("pws.capacity.uncalibratedPlan", { count: aggregation.unknownPlanAccounts })}
             </div>
           )}
           {aggregation && aggregation.partialWindowAccounts > 0 && (

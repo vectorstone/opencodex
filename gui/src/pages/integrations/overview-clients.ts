@@ -17,15 +17,18 @@ import type { VisualIntegrationState } from "./IntegrationStateBadge";
 import {
   FILE_INTEGRATION_CLIENTS,
   type FileIntegrationClientId,
+  type IntegrationJournalRow,
   type IntegrationStatus,
 } from "./integration-api";
 import type { NativeIntegrationClientId, NativeStatus } from "./native-api";
+import { CURSOR_SEEN_WINDOW_MS, type CursorIntegrationStatus } from "./cursor-api";
 
 export type OverviewClientId =
   | "codex"
   | "claude"
   | "claudeDesktop"
   | "grok"
+  | "cursor"
   | FileIntegrationClientId;
 
 /** How far the `/api/keys` read has got, since the count alone cannot say. */
@@ -131,6 +134,7 @@ export interface OverviewSources {
   claude: ClaudeCodePayload | null;
   claudeDesktop: ClaudeDesktopPayload | null;
   grok: GrokPayload | null;
+  cursor: CursorIntegrationStatus | null;
   native: NativeStatus[] | null;
   nativeSettled: boolean;
 }
@@ -147,9 +151,30 @@ const FILE_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   mcode: "integrations.tab.mcode",
   zcode: "integrations.tab.zcode",
   prime: "integrations.tab.prime",
+  aside: "integrations.tab.aside",
 };
 
 /** A file client's block is in the file for both `current` and `stale`. */
+/**
+ * Journal operation kinds to their labels.
+ *
+ * Lives here rather than beside the rollback components because a module that
+ * exports both a component and a constant breaks React fast refresh, and both
+ * Integrations surfaces plus their tests need this map.
+ */
+export const JOURNAL_KIND_KEY: Record<IntegrationJournalRow["kind"], TKey> = {
+  apply: "integrations.kind.apply",
+  disable: "integrations.kind.disable",
+  refresh: "integrations.kind.refresh",
+  restore: "integrations.kind.restore",
+  /*
+   * Distinct from `apply` on purpose. This row is the only signal that an
+   * operation replaced a block somebody else wrote, and it sits in the one list
+   * a user reads after a mistake.
+   */
+  overwrite: "integrations.kind.overwrite",
+};
+
 export function isAppliedState(state: VisualIntegrationState): boolean {
   return state === "current" || state === "stale";
 }
@@ -424,6 +449,37 @@ function grokRow(
   };
 }
 
+
+/**
+ * Cursor has no switch: its gateway is configured inside Cursor, and this proxy never
+ * writes there. "Applied" therefore means a Cursor client actually called us recently.
+ */
+function cursorRow(payload: CursorIntegrationStatus | null, now = Date.now()): OverviewRow {
+  const base = {
+    id: "cursor" as const,
+    hash: "integrations/cursor",
+    labelKey: "integrations.tab.cursor" as TKey,
+    toggle: null,
+    toggleBlocked: null,
+    togglePath: null,
+    status: null,
+    detail: null,
+    detailVars: null,
+  };
+  if (!payload) return { ...base, state: "unknown", installed: false, applied: false, detailKey: null };
+  if (!payload.privateInference.installed) {
+    return { ...base, state: "not-installed", installed: false, applied: false, detailKey: "integrations.detail.cursorAbsent" };
+  }
+  const seenRecently = payload.lastSeen !== null && now - payload.lastSeen.at < CURSOR_SEEN_WINDOW_MS;
+  return {
+    ...base,
+    state: seenRecently ? "current" : "absent",
+    installed: true,
+    applied: seenRecently,
+    detailKey: seenRecently ? "integrations.detail.cursorSeen" : "integrations.detail.cursorNeverSeen",
+  };
+}
+
 function fileRow(status: IntegrationStatus): OverviewRow {
   return {
     id: status.clientId,
@@ -463,6 +519,7 @@ export function buildOverviewRows(sources: OverviewSources): OverviewRows {
       sources.nativeSettled,
     ),
     grokRow(sources.grok, nativeGrok, sources.nativeSettled),
+    cursorRow(sources.cursor),
   ];
   for (const clientId of FILE_INTEGRATION_CLIENTS) {
     const status = statusByClient.get(clientId);

@@ -65,14 +65,27 @@ import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostR
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
 import type { ManagementContext } from "./context";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
+import { shadowCallTargetError } from "./shadow-call-validation";
 
 
-/** Management wire shape: omit default imageInput "auto" (persist/response sparse). */
-function sparseComboConfig<T extends { imageInput?: "auto" | "disabled" }>(combo: T): Omit<T, "imageInput"> & { imageInput?: "disabled" } {
-  const { imageInput, ...rest } = combo;
+/**
+ * Management wire shape: omit fields whose value is the default, so GET responses and
+ * persisted config stay sparse. A default echoed here would be written straight back by
+ * any client that round-trips GET into PUT, which is how an unset option ends up
+ * materialized in every user's config.json.
+ */
+function sparseComboConfig<T extends {
+  imageInput?: "auto" | "disabled";
+  reasoningEffortMode?: "strict" | "adaptive";
+}>(combo: T): Omit<T, "imageInput" | "reasoningEffortMode"> & {
+  imageInput?: "disabled";
+  reasoningEffortMode?: "adaptive";
+} {
+  const { imageInput, reasoningEffortMode, ...rest } = combo;
   return {
     ...rest,
     ...(imageInput === "disabled" ? { imageInput: "disabled" as const } : {}),
+    ...(reasoningEffortMode === "adaptive" ? { reasoningEffortMode: "adaptive" as const } : {}),
   };
 }
 
@@ -136,19 +149,19 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     if (error) return jsonResponse({ error }, 400);
     const normalized = normalizeComboConfig(body.combo as import("../../types").OcxComboConfig);
     // Persist only non-default identity/capability fields so config stays sparse.
+    // Capability defaults (`imageInput`, `reasoningEffortMode`) go through the same
+    // helper the GET/PUT responses use, so the wire shape and the stored shape cannot drift.
     const {
       alias: normalizedAlias,
       nativeAlias: normalizedNativeAlias,
       displayName: normalizedDisplayName,
-      imageInput: normalizedImageInput,
       ...normalizedBase
-    } = normalized;
+    } = sparseComboConfig(normalized);
     const stored: import("../../types").OcxComboConfig = {
       ...normalizedBase,
       ...(normalizedAlias ? { alias: normalizedAlias } : {}),
       ...(normalizedNativeAlias ? { nativeAlias: true } : {}),
       ...(normalizedDisplayName ? { displayName: normalizedDisplayName } : {}),
-      ...(normalizedImageInput === "disabled" ? { imageInput: "disabled" as const } : {}),
     };
     const sourceId = renameFrom ?? id;
     const previous = config.combos?.[sourceId];
@@ -169,7 +182,6 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     const nextCombos = { ...(config.combos ?? {}) };
     if (renameFrom) delete nextCombos[renameFrom];
     nextCombos[id] = stored;
-    config.combos = nextCombos;
     let shouldSyncClaudeAgentDefs = false;
     const migratedModels = new Map<string, string>();
     if (oldPublicModel && oldPublicModel !== newPublicModel && previous?.nativeAlias !== true) {
@@ -183,6 +195,15 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
         previous?.nativeAlias === true ? comboModelId(id) : newPublicModel,
       );
     }
+    const currentShadowTarget = config.shadowCallIntercept?.model;
+    const migratedShadowTarget = currentShadowTarget
+      ? migratedModels.get(currentShadowTarget)
+      : undefined;
+    if (migratedShadowTarget) {
+      const targetError = shadowCallTargetError({ ...config, combos: nextCombos }, migratedShadowTarget);
+      if (targetError) return jsonResponse({ error: targetError }, 400);
+    }
+    config.combos = nextCombos;
     if (migratedModels.size > 0) {
       const migrateReference = (model: string): string => migratedModels.get(model) ?? model;
       const migrateAgentReference = (model: string): string => {

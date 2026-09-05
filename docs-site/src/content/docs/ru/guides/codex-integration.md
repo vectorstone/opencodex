@@ -59,6 +59,7 @@ reference-image), используя тот же bearer ChatGPT, что и дл�
   провал жёсткий: никакого fallback на другой платный upstream нет. Id провайдера, управляемые
   registry, здесь не принимаются; если хотите использовать встроенные уровни OpenAI, опустите
   `images.provider`.
+- **Relay xAI Imagine (Grok OAuth):** если `images.bridgeEnabled` равно `true`, `images.provider` не задан и настроен провайдер `xai`, `/v1/images/generations` и `/v1/images/edits` уходят на `https://api.x.ai/v1`. Какие учётные данные используются, определяет `authMode` провайдера: при `"oauth"` relay переиспользует грант Grok CLI из `ocx login xai`, в любом другом режиме — API-ключ провайдера. OAuth-вход не активирует провайдер с ключом, и наоборот. Учётные данные ChatGPT не пересылаются. Если учётных данных нет, прокси возвращает 400 и не тарифицирует ChatGPT. Явно заданный `images.provider` забирает `/v1/images` себе: его ошибки валидации возвращаются как есть, relay xAI не пробуется. Relay отображает Codex `size` / `aspect_ratio` на тело Imagine и возвращает ту же форму `{created, data:[{b64_json}]}`. Суммарные декодированные байты и base64-выход партии (inline `b64_json` и скачанные URL) остаются ниже 100 MiB; превышение даёт 502. Если xAI возвращает URL изображения вместо байтов, прокси скачивает его сам без учётных данных: URL должен быть публичным HTTPS (без редиректов, `file:`, loopback и приватных адресов), каждый файл ограничен 50 MiB, а результат сохраняется как локальный артефакт и отдаётся только через аутентифицированный management-эндпоинт. Это отдельно от цикла Responses Image Bridge, который по-прежнему только с API-ключом.
 - **Fallback Google Antigravity (CCA):** если не настроен ни один OpenAI forward-candidate и ни
   один keyed provider, `/v1/images/generations` (но не `/images/edits`) переходит на endpoint
   Antigravity **Cloud Code Assist** с моделью `gemini-3.1-flash-image`. Этот fallback также
@@ -250,8 +251,8 @@ ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-windo
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/opencodex-catalog.json"
 tmp="$(mktemp "${dest}.XXXXXX")"
-curl -fsS -H "x-opencodex-api-key: $OPENCODEX_ADMIN_AUTH_TOKEN" \
-  "https://proxy.example.com/api/catalog" > "$tmp" \
+curl -fsS -H "x-opencodex-api-key: $OPENCODEX_API_AUTH_TOKEN" \
+  "https://proxy.example.com/v1/catalog" > "$tmp" \
   && mv "$tmp" "$dest"
 ocx sync-cache
 ```
@@ -263,6 +264,8 @@ ocx sync-cache
 Display name можно задать или отредактировать и через management API
 (`POST /api/custom-models`, `PUT /api/custom-models/<id>` с полем `displayName`) и через
 веб-дашборд. Символ `/` запрещён, потому что он столкнулся бы с разделителем routed-slug.
+
+`GET /v1/catalog` существует для того, чтобы чтение списка моделей не требовало админского токена. Маршрут только для чтения (`GET` и `HEAD`), принимает `x-opencodex-api-key`, bearer-токен или `x-api-key` и отдаёт в точности те же байты, что и управляющий маршрут. Ответы содержат строгий `ETag` — верните его в `If-None-Match`, чтобы повторно проверить и получить `304` вместо полного документа — и `Cache-Control: private, no-cache`. Ключ плоскости данных, допущенный здесь, **не получает ничего** на плоскости управления: `/api/catalog` и все маршруты `/api/*` по-прежнему требуют админский токен или сессию панели.
 
 Display name — это **только отображение, и оно устойчиво к перегенерации**. Каждый `ocx sync` и
 каждое обновление каталога заново выводят маршрутизируемые записи из `config.json`

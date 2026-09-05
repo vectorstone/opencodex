@@ -3,6 +3,7 @@ import { SUPPORTED_NATIVE_OPENAI_SLUGS } from "../codex/catalog/native-models";
 import type {
   OcxComboConfig,
   OcxComboDefaultEffort,
+  OcxComboReasoningEffortMode,
   OcxComboStrategy,
   OcxComboTarget,
   OcxConfig,
@@ -37,6 +38,8 @@ export interface NormalizedComboConfig {
   strategy: OcxComboStrategy;
   stickyLimit: number;
   defaultEffort: OcxComboDefaultEffort | null;
+  /** Picker-ladder derivation policy; `strict` preserves the legacy intersection rule. */
+  reasoningEffortMode: OcxComboReasoningEffortMode;
   /** Disable image input; `auto` preserves the intersection derived from all targets. */
   imageInput: "auto" | "disabled";
   /** Trimmed public alias, or null when the combo keeps the default `combo/<id>` slug. */
@@ -215,8 +218,11 @@ export function comboConfigIssues(
   }
   if (body.strategy !== undefined
     && body.strategy !== "failover"
-    && body.strategy !== "round-robin") {
-    issues.push({ path: ["strategy"], message: 'strategy must be "failover" or "round-robin"' });
+    && body.strategy !== "round-robin"
+    && body.strategy !== "random"
+    && body.strategy !== "least-used"
+    && body.strategy !== "reset-window") {
+    issues.push({ path: ["strategy"], message: 'strategy must be "failover", "round-robin", "random", "least-used", or "reset-window"' });
   }
   if (body.stickyLimit !== undefined
     && (typeof body.stickyLimit !== "number" || !Number.isInteger(body.stickyLimit)
@@ -234,6 +240,14 @@ export function comboConfigIssues(
   }
   if (body.imageInput !== undefined && body.imageInput !== "auto" && body.imageInput !== "disabled") {
     issues.push({ path: ["imageInput"], message: 'imageInput must be "auto" or "disabled"' });
+  }
+  if (body.reasoningEffortMode !== undefined
+    && body.reasoningEffortMode !== "strict"
+    && body.reasoningEffortMode !== "adaptive") {
+    issues.push({
+      path: ["reasoningEffortMode"],
+      message: 'reasoningEffortMode must be "strict" or "adaptive"',
+    });
   }
 
   if (body.alias !== undefined) {
@@ -354,6 +368,7 @@ export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig
     strategy: raw.strategy ?? "failover",
     stickyLimit: raw.stickyLimit ?? 1,
     defaultEffort: raw.defaultEffort ?? null,
+    reasoningEffortMode: raw.reasoningEffortMode === "adaptive" ? "adaptive" : "strict",
     imageInput: raw.imageInput === "disabled" ? "disabled" : "auto",
     alias: alias || null,
     nativeAlias: raw.nativeAlias === true,

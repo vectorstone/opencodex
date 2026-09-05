@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildGrokManagedBlock, injectGrokConfig } from "../src/grok/inject";
 import { handleChatCompletions } from "../src/server/chat-completions";
 import type { RequestLogContext } from "../src/server/request-log";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * D3 activation evidence: the fence stamps `x-opencodex-grok` on every registered
@@ -16,10 +17,10 @@ import type { OcxConfig } from "../src/types";
 test("the managed fence stamps the grok attribution header on every model", () => {
   const block = buildGrokManagedBlock(10100, [{ id: "kimi/k3", contextWindow: 262_144 }]);
   expect(block).toContain('extra_headers = { "x-opencodex-grok" = "1" }');
-  // One line per model, after the api_key line, so Grok parses it inside the table.
-  const modelSections = block.split("[model.").slice(1);
-  expect(modelSections.length).toBe(1);
-  expect(modelSections[0]).toContain("x-opencodex-grok");
+  // The header lives in the shared [model_providers.opencodex] block, inherited by every
+  // [model.*] table that references it via model_provider.
+  const providerBlock = block.slice(block.indexOf("[model_providers.opencodex]"), block.indexOf("[model."));
+  expect(providerBlock).toContain("x-opencodex-grok");
 });
 
 test("the fence survives a write and keeps the header line parseable", () => {
@@ -32,7 +33,7 @@ test("the fence survives a write and keeps the header line parseable", () => {
     const content = readFileSync(join(grokHome, "config.toml"), "utf8");
     expect(content).toContain('extra_headers = { "x-opencodex-grok" = "1" }');
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTreeWithRetry(root);
   }
 });
 

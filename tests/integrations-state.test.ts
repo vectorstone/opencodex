@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXPORT_CLIENTS, type ExportModel } from "../src/clients/config-export";
@@ -16,6 +16,7 @@ import { INTEGRATION_CLIENT_IDS, isLoopbackOnly } from "../src/integrations/regi
 import { classifyIntegration, readIntegrationState } from "../src/integrations/state";
 import { createIntegrationStateStore } from "../src/integrations/store";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * Activation coverage for devlog/_fin/260802_client_toggle_api/021 §6.
@@ -44,7 +45,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(home, { recursive: true, force: true });
+  removeTreeWithRetry(home);
 });
 
 function store() {
@@ -755,9 +756,9 @@ describe("installation detection is independent of config state", () => {
  * from. Rationale and the per-client table: 020 §1 amendment.
  */
 describe("the loopback-only set is one fact, read through one seam", () => {
-  test("omp, pi, kimi, gajae, dsh, mcode, zcode and prime are loopback-only and nobody else is", () => {
+  test("omp, pi, kimi, gajae, dsh, mcode, zcode, prime and aside are loopback-only and nobody else is", () => {
     const loopbackOnly = INTEGRATION_CLIENT_IDS.filter(id => isLoopbackOnly(id));
-    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime"]);
+    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
   });
 
   test("the registry restates nothing — it reads the export spec", () => {

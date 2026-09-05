@@ -1,6 +1,6 @@
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,7 @@ import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "./helpers/test-budget";
 import { configuredReasoningEfforts } from "../src/reasoning-effort";
 import { isModelTextOnly } from "../src/vision";
 import type { OcxProviderConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 const cliPath = join(repoRoot, "src", "cli", "index.ts");
@@ -62,7 +63,7 @@ describe("ocx models", () => {
       expect(result.stdout).toContain("test-model-3");
       expect(result.stdout).toContain("* =");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -74,7 +75,7 @@ describe("ocx models", () => {
       expect(result.stdout).toContain("test-model-1");
       expect(result.stdout).toContain("test:");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -85,7 +86,7 @@ describe("ocx models", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("not configured");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -101,7 +102,7 @@ describe("ocx models", () => {
       expect(testModels.length).toBe(3);
       expect(testModels[0].isDefault).toBe(true);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -113,7 +114,7 @@ describe("ocx models", () => {
       const parsed = JSON.parse(result.stdout);
       expect(parsed.models.every((m: { provider: string }) => m.provider === "test")).toBe(true);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -164,7 +165,7 @@ describe("ocx models richer metadata", () => {
       expect(modelB.contextWindow).toBe(32000);
       expect(modelB.inputModalities).toEqual(["text"]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -200,7 +201,7 @@ describe("ocx models richer metadata", () => {
       expect(row.contextWindow).toBe(131000);
       expect(row.reasoningEfforts).toEqual(["low", "high"]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -242,7 +243,7 @@ describe("ocx models richer metadata", () => {
       expect(ladderOf("model-b")).toEqual([]);
       expect(ladderOf("model-c")).toEqual(["low", "high"]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -275,7 +276,7 @@ describe("ocx models richer metadata", () => {
         .find((m: { model: string }) => m.model === "gpt-oss:120b");
       expect(row.inputModalities).toEqual(["text"]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -300,7 +301,7 @@ describe("ocx models richer metadata", () => {
         .find((m: { model: string }) => m.model === "gpt-oss:20b");
       expect(row.contextWindow).toBe(32000);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -311,7 +312,7 @@ describe("ocx models richer metadata", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("Unknown flag");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 });
@@ -325,7 +326,7 @@ describe("ocx models custom slash ids", () => {
       const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
       expect(config.customModels[0].modelId).toBe("openai/gpt-5.5");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -340,7 +341,7 @@ describe("ocx models custom slash ids", () => {
         const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
         expect(config.customModels ?? []).toEqual([]);
       } finally {
-        rmSync(dir, { recursive: true, force: true });
+        removeTreeWithRetry(dir);
       }
     }
   });
@@ -355,7 +356,7 @@ describe("ocx models custom slash ids", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("displayName must not contain /");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -384,7 +385,7 @@ describe("ocx models custom slash ids", () => {
       expect(multi.status).toBe(1);
       expect(multi.stderr).toContain("ambiguous");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -410,7 +411,7 @@ describe("ocx models custom slash ids", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("ambiguous");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -429,7 +430,7 @@ describe("ocx models custom slash ids", () => {
       const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
       expect(config.customModels).toHaveLength(2);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 });
@@ -457,7 +458,7 @@ describe("#2491 the removal selector uses the shared equivalence relation", () =
       const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
       expect(config.customModels).toHaveLength(2);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 
@@ -475,8 +476,93 @@ describe("#2491 the removal selector uses the shared equivalence relation", () =
       const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
       expect(config.customModels.map((m: { modelId: string }) => m.modelId)).toEqual(["unrelated"]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("a provider-qualified selector does not match a native id under another provider", () => {
+    const { dir } = freshConfig({
+      customModels: [
+        { id: "11111111-1111-4111-8111-111111111111", provider: "openai", modelId: "gpt-5.5" },
+        { id: "22222222-2222-4222-8222-222222222222", provider: "test", modelId: "openai/gpt-5.5" },
+      ],
+    });
+    try {
+      const result = runCli(["models", "remove", "openai/gpt-5.5", "--yes"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+      expect(config.customModels).toEqual([
+        expect.objectContaining({ provider: "test", modelId: "openai/gpt-5.5" }),
+      ]);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("a provider-qualified selector cannot remove a sole row from another provider", () => {
+    const { dir } = freshConfig({
+      customModels: [
+        { id: "22222222-2222-4222-8222-222222222222", provider: "test", modelId: "openai/gpt-5.5" },
+      ],
+    });
+    try {
+      const result = runCli(["models", "remove", "openai/gpt-5.5", "--yes"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("not found");
+      const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+      expect(config.customModels).toEqual([
+        expect.objectContaining({ provider: "test", modelId: "openai/gpt-5.5" }),
+      ]);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  /**
+   * A provider may publish a native id that is itself namespaced under its own name, so
+   * `acme` owning `acme/turbo` makes the selector `acme/turbo` name that row exactly while
+   * ALSO reading as the provider-qualified form of a sibling `turbo`. The resolver was called
+   * once per row with a singleton roster, so each row matched its own reading, the command saw
+   * two matches and aborted — the exact native spelling could never remove its own row.
+   */
+  test("a self-namespaced selector removes the row it names exactly", () => {
+    const { dir } = freshConfig({
+      customModels: [
+        { id: "11111111-1111-4111-8111-111111111111", provider: "acme", modelId: "acme/turbo" },
+        { id: "22222222-2222-4222-8222-222222222222", provider: "acme", modelId: "turbo" },
+      ],
+    });
+    try {
+      const result = runCli(["models", "remove", "acme/turbo", "--yes"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+      // The sibling survives: the selector named the native row, not the qualified reading.
+      expect(config.customModels).toEqual([
+        expect.objectContaining({ provider: "acme", modelId: "turbo" }),
+      ]);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  /**
+   * Guards the narrow path: with no sibling there is no collision, so this already worked and
+   * must keep working. It pins the case the resolver-level fix covers, so a future change that
+   * narrows the roster lookup cannot silently make a sole self-namespaced row unreachable.
+   */
+  test("a self-namespaced row is removable when it is the provider's only row", () => {
+    const { dir } = freshConfig({
+      customModels: [
+        { id: "11111111-1111-4111-8111-111111111111", provider: "acme", modelId: "acme/turbo" },
+      ],
+    });
+    try {
+      const result = runCli(["models", "remove", "acme/turbo", "--yes"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+      expect(config.customModels).toBeUndefined();
+    } finally {
+      removeTreeWithRetry(dir);
     }
   });
 });
-

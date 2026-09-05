@@ -110,6 +110,40 @@ for the command, disable-key semantics, and safety constraints.
 [Codex Integration](/guides/codex-integration/) for config injection, catalog sync, shims, WebSocket
 fallback, and restore mechanics.
 
+## Native quota fallback limitation
+
+When the Codex app exhausts its native five-hour quota it can switch to a reserve
+fallback model and grey out the other rows in its picker. Reported in
+[#2813](https://github.com/lidge-jun/opencodex/issues/2813), that gating also hides routed
+opencodex rows, even though those use unrelated provider credentials and consume none of the
+ChatGPT quota.
+
+This gate is applied by the client before a request reaches the proxy, so opencodex cannot lift
+it. Routed rows are written with `visibility: "list"`, catalog filtering consults only
+`disabledModels` and each provider's `selectedModels`, and no quota value takes part in routed
+visibility.
+
+Selecting a routed model explicitly does not go through the picker. Set the model in
+`config.toml`:
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+or send it directly:
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+Both paths route correctly **once the request reaches the proxy** — that part is covered by
+tests. The Codex desktop app, however, does not send the configured model while reserve mode is
+active: it decides reserve from its own `wham/usage` poll (`luna_reserve` upsell plus an allowed
+`gpt-reserve` additional limit) and forces the model setting to `gpt-reserve` before the request
+leaves, so the `config.toml` route is overridden in the app. Use `ocx access test`, Claude Code
+through the proxy (`ocx claude`), or any direct `/v1` client until the window resets. See
+[Routed models during Codex reserve mode](/guides/codex-integration/#routed-models-during-codex-reserve-mode).
+
 ## Why routed models show up
 
 Codex's model picker expects Codex-shaped catalog entries. opencodex builds routed entries by cloning

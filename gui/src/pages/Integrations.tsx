@@ -1,61 +1,18 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { navigateHash, normalizeHashPath } from "../hash-routing";
-import { useT, type TKey } from "../i18n/shared";
+import { useT } from "../i18n/shared";
+import ClientMark from "../components/ClientMark";
+import { INTEGRATION_MARKS } from "../components/integration-marks";
 import ApiKeys from "./ApiKeys";
 import Claude from "./Claude";
 import Grok from "./Grok";
 import CodexIntegrationPage from "./integrations/CodexIntegrationPage";
+import CursorIntegrationPage from "./integrations/CursorIntegrationPage";
 import IntegrationsOverview from "./integrations/IntegrationsOverview";
 import FileIntegrationPage, {
   type FileIntegrationClientId,
 } from "./integrations/FileIntegrationPage";
-
-type IntegrationTab =
-  | "overview"
-  | "keys"
-  | "codex"
-  | "claude"
-  | "grok"
-  | FileIntegrationClientId;
-
-interface TabDefinition {
-  id: IntegrationTab;
-  hash: string;
-  labelKey: TKey;
-}
-
-const TABS: readonly TabDefinition[] = [
-  { id: "overview", hash: "integrations", labelKey: "integrations.tab.overview" },
-  { id: "keys", hash: "integrations/keys", labelKey: "integrations.tab.keys" },
-  { id: "codex", hash: "integrations/codex", labelKey: "integrations.tab.codex" },
-  { id: "claude", hash: "integrations/claude", labelKey: "integrations.tab.claude" },
-  { id: "grok", hash: "integrations/grok", labelKey: "integrations.tab.grok" },
-  { id: "opencode", hash: "integrations/opencode", labelKey: "integrations.tab.opencode" },
-  { id: "pi", hash: "integrations/pi", labelKey: "integrations.tab.pi" },
-  { id: "omp", hash: "integrations/omp", labelKey: "integrations.tab.omp" },
-  { id: "hermes", hash: "integrations/hermes", labelKey: "integrations.tab.hermes" },
-  { id: "openclaw", hash: "integrations/openclaw", labelKey: "integrations.tab.openclaw" },
-  { id: "kimi", hash: "integrations/kimi", labelKey: "integrations.tab.kimi" },
-  { id: "gajae", hash: "integrations/gajae", labelKey: "integrations.tab.gajae" },
-  { id: "dsh", hash: "integrations/dsh", labelKey: "integrations.tab.dsh" },
-  { id: "mcode", hash: "integrations/mcode", labelKey: "integrations.tab.mcode" },
-  { id: "zcode", hash: "integrations/zcode", labelKey: "integrations.tab.zcode" },
-  { id: "prime", hash: "integrations/prime", labelKey: "integrations.tab.prime" },
-] as const;
-
-const FILE_CLIENTS = new Set<FileIntegrationClientId>([
-  "opencode",
-  "pi",
-  "omp",
-  "hermes",
-  "openclaw",
-  "kimi",
-  "gajae",
-  "dsh",
-  "mcode",
-  "zcode",
-  "prime",
-]);
+import { FILE_CLIENTS, TABS, type IntegrationTab } from "./integrations/integration-tabs";
 
 function readIntegrationTab(hash = window.location.hash): IntegrationTab {
   const raw = normalizeHashPath(hash);
@@ -72,7 +29,19 @@ function panelDomId(tab: IntegrationTab): string {
   return `integrations-panel-${tab}`;
 }
 
-export default function Integrations({ apiBase }: { apiBase: string }) {
+/*
+ * The strip carries 18 tabs on one row, which is precisely where a mark earns
+ * its place: the eye finds a logo faster than it reads the tenth label. Two
+ * tabs have no client behind them -- `overview` is the page itself and `keys`
+ * is a credential surface, not an integration -- so they stay text-only rather
+ * than borrowing a mark that would imply a client.
+ */
+function tabMark(tab: IntegrationTab): string | null {
+  if (tab === "overview" || tab === "keys") return null;
+  return INTEGRATION_MARKS[tab] ?? null;
+}
+
+export default function Integrations({ apiBase, machineApiBase = apiBase, connected = false }: { apiBase: string; machineApiBase?: string; connected?: boolean }) {
   const t = useT();
   const [tab, setTab] = useState<IntegrationTab>(readIntegrationTab);
   /*
@@ -84,7 +53,33 @@ export default function Integrations({ apiBase }: { apiBase: string }) {
     () => new Set([readIntegrationTab()]),
   );
   const tabRefs = useRef<Map<IntegrationTab, HTMLButtonElement> | null>(null);
+  const [machineClients, setMachineClients] = useState<string[]>([]);
+  const [machineSyncing, setMachineSyncing] = useState(false);
   if (tabRefs.current === null) tabRefs.current = new Map();
+
+  useEffect(() => {
+    if (!connected) return;
+    const controller = new AbortController();
+    void fetch(`${machineApiBase}/api/machine/clients`, { signal: controller.signal })
+      .then(response => response.ok ? response.json() : null)
+      .then((value: { selectedClients?: unknown } | null) => {
+        if (!controller.signal.aborted && Array.isArray(value?.selectedClients)) {
+          setMachineClients(value.selectedClients.filter((item): item is string => typeof item === "string"));
+        }
+      }).catch(() => {});
+    return () => controller.abort();
+  }, [connected, machineApiBase]);
+
+  const syncMachine = async () => {
+    setMachineSyncing(true);
+    try {
+      await fetch(`${machineApiBase}/api/machine/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } finally { setMachineSyncing(false); }
+  };
 
   /*
    * Every tab change goes through here, whether it came from a click or from
@@ -137,6 +132,13 @@ export default function Integrations({ apiBase }: { apiBase: string }) {
         <h2>{t("nav.integrations")}</h2>
       </div>
       <p className="page-sub">{t("integrations.subtitle")}</p>
+      {connected && (
+        <section className="notice" aria-label={t("connection.clients.title")}>
+          <strong>{t("connection.clients.title")}</strong>
+          <span>{machineClients.length > 0 ? machineClients.join(", ") : t("connection.clients.none")}</span>
+          <button type="button" className="btn btn-ghost btn-sm" disabled={machineSyncing} onClick={() => void syncMachine()}>{t(machineSyncing ? "connection.clients.syncing" : "connection.clients.sync")}</button>
+        </section>
+      )}
 
       <div className="page-tabs" role="tablist" aria-label={t("integrations.tabsLabel")}>
         {TABS.map(definition => (
@@ -156,6 +158,9 @@ export default function Integrations({ apiBase }: { apiBase: string }) {
             onClick={() => selectTab(definition.id, true)}
             onKeyDown={handleTabKeyDown}
           >
+            {tabMark(definition.id) && (
+              <ClientMark src={tabMark(definition.id)} label={t(definition.labelKey)} size={14} />
+            )}
             {t(definition.labelKey)}
           </button>
         ))}
@@ -181,6 +186,7 @@ export default function Integrations({ apiBase }: { apiBase: string }) {
             )}
             {definition.id === "claude" && <Claude apiBase={apiBase} active={active} />}
             {definition.id === "grok" && <Grok apiBase={apiBase} active={active} />}
+            {definition.id === "cursor" && <CursorIntegrationPage apiBase={apiBase} active={active} />}
             {FILE_CLIENTS.has(definition.id as FileIntegrationClientId) && (
               <FileIntegrationPage
                 apiBase={apiBase}

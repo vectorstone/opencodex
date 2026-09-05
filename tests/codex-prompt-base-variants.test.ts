@@ -4,7 +4,7 @@
  * Explicit temp paths only - these functions write a real Codex config.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -14,6 +14,7 @@ import {
   selectBaseVariant,
   writeBaseVariant,
 } from "../src/codex/prompt-layers";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const roots: string[] = [];
 
@@ -38,7 +39,7 @@ function rev(paths: ReturnType<typeof fixture>): string {
 }
 
 afterEach(() => {
-  while (roots.length) rmSync(roots.pop()!, { recursive: true, force: true });
+  while (roots.length) removeTreeWithRetry(roots.pop()!);
 });
 
 describe("base variant selection", () => {
@@ -68,8 +69,11 @@ describe("base variant selection", () => {
 
     expect(selectBaseVariant({ kind: "variant", id }, rev(paths), paths).ok).toBe(true);
     const withVariant = read(paths.configPath)!;
-    expect(withVariant).toContain("model_instructions_file = ");
-    expect(withVariant).toContain(resolve(join(paths.baseVariantDir, id + ".md")));
+    const selectedPath = resolve(join(paths.baseVariantDir, id + ".md"));
+    // The file is TOML, so Windows backslashes appear in an encoded basic-string
+    // literal rather than as the raw filesystem path.
+    expect(withVariant).toContain(`model_instructions_file = ${JSON.stringify(selectedPath)}`);
+    // Assert the decoded behavior separately from its on-disk representation.
     expect(readPromptLayers(paths).baseSelection).toEqual({ kind: "variant", id });
 
     expect(selectBaseVariant({ kind: "default" }, rev(paths), paths).ok).toBe(true);

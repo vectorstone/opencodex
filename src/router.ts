@@ -9,7 +9,7 @@ import {
 } from "./combos";
 import type { NormalizedComboConfig } from "./combos/types";
 import { hasOwnProvider } from "./config/provider-name";
-import { resolveEnvValue } from "./config";
+import { resolveProviderApiKey } from "./providers/key-store";
 import { assertProviderDestinationAllowed } from "./lib/destination-policy";
 import { redactSecretString, redactUrlForLog } from "./lib/redact";
 import {
@@ -33,6 +33,7 @@ import {
 } from "./providers/openai-tiers";
 import { decodeRoutedModelIdOrThrow, encodeRoutedModelId } from "./providers/slug-codec";
 import { resolveModelAlias } from "./providers/default-aliases";
+import { resolveBlockedModelRedirect } from "./lib/shadow-call";
 import { getStaleCached } from "./codex/model-cache";
 import { codexAccountNamespaceEntries } from "./codex/account-namespaces";
 import {
@@ -264,8 +265,27 @@ function warnIfBaseUrlDiscarded(providerName: string, userBaseUrl: string, effec
   );
 }
 
+/**
+ * One notice per provider id: the destination is an operator-configured key
+ * (never a caller-supplied string), so the log carries no request content.
+ */
+const compactionFallbackWarnings = new Set<string>();
+function warnCompactionDefaultProviderFallbackOnce(providerName: string): void {
+  if (compactionFallbackWarnings.has(providerName)) return;
+  compactionFallbackWarnings.add(providerName);
+  console.warn(
+    `compaction: no enabled canonical "openai" provider for the native compaction model;`
+    + ` summarizing through default provider "${providerName}" instead (#2901).`,
+  );
+}
+
+/** Test seam: forget which compaction fallbacks have been announced. */
+export function resetCompactionFallbackWarningsForTests(): void {
+  compactionFallbackWarnings.clear();
+}
+
 function usableResolvedApiKey(apiKey: string | undefined): string | undefined {
-  const resolved = resolveEnvValue(apiKey);
+  const resolved = resolveProviderApiKey(apiKey);
   return typeof resolved === "string" && resolved.trim().length > 0 ? resolved : undefined;
 }
 
@@ -327,6 +347,7 @@ export function routedProviderConfig(providerName: string, provider: OcxProvider
   const preserveReasoningContentModels = mergeStringArray(registryEntry.preserveReasoningContentModels, provider.preserveReasoningContentModels);
   const requiresReasoningPlaceholderModels = mergeStringArray(registryEntry.requiresReasoningPlaceholderModels, provider.requiresReasoningPlaceholderModels);
   const reasoningSplitModels = mergeStringArray(registryEntry.reasoningSplitModels, provider.reasoningSplitModels);
+  const reasoningDetailsModels = mergeStringArray(registryEntry.reasoningDetailsModels, provider.reasoningDetailsModels);
   const thinkingToggleModels = mergeStringArray(registryEntry.thinkingToggleModels, provider.thinkingToggleModels);
   const thinkingBudgetModels = mergeStringArray(registryEntry.thinkingBudgetModels, provider.thinkingBudgetModels);
   const registryBaseUrlIsTemplate = /\{[^}]*\}/.test(registryEntry.baseUrl);
@@ -352,6 +373,10 @@ export function routedProviderConfig(providerName: string, provider: OcxProvider
     ...(provider.requiresAdjacentResponsesToolResults === undefined
       && registryEntry.requiresAdjacentResponsesToolResults !== undefined
       ? { requiresAdjacentResponsesToolResults: registryEntry.requiresAdjacentResponsesToolResults }
+      : {}),
+    ...(provider.annotateEmptyToolOutputs === undefined
+      && registryEntry.annotateEmptyToolOutputs !== undefined
+      ? { annotateEmptyToolOutputs: registryEntry.annotateEmptyToolOutputs }
       : {}),
     ...(provider.fastWire === undefined && registryEntry.fastWire !== undefined
       ? {
@@ -446,6 +471,7 @@ export function routedProviderConfig(providerName: string, provider: OcxProvider
     ...(preserveReasoningContentModels ? { preserveReasoningContentModels } : {}),
     ...(requiresReasoningPlaceholderModels ? { requiresReasoningPlaceholderModels } : {}),
     ...(reasoningSplitModels ? { reasoningSplitModels } : {}),
+    ...(reasoningDetailsModels ? { reasoningDetailsModels } : {}),
     ...(thinkingToggleModels ? { thinkingToggleModels } : {}),
     ...(thinkingBudgetModels ? { thinkingBudgetModels } : {}),
   };
@@ -489,7 +515,7 @@ export function comboRouteDecisionTrace(
       reason: "combo-pick",
       candidateIndex: pick.targetIndex,
       ...(combo
-        ? { tieBreak: combo.strategy === "round-robin" ? "round-robin" : "failover" }
+        ? { tieBreak: combo.strategy }
         : {}),
     },
     candidates: combo ? comboRouteCandidates(config, pick, combo) : undefined,
@@ -506,19 +532,23 @@ function isBareOpenAiFamilyModel(modelId: string): boolean {
 }
 
 function routeResult(
+  config: OcxConfig | undefined,
   providerName: string,
   provider: OcxProviderConfig,
   modelId: string,
   routeKind: RouteDecisionKind,
   routeReason: string,
 ): RouteResult {
+  const redirected = resolveBlockedModelRedirect(config, modelId);
+  const effectiveModelId = redirected ?? modelId;
+  const effectiveRouteReason = redirected ? "blocked-model-redirect" : routeReason;
   const codexAccountMode = providerCodexAccountMode(providerName, provider);
   return {
     providerName,
     provider: routedProviderConfig(providerName, provider),
-    modelId,
+    modelId: effectiveModelId,
     routeKind,
-    routeReason,
+    routeReason: effectiveRouteReason,
     ...(codexAccountMode ? { codexAccountMode } : {}),
   };
 }
@@ -567,6 +597,7 @@ function routeModelInternal(
   modelId: string,
   bypassCombos: boolean,
   policyEvidence?: PolicyRequestEvidence,
+  allowCompactionNativeFallback = false,
 ): RouteResult {
   const slash = modelId.indexOf("/");
   // Policy namespace is system-reserved: an explicit `policy/<id>` or a
@@ -621,7 +652,7 @@ function routeModelInternal(
         throw new NoEnabledOpenAiProviderError(nativeModelId);
       }
       return {
-        ...routeResult(OPENAI_CODEX_PROVIDER_ID, provider, nativeModelId, "explicit-account", "account-namespace"),
+        ...routeResult(config, OPENAI_CODEX_PROVIDER_ID, provider, nativeModelId, "explicit-account", "account-namespace"),
         // Exact account injection uses the pool credential machinery even when the canonical
         // provider is globally Direct. The fixed id bypasses pool selection entirely.
         codexAccountMode: "pool",
@@ -666,7 +697,7 @@ function routeModelInternal(
       // itself a known model (e.g. orcarouter/auto). Route it whole instead of stripping to the
       // remainder, which would send a bare `auto` the upstream cannot resolve.
       if (known.includes(modelId)) {
-        return routeResult(provName, prov, modelId, "explicit-provider", "explicit-provider-namespace");
+        return routeResult(config, provName, prov, modelId, "explicit-provider", "explicit-provider-namespace");
       }
       // Codex-facing alias ids (`provider/vendor-model`) decode back to the native
       // slash id via an exact known-id lookup; raw full-slash selectors keep working.
@@ -676,6 +707,7 @@ function routeModelInternal(
         ? decoded
         : resolveModelAlias(config, prov, known, requestedModel) ?? decoded;
       return routeResult(
+        config,
         provName,
         prov,
         nativeModel,
@@ -689,7 +721,29 @@ function routeModelInternal(
   if (isBareOpenAiFamilyModel(modelId)) {
     const provider = config.providers[OPENAI_CODEX_PROVIDER_ID];
     if (provider && provider.disabled !== true) {
-      return routeResult(OPENAI_CODEX_PROVIDER_ID, provider, modelId, "native", "native-family");
+      return routeResult(config, OPENAI_CODEX_PROVIDER_ID, provider, modelId, "native", "native-family");
+    }
+    // Codex chooses a bare native model for compaction even when the operator's
+    // ordinary route is a third-party provider. Keep the native reservation
+    // unchanged for ordinary turns; only the explicit compaction surface may
+    // use the configured default as its summarizer destination.
+    if (allowCompactionNativeFallback
+      && config.defaultProvider !== OPENAI_CODEX_PROVIDER_ID
+      && config.defaultProvider !== LEGACY_CHATGPT_PROVIDER_ID
+      && config.defaultProvider !== LEGACY_OPENAI_MULTI_PROVIDER_ID
+      && hasOwnProvider(config.providers, config.defaultProvider)) {
+      const defaultProvider = config.providers[config.defaultProvider];
+      if (defaultProvider.disabled !== true) {
+        warnCompactionDefaultProviderFallbackOnce(config.defaultProvider);
+        return routeResult(
+          config,
+          config.defaultProvider,
+          defaultProvider,
+          modelId,
+          "default-provider",
+          "compaction-default-provider",
+        );
+      }
     }
     throw new NoEnabledOpenAiProviderError(modelId);
   }
@@ -697,7 +751,7 @@ function routeModelInternal(
   for (const [provName, prov] of activeProviderEntries(config)) {
     if (prov.defaultModel === modelId
       || (typeof prov.defaultModel === "string" && encodeRoutedModelId(prov.defaultModel) === modelId)) {
-      return routeResult(provName, prov, prov.defaultModel as string, "explicit-provider", "configured-default-model");
+      return routeResult(config, provName, prov, prov.defaultModel as string, "explicit-provider", "configured-default-model");
     }
   }
 
@@ -708,7 +762,7 @@ function routeModelInternal(
     if (prov.models && Array.isArray(prov.models)) {
       const hit = (prov.models as string[]).find(id => id === modelId || encodeRoutedModelId(id) === modelId);
       if (hit !== undefined) {
-        return routeResult(provName, prov, hit, "explicit-provider", "configured-model-list");
+        return routeResult(config, provName, prov, hit, "explicit-provider", "configured-model-list");
       }
     }
   }
@@ -728,7 +782,7 @@ function routeModelInternal(
   }
   if (aliasMatches[0]) {
     const match = aliasMatches[0];
-    return routeResult(match.provider, config.providers[match.provider], match.model, "explicit-provider", "model-alias");
+    return routeResult(config, match.provider, config.providers[match.provider], match.model, "explicit-provider", "model-alias");
   }
 
   if (config.defaultProvider === LEGACY_CHATGPT_PROVIDER_ID) {
@@ -737,18 +791,13 @@ function routeModelInternal(
   if (hasOwnProvider(config.providers, config.defaultProvider)) {
     const defaultProv = config.providers[config.defaultProvider];
     if (defaultProv.disabled === true) throw new Error(`Default provider is disabled: ${config.defaultProvider}`);
-    return routeResult(config.defaultProvider, defaultProv, modelId, "default-provider", "default-provider");
+    return routeResult(config, config.defaultProvider, defaultProv, modelId, "default-provider", "default-provider");
   }
 
   throw new Error(`No provider configured for model: ${modelId}`);
 }
 
-export function routeModel(
-  config: OcxConfig,
-  modelId: string,
-  policyEvidence?: PolicyRequestEvidence,
-): RouteResult {
-  const route = routeModelInternal(config, modelId, false, policyEvidence);
+function routeWithDecisionTrace(config: OcxConfig, modelId: string, route: RouteResult): RouteResult {
   // Policy routes carry a full evaluation trace already; never rebuild it.
   if (route.routeDecision) return route;
   const accountRef = route.codexAccountNamespace;
@@ -763,7 +812,7 @@ export function routeModel(
       reason: route.routeReason,
       ...(route.combo ? { candidateIndex: route.combo.targetIndex } : {}),
       ...(combo
-        ? { tieBreak: combo.strategy === "round-robin" ? "round-robin" : "failover" }
+        ? { tieBreak: combo.strategy }
         : {}),
     },
     candidates: route.routeKind === "combo" && route.combo && combo
@@ -771,6 +820,31 @@ export function routeModel(
       : undefined,
   });
   return route;
+}
+
+export function routeModel(
+  config: OcxConfig,
+  modelId: string,
+  policyEvidence?: PolicyRequestEvidence,
+): RouteResult {
+  const route = routeModelInternal(config, modelId, false, policyEvidence);
+  return routeWithDecisionTrace(config, modelId, route);
+}
+
+/**
+ * Route a client-selected compaction model. Codex may send a bare native model
+ * even when its ordinary turns are configured for another provider; in that
+ * one case the configured default provider is a safe summarizer destination.
+ * This helper is intentionally separate so ordinary requests retain the
+ * canonical OpenAI reservation and exact account selectors remain fail-closed.
+ */
+export function routeCompactionModel(
+  config: OcxConfig,
+  modelId: string,
+  policyEvidence?: PolicyRequestEvidence,
+): RouteResult {
+  const route = routeModelInternal(config, modelId, false, policyEvidence, true);
+  return routeWithDecisionTrace(config, modelId, route);
 }
 
 /** Resolve a combo-selected provider/model target without consulting public combo aliases again. */
@@ -786,7 +860,7 @@ function routeByKnownModelPattern(config: OcxConfig, modelId: string): RouteResu
       );
       if (matchingProvider) {
         const [provName, prov] = matchingProvider;
-        return routeResult(provName, prov, modelId, "explicit-provider", "model-pattern");
+        return routeResult(config, provName, prov, modelId, "explicit-provider", "model-pattern");
       }
       // Deliberately no "first provider with an Anthropic adapter" fallback here. Picking by
       // object insertion order, without checking `models`, `selectedModels`, `disabledModels` or

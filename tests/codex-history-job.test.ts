@@ -12,6 +12,7 @@ import {
   deriveCodexHistoryOperation,
   runCodexHistoryJob,
 } from "../src/codex/history-job";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const sandboxes: string[] = [];
 let previousCodexHome: string | undefined;
@@ -20,7 +21,7 @@ afterEach(() => {
   if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = previousCodexHome;
   previousCodexHome = undefined;
-  for (const root of sandboxes.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of sandboxes.splice(0)) removeTreeWithRetry(root);
 });
 
 interface Fixture {
@@ -131,6 +132,13 @@ test("the failure wording names the real reason instead of always blaming the Co
   const partialIntegrity = { ...integrity, rows: 1, files: 1 } as const;
   expect(describeHistoryJobFailure(partialIntegrity, "restore")).toContain("partial restore");
   expect(describeHistoryJobFailure(partialIntegrity, "restore")).toContain("manifest was retained");
+
+  // An ambiguous reroute is not a retry: two histories produced the same row and no durable
+  // fact separates them, so "run doctor" points the operator the wrong way.
+  const ambiguous = { ...integrity, historyIntegrityCode: "history_apply_ambiguous_reroute" } as const;
+  expect(describeHistoryJobFailure(ambiguous, "apply")).toContain("cannot prove whether an earlier relabel was undone");
+  expect(describeHistoryJobFailure(ambiguous, "apply")).toContain("Resolve it manually");
+  expect(describeHistoryJobFailure(ambiguous, "apply")).not.toContain("'ocx doctor'");
 
   const partialPermission = { ...permission, rows: 1, files: 1 } as const;
   expect(describeHistoryJobFailure(partialPermission, "apply")).toContain("changed but did not converge");
@@ -343,6 +351,6 @@ test("the synchronous restore body is gated on skipHistory", () => {
     expect(JSON.parse(restored.stdout.trim().split("\n").filter(Boolean).pop() ?? "{}")).toEqual({ history: "ok" });
     expect(provider()).toBe("openai");
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTreeWithRetry(root);
   }
 }, 30_000);

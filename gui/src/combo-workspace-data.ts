@@ -4,13 +4,48 @@
  */
 
 import { SUPPORTED_NATIVE_OPENAI_SLUGS } from "../../src/codex/catalog/native-models";
+import type { TKey } from "./i18n/shared";
 
 export { SUPPORTED_NATIVE_OPENAI_SLUGS };
 
-export type ComboStrategy = "failover" | "round-robin";
+export type ComboStrategy = "failover" | "round-robin" | "random" | "least-used" | "reset-window";
 export type ComboEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export const COMBO_EFFORTS: ComboEffort[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+/** Mirrors OcxComboStrategy in src/types/config.ts. */
+export const COMBO_STRATEGIES: readonly ComboStrategy[] = [
+  "failover",
+  "round-robin",
+  "random",
+  "least-used",
+  "reset-window",
+] as const;
+
+export const COMBO_STRATEGY_LABEL_KEYS: Record<ComboStrategy, TKey> = {
+  failover: "cws.strategy.failover",
+  "round-robin": "cws.strategy.roundRobin",
+  random: "cws.strategy.random",
+  "least-used": "cws.strategy.leastUsed",
+  "reset-window": "cws.strategy.resetWindow",
+};
+
+export const COMBO_STRATEGY_HINT_KEYS: Record<ComboStrategy, TKey> = {
+  failover: "cws.strategy.failoverHint",
+  "round-robin": "cws.strategy.roundRobinHint",
+  random: "cws.strategy.randomHint",
+  "least-used": "cws.strategy.leastUsedHint",
+  "reset-window": "cws.strategy.resetWindowHint",
+};
+
+export const COMBO_TARGETS_HINT_KEYS: Record<ComboStrategy, TKey> = {
+  failover: "cws.targets.failoverHint",
+  "round-robin": "cws.targets.roundRobinHint",
+  random: "cws.targets.randomHint",
+  "least-used": "cws.targets.leastUsedHint",
+  "reset-window": "cws.targets.resetWindowHint",
+};
+
+const COMBO_STRATEGY_SET = new Set<string>(COMBO_STRATEGIES);
 
 /**
  * Intersection of advertised effort ladders for picker availability.
@@ -19,6 +54,7 @@ export const COMBO_EFFORTS: ComboEffort[] = ["low", "medium", "high", "xhigh", "
 export function intersectComboEfforts(
   targets: readonly ComboTarget[],
   modelEfforts: ReadonlyMap<string, readonly string[] | undefined>,
+  reasoningEffortMode: "strict" | "adaptive" = "strict",
 ): ComboEffort[] {
   const complete = targets.filter((t) => t.provider.trim() && t.model.trim());
   if (complete.length === 0) return [...COMBO_EFFORTS];
@@ -28,6 +64,9 @@ export function intersectComboEfforts(
     const key = `${target.provider.trim()}/${target.model.trim()}`;
     const listed = modelEfforts.get(key);
     if (listed === undefined) continue;
+    // Adaptive mirrors the served catalog: a target advertising no effort control is
+    // excluded from the intersection rather than collapsing it for every sibling.
+    if (reasoningEffortMode === "adaptive" && listed.length === 0) continue;
     const member = listed.filter((effort) => effortSet.has(effort));
     if (common === null) {
       common = member;
@@ -71,6 +110,10 @@ function normalizeImageInput(value: unknown): "auto" | "disabled" {
   return value === "disabled" ? "disabled" : "auto";
 }
 
+function normalizeReasoningEffortMode(value: unknown): "strict" | "adaptive" {
+  return value === "adaptive" ? "adaptive" : "strict";
+}
+
 export interface ComboItem {
   id: string;
   /** Wire id shown to clients, e.g. combo/free */
@@ -85,12 +128,18 @@ export interface ComboItem {
   stickyLimit: number;
   defaultEffort: ComboEffort | null;
   imageInput?: "auto" | "disabled";
+  /**
+   * Picker-ladder policy. `adaptive` lets targets that advertise no effort control drop
+   * out of the intersection instead of emptying it for the whole group.
+   */
+  reasoningEffortMode?: "strict" | "adaptive";
   targets: ComboTarget[];
 }
 
 export interface ComboSections {
   failover: ComboItem[];
   roundRobin: ComboItem[];
+  other: ComboItem[];
 }
 
 export interface ComboAttentionItem {
@@ -136,7 +185,9 @@ function normalizeAlias(raw: unknown): string | null {
 }
 
 export function normalizeStrategy(raw: unknown): ComboStrategy {
-  return raw === "round-robin" ? "round-robin" : "failover";
+  return typeof raw === "string" && COMBO_STRATEGY_SET.has(raw)
+    ? raw as ComboStrategy
+    : "failover";
 }
 
 export function normalizeStickyLimit(raw: unknown): number {
@@ -190,6 +241,7 @@ export function parseComboList(payload: unknown): ComboItem[] {
       stickyLimit: normalizeStickyLimit(r.stickyLimit),
       defaultEffort: normalizeDefaultEffort(r.defaultEffort),
       imageInput: normalizeImageInput(r.imageInput),
+      reasoningEffortMode: normalizeReasoningEffortMode(r.reasoningEffortMode),
       targets,
     });
   }
@@ -199,11 +251,13 @@ export function parseComboList(payload: unknown): ComboItem[] {
 export function groupCombos(items: ComboItem[]): ComboSections {
   const failover: ComboItem[] = [];
   const roundRobin: ComboItem[] = [];
+  const other: ComboItem[] = [];
   for (const item of items) {
-    if (item.strategy === "round-robin") roundRobin.push(item);
-    else failover.push(item);
+    if (item.strategy === "failover") failover.push(item);
+    else if (item.strategy === "round-robin") roundRobin.push(item);
+    else other.push(item);
   }
-  return { failover, roundRobin };
+  return { failover, roundRobin, other };
 }
 
 export function filterCombos(items: ComboItem[], query: string): ComboItem[] {
@@ -445,6 +499,7 @@ export function draftEquals(a: ComboItem, b: ComboItem): boolean {
     || a.stickyLimit !== b.stickyLimit
     || a.defaultEffort !== b.defaultEffort
     || (a.imageInput ?? "auto") !== (b.imageInput ?? "auto")
+    || (a.reasoningEffortMode ?? "strict") !== (b.reasoningEffortMode ?? "strict")
   ) return false;
   if (a.targets.length !== b.targets.length) return false;
   return a.targets.every((t, i) => {
@@ -462,21 +517,24 @@ export function toPutBody(item: ComboItem, options: { renameFrom?: string } = {}
     stickyLimit?: number;
     defaultEffort: ComboEffort | null;
     imageInput?: "disabled";
+    reasoningEffortMode?: "adaptive";
     alias?: string;
     nativeAlias?: true;
     displayName?: string;
   };
 } {
+  const weighted = item.strategy === "round-robin" || item.strategy === "random";
   return {
     id: item.id.trim(),
     ...(options.renameFrom ? { renameFrom: options.renameFrom } : {}),
     combo: {
-      targets: item.targets.map((target) => item.strategy === "round-robin"
+      targets: item.targets.map((target) => weighted
         ? { provider: target.provider.trim(), model: target.model.trim(), weight: target.weight ?? 1 }
         : { provider: target.provider.trim(), model: target.model.trim() }),
       strategy: item.strategy,
       defaultEffort: item.defaultEffort,
       ...(item.imageInput === "disabled" ? { imageInput: "disabled" as const } : {}),
+      ...(item.reasoningEffortMode === "adaptive" ? { reasoningEffortMode: "adaptive" as const } : {}),
       ...(item.strategy === "round-robin" ? { stickyLimit: item.stickyLimit } : {}),
       ...(item.alias && item.alias.trim() ? { alias: item.alias.trim() } : {}),
       ...(item.nativeAlias ? { nativeAlias: true } : {}),
@@ -561,6 +619,8 @@ export function validateComboDraft(
     if (!Number.isInteger(item.stickyLimit) || item.stickyLimit < 1 || item.stickyLimit > 100) {
       return "invalidStickyLimit";
     }
+  }
+  if (item.strategy === "round-robin" || item.strategy === "random") {
     for (const target of item.targets) {
       const weight = target.weight ?? 1;
       if (!Number.isInteger(weight) || weight < 1 || weight > 10000) return "invalidWeight";
@@ -584,6 +644,7 @@ export function emptyDraft(id = ""): ComboItem {
     stickyLimit: 1,
     defaultEffort: null,
     imageInput: "auto",
+    reasoningEffortMode: "strict",
     targets: [newComboTarget()],
   };
 }

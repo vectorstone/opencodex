@@ -61,14 +61,16 @@ opencodex lit ces variables dans son propre environnement. Si votre passerelle u
 dossier personnel déplacé, lancez opencodex avec les mêmes variables ; sinon, il suivra correctement une
 autre installation.
 
-## Les quatre autres surfaces ne sont pas des commutateurs
+## Les cinq autres surfaces ne sont pas des commutateurs
 
 **Clés API** gère les propres identifiants d'opencodex et n'est donc pas un client. **Codex CLI** est relié
 par le service du proxy lui-même : démarrer opencodex applique ce routage et l'arrêter restaure le routage
 natif ; aucun fichier ne doit donc être activé ou désactivé séparément. **Claude** conserve son propre
 indicateur d'activation et le flux **Enregistrer/Appliquer** de Desktop, tandis que **Grok Build** conserve
 sa barrière « sélectionner, puis appliquer » pour les modèles. Ces règles sont antérieures à cette
-fonctionnalité et restent inchangées.
+fonctionnalité et restent inchangées. **Cursor** n'écrit absolument rien : son onglet affiche la détection,
+les valeurs de la passerelle et la dernière requête observée, et tout le reste se passe dans Cursor Private
+Inference.
 
 ## Restauration
 
@@ -144,6 +146,16 @@ ocx integration client disable --client hermes
 ocx integration client history --client hermes
 ocx integration client restore --op <opId> [--confirm-drift]
 ```
+
+`--overwrite-conflict` est la forme terminale de **Replace** :
+
+```bash
+ocx integration client enable --client zcode --overwrite-conflict
+```
+
+Comme `--confirm-drift`, il n'est jamais supposé : sans lui, un conflit reste refusé.
+Il ne s'applique qu'à `enable` ; forcer un *disable* sur un conflit supprimerait un bloc
+que nous n'avons jamais écrit, donc cette combinaison est rejetée.
 
 Pour MiniMax Code, connectez une fois le fournisseur puis utilisez l’enveloppe qui vérifie la connexion :
 

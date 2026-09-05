@@ -26,7 +26,7 @@ yardımcı özellikleri nasıl çalıştıracağını kontrol eder.
 | `codexAutoStart?` | `boolean` | `true` | Codex dolgusunun Codex'i başlatmadan önce `ocx ensure` çalıştırmasına izin verin. False, ensure'ı bir işlem yapmayan (no-op) hale getirir. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Tamamlanan harici bir Codex güncellemesi değiştirdikten sonra kurulu bir dolguyu geri yükleyin. Ortam vazgeçmesi: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Tersine çevrilebilir Codex App geçmişi uyumluluğu. Orijinal meta veriler yedeklenir ve `ocx stop` / `ocx restore` tarafından geri yüklenir. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını düşük çabayla seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını, istek için yapılandırılan akıl yürütme çabasını koruyarak seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | kullanılabilir olduğunda açık | Web arama sidecar seçenekleri. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | kullanılabilir olduğunda açık | Görsel açıklama sidecar seçenekleri. |
 | `images?` | `OcxImagesConfig` | otomatik OpenAI seçimi | Codex `image_gen` için bağımsız Görseller aktarma seçenekleri. |
@@ -111,8 +111,9 @@ tarafından atanmaz: geçici bir port yeniden başlatmalar arasında değişirke
 zaten çalışan app-server'lar önceki `base_url`'i tutardı.
 
 Dinleyici yalnızca `POST /v1/responses`, onun WebSocket yükseltmesi, `POST
-/v1/responses/compact` ve `GET /v1/models` sunar. `/api/*` ve kontrol paneli
-dahil diğer her şey `404` döndürür.
+/v1/responses/compact`, `POST /v1/alpha/search` (yerel Codex web arama aktarımı),
+`GET /v1/models` ve bağımsız sesli WebSocket yükseltmelerini sunar. `/api/*` ve
+kontrol paneli dahil diğer her şey `404` döndürür.
 
 :::danger[Bu kimliği doğrulanmamış bir yüzeydir]
 Makinedeki her süreç bu dinleyiciyi kullanabilir. Hesap kotasını ve ücretli
@@ -196,13 +197,13 @@ modu](/tr/guides/claude-code/#auth-mode).
 ## Gölge çağrılar
 
 Codex, başlıklar ve commit mesajları gibi görevler için küçük yardımcı modeller
-kullanır. Tanınan kaynak model öneklerini düşük çabayla yapılandırılmış başka
-bir modele yeniden yönlendirmek için `shadowCallIntercept`'i etkinleştirin.
+kullanır. Tanınan kaynak model öneklerini yapılandırılmış başka bir modele yeniden
+yönlendirmek için `shadowCallIntercept`'i etkinleştirin. Değiştirilen istek, yapılandırılmış
+akıl yürütme çabasını korur.
 `sourceModels`'ı yalnızca bir istemci farklı yardımcı kimlikleri kullandığında
-ayarlayın. Codex 0.145.0+, istek amacını `x-codex-turn-metadata` içinde
-işaretler: normal `request_kind: "turn"` istekleri seçilen modeli tutarken
-tanınan bakım istekleri yeniden yönlendirilebilir. Bu meta verileri içermeyen
-istemciler eski önek davranışını korur.
+ayarlayın. Yakalama model tabanlıdır: çıplak model kimliği `sourceModels` ile
+eşleşen her istek, normal `request_kind: "turn"` istekleri dahil, yeniden
+yönlendirilebilir. `x-codex-turn-metadata` eşleşen bir isteği muaf tutmaz.
 
 ```json
 {
@@ -281,3 +282,9 @@ sınırı tüketmez. Uzak `https:` görselleri ve başarısız veya boş açıkl
 
 Anthropic OAuth sidecar'ları opencodex'in mevcut Claude Code OAuth parmak izini
 yeniden kullanır. Hedeflenen hesap ve iş yükünü kapsamlı bir şekilde test edin.
+
+## Remote Hub anahtarları ve varsayılanlar
+
+`runtimeRole` varsayılan olarak `standalone` değerindedir. Hub; `hub.managementPublicOrigin`, yalnız loopback `hub.managementIngress` (yokken `enabled:false`) ve tam `remoteGui.allowedTailscaleUsers` (yokken boş) kullanır. İstemci anahtarı `config.json` yerine `service-api-token` içinde kalır; döndürme sırasında `service-api-token.prev` geçici olarak bulunabilir. Kullanım kayıtları yansıtılmaz.
+
+`remoteGui.allowInsecureHttp`, yalnızca eski strict-schema yapılandırmalarının yüklenebilmesi için tutulan, kullanımdan kaldırılmış bir no-op'tur. Yapılandırmadan silin: pairing grant'leri yalnız loopback veya kimliği doğrulanmış HTTPS üzerinden kabul edilir ve `true` değeri düz HTTP pairing'i yeniden açmaz.

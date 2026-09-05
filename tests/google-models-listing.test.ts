@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildCatalogEntries, gatherRoutedModels as gatherRoutedModelsDirect } from "../src/codex/catalog";
@@ -8,6 +8,7 @@ import { captureModelCacheGeneration, clearModelCache, getStaleCached } from "..
 import { registerAntigravityDiscoveredWireModels, resolveAntigravityWireModelId } from "../src/providers/antigravity-models";
 import type { OcxConfig, OcxProviderConfig } from "../src/types";
 import { withStubbedProviderFetch } from "./helpers/catalog-provider-fetch";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /** Discovery runs on the pinned transport; hand it back the stubbed global. */
 const gatherRoutedModels: typeof gatherRoutedModelsDirect = (config, options) =>
@@ -170,7 +171,7 @@ describe("Antigravity live model discovery", () => {
       });
       expect(future).not.toHaveProperty("default_reasoning_level");
     } finally {
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -211,7 +212,7 @@ describe("Antigravity live model discovery", () => {
       expect(getStaleCached("google-antigravity")).toBeNull();
     } finally {
       warning.mockRestore();
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -269,7 +270,7 @@ describe("Antigravity live model discovery", () => {
         .toEqual(["configured-only"]);
       expect(resolveAntigravityWireModelId("stale-model", baseUrl)).toBe("stale-model");
     } finally {
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -356,7 +357,7 @@ describe("google models listing via catalog", () => {
       expect(seen[0].url).toBe("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000");
       expect(seen[0].headers["x-goog-api-key"]).toBe("gk-123");
       const ids = models.filter(m => m.provider === "google").map(m => m.id);
-      expect(ids).toEqual(["gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.7-flash"]);
+      expect(ids).toEqual(["gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]);
       expect(ids).not.toContain("gemini-3-pro");
       expect(ids).not.toContain("gemini-3-flash");
       expect(getStaleCached("google")).toBeNull();

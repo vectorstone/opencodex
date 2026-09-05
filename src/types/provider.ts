@@ -17,6 +17,15 @@ export interface OpenRouterProviderRouting {
   allowFallbacks?: boolean;
 }
 
+export interface VercelGatewayRouting {
+  /** Vercel AI Gateway provider slugs to try first, in priority order. */
+  order?: string[];
+  /** Restrict routing to these Vercel AI Gateway provider slugs. */
+  only?: string[];
+  /** Sort providers by "cost", "ttft", or "tps". */
+  sort?: "cost" | "ttft" | "tps";
+}
+
 export interface ResponsesItemIdRepairConfig {
   /** Exact `message` item ids that the proxy should rewrite to request-local canonical ids. */
   message?: string[];
@@ -30,6 +39,25 @@ export interface ResponsesItemIdRepairConfig {
    * function_call ids and call_id pairing are never rewritten.
    */
   repairInvalidIds?: boolean;
+}
+
+/**
+ * Opt-in retry for pre-stream transient upstream statuses (500/502/503/504/520/521/522) on
+ * `providers.<name>.transientRetryOn5xx`.
+ *
+ * Disabled unless the object is present; a bare `{}` opts in with defaults. Separate from
+ * `retryOn429`, which handles rate limiting with its own waits.
+ */
+export interface TransientRetryPolicy {
+  /** Master switch. Presence of the object also enables the policy (default true). */
+  enabled?: boolean;
+  /**
+   * TOTAL upstream sends allowed for one request, including the first (1..10, default 3).
+   *
+   * Not a per-layer retry count: the connection-reset and transient-status recovery layers
+   * share this single budget, so `3` means at most three real requests reach the provider.
+   */
+  attempts?: number;
 }
 
 /**
@@ -78,7 +106,13 @@ export interface ProviderRequestPacingConfig extends RequestPacingRule {
 }
 
 export interface FastWire {
-  kind: "service-tier" | "anthropic-speed";
+  /**
+   * How the provider expresses Fast on the wire. `service-tier` is OpenAI's
+   * `service_tier` request field; `cursor-variant` is a MODEL-VARIANT switch, because
+   * Cursor has no tier field — its fast product is a different model id
+   * (`claude-opus-5-thinking-high-fast`) or a `{id:"fast"}` request parameter for Grok.
+   */
+  kind: "service-tier" | "anthropic-speed" | "cursor-variant";
   /** Canonical tier name to upstream wire spelling. */
   canonicalToWire: Readonly<Record<string, string>>;
   /** Policy for non-canonical caller-provided tier values. */
@@ -140,6 +174,8 @@ export interface OcxProviderConfig {
   alias?: string;
   /** Native model id -> short, slash-free request alias. */
   modelAliases?: Record<string, string>;
+  /** Display-only labels for exact native model ids discovered under this provider. */
+  modelDisplayNames?: Record<string, string>;
   /** Override the global built-in model-alias switch for this provider. */
   defaultAliases?: boolean;
   adapter: string;
@@ -198,6 +234,16 @@ export interface OcxProviderConfig {
    */
   requiresAdjacentResponsesToolResults?: boolean;
   /**
+   * When enabled, a tool result that is present but empty (no usable text or content
+   * part) is rewritten to an explicit annotation before it reaches the upstream wire,
+   * so models do not silently accept an empty result or re-issue the same call.
+   * Non-empty results and missing-result placeholders stay byte-identical.
+   * Seeded true for DeepSeek; absent keeps legacy behavior for every other provider.
+   * Only the OpenAI-family adapters (openai-chat / openai-responses) read this option;
+   * other adapters ignore it.
+   */
+  annotateEmptyToolOutputs?: boolean;
+  /**
    * Provider fallback for canonical Fast capability over an OpenAI `service_tier` wire.
    * This pure tri-state feeds catalog publication, routing eligibility, compatibility
    * fingerprints, and proxy-owned canonical Fast injection on both Responses and Chat routes.
@@ -237,6 +283,18 @@ export interface OcxProviderConfig {
    * (current behavior unchanged). Only meaningful for https: base URLs.
   */
   upstreamHttpVersion?: UpstreamHttpVersion;
+  /**
+   * Opt-in upstream Responses WebSocket transport for `openai-responses` requests. When true,
+   * streaming POST turns use the configured Responses path (default `/v1/responses`): forward
+   * providers use `{baseUrl}/responses`, while key-auth providers use `responsesPath` or the
+   * legacy `/v1/responses` fallback. HTTPS providers use wss and are re-encoded to SSE; HTTP
+   * providers continue using SSE, and `openai-chat` requests stay on HTTP. This mirrors the
+   * canonical ChatGPT backend optimization for any OpenAI-compatible gateway that speaks the
+   * Responses WebSocket protocol (for example an aggregator like sub2api whose WS ingress is
+   * measurably faster than its SSE queue). Default false. Canonical ChatGPT backend WS selection
+   * is independent of this flag.
+   */
+  upstreamWebsocket?: boolean;
   /**
    * Google only. When `false`, the AI Studio (direct) path sends Gemini Flash ids
    * unchanged to the wire instead of applying the `-tiered` suffix (`gemini-3.7-flash`
@@ -281,6 +339,16 @@ export interface OcxProviderConfig {
    * full set so the user can pick). See devlog issue_052_provider-model-allowlist.
    */
   selectedModels?: string[];
+  /**
+   * Per-provider retention allowlist for authoritative live discovery. When non-empty, any
+   * model id in this list is preserved in the routed catalog even if the live `/models`
+   * endpoint omits it (ad-hoc / private providers whose live discovery drops callable ids).
+   * Mirrors the built-in `kimi`/`xai` compatibility tables — opt-in for every other provider.
+   * Ids listed here need not be repeated in `models`: discovery folds them into the configured
+   * seed, so they exist under `liveModels: false` too. `selectedModels` still narrows what is
+   * visible. Empty/undefined = no opt-in (default behavior). See #1690.
+   */
+  retainModels?: string[];
   /** Override for newly discovered models. Absent/"inherit" uses the install policy. */
   newModelPolicy?: "on" | "off" | "inherit";
   /**
@@ -342,6 +410,10 @@ export interface OcxProviderConfig {
   openRouterRouting?: OpenRouterProviderRouting;
   /** Exact model-id overrides for `openRouterRouting`. Each matching entry replaces the default. */
   modelOpenRouterRouting?: Record<string, OpenRouterProviderRouting>;
+  /** Default provider-routing preferences for models sent through Vercel AI Gateway (issue #1406). */
+  vercelGatewayRouting?: VercelGatewayRouting;
+  /** Exact model-id overrides for `vercelGatewayRouting`. Each matching entry replaces the default. */
+  modelVercelGatewayRouting?: Record<string, VercelGatewayRouting>;
   /**
    * "key" (default): authenticate upstream with `apiKey`.
    * "forward": relay the caller's incoming auth headers verbatim (OAuth passthrough; gpt only).
@@ -360,6 +432,13 @@ export interface OcxProviderConfig {
    */
   oauthAccountFailover?: {
     enabled?: boolean;
+    /**
+     * Generic OAuth pool selection strategy (#695). Persisted through the pool-settings
+     * contract; the selector does not consume it yet, so omitted keeps today's behavior.
+     */
+    strategy?: "quota" | "round-robin" | "fill-first";
+    /** 0-100 usage percent at which a proactive switch may be considered (#695); inert today. */
+    autoSwitchThreshold?: number;
   };
   /** Allow an explicitly key/oauth provider to run without a credential (for keyless local proxies). */
   keyOptional?: boolean;
@@ -422,6 +501,12 @@ export interface OcxProviderConfig {
    */
   supportsOpenAiWebSearchToolFields?: boolean;
   /**
+   * Opt xAI Responses destinations into the provider-hosted `x_search` declaration when a live
+   * `web_search` tool survives final request normalization. Disabled by default. This is separate
+   * from the web-search sidecar's `search.xSearch` options and never widens caller tool selectors.
+   */
+  xaiResponsesXSearch?: boolean;
+  /**
    * Whether the Responses upstream accepts native custom tools and custom_tool_call items.
    * Set false only for a provider whose native contract rejects them; absence preserves
    * apply_patch passthrough compatibility for OpenAI and unclassified gateways.
@@ -456,6 +541,14 @@ export interface OcxProviderConfig {
    * per-model compatibility escape hatch for mixed-capability gateways.
    */
   noStructuredOutputModels?: string[];
+  /**
+   * Model ids that accept a reasoning-effort field on an ordinary turn but reject it
+   * once function tools are present. The model keeps its advertised effort ladder;
+   * OpenCodex omits the wire field for tool-bearing requests only and lets the
+   * upstream default apply. Narrower than `noReasoningModels`, which strips reasoning
+   * from every request and costs the model its picker entirely.
+   */
+  omitReasoningEffortWithToolsModels?: string[];
   /**
    * Allow multiple tool calls per completion. DEFAULT-ON for openai-chat providers (the
    * buffered stream parser assembles interleaved/fragmented multi-call turns safely);
@@ -538,10 +631,24 @@ export interface OcxProviderConfig {
    */
   retryOn429?: RateLimitRetryPolicy;
   /**
+   * Opt-in retry for pre-stream transient upstream statuses
+   * (`providers.<name>.transientRetryOn5xx`). Disabled unless present; a bare `{}` opts in
+   * with defaults. Key-auth `openai-chat` only.
+   */
+  transientRetryOn5xx?: TransientRetryPolicy;
+  /**
    * Model ids whose OpenAI-compatible chat endpoint accepts `reasoning_split: true` and returns
    * thinking separately in `reasoning_content` / `reasoning_details` instead of visible content.
    */
   reasoningSplitModels?: string[];
+  /**
+   * Model ids whose chat endpoint carries thinking as a structured `reasoning_details` array
+   * (MiniMax M-series with `reasoning_split`): stream deltas repeat each detail's `text` as a
+   * cumulative snapshot, so the adapter prefix-diffs instead of appending, and preserved
+   * reasoning replays as a `reasoning_details` array rather than a `reasoning_content` string
+   * (upstream requires the array back verbatim to keep interleaved thinking intact).
+   */
+  reasoningDetailsModels?: string[];
   /**
    * Model ids whose reasoning is a vendor `thinking: {type}` toggle on the
    * chat-completions wire (MiMo v2.x, GLM 5/5.1 style), NOT an OpenAI `reasoning_effort` ladder.

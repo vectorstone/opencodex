@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { ComboEffort, ComboStrategy, ComboTarget, ProviderQuotaStates } from "../combo-workspace-data";
 import { comboImagesSupported } from "../combo-capabilities";
-import { COMBO_EFFORTS, newComboTarget } from "../combo-workspace-data";
+import { COMBO_EFFORTS, COMBO_STRATEGIES, COMBO_STRATEGY_LABEL_KEYS, newComboTarget } from "../combo-workspace-data";
 import { IconArrowDown, IconArrowUp, IconGrip, IconPlus, IconTrash } from "../icons";
 import { useT } from "../i18n/shared";
 import { Switch } from "../ui";
@@ -21,10 +21,7 @@ export function StrategySeg({
   const t = useT();
   return (
     <div className="cwi-strategy-seg" role="radiogroup" aria-label={t("cws.strategy")}>
-      {([
-        ["failover", "cws.strategy.failover"],
-        ["round-robin", "cws.strategy.roundRobin"],
-      ] as const).map(([id, key]) => (
+      {COMBO_STRATEGIES.map((id) => (
         <button
           key={id}
           type="button"
@@ -34,7 +31,7 @@ export function StrategySeg({
           disabled={disabled}
           onClick={() => onChange(id)}
         >
-          {t(key)}
+          {t(COMBO_STRATEGY_LABEL_KEYS[id])}
         </button>
       ))}
     </div>
@@ -90,14 +87,16 @@ export function ComboCapabilities({
   targets,
   models,
   imageInput,
+  reasoningEffortMode,
   disabled,
   onChange,
 }: {
   targets: ComboTarget[];
   models: ModelOption[];
   imageInput: "auto" | "disabled";
+  reasoningEffortMode: "strict" | "adaptive";
   disabled?: boolean;
-  onChange: (patch: { imageInput?: "auto" | "disabled" }) => void;
+  onChange: (patch: { imageInput?: "auto" | "disabled"; reasoningEffortMode?: "strict" | "adaptive" }) => void;
 }) {
   const t = useT();
   const imagesSupported = comboImagesSupported(targets, models);
@@ -122,6 +121,20 @@ export function ComboCapabilities({
           }}
           disabled={disabled || !imagesSupported}
           label={t("cws.capability.imageInput")}
+        />
+      </div>
+      <div className="cwi-capability-row">
+        <div>
+          <span className="cwi-capability-label">{t("cws.capability.adaptiveEffort")}</span>
+          <p className="muted cwi-capability-hint">{t("cws.capability.adaptiveEffortHint")}</p>
+        </div>
+        <Switch
+          on={reasoningEffortMode === "adaptive"}
+          onClick={() => {
+            onChange({ reasoningEffortMode: reasoningEffortMode === "adaptive" ? "strict" : "adaptive" });
+          }}
+          disabled={disabled}
+          label={t("cws.capability.adaptiveEffort")}
         />
       </div>
     </section>
@@ -270,7 +283,7 @@ export function TargetEditor({
                 <option key={id} value={id}>{id}</option>
               ))}
             </select>
-            {strategy === "round-robin" && (
+            {(strategy === "round-robin" || strategy === "random") && (
               <input
                 className="input mono"
                 type="number"

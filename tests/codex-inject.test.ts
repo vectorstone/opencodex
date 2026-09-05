@@ -7,16 +7,85 @@ import {
   chooseCatalogPathForInjection,
   dominantEol,
   setRootOpenaiBaseUrl,
+  setRootRealtimeWsBaseUrl,
   stripInjectedOpenaiBaseUrl,
   stripOpencodexConfig,
   stripRootContextWindowOverrides,
+  standaloneCodexRoutingTarget,
 } from "../src/codex/inject";
+import { stripJournaledOpenaiBaseUrl } from "../src/codex/injected-marker";
 import {
   MANAGED_AGENTS_TABLE_MARKER,
   MANAGED_SUBAGENT_DEFAULT_MARKER,
 } from "../src/codex/subagent-defaults";
 
 describe("Codex config injection", () => {
+  test("standalone routing-target wrappers remain byte-compatible", () => {
+    const target = standaloneCodexRoutingTarget(10100, { hostname: "192.168.1.20" });
+    expect(buildProviderTableBlock(target, true)).toBe(
+      buildProviderTableBlock(10100, true, true, "192.168.1.20"),
+    );
+    expect(buildProfileFile(target, "/tmp/opencodex-catalog.json", true)).toBe(
+      buildProfileFile(10100, "/tmp/opencodex-catalog.json", true, true, "192.168.1.20"),
+    );
+  });
+
+  describe("authless Codex Desktop opt-in (#1107)", () => {
+    test("default target on loopback stays Design B and byte-identical", () => {
+      const target = standaloneCodexRoutingTarget(10100, {});
+      expect(target.desktopAuthless).toBeUndefined();
+      expect(buildProfileFile(target, null)).toBe(buildProfileFile(10100, null));
+      expect(buildProviderTableBlock(target)).toContain("requires_openai_auth = true");
+    });
+
+    test("loopback opt-in emits the provider table with requires_openai_auth = false and no env_key", () => {
+      const target = standaloneCodexRoutingTarget(10100, { codexDesktopAuthless: true });
+      expect(target).toMatchObject({ requiresAdmissionToken: false, desktopAuthless: true });
+      const block = buildProviderTableBlock(target);
+      expect(block).toContain("[model_providers.opencodex]");
+      expect(block).toContain('base_url = "http://127.0.0.1:10100/v1"');
+      expect(block).toContain("requires_openai_auth = false");
+      expect(block).not.toContain("env_key");
+      const profile = buildProfileFile(target, "/tmp/opencodex-catalog.json");
+      expect(profile).toContain('model_provider = "opencodex"');
+      expect(profile).toContain("requires_openai_auth = false");
+      expect(profile).not.toContain("openai_base_url");
+    });
+
+    test("non-loopback binds ignore the opt-in: admission env_key and requires_openai_auth = true stay", () => {
+      const target = standaloneCodexRoutingTarget(10100, { hostname: "192.168.1.20", codexDesktopAuthless: true });
+      expect(target.desktopAuthless).toBeUndefined();
+      expect(target.requiresAdmissionToken).toBe(true);
+      const block = buildProviderTableBlock(target);
+      expect(block).toContain("requires_openai_auth = true");
+      expect(block).toContain('env_key = "OPENCODEX_API_AUTH_TOKEN"');
+    });
+
+    test("the unauthenticated loopback listener still honors the opt-in", () => {
+      const target = standaloneCodexRoutingTarget(10100, {
+        codexDesktopAuthless: true,
+        unauthenticatedLoopbackListener: { enabled: true, port: 10199 },
+      });
+      expect(target).toMatchObject({ baseUrl: "http://127.0.0.1:10199/v1", desktopAuthless: true });
+    });
+  });
+
+  test("explicit HTTPS target emits exact provider destination and admission env", () => {
+    const target = {
+      baseUrl: "https://hub.example.test/v1",
+      requiresAdmissionToken: true,
+      tokenEnv: "OPENCODEX_API_AUTH_TOKEN" as const,
+    };
+    const block = buildProviderTableBlock(target);
+    expect(block).toContain('base_url = "https://hub.example.test/v1"');
+    expect(block).toContain('env_key = "OPENCODEX_API_AUTH_TOKEN"');
+    const loopbackLooking = buildProviderTableBlock({ ...target, baseUrl: "https://127.0.0.1/v1" });
+    expect(loopbackLooking).toContain('env_key = "OPENCODEX_API_AUTH_TOKEN"');
+    expect(() => buildProviderTableBlock({ ...target, baseUrl: "https://hub.example.test/not-v1" })).toThrow(
+      "canonical HTTP(S) /v1 URL",
+    );
+  });
+
   test("omits provider-level Responses WebSocket support by default", () => {
     const block = buildProviderTableBlock(10100);
 
@@ -308,6 +377,133 @@ describe("Design B openai_base_url injection", () => {
 
     const userOwned = 'openai_base_url = "https://my-own-gateway.example/v1"\n\n[features]\n';
     expect(stripInjectedOpenaiBaseUrl(userOwned)).toBe(userOwned);
+  });
+
+  describe("realtime sideband override (experimental_realtime_ws_base_url)", () => {
+    const loopback = { baseUrl: "http://127.0.0.1:10100/v1", requiresAdmissionToken: false, tokenEnv: "OPENCODEX_API_AUTH_TOKEN" } as const;
+    const base = 'model = "gpt-5.5"\n\n[features]\nfast_mode = true\n';
+
+    test("is written as its own marker-owned pair directly under the routing pair, with the same value", () => {
+      const routed = setRootOpenaiBaseUrl(base, loopback).content;
+      const { content, keptUserRealtimeWsBaseUrl } = setRootRealtimeWsBaseUrl(routed, loopback);
+      expect(keptUserRealtimeWsBaseUrl).toBe(false);
+      const lines = content.split("\n");
+      const routing = lines.indexOf('openai_base_url = "http://127.0.0.1:10100/v1"');
+      expect(routing).toBeGreaterThan(0);
+      expect(lines[routing - 1]).toContain("Auto-injected by opencodex");
+      expect(lines[routing + 1]).toContain("Auto-injected by opencodex");
+      expect(lines[routing + 2]).toBe('experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"');
+      expect(lines.indexOf("[features]")).toBeGreaterThan(routing + 2);
+      expect(content.match(/Auto-injected by opencodex/g)?.length).toBe(2);
+    });
+
+    test("a pre-upgrade block where the user's own realtime line sits right under our routing pair is left alone", () => {
+      // Older injections wrote only marker + openai_base_url. A user who added the realtime
+      // key by hand directly beneath must keep it: ownership is per marker, never by adjacency.
+      const original = [
+        "# Auto-injected by opencodex",
+        'openai_base_url = "http://127.0.0.1:10100/v1"',
+        'experimental_realtime_ws_base_url = "https://realtime.example/v1"',
+        "",
+        "[features]",
+        "",
+      ].join("\n");
+      const { content, keptUserRealtimeWsBaseUrl } = setRootRealtimeWsBaseUrl(original, loopback);
+      expect(keptUserRealtimeWsBaseUrl).toBe(true);
+      expect(content).toBe(original);
+      const stripped = stripInjectedOpenaiBaseUrl(original);
+      expect(stripped).not.toContain("openai_base_url");
+      expect(stripped).toContain('experimental_realtime_ws_base_url = "https://realtime.example/v1"');
+    });
+
+    test("an orphaned marker + realtime pair (routing line removed by hand) is stripped, not accumulated", () => {
+      const orphan = [
+        'model = "gpt-5.5"',
+        "# Auto-injected by opencodex",
+        'experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"',
+        "",
+        "# Auto-injected by opencodex",
+        "[model_providers.opencodex]",
+        'name = "OpenCodex Proxy"',
+        'base_url = "http://127.0.0.1:10100/v1"',
+        "",
+        "[features]",
+        "fast_mode = true",
+        "",
+      ].join("\n");
+      const stripped = stripOpencodexConfig(orphan);
+      expect(stripped).not.toContain("experimental_realtime_ws_base_url");
+      expect(stripped).not.toContain("opencodex");
+      expect(stripped).toContain('model = "gpt-5.5"');
+      expect(stripped).toContain("fast_mode = true");
+    });
+
+    test("re-inject is idempotent and follows a port change", () => {
+      const first = setRootRealtimeWsBaseUrl(setRootOpenaiBaseUrl(base, loopback).content, loopback).content;
+      const again = setRootRealtimeWsBaseUrl(first, loopback).content;
+      expect(again).toBe(first);
+      const moved = { ...loopback, baseUrl: "http://127.0.0.1:10190/v1" };
+      const second = setRootRealtimeWsBaseUrl(first, moved).content;
+      expect(second.match(/experimental_realtime_ws_base_url/g)?.length).toBe(1);
+      expect(second).toContain('experimental_realtime_ws_base_url = "http://127.0.0.1:10190/v1"');
+    });
+
+    test("keeps a user's own experimental_realtime_ws_base_url and injects nothing", () => {
+      const original = 'experimental_realtime_ws_base_url = "https://realtime.example/v1"\n\n[features]\n';
+      const { content, keptUserRealtimeWsBaseUrl } = setRootRealtimeWsBaseUrl(original, loopback);
+      expect(keptUserRealtimeWsBaseUrl).toBe(true);
+      expect(content).toBe(original);
+      // A user-owned key elsewhere at the root is also kept when a marker block exists.
+      const routed = setRootOpenaiBaseUrl(`${original}`, loopback).content;
+      const withRouted = setRootRealtimeWsBaseUrl(routed, loopback);
+      expect(withRouted.keptUserRealtimeWsBaseUrl).toBe(true);
+      expect(withRouted.content).toBe(routed);
+    });
+
+    test("without a marker-owned openai_base_url nothing is written", () => {
+      const { content } = setRootRealtimeWsBaseUrl(base, loopback);
+      expect(content).toBe(base);
+    });
+
+    test("strip removes both marker-owned keys and leaves the user's own override", () => {
+      const injected = setRootRealtimeWsBaseUrl(setRootOpenaiBaseUrl(base, loopback).content, loopback).content;
+      const stripped = stripInjectedOpenaiBaseUrl(injected);
+      expect(stripped).not.toContain("openai_base_url");
+      expect(stripped).not.toContain("experimental_realtime_ws_base_url");
+      expect(stripped).not.toContain("Auto-injected by opencodex");
+      expect(stripped).toContain("[features]");
+
+      const userOwned = 'experimental_realtime_ws_base_url = "https://realtime.example/v1"\n\n[features]\n';
+      expect(stripInjectedOpenaiBaseUrl(userOwned)).toBe(userOwned);
+    });
+
+    test("stripOpencodexConfig drops the sideband override together with the routing override", () => {
+      const injected = setRootRealtimeWsBaseUrl(setRootOpenaiBaseUrl(base, loopback).content, loopback).content;
+      const stripped = stripOpencodexConfig(injected);
+      expect(stripped).not.toContain("experimental_realtime_ws_base_url");
+      expect(stripped).not.toContain("openai_base_url");
+      expect(stripped).toContain("[features]");
+    });
+
+    test("an app-reserialized config (comments dropped) is still recognized by journaled value", () => {
+      // #1798: the Codex app rewrites config.toml keeping values and dropping comments.
+      const rewritten = [
+        'openai_base_url = "http://127.0.0.1:10100/v1"',
+        'experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"',
+        'model = "gpt-5.5"',
+        "",
+      ].join("\n");
+      const stripped = stripJournaledOpenaiBaseUrl(rewritten, "http://127.0.0.1:10100/v1", "http://127.0.0.1:10100/v1");
+      expect(stripped).toBe('model = "gpt-5.5"\n');
+      // A different value is not ours and must survive.
+      const foreign = 'experimental_realtime_ws_base_url = "https://realtime.example/v1"\nmodel = "gpt-5.5"\n';
+      expect(stripJournaledOpenaiBaseUrl(foreign, "http://127.0.0.1:10100/v1", "http://127.0.0.1:10100/v1")).toBe(foreign);
+      // A user-owned override that happens to EQUAL the proxy URL is not ours either when the
+      // journal recorded that we preserved it (null) — the realtime key has its own evidence.
+      expect(stripJournaledOpenaiBaseUrl(rewritten, "http://127.0.0.1:10100/v1", null)).toBe(
+        'experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"\nmodel = "gpt-5.5"\n',
+      );
+    });
   });
 
   test("stripOpencodexConfig removes the Design B form including routed root models", () => {

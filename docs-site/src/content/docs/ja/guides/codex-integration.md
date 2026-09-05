@@ -40,6 +40,7 @@ Codex の組み込み `image_gen` ツールは、`/v1/responses` を経由しま
 失敗。壊れた/期限切れのプール認証情報が、別途請求される API 使用量の背後に隠れることはありません。
 - **明示的なカスタム プロバイダー:** `images.provider` をカスタム API キーの ID に設定します。
 `openai-responses` プロバイダー。そのエンドポイントは OpenAI Images API を実装します。明示的な選択はクローズに失敗し、別の有料アップストリームにフォールバックすることはありません。レジストリで管理されているプロバイダー ID はここでは受け入れられません。組み込みの OpenAI 層を使用するには、`images.provider` を省略します。
+- **xAI Imagine (Grok OAuth) リレー:** `images.bridgeEnabled` が `true` で、`images.provider` が未設定、かつ `xai` プロバイダーが設定されている場合、`/v1/images/generations` と `/v1/images/edits` は `https://api.x.ai/v1` に送られます。使われる資格情報はプロバイダーの `authMode` で決まります。`"oauth"` なら `ocx login xai` の Grok CLI グラントを再利用し、それ以外ならプロバイダーの API キーを使います。OAuth ログインがキー方式のプロバイダーを有効にすることはなく、その逆もありません。ChatGPT の資格情報は転送されません。資格情報が無い場合、プロキシは ChatGPT に課金せず 400 を返します。`images.provider` を明示すると `/v1/images` はそのプロバイダーが受け持ち、その検証エラーがそのまま返され、xAI リレーは試行されません。リレーは Codex の `size` / `aspect_ratio` を xAI Imagine のボディに写し、同じ `{created, data:[{b64_json}]}` 形を返します。バッチ全体（インライン `b64_json` とダウンロードした URL）のデコード済みバイトと base64 エンコード出力は合わせて 100 MiB 未満です。上限を超えるバッチは 502 を返します。xAI がインラインのバイト列ではなく画像 URL を返した場合、プロキシは資格情報なしで自ら取得します。URL は公開 HTTPS でなければならず（リダイレクト、`file:`、ループバックやプライベートアドレスは不可）、1 ファイルあたり 50 MiB が上限で、結果はローカルのアーティファクトとして保存され、認証済みの管理エンドポイント経由でのみ配信されます。これは API キー専用の Responses Image Bridge ループとは独立です。
 - **Google Antigravity (CCA) フォールバック:** OpenAI 前方候補でもキー付きでもない場合
 プロバイダーが構成されている場合、`/v1/images/generations` (`/images/edits` ではありません) は、`gemini-3.1-flash-image` モデルを使用して Antigravity **Cloud Code Assist** エンドポイントにフォールバックします。フォールバックは、OpenAI 候補が構成されていない場合だけでなく、OpenAI 認証の解決が失敗した後 (ChatGPT 資格情報の期限切れまたは欠落など) にも起動されます。これには `ocx login google-antigravity` が必要です。 OAuth トークンは、固定された CCA レジストリ ホストにのみ送信され、構成レベルの `baseUrl` オーバーライドには送信されません。応答は、Codex が期待するのと同じ `{created, data:[{b64_json}]}` 形状で返されます。
 - **どちらでもない:** プロキシは一般的な 404 ではなく明確なエラーを返します。 ルーティングされたプロバイダー
@@ -163,13 +164,13 @@ CLI から表示名を追加します (プロキシは、ライブ時にカタ�
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
-リモート Codex クライアントは、管理 API 経由で同じ生成されたカタログをフェッチできます (他の `/api/*` ルートと同じアドミッション トークン)。
+リモート Codex クライアントは、通常のデータプレーン キー（管理者トークンではなく、`/v1/responses` で既に使用しているものと同じ資格情報）で同じ生成済みカタログを取得できます。
 
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/opencodex-catalog.json"
 tmp="$(mktemp "${dest}.XXXXXX")"
-curl -fsS -H "x-opencodex-api-key: $OPENCODEX_ADMIN_AUTH_TOKEN" \
-  "https://proxy.example.com/api/catalog" > "$tmp" \
+curl -fsS -H "x-opencodex-api-key: $OPENCODEX_API_AUTH_TOKEN" \
+  "https://proxy.example.com/v1/catalog" > "$tmp" \
   && mv "$tmp" "$dest"
 ocx sync-cache
 ```
@@ -177,6 +178,8 @@ ocx sync-cache
 応答は生の `opencodex-catalog.json` ドキュメント (プロバイダーの資格情報なし) です。利用可能な場合、`x-opencodex-codex-version` ヘッダーはサーバー上の Codex ランタイム バージョンを報告するため、クライアントはバージョンの偏りを特定できます。
 
 管理 API (`POST /api/custom-models`、`PUT /api/custom-models/<id>` と `displayName` 文字列) および Web ダッシュボードを通じて設定または編集することもできます。 `/` は、配線済みスラグ セパレータと衝突する可能性があるため拒否されます。
+
+`GET /v1/catalog` は、モデル一覧の読み取りに管理トークンを必要としないために存在します。読み取り専用（`GET` と `HEAD`）で、`x-opencodex-api-key`、bearer トークン、`x-api-key` を受け付け、管理ルートとまったく同じバイト列を返します。レスポンスには強い `ETag` が付き、`If-None-Match` で送り返すと全文ではなく `304` が返ります。また `Cache-Control: private, no-cache` が設定されます。ここで許可されたデータプレーンキーは、管理プレーンでは**何も**得られません。`/api/catalog` を含むすべての `/api/*` ルートは、引き続き管理トークンまたはダッシュボードセッションを要求します。
 
 表示名は **表示専用であり、再生成しても安定しています**。 `ocx sync` およびカタログが更新されるたびに、`config.json` (`customModels` を含む) からルーティングされたエントリが再取得されるため、設定された名前はルーティングされたスラッグに戻るのではなく、再適用されます。管理対象サービスの再起動でも、プロキシのバインド直後にこの同期が試行されます。オフライン ログイン中など、ベストエフォート型ブート同期が失敗した場合、以前に永続化されたカタログが保持され、次に成功した `ocx sync` が構成された名前を再適用します。本物のアップストリーム ネイティブ名 (例: `gpt-5.6-sol` → "GPT-5.6-Sol") は、固定されたアップストリーム スナップショットから取得され、カスタム表示名によって上書きされることはありません。
 

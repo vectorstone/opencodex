@@ -1,4 +1,4 @@
-import { resolveEnvValue } from "../config";
+import { resolveProviderApiKey } from "./key-store";
 import {
   CodexPoolAuthenticationError,
   headersForCodexAuthContext,
@@ -140,6 +140,9 @@ export async function resolveFirstUsableOpenAiSidecar(
             probeLeaseId: authContext.probeLeaseId,
             probeQuotaScope: authContext.probeQuotaScope,
             writerGeneration: authContext.writerGeneration,
+            // 401/403 here is evidence about this exact stored credential; without the generation a
+            // replacement inherits the quarantine (#2892 gap 4).
+            ...(authContext.kind === "pool" ? { credentialGeneration: authContext.generation } : {}),
           },
         ),
       };
@@ -172,6 +175,8 @@ export async function resolveFirstUsableOpenAiSidecar(
               threadId: authContext.affinityKey,
               probeLeaseId: authContext.probeLeaseId,
               writerGeneration: authContext.writerGeneration,
+              // Same fence as the exact-account recorder above (#2892 gap 4).
+              ...(authContext.kind === "pool" ? { credentialGeneration: authContext.generation } : {}),
             },
           ),
         }
@@ -193,7 +198,7 @@ export function selectOpenAiImagesProvider(config: OcxConfig): OpenAiImagesProvi
     && provider.authMode !== "forward"
     && provider.baseUrl.replace(/\/+$/, "") === "https://api.openai.com/v1"
   ) {
-    const apiKey = resolveEnvValue(provider.apiKey)?.trim();
+    const apiKey = resolveProviderApiKey(provider.apiKey)?.trim();
     if (apiKey) selection.keyed = { providerName: OPENAI_API_PROVIDER_ID, provider, apiKey };
   }
   return selection;
@@ -231,7 +236,7 @@ export function selectImagesProvider(config: OcxConfig): OpenAiImagesProviderSel
     };
   }
 
-  const apiKey = resolveEnvValue(provider.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(provider.apiKey)?.trim();
   if (!apiKey) {
     return { forwardCandidates: [], error: `images.provider "${providerName}" has no usable API key` };
   }

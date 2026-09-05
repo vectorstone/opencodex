@@ -8,10 +8,12 @@ import { isDebugEnabled } from "../lib/debug-settings";
 import { isCyberPolicyCode } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
 import { contentPartsToText } from "./image";
+import { EMPTY_TOOL_OUTPUT_ANNOTATION, isWhitespaceOnlyTextPartArray } from "./empty-tool-output-annotation";
 import { identifyRoutedModel } from "./identity";
 import { peekReasoningForCall } from "../responses/reasoning-replay-cache";
 import { buildNonOpenAIToolCatalogNudgeForTools, shouldInjectNonOpenAIToolCatalogNudge } from "./tool-catalog-nudge";
 import { openRouterProviderPayload, resolveOpenRouterRouting } from "../providers/openrouter-routing";
+import { resolveVercelGatewayRouting, vercelGatewayProviderPayload } from "../providers/vercel-gateway-routing";
 import {
   canForwardForeignServiceTierForChatModel,
   fastPolicyForModel,
@@ -26,6 +28,7 @@ import {
 } from "../providers/fastwire";
 import { openaiChatCompletionsUrl } from "./openai-chat-url";
 import { stripResponsesOnlyEncryptedMarker } from "./responses-tool-schema";
+import { agentRouterDefaultHeaders, frameAgentRouterMessages } from "./agentrouter";
 import {
   isXaiSchemaTarget,
   lookupLocalJsonPointer,
@@ -87,7 +90,10 @@ function openAIChatTransport(provider: OcxProviderConfig): {
   if ((provider.authMode === "key" || provider.authMode === "oauth") && !provider.keyOptional && !hasCredential) {
     throw new Error(`${provider.adapter} requires a non-empty credential (authMode: ${provider.authMode})`);
   }
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...agentRouterDefaultHeaders(provider.baseUrl, provider.headers),
+  };
   if (hasCredential) headers.Authorization = `Bearer ${provider.apiKey}`;
   if (provider.headers) Object.assign(headers, provider.headers);
   return { url: openaiChatCompletionsUrl(provider.baseUrl), headers, hasCredential };
@@ -111,7 +117,7 @@ export function buildOpenAIChatPassthroughRequest(
 
   const body: Record<string, unknown> = {
     model: provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(modelId) : modelId,
-    messages: rawBody.messages,
+    messages: frameAgentRouterMessages(provider.baseUrl, rawBody.messages),
     stream,
   };
   for (const field of CHAT_PASSTHROUGH_FIELDS) {
@@ -120,6 +126,8 @@ export function buildOpenAIChatPassthroughRequest(
 
   const openRouterRouting = resolveOpenRouterRouting(provider, modelId);
   if (openRouterRouting) body.provider = openRouterProviderPayload(openRouterRouting);
+  const vercelRouting = resolveVercelGatewayRouting(provider, modelId);
+  if (vercelRouting) body.provider = vercelGatewayProviderPayload(vercelRouting);
 
   if (modelInList(provider.noTemperatureModels, modelId)) delete body.temperature;
   if (modelInList(provider.noTopPModels, modelId)) delete body.top_p;
@@ -313,6 +321,39 @@ function reasoningTextFrom(record: Record<string, unknown>): string | undefined 
     : typeof record.reasoning === "string" && record.reasoning.length > 0
       ? record.reasoning
       : undefined;
+}
+
+interface ReasoningDetailSegment {
+  key: string;
+  text: string;
+}
+
+/**
+ * Structured `reasoning_details` array (MiniMax M-series with `reasoning_split`).
+ * Each segment's key scopes cumulative-snapshot tracking: upstream repeats the
+ * full text-so-far under a stable `id`/`index` instead of sending increments.
+ */
+function reasoningDetailSegmentsFrom(record: Record<string, unknown>): ReasoningDetailSegment[] {
+  const raw = record.reasoning_details;
+  if (!Array.isArray(raw)) return [];
+  const segments: ReasoningDetailSegment[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const item: unknown = raw[i];
+    if (!isRecord(item)) continue;
+    if (typeof item.text !== "string" || item.text.length === 0) continue;
+    const key = typeof item.id === "string" && item.id.length > 0
+      ? `id:${item.id}`
+      : typeof item.index === "number"
+        ? `i:${item.index}`
+        : `n:${i}`;
+    segments.push({ key, text: item.text });
+  }
+  return segments;
+}
+
+/** Single-segment `reasoning_details` entry for replaying preserved reasoning (MiniMax wire shape). */
+function reasoningDetailSegmentForWire(text: string): Record<string, unknown> {
+  return { type: "reasoning.text", id: "reasoning-text-1", format: "MiniMax-response-v1", index: 0, text };
 }
 
 function invalidChoicesEvent(usage?: OcxUsage): Extract<AdapterEvent, { type: "error" }> {
@@ -588,9 +629,22 @@ function isNativeOpenAIChatTarget(provider: OcxProviderConfig): boolean {
  * being flattened to the "[image]" marker the model can't actually see. Data URLs and remote https
  * URLs are both valid in image_url.url, unlike Gemini inline_data which needs base64.
  */
-function toolResultTextForWire(content: string | OcxContentPart[]): string {
-  if (typeof content === "string") return content;
+function toolResultTextForWire(content: string | OcxContentPart[], annotateEmpty = false): string {
+  // An empty content array is a present-but-empty result; `contentPartsToText` would
+  // otherwise fall back to the "[image]" marker and hide the emptiness from the model.
+  if (annotateEmpty && Array.isArray(content) && content.length === 0) return EMPTY_TOOL_OUTPUT_ANNOTATION;
+  if (typeof content === "string") {
+    if (annotateEmpty && content.trim() === "") return EMPTY_TOOL_OUTPUT_ANNOTATION;
+    return content;
+  }
   const text = content.filter((p) => p.type === "text").map((p) => (p as OcxTextContent).text).join("");
+  // A whitespace-only text-part array is the array twin of a blank string; the
+  // shared emptiness contract (same module as the Responses adapter) annotates it
+  // instead of forwarding whitespace the model silently accepts. Image parts and
+  // any other non-text part keep the array non-empty.
+  if (annotateEmpty && isWhitespaceOnlyTextPartArray(content)) {
+    return EMPTY_TOOL_OUTPUT_ANNOTATION;
+  }
   if (text) {
     const untransportableImages = content.filter((p) => p.type === "image" && !p.imageUrl).length;
     return `${text}${"[image]".repeat(untransportableImages)}`;
@@ -745,9 +799,17 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           }
         }
         if (reasoningContent.length > 0 && modelInList(provider.preserveReasoningContentModels, parsed.modelId)) {
-          chatMsg.reasoning_content = reasoningContent;
+          // MiniMax's interleaved-thinking contract requires the structured
+          // reasoning_details array back on the next turn; a reasoning_content
+          // string is the native-format pass-back the docs mark unsupported.
+          if (modelInList(provider.reasoningDetailsModels, parsed.modelId)) {
+            chatMsg.reasoning_details = [reasoningDetailSegmentForWire(reasoningContent)];
+          } else {
+            chatMsg.reasoning_content = reasoningContent;
+          }
         }
-        if (chatMsg.content === undefined && toolCalls.length === 0 && chatMsg.reasoning_content === undefined) break;
+        const hasReplayedReasoning = chatMsg.reasoning_content !== undefined || chatMsg.reasoning_details !== undefined;
+        if (chatMsg.content === undefined && toolCalls.length === 0 && !hasReplayedReasoning) break;
         flushPendingToolCalls();
         const wireToolCalls = toolCalls.map(tc => {
           let id = tc.id;
@@ -763,7 +825,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           }));
           if (!chatMsg.content) chatMsg.content = emptyAssistantContent(provider);
         }
-        if (chatMsg.reasoning_content !== undefined && chatMsg.content === undefined && chatMsg.tool_calls === undefined) {
+        if (hasReplayedReasoning && chatMsg.content === undefined && chatMsg.tool_calls === undefined) {
           chatMsg.content = emptyAssistantContent(provider);
         }
         out.push(chatMsg);
@@ -777,7 +839,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           out.push({
             role: "tool",
             tool_call_id: toolCallId,
-            content: toolResultTextForWire(msg.content),
+            content: toolResultTextForWire(msg.content, provider.annotateEmptyToolOutputs === true),
           });
           pendingToolResultImageParts.push(...toolResultImageChatParts(msg.content));
           pendingToolCalls.splice(matchIdx, 1);
@@ -808,10 +870,15 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
               && modelInList(provider.requiresReasoningPlaceholderModels ?? provider.preserveReasoningContentModels, parsed.modelId)
               ? " "
               : undefined);
+          const orphanReasoningFields: Record<string, unknown> = !orphanReasoning
+            ? {}
+            : modelInList(provider.reasoningDetailsModels, parsed.modelId)
+              ? { reasoning_details: [reasoningDetailSegmentForWire(orphanReasoning)] }
+              : { reasoning_content: orphanReasoning };
           out.push({
             role: "assistant",
             content: emptyAssistantContent(provider),
-            ...(orphanReasoning ? { reasoning_content: orphanReasoning } : {}),
+            ...orphanReasoningFields,
             tool_calls: [{
               id: toolCallId,
               type: "function",
@@ -822,7 +889,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           out.push({
             role: "tool",
             tool_call_id: toolCallId,
-            content: toolResultTextForWire(msg.content),
+            content: toolResultTextForWire(msg.content, provider.annotateEmptyToolOutputs === true),
           });
           pendingToolResultImageParts.push(...toolResultImageChatParts(msg.content));
           flushToolResultImages();
@@ -1372,14 +1439,16 @@ function canSerializeOpenAIChatServiceTier(
 }
 
 export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAdapter {
+  let lastRequestedModelId: string | undefined;
   return {
     name: "openai-chat",
 
     formatErrorBody: formatOpenAIChatErrorBody,
 
     buildRequest(parsed: OcxParsedRequest) {
+      lastRequestedModelId = parsed.modelId;
       const { url, headers, hasCredential } = openAIChatTransport(provider);
-      const messages = messagesToChatFormat(parsed, provider);
+      const messages = frameAgentRouterMessages(provider.baseUrl, messagesToChatFormat(parsed, provider));
       const tools = toolsToChatFormatForProvider(parsed, provider);
       const toolChoice = toolChoiceToChatFormat(parsed.options.toolChoice, parsed.context.tools, provider);
 
@@ -1406,6 +1475,8 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const maxTokens = resolveMaxTokens(provider, parsed);
       const openRouterRouting = resolveOpenRouterRouting(provider, parsed.modelId);
       if (openRouterRouting) body.provider = openRouterProviderPayload(openRouterRouting);
+      const vercelRouting = resolveVercelGatewayRouting(provider, parsed.modelId);
+      if (vercelRouting) body.provider = vercelGatewayProviderPayload(vercelRouting);
       if (tools) body.tools = tools;
       if (tools && toolChoice !== undefined) {
         body.tool_choice = modelInList(provider.autoToolChoiceOnlyModels, parsed.modelId)
@@ -1421,10 +1492,18 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       }
       if (parsed.options.stopSequences !== undefined) body.stop = parsed.options.stopSequences;
       const reasoningDisabled = modelInList(provider.noReasoningModels, parsed.modelId);
-      const reasoningEffort = mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning);
+      // Some gateways accept a reasoning-effort field on a plain turn but reject the
+      // effort + tools combination. `noReasoningModels` would fix that only by
+      // stripping reasoning everywhere, costing the model its whole picker. This keeps
+      // the ladder advertised and drops the wire field for tool-bearing requests only.
+      const omitReasoningEffortWithTools = !!tools
+        && modelInList(provider.omitReasoningEffortWithToolsModels, parsed.modelId);
+      const reasoningEffort = omitReasoningEffortWithTools
+        ? undefined
+        : mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning);
       const nativeOpenAI = isNativeOpenAIChatTarget(provider);
       let reasoningLog: AdapterRequest["reasoningLog"];
-      if (!reasoningDisabled && provider.reasoningWireFormat === "gateway-object" && parsed.options.reasoning === "none") {
+      if (!reasoningDisabled && !omitReasoningEffortWithTools && provider.reasoningWireFormat === "gateway-object" && parsed.options.reasoning === "none") {
         if (nativeOpenAI) {
           body.reasoning_effort = "none";
           reasoningLog = {
@@ -1643,6 +1722,14 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       let pendingUsage: OcxUsage | undefined;
       let finishReason: string | undefined;
       let sawUserFacingOutput = false;
+      // MiniMax-style structured reasoning: each stream chunk repeats a detail's
+      // full text-so-far, so deltas are derived by prefix-diffing per segment key.
+      // A piece that does not extend the previous snapshot is appended whole, which
+      // keeps incremental senders parseable on the same path.
+      const reasoningDetailSnapshots = new Map<string, string>();
+      // Gate on the routed model, not list length: a mixed openai-chat provider
+      // can list MiniMax ids without putting every sibling on MiniMax semantics.
+      const reasoningDetailsOptIn = modelInList(provider.reasoningDetailsModels, lastRequestedModelId ?? "");
 
       const handleDataLine = function* (line: string): Generator<AdapterEvent, "continue" | "terminate"> {
         const rawPayload = sseFieldValue(line, "data");
@@ -1699,8 +1786,23 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         if (typeof choice.finish_reason === "string" && choice.finish_reason) finishReason = choice.finish_reason;
         const delta = choice.delta;
         if (delta) {
-          const reasoningText = reasoningTextFrom(delta);
-          if (reasoningText !== undefined) yield { type: "reasoning_raw_delta", text: reasoningText };
+          const detailSegments = reasoningDetailsOptIn ? reasoningDetailSegmentsFrom(delta) : [];
+          if (detailSegments.length > 0) {
+            for (const segment of detailSegments) {
+              const prev = reasoningDetailSnapshots.get(segment.key) ?? "";
+              if (segment.text === prev) continue;
+              if (segment.text.startsWith(prev)) {
+                reasoningDetailSnapshots.set(segment.key, segment.text);
+                yield { type: "reasoning_raw_delta", text: segment.text.slice(prev.length) };
+              } else {
+                reasoningDetailSnapshots.set(segment.key, prev + segment.text);
+                yield { type: "reasoning_raw_delta", text: segment.text };
+              }
+            }
+          } else {
+            const reasoningText = reasoningTextFrom(delta);
+            if (reasoningText !== undefined) yield { type: "reasoning_raw_delta", text: reasoningText };
+          }
           if (typeof delta.content === "string" && delta.content.length > 0) {
             sawUserFacingOutput = true;
             yield { type: "text_delta", text: delta.content };
@@ -1992,7 +2094,14 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         }
 
         const msg = rawMessage as Record<string, unknown>;
-        const reasoningText = reasoningTextFrom(msg);
+        let reasoningText = reasoningTextFrom(msg);
+        if (reasoningText === undefined && modelInList(provider.reasoningDetailsModels, lastRequestedModelId ?? "")) {
+          // MiniMax split-reasoning responses carry the same thinking in both
+          // reasoning_content and reasoning_details; the array is the fallback
+          // when only the structured form arrives.
+          const segments = reasoningDetailSegmentsFrom(msg);
+          if (segments.length > 0) reasoningText = segments.map(s => s.text).join("");
+        }
         if (reasoningText !== undefined) events.push({ type: "reasoning_raw_delta", text: reasoningText });
         if (typeof msg.content === "string") events.push({ type: "text_delta", text: msg.content });
         const rawToolCalls = msg.tool_calls;

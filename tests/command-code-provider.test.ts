@@ -87,6 +87,31 @@ describe("Command Code provider", () => {
     });
   });
 
+  /*
+   * #2883. `z-ai/glm-5.3-flash` is a live-discovered route whose id shares
+   * neither the vendor prefix nor the model of `zai-org/GLM-5.3`, so no
+   * `modelRecordValue` relaxation reaches it — only an explicit row does. Both
+   * presets must carry it, because the picker is empty on whichever one the
+   * user configured, and the two entries are separately constructed.
+   */
+  test("the live GLM-5.3-Flash route carries its own effort ladder on both presets", () => {
+    const oauth = PROVIDER_REGISTRY.find(row => row.id === "command-code");
+    const apiKey = PROVIDER_REGISTRY.find(row => row.id === "commandcode");
+    for (const [label, entry] of [["oauth", oauth], ["api-key", apiKey]] as const) {
+      expect(entry?.modelReasoningEfforts?.["z-ai/glm-5.3-flash"], `${label} preset ladder`)
+        .toEqual(["low", "high", "max"]);
+    }
+    // Distinct rows for distinct upstream models: GLM-5.3 and GLM-5.3-Flash happen to
+    // share a ladder today, but neither may be derived from the other.
+    expect(commandCodeReasoningEfforts("z-ai/glm-5.3-flash")).toEqual(["low", "high", "max"]);
+    expect(commandCodeReasoningEfforts("zai-org/GLM-5.3")).toEqual(["low", "high", "max"]);
+    // The reported id arrives lowercase from live discovery; a caller may still fold case.
+    expect(commandCodeReasoningEfforts("Z-AI/GLM-5.3-Flash")).toEqual(["low", "high", "max"]);
+    // Nothing widened into a substring match: a sibling that upstream does not list
+    // must stay unknown rather than inheriting the Flash ladder.
+    expect(commandCodeReasoningEfforts("z-ai/glm-5.3-flash-vision")).toBeUndefined();
+  });
+
   test("OAuth and API-key presets share only verified image capabilities", () => {
     const oauth = PROVIDER_REGISTRY.find(row => row.id === "command-code");
     const apiKey = PROVIDER_REGISTRY.find(row => row.id === "commandcode");
@@ -96,6 +121,8 @@ describe("Command Code provider", () => {
       "gpt-5.6-sol",
       "MiniMaxAI/MiniMax-M3",
       "moonshotai/Kimi-K3",
+      "meta/muse-spark-1.3",
+      "meta/muse-spark-1.3-contributor",
       "meta/muse-spark-1.2",
       "meta/muse-spark-1.2-contributor",
     ];
@@ -357,6 +384,13 @@ describe("Command Code provider", () => {
     // variant all 200, ultra 400). The proxy previously stripped the field;
     // this covers the actual forwarding behavior.
     expect(commandCodeReasoningEfforts("meta/muse-spark-1.2-contributor")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    // 1.3 shipped as the same-shaped successor and carries the identical ladder.
+    expect(commandCodeReasoningEfforts("meta/muse-spark-1.3-contributor")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    expect(commandCodeReasoningEfforts("meta/muse-spark-1.3")).toEqual(
       ["low", "medium", "high", "xhigh", "max"],
     );
     expect(commandCodeReasoningEfforts("meta/muse-spark-1.2")).toEqual(

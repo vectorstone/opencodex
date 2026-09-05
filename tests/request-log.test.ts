@@ -33,9 +33,10 @@ import {
   resetUsageReadCacheForTests,
   type PersistedUsageEntry,
 } from "../src/usage/log";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 async function* replayAdapterEvents(events: AdapterEvent[]): AsyncGenerator<AdapterEvent> {
   for (const event of events) yield event;
@@ -281,7 +282,7 @@ describe("request log metadata", () => {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
       resetUsageReadCacheForTests();
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -315,7 +316,7 @@ describe("request log metadata", () => {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
       resetUsageReadCacheForTests();
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -351,7 +352,7 @@ describe("request log metadata", () => {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
       resetUsageReadCacheForTests();
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -627,7 +628,7 @@ describe("request log metadata", () => {
   });
 
   test("generates compact request ids", () => {
-    expect(nextRequestLogId(1_700_000_000_000)).toMatch(/^ocx-[a-z0-9]+-[a-z0-9]+$/);
+    expect(nextRequestLogId(1_700_000_000_000)).toMatch(/^ocx-[a-f0-9]{32}$/);
     expect(nextRequestLogId(1_700_000_000_000)).not.toBe(nextRequestLogId(1_700_000_000_000));
   });
 
@@ -1469,7 +1470,7 @@ describe("request log metadata", () => {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
       resetUsageReadCacheForTests();
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 

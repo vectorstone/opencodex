@@ -85,12 +85,15 @@ function readDefaultReasoningEffort(raw: unknown, efforts: string[] | undefined)
 import type { CatalogModel } from "../../codex/catalog";
 import { accountBoundNativeOpenAiSlugsBySelector, catalogModelSlug, configuredNativeAliasSlugs, disabledNativeSlugs, invalidateCodexModelsCache, nativeModelRows, shouldIncludeAccountBoundNativeOpenAi, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
 import { CatalogGatherBusyError } from "../../codex/catalog/provider-fetch";
-import { getProviderLiveModelCount } from "../../codex/model-cache";
+import { clearModelCache, getProviderLiveModelCount } from "../../codex/model-cache";
+import { NATIVE_OPENAI_MODELS } from "../../codex/catalog/native-models";
+
 import {
   DEFAULT_SUBAGENT_MODELS,
   codexAutoStartEnabled,
   hasOwnProvider,
   isValidProviderName,
+  modelDisplayNamesConfigError,
   multiAgentGuidanceEnabled,
   providerBaseUrlConfigError,
   providerHeadersConfigError,
@@ -113,6 +116,7 @@ import { providerCodexAccountMode } from "../../providers/registry";
 import { encodedModelIdCollides, routedSlug, slugEquals } from "../../providers/slug-codec";
 import { knownModelIdsForProvider } from "../../router";
 import { effectiveModelAliases, MODEL_ALIAS_PATTERN } from "../../providers/default-aliases";
+import { isValidModelDiscoveryModelId } from "../../providers/model-discovery-limits";
 import { comboPublicModelId } from "../../combos/types";
 import { COMBO_NAMESPACE, comboDisabledModelSelectors, comboModelId, preservesPhysicalComboProvider } from "../../combos";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
@@ -345,21 +349,99 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
   }
 
   if (url.pathname === "/api/catalog" && req.method === "GET") {
-    const { readCatalog, readCodexCatalogPath } = await import("../../codex/catalog");
-    const catalog = readCatalog(readCodexCatalogPath());
-    if (!catalog) return jsonResponse({ error: "catalog not found" }, 404, req, config);
+    // Shared with GET|HEAD /v1/catalog (#809) so both planes emit identical bytes.
+    const { serializePersistedCatalog, persistedCodexVersion } = await import("../catalog-download");
+    const serialized = await serializePersistedCatalog();
+    // No size ceiling here on purpose: this route's behavior predates the shared serializer
+    // and a 2,000-model catalog (~92 MB, within the supported bound) must keep working.
+    if (serialized.body === null) return jsonResponse({ error: "catalog not found" }, 404, req, config);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...corsHeaders(req, config),
     };
-    const { loadPersistedCodexRuntime } = await import("../../codex/runtime");
-    const version = loadPersistedCodexRuntime()?.selectedVersion;
+    if (serialized.etag) headers.ETag = serialized.etag;
+    const version = await persistedCodexVersion();
     if (version) headers["x-opencodex-codex-version"] = version;
-    return new Response(JSON.stringify(catalog), { status: 200, headers });
+    return new Response(serialized.body, { status: 200, headers });
   }
 
   if (url.pathname === "/api/models" && req.method === "GET") {
     return jsonResponse(await listManagementModelRows(config));
+  }
+
+  const displayNameMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/model-display-names$/);
+  if (displayNameMatch && req.method === "PUT") {
+    let name: string;
+    try { name = decodeURIComponent(displayNameMatch[1]!); } catch { return jsonResponse({ error: "invalid provider encoding" }, 400); }
+    if (name === "keys") return null;
+    if (!hasOwnProvider(config.providers, name)) {
+      return jsonResponse({ error: `provider '${name}' not found` }, 404, req, config);
+    }
+    let body: unknown;
+    try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(body) || typeof body.modelId !== "string"
+      || (body.displayName !== null && typeof body.displayName !== "string")) {
+      return jsonResponse({ error: "modelId and displayName string or null are required" }, 400, req, config);
+    }
+    const modelId = body.modelId.trim();
+    const displayName = typeof body.displayName === "string" ? body.displayName.trim() : null;
+    if (!isValidModelDiscoveryModelId(modelId)) {
+      return jsonResponse({ error: "modelId must be a valid model id" }, 400, req, config);
+    }
+    const validationError = displayName === null
+      ? null
+      : modelDisplayNamesConfigError({ [modelId]: displayName });
+    if (validationError) return jsonResponse({ error: validationError }, 400, req, config);
+
+    const provider = config.providers[name]!;
+    const hadDisplayNames = Object.hasOwn(provider, "modelDisplayNames");
+    const previousDisplayNames = provider.modelDisplayNames;
+    const nextDisplayNames = Object.assign(
+      Object.create(null) as Record<string, string>,
+      previousDisplayNames ?? {},
+    );
+    if (displayName === null) delete nextDisplayNames[modelId];
+    else nextDisplayNames[modelId] = displayName;
+    const mergedValidationError = modelDisplayNamesConfigError(nextDisplayNames);
+    if (mergedValidationError) return jsonResponse({ error: mergedValidationError }, 400, req, config);
+    if (Object.keys(nextDisplayNames).length > 0) provider.modelDisplayNames = nextDisplayNames;
+    else delete provider.modelDisplayNames;
+
+    try {
+      persistConfig(config);
+    } catch (error) {
+      if (hadDisplayNames) provider.modelDisplayNames = previousDisplayNames;
+      else delete provider.modelDisplayNames;
+      throw error;
+    }
+    clearModelCache(name);
+    const catalogRefresh = await convergeCodexCatalog();
+    const storedDisplayName = provider.modelDisplayNames?.[modelId] ?? null;
+    if (catalogRefresh.status === "failed") {
+      return jsonResponse({
+        error: "model display name saved but catalog refresh failed",
+        saved: true,
+        provider: name,
+        modelId,
+        displayNameOverride: storedDisplayName,
+        catalogRefresh,
+      }, 503, req, config);
+    }
+    const row = (await listManagementModelRows(config)).find(candidate => (
+      candidate.native !== true
+      && candidate.custom !== true
+      && candidate.provider === name
+      && candidate.id === modelId
+    ));
+    return jsonResponse({
+      ok: true,
+      provider: name,
+      modelId,
+      displayName: row?.displayName ?? storedDisplayName ?? routedSlug(name, modelId),
+      displayNameOverride: storedDisplayName,
+      displayNameSource: row?.displayNameSource ?? (storedDisplayName ? "operator" : "fallback"),
+      catalogRefresh,
+    });
   }
 
   /**
@@ -478,6 +560,12 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     const supportedNative = new Set([
       ...nativeModelRows(config).map(row => row.slug),
       ...accountNativeQualified,
+      // A model suppressed by an unconfirmed entitlement roster is absent from
+      // nativeModelRows, so validating against those rows alone rejected a model this build
+      // knows perfectly well and left the operator with no way to clear its disable key
+      // (#2886). Accepting the target says "this build knows this model", not "this account
+      // may use it" — visibility only writes disabledModels and routing stays gated.
+      ...NATIVE_OPENAI_MODELS,
     ]);
     const targets: Array<{ id: string; native: boolean }> = [];
     const seen = new Set<string>();

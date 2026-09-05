@@ -1,10 +1,11 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claimOwnedServiceHome } from "./helpers/owned-service-home";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * Regression: `ocx start` + Ctrl-C must NOT orphan the Bun proxy.
@@ -39,7 +40,7 @@ afterAll(() => {
     try { c.kill("SIGKILL"); } catch { /* already gone */ }
   }
   for (const dir of tmpHomes) {
-    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { removeTreeWithRetry(dir); } catch { /* best-effort */ }
   }
 });
 
@@ -66,6 +67,22 @@ async function healthy(port: number): Promise<boolean> {
   }
 }
 
+/**
+ * Startup budget for the proxy, generous on CI and tight locally.
+ *
+ * The subject of this test is signal forwarding, not startup latency, so the
+ * budget only has to be long enough that a slow machine does not read as an
+ * orphaned proxy. Locally the spawn is healthy in ~800ms; a shared CI runner
+ * building four shards plus a macOS suite in parallel is a different machine
+ * entirely, and 20s was not enough for it twice on 2026-09-03.
+ *
+ * Raising this cannot hide the regression the test guards: an orphaned proxy
+ * fails at step 4 (the port never frees), which has its own deadline. What a
+ * too-short startup budget DOES hide is that distinction — it fails before the
+ * shutdown path runs at all.
+ */
+const STARTUP_BUDGET_MS = process.env.CI ? 60_000 : 20_000;
+
 async function waitUntil(fn: () => Promise<boolean>, deadlineMs: number): Promise<boolean> {
   const end = Date.now() + deadlineMs;
   while (Date.now() < end) {
@@ -90,8 +107,17 @@ describe.skipIf(!runnable)("ocx launcher graceful shutdown", () => {
         const codexConfig = join(home, "config.toml");
         writeFileSync(codexConfig, 'model = "gpt-5.1"\n');
 
+        // stdout/stderr are CAPTURED, not discarded.
+        //
+        // This test failed twice on the v2.41.0 promotion at exactly 20s -- the
+        // startup deadline below, not the shutdown path this test is named for.
+        // With `stdio: "ignore"` the failure said only `expect(up).toBe(true)`:
+        // no proxy log, no exit code, no way to tell a slow runner from a real
+        // startup regression. Locally the same spawn is healthy in ~800ms, so a
+        // 25x margin is already generous and the missing evidence was the actual
+        // problem.
         const child = spawn("node", [BIN_OCX, "start", "--port", String(port)], {
-          stdio: "ignore",
+          stdio: ["ignore", "pipe", "pipe"],
           env: {
             ...process.env,
             HOME: identity.homeDir,
@@ -104,11 +130,25 @@ describe.skipIf(!runnable)("ocx launcher graceful shutdown", () => {
         spawned.push(child);
 
         let exited = false;
+        let exitCode: number | null = null;
+        let exitSignal: NodeJS.Signals | null = null;
         child.on("exit", () => { exited = true; });
+        child.on("exit", (code, sig) => { exitCode = code; exitSignal = sig; });
+
+        let output = "";
+        child.stdout?.on("data", chunk => { output += String(chunk); });
+        child.stderr?.on("data", chunk => { output += String(chunk); });
 
         // 1. Proxy comes up + injected the Codex config (Design B root override on loopback).
-        const up = await waitUntil(() => healthy(port), 20_000);
-        expect(up).toBe(true);
+        const up = await waitUntil(() => healthy(port), STARTUP_BUDGET_MS);
+        if (!up) {
+          // Name what actually went wrong instead of asserting a bare boolean.
+          const died = exited ? ` The launcher EXITED (code ${exitCode}, signal ${exitSignal}).` : " The launcher was still running.";
+          throw new Error(
+            `The proxy never answered /healthz on port ${port} within ${STARTUP_BUDGET_MS}ms.${died}`
+            + ` Launcher output:\n${output.trim() || "(none)"}`,
+          );
+        }
         expect(existsSync(join(home, "ocx.pid"))).toBe(true);
         const injected = readFileSync(codexConfig, "utf8");
         expect(injected).toContain("# Auto-injected by opencodex");
@@ -131,7 +171,7 @@ describe.skipIf(!runnable)("ocx launcher graceful shutdown", () => {
         expect(existsSync(join(home, "runtime-port.json"))).toBe(false);
         expect(readFileSync(codexConfig, "utf8")).not.toContain("opencodex");
       },
-      45_000,
+      STARTUP_BUDGET_MS + 40_000,
     );
   }
 });

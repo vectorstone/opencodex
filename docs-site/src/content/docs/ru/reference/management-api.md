@@ -136,6 +136,12 @@ GUI-сессия в стиле loopback не выпускается.
 | `POST /api/storage/cleanup-policy/run` | Запустить manual cleanup-policy run | 409 `already_running`; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | Тестовый policy-stream hook | 404 `not_found`, когда недоступен |
 
+Строки в `models`, `providers` и `days[].models` также содержат `cacheHitRate` — долю входных
+токенов, полученных из кэша промптов провайдера и ограниченную диапазоном `[0, 1]`. Значение равно
+`null`, а не `0`, если провайдер не передал телеметрию кэша или в строке нет входных токенов: отсутствие
+данных о кэше и фактическая доля попаданий 0 % — разные сведения, и диаграмма, отображающая их
+одинаково, вводит в заблуждение.
+
 :::caution
 Endpoint'ы storage cleanup могут перемещать или навсегда удалять архивные данные сессий. Всегда
 сначала выполняйте preview и отправляйте возвращённый digest. Если может понадобиться восстановление,
@@ -215,7 +221,7 @@ Management-аутентификация доказывает доступ к п�
 | --- | --- | --- |
 | `GET /api/system/memory` | Вернуть скалярные метрики процесса, heap, stream, response-state, watchdog и active-turn | — |
 | `POST /api/system/restart` | Начать restart процесса с учётом drain, не снимая client injection | Возвращает 202; повторные вызовы сообщают о текущем drain |
-| `POST /api/stop` | Остановить службу, восстановить native Codex, убрать managed Grok injection и выполнить drain прокси | 409 service ownership conflict |
+| `POST /api/stop` | Остановить службу, восстановить native Codex, убрать managed Grok injection и выполнить drain прокси | 409 service ownership conflict; 409 `respawnable_service`, когда обёртка планировщика заданий Windows может перезапустить прокси, а вызывающая сторона — не `ocx stop` (ничего не изменяется); 409, когда установленный менеджер отказывается останавливаться; 409 `service_state_unknown`, когда состояние планировщика заданий не удаётся прочитать (ничего не изменяется; исправьте запрос и повторите) |
 
 ### Делегирование аутентификации Codex
 
@@ -271,3 +277,7 @@ fail closed, пока аккаунт отсутствует, а при повт�
 соответствующие команды `ocx`: они обращаются к тому же живому API и возвращают ненулевой код,
 если прокси недоступен или операция завершилась неудачей. Прямой HTTP полезнее всего там, где
 интеграции нужен точный контракт endpoint'ов, описанный выше.
+
+## Удалённые сессии и ротация ключей данных
+
+`POST /api/keys/rotate {id}` начинает десятиминутный overlap и один раз возвращает новый секрет. `POST /api/keys/rotate/commit {id,rotationId}` подтверждает, `DELETE /api/keys/rotate {id,rotationId}` отменяет. Требуется management auth; ключ данных не подходит. `POST /api/session/logout` требует текущую `gui-session`, совпадающий Origin и CSRF. Admin token получает 403 и не может создать consent session.

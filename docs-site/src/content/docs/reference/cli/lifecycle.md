@@ -32,7 +32,11 @@ ocx start --port 8080
 
 Stop the running proxy (by PID), remove the PID file, and restore native Codex. If a managed
 background service is installed, `ocx stop` also stops it first so it cannot respawn the proxy.
-The same action is available from the web dashboard's **Stop** button (`POST /api/stop`).
+The web dashboard's **Stop** button runs the same action (`POST /api/stop`) on every backend
+except Windows Task Scheduler. There the wrapper can respawn the proxy after the task ends,
+and only a stop running outside the proxy can verify that restart window before restoring
+your client config — so the dashboard refuses with `respawnable_service`, changes nothing,
+and asks you to run `ocx stop`.
 
 ### `ocx restart`
 
@@ -157,11 +161,18 @@ command exits 0 only when healthy and 1 otherwise, making it suitable for servic
 
 Check post-sync readiness through the unauthenticated `GET /readyz` endpoint. It returns `200` when
 ready, or `503` with `Retry-After: 1` for `pending` and terminal `failed`. Its sanitized HTTP identity
-is `{service, version, uptime, pid, port, status}`. Old proxies without `/readyz` fail closed as
-`unreachable`; `/healthz` is separate liveness, not readiness. The command performs one probe by
+is `{service, version, uptime, pid, port, status}` plus the remote-hub protocol fields
+`{protocol, minimumClientProtocol, managementUrl}`. `protocol` is the hub protocol this proxy
+speaks and `minimumClientProtocol` the oldest client it still accepts, so a client can refuse an
+incompatible pairing before sending anything else. `managementUrl` is the origin a client should
+use for the management plane: the configured `hub.managementPublicOrigin` when `runtimeRole` is
+`hub`, and otherwise the origin the request itself arrived on. A readiness request with no
+HTTP(S) origin is rejected rather than answered with a guess. Old proxies without `/readyz` fail
+closed as `unreachable`; `/healthz` is separate liveness, not readiness. The command performs one probe by
 default; `--wait` polls until ready or timeout, but exits immediately when it observes the terminal `failed` state. The
 default timeout is 45 seconds; `--timeout <seconds>` requires `--wait` and accepts positive integer seconds from 1–300.
-CLI JSON emits `{ready, status, pid, port}`, where `status` is `ready`, `pending`, `failed`, or
+The CLI's own `--json` output is deliberately narrower than the HTTP body: it emits
+`{ready, status, pid, port}`, where `status` is `ready`, `pending`, `failed`, or
 `unreachable`. Exit codes are 0 for ready; 1 for not-ready, pending, failed, timeout, or
 unreachable; and 64 for invalid arguments.
 
@@ -231,11 +242,24 @@ interrupted package update removed either file, it logs one `installation is inc
 stops instead of retrying the same missing executable every five seconds. Reinstall opencodex, then
 run `ocx service repair` to refresh the task with the restored package paths.
 
+On Linux, the systemd unit invokes the first regular, executable `ocx` file found on `PATH` at
+install time rather than the Bun and CLI paths inside the installed package tree. Version managers such as
+**mise** and **asdf** install into a versioned directory and delete the old one on upgrade, which
+used to leave the unit pointing at files that no longer existed — systemd then restart-looped while
+still reporting the service as installed. A shim path survives the upgrade, so the unit keeps
+resolving. Source checkouts without an `ocx` launcher keep the previous direct Bun + CLI form. A
+trusted `OPENCODEX_BUN_PATH` selected before Bun starts is preserved through the shim; package-local
+bundled Bun paths are deliberately rediscovered after upgrades instead of being pinned in the unit.
+
+Units installed before this change still carry the old versioned paths and cannot migrate
+themselves — once the old executable is deleted, no opencodex code runs to fix it. Run
+`ocx service repair` once after upgrading; subsequent version changes need no action.
+
 | Subcommand | Action |
 | --- | --- |
-| none | Install and start when absent; otherwise refresh and restart the existing service without re-registering it. |
+| none | Install and start when absent; otherwise refresh and restart the existing service. A healthy Windows scheduler definition is reused; a stale definition may be re-registered and require elevation. |
 | `install` | Create and start the service. Registers it, which on Windows needs elevation. |
-| `repair` | Refresh an installed service in place and restart it, without re-registering it. |
+| `repair` | Refresh an installed service in place and restart it. A healthy Windows scheduler definition is reused; a stale definition may be re-registered and require elevation. |
 | `restart` | Alias of `repair`. |
 | `start` | Start an installed service. |
 | `stop` | Stop the service and restore native Codex. |
@@ -355,7 +379,10 @@ never print proxy values; resolve the reported handoff and run `ocx doctor` befo
 autostart.
 
 If a completed external Codex update overwrites an installed shim, the next ordinary `ocx` command
-backs up the stable new launcher and restores the shim before dispatch. A launcher that is still
+backs up the stable new launcher and restores the shim before dispatch. The zero-effect
+`ocx system codex-cli-update check` inspection command and malformed invocations in its reserved
+`ocx system codex-cli-update` namespace never perform that repair.
+A launcher that is still
 changing is left untouched and retried later. Repair failures warn without failing the requested
 command; manual fallback: `ocx codex-shim install`. Set `codexShimAutoRestore` to `false`, or set
 `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` for a process-level opt-out.
@@ -391,6 +418,32 @@ Use `ocx service` for an always-on background proxy (recommended). Use `ocx code
 lightweight, on-demand startup without a daemon — the proxy starts only when `codex` is launched.
 :::
 
+#### Token injection without the shim
+
+On a non-loopback bind the injected provider carries `env_key = "OPENCODEX_API_AUTH_TOKEN"`. That
+line tells Codex which variable to read; it does not create it. Codex refuses to start a request
+when the variable is missing (`Missing environment variable: OPENCODEX_API_AUTH_TOKEN`), and the
+proxy is never reached. The value lives in `$OPENCODEX_HOME/service-api-token`; only a process that
+exports it into Codex's environment closes the gap.
+
+What does carry the token into a Codex process:
+
+- the shim installed by `ocx codex-shim install` (reads the token file at launch; the supported path
+  for Codex started from shells, Desktop, cron, or another service);
+- exporting `OPENCODEX_API_AUTH_TOKEN` yourself in the process that starts Codex — a shell profile,
+  the cron line, or an `Environment=`/`EnvironmentFile=` on the systemd unit that launches
+  **Codex** (not the proxy). Point it at the existing token file; do not copy the value into
+  `config.toml`.
+
+What does not: an `EnvironmentFile=` or `OCX_API_TOKEN_FILE` on `opencodex-proxy.service`. Those
+configure the proxy process only and never flow into an independently launched `codex exec`.
+
+A Codex upgrade that replaces the launcher removes the shim; the next ordinary `ocx` command restores
+it (see above), but a `codex exec` that runs before that fails. `ocx doctor` reports this exact
+state under "Codex env_key launch readiness" (env_key configured, variable unset, shim missing or
+unhealthy, token file present) with the repair command, and never prints the token. Reading the token
+file directly from Codex is not something Codex supports, so there is no OpenCodex directive for it.
+
 ### `ocx tray <install|start|stop|status|uninstall|remove> [--json] [--no-start]`
 
 Install and control the Windows status tray icon. It starts at Windows login and provides one-click
@@ -405,6 +458,11 @@ Open the [web dashboard](/guides/web-dashboard/) at `http://localhost:<port>`, a
 if it is not running.
 
 ## Updating
+
+`ocx update` updates OpenCodex itself; it does not update the Codex CLI. Use the
+[system inspection commands](/reference/cli/agents/) to inspect the configured Codex CLI candidate
+with bounded, read-only provenance inspection. `ocx system codex-cli-update check` does not query a
+package registry or install an update.
 
 ### `ocx update [--tag latest|preview]`
 
@@ -425,3 +483,7 @@ ocx update --tag preview
 
 New versions become available when the [Release workflow](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml)
 publishes them to npm.
+
+## Remote Hub client lifecycle
+
+Use `ocx connect <url> --pairing-code-stdin`, `ocx connect status`, `ocx sync`, and `ocx connect rotate --pairing-code-stdin`. The initial catalog download fails after five seconds without incoming bytes, but active transfers may run longer; use `--catalog-timeout <seconds>` (1–120) to override that inactivity window. `ocx disconnect` restores local state offline and does not revoke the hub key. While connected only, `ocx connect revoke --admin-token-stdin` revokes the persisted `apiKeyId`; after disconnect use the hub's **Integrations → API Keys** page. Secrets are stdin-only and never belong in argv.

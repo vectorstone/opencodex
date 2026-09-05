@@ -925,6 +925,11 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         nativeContextLimits(latest),
       );
       if (!result.written) return jsonResponse({ error: result.reason ?? "Claude Desktop apply failed", saved: true, path: result.path }, 500);
+      const { claudeDesktopPolicyWarning, probeClaudeDesktopPolicy } = await import("../../claude/desktop-policy");
+      const policyState = (deps.probeClaudeDesktopPolicy ?? probeClaudeDesktopPolicy)({
+        platform: deps.platform ?? process.platform,
+      });
+      const policyWarning = claudeDesktopPolicyWarning(policyState);
       // Persist applied fingerprint + timestamp so GUI can show saved-vs-applied state.
       if (result.fingerprint) {
         // The Desktop write already landed, so a failed bookkeeping save is not
@@ -941,11 +946,22 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
             saved: false,
             path: result.path,
             fingerprint: result.fingerprint,
-            warning: `Claude Desktop was applied, but the applied marker was not saved (${marked.reason}).`,
+            warning: [
+              `Claude Desktop was applied, but the applied marker was not saved (${marked.reason}).`,
+              policyWarning,
+            ].filter(Boolean).join(" "),
           });
         }
       }
-      return jsonResponse({ ok: true, saved: true, applied: true, path: result.path, fingerprint: result.fingerprint });
+      return jsonResponse({
+        ok: true,
+        saved: true,
+        applied: true,
+        path: result.path,
+        fingerprint: result.fingerprint,
+        policyState,
+        ...(policyWarning ? { warning: policyWarning } : {}),
+      });
     } catch (error) {
       rethrowManagementBodyTooLarge(error);
       return jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 400);
@@ -967,7 +983,24 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       // a stale apply the operator should refresh.
       const stale = desiredEnabled && observed.kind === "gateway_drifted";
       const { getDesktopHealth } = await import("../../claude/desktop-health");
-      const health = getDesktopHealth();
+      const { claudeDesktopPolicyHealth, probeClaudeDesktopPolicy } = await import("../../claude/desktop-policy");
+      const policyState = (deps.probeClaudeDesktopPolicy ?? probeClaudeDesktopPolicy)({
+        platform: deps.platform ?? process.platform,
+      });
+      const policy = claudeDesktopPolicyHealth(policyState);
+      const health = {
+        ...getDesktopHealth(),
+        ok: policy.ok,
+        status: policy.status,
+        policy,
+      };
+      const policyConflict = desiredEnabled && !policy.ok;
+      const baseDrift = desiredEnabled ? !applied || stale : applied || observed.kind === "unsafe";
+      const driftReason = policyConflict
+        ? policy.state === "present" ? "managed_policy_present" : "managed_policy_unknown"
+        : desiredEnabled
+          ? !applied ? "desired_on_not_current" : stale ? "profile_drift" : null
+          : applied ? "desired_off_gateway_selected" : null;
       return jsonResponse({
         desiredEnabled,
         installed: observed.kind !== "not_installed",
@@ -982,8 +1015,8 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         // undeterminable (no/unreadable metadata or no appliedId); a readable
         // appliedId with no owned entry is a KNOWN false. Predates the inspector.
         activeProfile: observed.ownedProfileActive,
-        drift: desiredEnabled ? !applied || stale : applied || observed.kind === "unsafe",
-        driftReason: desiredEnabled ? (!applied ? "desired_on_not_current" : stale ? "profile_drift" : null) : (applied ? "desired_off_gateway_selected" : null),
+        drift: baseDrift || policyConflict,
+        driftReason,
         health,
       });
     } catch (error) {
@@ -1008,6 +1041,11 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       ...models.filter(m => !isDisabled(m.provider, m.id)).map(m => `${m.provider}/${m.id}`),
     ];
     const aliases: { id: string; display_name: string }[] = [];
+    // Resolved once, not per model: with the global fast switch on, Claude Code discovers the
+    // fast identity, so the dashboard must list the same id rather than the umbrella one.
+    const cursorFastIdFor = config.fastMode === true
+      ? (await import("../../adapters/cursor/catalog")).cursorFastIdFor
+      : undefined;
     for (const slug of listCatalogNativeSlugs()) {
       // Readable CLI-surface alias with hash fallback (devlog 050 / audit 051 #2) —
       // the same shared helper the /v1/models ?ids=cli path uses.
@@ -1015,7 +1053,8 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     }
     for (const m of models) {
       if (isDisabled(m.provider, m.id)) continue;
-      aliases.push({ id: claudeCodeAlias(m.provider, m.id), display_name: `${m.id} (${m.provider})` });
+      const listedId = (m.provider === "cursor" ? cursorFastIdFor?.(m.id) : undefined) ?? m.id;
+      aliases.push({ id: claudeCodeAlias(m.provider, listedId), display_name: `${listedId} (${m.provider})` });
     }
     const contextWindows = buildClaudeContextWindows([...visibleNativeSlugs(config)], models, nativeContextLimits(config));
     const webSearchOverride = config.claudeCode?.webSearchSidecar;

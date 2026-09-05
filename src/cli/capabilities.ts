@@ -108,6 +108,29 @@ export const CAPABILITIES: readonly Capability[] = [
     details: ["Reads /healthz plus local config; drives no management API route."],
   },
   {
+    command: ["connect", "rotate"],
+    summary: "Rotate the connected client's data key against the hub, with commit and abort.",
+    // One command drives all three: start returns the new secret once, commit promotes it,
+    // and abort unwinds a rotation that could not be confirmed. They are not separate verbs
+    // because a half-rotation is not a state an operator should be able to leave behind.
+    routes: [
+      { method: "POST", path: "/api/keys/rotate" },
+      { method: "POST", path: "/api/keys/rotate/commit" },
+      { method: "DELETE", path: "/api/keys/rotate" },
+    ],
+    flags: [
+      { name: "--pairing-code-stdin", value: "boolean", summary: "Read a one-time pairing code from stdin as the rotation authority." },
+      { name: "--admin-token-stdin", value: "boolean", summary: "Read the hub admin token from stdin as the rotation authority." },
+      { name: "--json", value: "boolean", summary: "Emit the rotation result as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: [
+      "Requires transient authority on stdin; the credential is never persisted or echoed.",
+      "A rotation left pending by a crash is resumed here — startup and status stop rather than guess which key generation is live.",
+    ],
+  },
+  {
     command: ["capabilities"],
     summary: "List the declared CLI capabilities and the management routes they drive.",
     routes: [],
@@ -129,6 +152,21 @@ export const CAPABILITIES: readonly Capability[] = [
     mutates: false,
     json: "envelope",
     details: ["Reads local config; drives no management API route."],
+  },
+  {
+    command: ["provider", "keychain"],
+    summary: "Move a provider's API key into the OS keychain, restore it, or report where it lives.",
+    routes: [
+      { method: "GET", path: "/api/providers/keychain" },
+      { method: "POST", path: "/api/providers/keychain" },
+    ],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit the keychain status or result as JSON." }],
+    mutates: true,
+    json: "payload",
+    details: [
+      "`store` verifies every keychain write by read-back before config.json is rewritten with keychain: references; an unavailable keychain refuses with 503 and leaves the file untouched.",
+      "Headless services usually have no unlocked keychain session; prefer ${ENV_VAR} references there.",
+    ],
   },
   {
     command: ["account", "list"],
@@ -209,7 +247,7 @@ export const CAPABILITIES: readonly Capability[] = [
       "A bare invocation reads and never writes.",
       "The APPLIED value is echoed, not the requested one, so a server-side normalization stays visible.",
       "Values are not re-validated in the CLI: the server owns the strategy names and the 1-100 sticky bound.",
-      "`anthropic` is the only OAuth pool with this setting; other OAuth providers are refused without a round-trip.",
+      "`anthropic` owns the full pool contract. Other OAuth providers reach the same endpoint with a generic subset (enabled/strategy/autoSwitchThreshold) whose settings persist but do not yet steer selection; `sticky` and `quotaWindow` are refused for them.",
     ],
   },
   {
@@ -236,7 +274,7 @@ export const CAPABILITIES: readonly Capability[] = [
       { name: "--conversation", value: "string", summary: "Restrict to one conversation id (`--conversationId` is accepted too)." },
       { name: "--status", value: "string", summary: "An exact code (429) or a class (5xx)." },
       { name: "--limit", value: "number", summary: "Row cap; defaults to 200." },
-      { name: "--follow", value: "boolean", summary: "Stream new rows as JSONL; implies --jsonl." },
+      { name: "--follow", value: "boolean", summary: "Poll for new rows; add --jsonl to emit JSONL." },
       { name: "--json", value: "boolean", summary: "Emit the server payload as JSON." },
       { name: "--jsonl", value: "boolean", summary: "Emit one row per line." },
     ],
@@ -419,6 +457,20 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["system", "codex-cli-update", "check"],
+    summary: "Inspect a configured Codex CLI candidate and its ownership provenance.",
+    routes: [],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit the redacted provenance report as JSON." }],
+    mutates: false,
+    json: "envelope",
+    details: [
+      "Proof-bound published-launcher context authenticates the configured candidate snapshot, not successful Codex execution; this check does not attest or admit a selected runtime.",
+      "On Windows this first slice performs no candidate or configuration filesystem I/O: only a proof-captured absolute environment candidate can receive lexical app-bundle or version-manager labels; every other Windows candidate fails closed.",
+      "Makes no package-registry request.",
+      "Does not execute Codex or npm, install or repair software, control a process, or write configuration or cache state.",
+    ],
+  },
+  {
     command: ["system", "codex-restart"],
     summary: "Restart the Codex app-server.",
     routes: [{ method: "POST", path: "/api/system/codex-restart" }],
@@ -446,13 +498,14 @@ export const CAPABILITIES: readonly Capability[] = [
   },
   {
     command: ["integration", "native"],
-    summary: "Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations.",
+    summary: "Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations, and read the Cursor status (which builds are installed, gateway values, last request seen).",
     routes: [
       { method: "GET", path: "/api/native-integrations" },
       { method: "PUT", path: "/api/native-integrations/claude" },
       { method: "PUT", path: "/api/native-integrations/claude-desktop" },
       { method: "PUT", path: "/api/native-integrations/codex" },
       { method: "PUT", path: "/api/native-integrations/grok" },
+      { method: "GET", path: "/api/native-integrations/cursor" },
     ],
     flags: [{ name: "--json", value: "boolean", summary: "Emit the client rows or toggle result as JSON." }],
     mutates: true,

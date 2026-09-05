@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -7,6 +8,7 @@ import {
   isClientClosedMessage,
   isCyberPolicyCode,
   isCyberPolicyMessage,
+  upstreamErrorMessageFromPayload,
 } from "../lib/errors";
 import { CODEX_CONFIG_PATH, readRootTomlString } from "../codex/paths";
 import { readCodexCatalogPath } from "../codex/catalog";
@@ -123,6 +125,12 @@ export interface RequestLogContext {
   terminalHttpStatus?: number;
   /** Recognized structured terminal code whose exact identity must survive status mapping. */
   terminalErrorCode?: typeof CYBER_POLICY_ERROR_CODE;
+  /**
+   * Proxy-owned error code for a request OpenCodex terminated locally, before or instead of an
+   * upstream send. Status-derived classification cannot name these: there is no upstream
+   * message to classify, and the status alone would read as a provider failure.
+   */
+  errorCode?: string;
   /** Structured reason from `response.incomplete`; internal-only input to log classification. */
   terminalIncompleteReason?: string;
   affinity?: "reused" | "new_bind" | "rebound" | "cleared";
@@ -201,7 +209,6 @@ const requestLog: RequestLogEntry[] = [];
 const MAX_LOG_SIZE = 2000;
 const requestLogEntryBytes = new WeakMap<RequestLogEntry, number>();
 let requestLogBytes = 0;
-let requestLogSeq = 0;
 /** True after hydrateRequestLogsFromDisk ran once in this process. */
 let requestLogsHydratedFromDisk = false;
 
@@ -430,9 +437,8 @@ export function addRequestLog(entry: RequestLogEntry) {
   }
 }
 
-export function nextRequestLogId(timestamp = Date.now()): string {
-  requestLogSeq = (requestLogSeq % 1_000_000) + 1;
-  return `ocx-${timestamp.toString(36)}-${requestLogSeq.toString(36)}`;
+export function nextRequestLogId(_timestamp = Date.now()): string {
+  return `ocx-${randomBytes(16).toString("hex")}`;
 }
 
 /**
@@ -795,10 +801,7 @@ function captureUpstreamErrorParsed(
       logCtx.terminalIncompleteReason = reason.trim();
     }
     if (logCtx.upstreamError) return;
-    const message = json?.error?.message
-      ?? json?.last_error?.message
-      ?? json?.response?.error?.message
-      ?? json?.response?.incomplete_details?.message;
+    const message = upstreamErrorMessageFromPayload(parsed);
     if (typeof message === "string" && message.trim()) {
       logCtx.upstreamError = redactSecretString(message).slice(0, 500);
       return;
@@ -928,7 +931,9 @@ export function addFinalRequestLog(
   const effectiveStatus = status >= 500 && logCtx.upstreamError && isClientClosedMessage(logCtx.upstreamError)
     ? 499
     : status;
-  const errorCode = requestLogErrorCode(
+  // A locally assigned code wins: it names a refusal this proxy made itself, which no
+  // status-plus-upstream-message classification can reconstruct.
+  const errorCode = logCtx.errorCode ?? requestLogErrorCode(
     effectiveStatus,
     logCtx.upstreamError,
     logCtx.terminalErrorCode,
@@ -1308,6 +1313,5 @@ export function getRequestLogEntries(): RequestLogEntry[] { return requestLog; }
 export function clearRequestLogsForTests(): void {
   requestLog.length = 0;
   requestLogBytes = 0;
-  requestLogSeq = 0;
   requestLogsHydratedFromDisk = false;
 }

@@ -1,7 +1,7 @@
 import { chmodSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { hardenSecretDir } from "../lib/windows-secret-acl";
+import { hardenSecretDirAsync, windowsSecretAclApplies } from "../lib/windows-secret-acl";
 import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 
 /**
@@ -14,6 +14,7 @@ export function expandUserPath(raw: string): string {
   return raw;
 }
 let resolvedConfigDirCache: { raw: string | undefined; path: string } | null = null;
+const configDirHardeningFlights = new Map<string, Promise<void>>();
 
 export function getConfigDir(): string {
   const raw = process.env["OPENCODEX_HOME"]?.trim() || undefined;
@@ -34,7 +35,35 @@ export function hardenConfigDir(): void {
   assertNotRealHomeUnderTest(dir);
   if (!existsSync(dir)) return;
   try { chmodSync(dir, 0o700); } catch { /* best-effort */ }
-  if (process.platform === "win32") {
-    hardenSecretDir(dir, { required: false });
+  if (windowsSecretAclApplies() && !configDirHardeningFlights.has(dir)) {
+    // This is an optional read-path harden. Waiting synchronously here used to stop the Bun
+    // event loop (including /healthz) for the full icacls timeout. Required mutation paths keep
+    // their own awaited/fail-closed hardening; ordinary config reads only start one soft flight.
+    const flight = hardenSecretDirAsync(dir, { required: false })
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        if (configDirHardeningFlights.get(dir) === flight) configDirHardeningFlights.delete(dir);
+      });
+    configDirHardeningFlights.set(dir, flight);
   }
+}
+
+/**
+ * Settle the optional hardening flight for one config directory.
+ *
+ * The flight spawns `icacls.exe`, which holds the directory open until it exits. Windows file
+ * locking is mandatory, so anything that removes or renames that directory after a "clean"
+ * shutdown — a test fixture teardown, an uninstaller, a home move — gets EPERM/EBUSY unless the
+ * process that started the child also waits for it. `server.stop` calls this so the shutdown
+ * contract owns every child it started. No-op when nothing is in flight.
+ */
+export async function flushConfigDirHardening(dir: string = getConfigDir()): Promise<void> {
+  const flight = configDirHardeningFlights.get(dir);
+  if (flight) await flight;
+}
+
+/** Test-only: settle every in-flight config-directory harden regardless of directory. */
+export async function flushConfigDirHardeningForTests(): Promise<void> {
+  await Promise.all([...configDirHardeningFlights.values()]);
 }

@@ -81,8 +81,25 @@ export function codexIntegrationMode(
 }
 
 /** Whether a Codex sync is permitted for this admitted config snapshot. */
-export function shouldSyncCodexOnStart(config: Pick<OcxConfig, "clientIntegrations">): boolean {
-  return codexIntegrationEnabled(config);
+type LocalClientSyncConfig = Pick<
+  OcxConfig,
+  "clientIntegrations" | "runtimeRole" | "unauthenticatedLoopbackListener"
+>;
+
+function localClientSyncAllowed(config: LocalClientSyncConfig): boolean {
+  return config.runtimeRole !== "hub"
+    || config.unauthenticatedLoopbackListener?.enabled === true;
+}
+
+export function shouldSyncCodexOnStart(config: LocalClientSyncConfig): boolean {
+  // A hub is a server for OTHER machines: it must not rewrite its own host's
+  // Codex/Claude/Grok client configs on startup (interview decision Q6, and the
+  // first clisu-oracle dogfood boot proved the failure mode — the hub marked
+  // /readyz failed because it tried to run the full local client sync).
+  // A hub can be a local client only through its explicitly enabled loopback
+  // listener. The public hub bind remains outside this gate and still requires
+  // admission; an explicit client OFF continues to win.
+  return localClientSyncAllowed(config) && codexIntegrationEnabled(config);
 }
 
 /**
@@ -230,7 +247,7 @@ export function setClaudeDesktopIntegrationEnabled(enabled: boolean): CodexDesir
  */
 export async function syncCodexOnStartIfEnabled(
   port: number,
-  config: Pick<OcxConfig, "clientIntegrations">,
+  config: LocalClientSyncConfig,
   sync: CodexStartupSync = defaultStartupSync,
   readinessGate?: ReadinessGate,
 ): Promise<{ ran: boolean; catalogWritten: boolean; cacheSynced: boolean }> {
@@ -273,6 +290,6 @@ async function defaultStartupSync(port: number): Promise<CodexStartupSyncOutcome
  * startup and its diagnostic is worth printing. This only answers whether to
  * attempt the sync at all.
  */
-export function shouldSyncGrokOnStart(config: Pick<OcxConfig, "clientIntegrations">): boolean {
-  return grokIntegrationEnabled(config);
+export function shouldSyncGrokOnStart(config: LocalClientSyncConfig): boolean {
+  return localClientSyncAllowed(config) && grokIntegrationEnabled(config);
 }

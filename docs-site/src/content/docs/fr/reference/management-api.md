@@ -143,6 +143,12 @@ réestimée d'après la tarification active au moment de la lecture du résumé.
 et non de frais d'abonnement. Les nouvelles requêtes du pool principal utilisent le libellé réservé `main` ; les anciennes lignes
 `openai` sans qualification restent dans une catégorie ambiguë au lieu d'être réaffectées d'après la configuration actuelle.
 
+Les lignes de `models`, `providers` et `days[].models` comportent également `cacheHitRate` : la part des jetons
+d'entrée servis depuis le cache d'invites du fournisseur, limitée à `[0, 1]`. Cette valeur est `null` — jamais `0` —
+lorsque le fournisseur n'a transmis aucune télémétrie de cache ou que la ligne ne contient aucun jeton d'entrée, car
+« aucune donnée de cache » et « un véritable taux de succès de 0 % » sont deux faits distincts, et un graphique qui
+les représente de la même manière est trompeur.
+
 :::caution
 Les points de terminaison de nettoyage du stockage peuvent déplacer ou supprimer définitivement les données de session archivées. Toujours prévisualiser
 d’abord et soumettez le résumé renvoyé. Préférez la quarantaine lorsqu’une récupération peut être nécessaire.
@@ -221,7 +227,7 @@ lui-même s'il souhaite ajouter une étoile au dépôt.
 | --- | --- | --- |
 | `GET /api/system/memory` | Renvoyer les mesures scalaires du processus, du tas, des flux, de l'état des réponses, du mécanisme de surveillance et des tours actifs | — |
 | `POST /api/system/restart` | Amorcer un redémarrage du processus qui attend l'évacuation des requêtes, sans retirer l'injection du client | Renvoie 202 ; les appels répétés signalent l'évacuation déjà en cours |
-| `POST /api/stop` | Arrêter le service, restaurer Codex en mode natif, retirer l'injection Grok gérée et évacuer les requêtes du proxy | 409 conflit de propriété du service |
+| `POST /api/stop` | Arrêter le service, restaurer Codex en mode natif, retirer l'injection Grok gérée et évacuer les requêtes du proxy | 409 conflit de propriété du service; 409 `respawnable_service` lorsqu'un wrapper du Planificateur de tâches Windows pourrait relancer le proxy et que l'appelant n'est pas `ocx stop` (rien n'est modifié) ; 409 lorsque le gestionnaire installé refuse de s'arrêter ; 409 `service_state_unknown` lorsque l'état du Planificateur de tâches ne peut pas être lu (rien n'est modifié ; réparez la requête puis réessayez) |
 | `GET /api/system/codex-app-server` | Indiquer si les serveurs d'application Codex en cours d'exécution sont antérieurs au catalogue de modèles actuel | — |
 | `POST /api/system/codex-restart` | Actualiser le catalogue, puis demander aux serveurs d'application Codex obsolètes de s'arrêter afin que le sélecteur de modèles se recharge | Renvoie 200 avec `code: partially_stopped` lorsqu'une cible ne s'arrête pas |
 
@@ -280,3 +286,7 @@ Pour l'administration courante, le [tableau de bord web](/fr/guides/web-dashboar
 Pour les hôtes sans interface graphique et l'automatisation, utilisez les commandes `ocx` correspondantes : elles appellent cette
 même API active et renvoient un code différent de zéro lorsque le proxy est inaccessible ou que l'opération échoue.
 L'accès HTTP direct est surtout utile aux intégrations qui exigent les contrats exacts des points de terminaison ci-dessus.
+
+## Sessions distantes et rotation des clés de données
+
+`POST /api/keys/rotate {id}` démarre un chevauchement de dix minutes et renvoie le nouveau secret une seule fois. `POST /api/keys/rotate/commit {id,rotationId}` valide; `DELETE /api/keys/rotate {id,rotationId}` annule. L'authentification de gestion est obligatoire et une clé de données ne suffit pas. `POST /api/session/logout` exige la `gui-session` courante, l'Origin correspondante et CSRF. Un jeton admin reçoit 403 et ne peut jamais créer une session de consentement.

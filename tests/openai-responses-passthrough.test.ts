@@ -122,6 +122,80 @@ test("noncanonical pool-required providers use only their configured static cred
   expect(request.headers.session_id).toBeUndefined();
 });
 
+test("noncanonical Responses destinations strip Codex-private item metadata", () => {
+  const rawBody = {
+    model: "openai/gpt-5.6-sol",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ping" }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+      },
+      {
+        type: "function_call",
+        name: "lookup",
+        arguments: "{}",
+        call_id: "call-1",
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+      },
+    ],
+  };
+
+  for (const configuredProvider of [
+    {
+      adapter: "openai-responses",
+      baseUrl: "https://gateway.example/v1",
+      authMode: "key" as const,
+      apiKey: "test-key",
+    },
+    {
+      adapter: "openai-responses",
+      baseUrl: "https://gateway.example/v1",
+      authMode: "forward" as const,
+    },
+  ]) {
+    const request = createResponsesPassthroughAdapter(configuredProvider).buildRequest({
+      modelId: rawBody.model,
+      context: { messages: [] },
+      stream: true,
+      options: {},
+      _rawBody: rawBody,
+    }, { headers: new Headers() });
+    const body = JSON.parse(request.body) as { input: Record<string, unknown>[] };
+
+    expect(body.input.every(item => !("internal_chat_message_metadata_passthrough" in item)))
+      .toBe(true);
+  }
+
+  expect(rawBody.input.every(item => "internal_chat_message_metadata_passthrough" in item))
+    .toBe(true);
+});
+
+test("canonical ChatGPT forward preserves Codex-private item metadata", () => {
+  const request = createResponsesPassthroughAdapter(provider).buildRequest({
+    modelId: "gpt-5.6-sol",
+    context: { messages: [] },
+    stream: true,
+    options: {},
+    _rawBody: {
+      model: "gpt-5.6-sol",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ping" }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+      }],
+    },
+  }, { headers: new Headers({ authorization: "Bearer token" }) });
+  const body = JSON.parse(request.body) as {
+    input: { internal_chat_message_metadata_passthrough?: unknown }[];
+  };
+
+  expect(body.input[0].internal_chat_message_metadata_passthrough)
+    .toEqual({ turn_id: "turn-1" });
+});
+
 test("passthrough serialized-body observation releases after the request settles", () => {
   const budget = createTranslatorBudget();
   const request = createResponsesPassthroughAdapter(provider).buildRequest({
@@ -238,6 +312,45 @@ describe("DeepSeek Responses endpoint contract", () => {
       { headers: new Headers({ authorization: "Bearer token" }) },
     ).body) as typeof rawBody;
     expect(nativeBody.tools).toEqual(rawBody.tools);
+  });
+
+  test("xAI multi-agent clamps synthetic max and ultra efforts to its real Responses ladder", () => {
+    const config: OcxConfig = {
+      port: 10100,
+      defaultProvider: "xai",
+      providers: {
+        xai: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          authMode: "key",
+          apiKey: "xai-test-key",
+        },
+      },
+    };
+    const route = routeModel(config, "xai/grok-4.20-multi-agent-0309");
+    const responsesProvider = resolveWireProtocolOverride(
+      "xai",
+      route.modelId,
+      route.provider,
+      "responses",
+    );
+
+    expect(responsesProvider.adapter).toBe("openai-responses");
+    for (const requested of ["max", "ultra"] as const) {
+      const body = JSON.parse(createResponsesPassthroughAdapter(responsesProvider).buildRequest({
+        modelId: route.modelId,
+        context: { messages: [] },
+        stream: true,
+        options: { reasoning: requested },
+        _rawBody: {
+          model: route.modelId,
+          input: "ping",
+          reasoning: { effort: requested },
+        },
+      }, { headers: new Headers() }).body) as { reasoning?: { effort?: string } };
+
+      expect(body.reasoning?.effort).toBe("xhigh");
+    }
   });
 
   test("a config saved before the fix is backfilled, and a hand-set path is preserved", () => {
@@ -1256,11 +1369,11 @@ describe("OpenAI Responses passthrough sanitization", () => {
     expect(input[0]).not.toHaveProperty("id");
   });
 
-  test("backfills queries on a replayed single-query web_search_call (#930)", () => {
+  test("backfills web_search_call actions in either missing direction (#930, #3071)", () => {
     // The bridge fix only helps items created after it. A conversation that already
-    // recorded {type:"search", query:"..."} replays that stored item every turn, and
-    // DeepSeek's parser rejects the whole request over it — so upgrading alone would
-    // leave those threads permanently broken.
+    // recorded a legacy web_search_call replays that stored item every turn. DeepSeek's
+    // parser rejects an action without `queries` (#930) and Console Go rejects one
+    // without `query` (#3071) — so upgrading alone would leave those threads broken.
     const adapter = createResponsesPassthroughAdapter(provider);
     const request = adapter.buildRequest({
       modelId: "provider-model",
@@ -1280,11 +1393,64 @@ describe("OpenAI Responses passthrough sanitization", () => {
 
     // Repaired: singular query gains the array the strict parser requires.
     expect(input[0].action).toEqual({ type: "search", query: "legacy", queries: ["legacy"] });
-    // Untouched: a batch already satisfies the parser, and adding `query` would collapse
-    // the native plural rendering.
-    expect(input[1].action).toEqual({ type: "search", queries: ["a", "b"] });
+    // Repaired: multi-query batch gains the singular `query` Console Go requires.
+    expect(input[1].action).toEqual({ type: "search", query: "a", queries: ["a", "b"] });
     // Untouched: not a search action.
     expect(input[2].action).toEqual({ type: "open_page", url: "https://example.test" });
+  });
+
+  test("does not forge a singular query from a malformed or empty queries array (#3071)", () => {
+    // Input items use a loose schema, so a stored `queries` need not be an array of
+    // strings. Copying a non-string first member would satisfy the presence check and
+    // still fail the Console Go validator this repair exists to satisfy — a repair that
+    // reports success and produces an invalid shape is worse than no repair.
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest({
+      modelId: "provider-model",
+      context: { messages: [] },
+      stream: true,
+      options: {},
+      _rawBody: {
+        model: "provider-model",
+        input: [
+          { type: "web_search_call", id: "ws_num", status: "completed", action: { type: "search", queries: [42] } },
+          { type: "web_search_call", id: "ws_obj", status: "completed", action: { type: "search", queries: [{ q: "x" }] } },
+          { type: "web_search_call", id: "ws_empty", status: "completed", action: { type: "search", queries: [] } },
+        ],
+      },
+    }, meta);
+    const input = (JSON.parse(request.body) as { input: Array<{ action: Record<string, unknown> }> }).input;
+
+    // Left alone: a non-string first member is not a query.
+    expect(input[0].action).toEqual({ type: "search", queries: [42] });
+    expect(input[1].action).toEqual({ type: "search", queries: [{ q: "x" }] });
+    // Canonicalized: an empty array satisfies neither validator, so it becomes the same
+    // empty-search shape the bridge emits rather than being passed through.
+    expect(input[2].action).toEqual({ type: "search", query: "", queries: [""] });
+  });
+
+  test("repairs a partly-malformed or already-queried empty action (#3071)", () => {
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest({
+      modelId: "provider-model",
+      context: { messages: [] },
+      stream: true,
+      options: {},
+      _rawBody: {
+        model: "provider-model",
+        input: [
+          { type: "web_search_call", id: "ws_mixed", status: "completed", action: { type: "search", queries: ["a", 42] } },
+          { type: "web_search_call", id: "ws_qempty", status: "completed", action: { type: "search", query: "legacy", queries: [] } },
+        ],
+      },
+    }, meta);
+    const input = (JSON.parse(request.body) as { input: Array<{ action: Record<string, unknown> }> }).input;
+
+    // Left alone: deriving `query: "a"` would satisfy Console Go and leave DeepSeek to
+    // reject the same replay over the non-string second member.
+    expect(input[0].action).toEqual({ type: "search", queries: ["a", 42] });
+    // Canonicalized without discarding the query the item already carried.
+    expect(input[1].action).toEqual({ type: "search", query: "legacy", queries: ["legacy"] });
   });
 
   test("strips invalid type-specific ids from serialized input items", () => {
@@ -1551,6 +1717,61 @@ describe("OpenAI Responses passthrough sanitization", () => {
     });
   });
 
+  test("keeps the reserved functions group intact for codex-spark, flattens MCP groups (#3217)", () => {
+    // Codex 0.147+ on Responses Lite ships every ordinary client tool inside the reserved
+    // `functions` namespace group, carried in an `additional_tools` input item. Flattening that
+    // group made the backend answer `custom_tool_call { name: "exec", namespace: "exec" }`,
+    // which codex-rs concatenates into the unroutable `execexec` and loops on.
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const functionsGroup = {
+      type: "namespace",
+      name: "functions",
+      description: "client tools",
+      tools: [
+        { type: "custom", name: "exec", description: "shell" },
+        { type: "function", name: "wait", parameters: { type: "object", properties: {} }, defer_loading: true },
+        { type: "tool_search", name: "tool_search" },
+      ],
+    };
+    const mcpGroup = {
+      type: "namespace",
+      name: "mcp__docs",
+      tools: [{ type: "function", name: "search", parameters: { type: "object", properties: {} } }],
+    };
+    const request = adapter.buildRequest({
+      modelId: "gpt-5.3-codex-spark",
+      context: { messages: [] },
+      stream: true,
+      options: {},
+      _rawBody: {
+        model: "gpt-5.3-codex-spark",
+        input: [
+          { type: "additional_tools", role: "developer", tools: [functionsGroup, mcpGroup] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "run pwd" }] },
+        ],
+        tools: [functionsGroup, mcpGroup],
+      },
+    }, { headers: new Headers({ authorization: "Bearer token" }) });
+    const body = JSON.parse(request.body) as {
+      tools: Array<Record<string, unknown>>;
+      input: Array<{ type: string; tools?: Array<Record<string, unknown>> }>;
+    };
+    const expectedGroup = {
+      type: "namespace",
+      name: "functions",
+      description: "client tools",
+      tools: [
+        { type: "custom", name: "exec", description: "shell" },
+        { type: "function", name: "wait", parameters: { type: "object", properties: {} } },
+      ],
+    };
+    // The reserved group survives as a group with its custom child; tool_search is still dropped
+    // and defer_loading still stripped inside it. The MCP group is still flattened.
+    expect(body.tools).toEqual([expectedGroup, { type: "function", name: "search", parameters: { type: "object", properties: {} } }]);
+    const additional = body.input.find(item => item.type === "additional_tools");
+    expect(additional?.tools).toEqual([expectedGroup, { type: "function", name: "search", parameters: { type: "object", properties: {} } }]);
+  });
+
   test("strips image_generation hosted tool for codex-spark passthrough", () => {
     const adapter = createResponsesPassthroughAdapter(provider);
     const request = adapter.buildRequest({
@@ -1645,6 +1866,120 @@ describe("OpenAI Responses passthrough sanitization", () => {
     const body = JSON.parse(request.body) as { tools: Record<string, unknown>[] };
 
     expect(body.tools).toEqual([{ type: "web_search", external_web_access: true }]);
+  });
+
+  function buildXaiXSearchBody({
+    baseUrl = "https://cli-chat-proxy.grok.com/v1",
+    enabled,
+    tools,
+    toolChoice,
+  }: {
+    baseUrl?: string;
+    enabled?: boolean;
+    tools: Record<string, unknown>[];
+    toolChoice?: unknown;
+  }): Record<string, unknown> {
+    const request = createResponsesPassthroughAdapter({
+      adapter: "openai-responses",
+      baseUrl,
+      authMode: "key",
+      apiKey: "xai-test",
+      supportsOpenAiWebSearchToolFields: false,
+      ...(enabled === undefined ? {} : { xaiResponsesXSearch: enabled }),
+    }).buildRequest({
+      modelId: "grok-4.6",
+      context: { messages: [] },
+      stream: true,
+      options: {},
+      _rawBody: {
+        model: "grok-4.6",
+        input: [],
+        tools,
+        ...(toolChoice === undefined ? {} : { tool_choice: toolChoice }),
+      },
+    }, { headers: new Headers() });
+    return JSON.parse(request.body) as Record<string, unknown>;
+  }
+
+  test.each([
+    "https://api.x.ai/v1",
+    "https://cli-chat-proxy.grok.com/v1",
+  ])("injects x_search after live web_search normalization for %s", baseUrl => {
+    const body = buildXaiXSearchBody({
+      baseUrl,
+      enabled: true,
+      tools: [
+        { type: "function", name: "shell", parameters: { type: "object" } },
+        { type: "web_search", external_web_access: true, search_context_size: "medium" },
+      ],
+    }) as { tools: Record<string, unknown>[] };
+
+    expect(body.tools).toEqual([
+      { type: "function", name: "shell", parameters: { type: "object" } },
+      { type: "web_search" },
+      { type: "x_search" },
+    ]);
+  });
+
+  test("does not inject x_search outside the exact activation contract", () => {
+    const cases = [
+      buildXaiXSearchBody({
+        tools: [{ type: "web_search", external_web_access: true }],
+      }),
+      buildXaiXSearchBody({
+        baseUrl: "https://responses.example.test/v1",
+        enabled: true,
+        tools: [{ type: "web_search", external_web_access: true }],
+      }),
+      buildXaiXSearchBody({
+        baseUrl: "https://api.x.ai/v1",
+        enabled: true,
+        tools: [
+          { type: "function", name: "shell", parameters: { type: "object" } },
+          { type: "web_search", external_web_access: false },
+        ],
+      }),
+      buildXaiXSearchBody({
+        enabled: true,
+        tools: [{ type: "function", name: "shell", parameters: { type: "object" } }],
+      }),
+    ];
+
+    for (const body of cases) {
+      expect((body.tools as Record<string, unknown>[] | undefined)?.some(tool => tool.type === "x_search") ?? false)
+        .toBe(false);
+    }
+    expect(cases[2].tools).toEqual([
+      { type: "function", name: "shell", parameters: { type: "object" } },
+    ]);
+  });
+
+  test("keeps specific and allowed_tools selectors unchanged when x_search is injected", () => {
+    const selectors = [
+      { type: "function", name: "shell" },
+      {
+        type: "allowed_tools",
+        mode: "auto",
+        tools: [{ type: "function", name: "shell" }, { type: "web_search" }],
+      },
+    ];
+
+    for (const selector of selectors) {
+      const body = buildXaiXSearchBody({
+        enabled: true,
+        tools: [
+          { type: "function", name: "shell", parameters: { type: "object" } },
+          { type: "web_search", external_web_access: true },
+        ],
+        toolChoice: selector,
+      }) as { tools: Record<string, unknown>[]; tool_choice: Record<string, unknown> };
+      expect(body.tools.some(tool => tool.type === "x_search")).toBe(true);
+      expect(body.tool_choice).toEqual(selector);
+      const allowed = body.tool_choice.type === "allowed_tools"
+        ? body.tool_choice.tools as Record<string, unknown>[]
+        : [];
+      expect(allowed.some(tool => tool.type === "x_search")).toBe(false);
+    }
   });
 
   // `activateDeferredTool` clears `defer_loading` only for tools a `tool_search_output` already
@@ -3500,5 +3835,98 @@ describe("reasoning input content channel", () => {
     });
     expect(out.content).toEqual([]);
     expect(out.encrypted_content).toBe("upstream-issued-blob");
+  });
+});
+
+
+describe("raw usage passthrough on the forward path (#41980 parity, #37138 adjacency)", () => {
+  const usageExtras = {
+    input_tokens: 7,
+    output_tokens: 4,
+    total_tokens: 11,
+    subscription: { window: { used_percent: 12 } },
+    future_counter_v2: "wire-value",
+  };
+  const config = {
+    port: 0,
+    defaultProvider: "fixture",
+    providers: {
+      fixture: {
+        adapter: "openai-responses",
+        baseUrl: "https://fixture.test/v1",
+        authMode: "key" as const,
+        apiKey: "fixture-key",
+      },
+    },
+  } as OcxConfig;
+  const requestBody = (stream: boolean) => JSON.stringify({
+    model: "fixture/model",
+    stream,
+    input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+  });
+  const call = (stream: boolean) => handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: requestBody(stream),
+  }), config, { model: "", provider: "" });
+
+  test("streamed response.completed with usage extras reaches the client byte-identical", async () => {
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response([
+      'event: response.completed',
+      `data: ${JSON.stringify({ type: "response.completed", response: {
+        id: "resp_x", status: "completed", output: [
+          { type: "message", status: "completed", content: [{ type: "output_text", text: "hi" }] },
+        ], usage: usageExtras,
+      } })}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n"), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+    try {
+      const response = await call(true);
+      const text = await response.text();
+      const completedLine = text.split("\n").find(line => line.startsWith("data:") && line.includes("response.completed"));
+      expect(completedLine).toBeDefined();
+      const payload = JSON.parse(completedLine!.slice(5).trim()) as { response: { usage: unknown } };
+      expect(payload.response.usage).toEqual(usageExtras);
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+
+  test("non-streaming forward JSON keeps usage extras", async () => {
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      id: "resp_x",
+      status: "completed",
+      output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: "hi" }] }],
+      usage: usageExtras,
+    }), { headers: { "content-type": "application/json" } })) as typeof fetch;
+    try {
+      const response = await call(false);
+      const json = await response.json() as { usage: unknown };
+      expect(json.usage).toEqual(usageExtras);
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+
+  test("response.completed without usage is accepted (Codex tolerates usage: null, #37138)", async () => {
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response([
+      'data: {"type":"response.completed","response":{"id":"resp_x","status":"completed","output":[{"type":"message","status":"completed","content":[{"type":"output_text","text":"hi"}]}]}}',
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n"), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+    try {
+      const response = await call(true);
+      const text = await response.text();
+      expect(text).toContain("response.completed");
+      expect(text).not.toContain('"usage"');
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
   });
 });

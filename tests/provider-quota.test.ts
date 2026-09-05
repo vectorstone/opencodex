@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as authApi from "../src/codex/auth-api";
@@ -94,8 +95,8 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
   if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = previousCodexHome;
-  rmSync(opencodexHome, { recursive: true, force: true });
-  rmSync(codexHome, { recursive: true, force: true });
+  removeTreeWithRetry(opencodexHome);
+  removeTreeWithRetry(codexHome);
 });
 
 describe("fetchProviderQuotaReports", () => {
@@ -979,9 +980,11 @@ describe("fetchProviderQuotaReports", () => {
       fiveHourResetAt: 1789000000000,
       weeklyPercent: 52,
       weeklyResetAt: 1789600000000,
-      monthlyPercent: 12.3,
-      monthlyResetAt: 1789000000000,
     });
+    // The TIME_LIMIT row is the MCP call allowance, not a model-token window, so it
+    // must not surface as monthly model quota (issue #1168).
+    expect(result.reports[0]?.quota.monthlyPercent).toBeUndefined();
+    expect(result.reports[0]?.quota.monthlyResetAt).toBeUndefined();
     expect(seen).toHaveLength(1);
     expect(seen[0]?.url).toBe("https://api.z.ai/api/monitor/usage/quota/limit");
     expect(seen[0]?.authorization).toBe("Bearer zai-secret");
@@ -1017,11 +1020,12 @@ describe("fetchProviderQuotaReports", () => {
     expect(result.reports[0]?.quota).toMatchObject({
       fiveHourPercent: 20,
       weeklyPercent: 52,
-      monthlyPercent: 7.5,
     });
+    expect(result.reports[0]?.quota.monthlyPercent).toBeUndefined();
     expect(seen).toHaveLength(1);
     expect(seen[0]?.url).toBe("https://open.bigmodel.cn/api/monitor/usage/quota/limit");
-    expect(seen[0]?.authorization).toBe("Bearer zai-secret");
+    // BigModel takes the raw key; a Bearer prefix is rejected upstream (issue #1168).
+    expect(seen[0]?.authorization).toBe("zai-secret");
     expect(seen[0]?.redirect).toBe("error");
   });
 
@@ -1078,11 +1082,11 @@ describe("fetchProviderQuotaReports", () => {
     expect(result.reports[0]?.quota).toMatchObject({
       fiveHourPercent: 30,
       weeklyPercent: 60,
-      monthlyPercent: 9.5,
     });
+    expect(result.reports[0]?.quota.monthlyPercent).toBeUndefined();
     expect(seen).toHaveLength(1);
     expect(seen[0]?.url).toBe("https://open.bigmodel.cn/api/monitor/usage/quota/limit");
-    expect(seen[0]?.authorization).toBe("Bearer zai-secret");
+    expect(seen[0]?.authorization).toBe("zai-secret");
   });
 
   test("Z.AI quota treats an unsuccessful payload as a no-report", async () => {
@@ -1127,7 +1131,7 @@ describe("fetchProviderQuotaReports", () => {
     expect(seen).toEqual([]);
   });
 
-  test("Z.AI quota ignores token rows whose window length does not match", async () => {
+  test("Z.AI quota reports nothing when only unmatched token rows and an MCP row remain", async () => {
     globalThis.fetch = (async () => new Response(JSON.stringify({
       success: true,
       data: {
@@ -1141,10 +1145,10 @@ describe("fetchProviderQuotaReports", () => {
 
     const result = await fetchProviderQuotaReports(keyQuotaConfig("zai", "https://api.z.ai/api/coding/paas/v4"), true);
 
-    expect(result.reports).toHaveLength(1);
-    expect(result.reports[0]?.quota).toMatchObject({ monthlyPercent: 12.3 });
-    expect(result.reports[0]?.quota.fiveHourPercent).toBeUndefined();
-    expect(result.reports[0]?.quota.weeklyPercent).toBeUndefined();
+    // Neither token row matches a known window length and the TIME_LIMIT row is the MCP
+    // allowance, so there is no model-quota evidence at all. Reporting no quota is the
+    // honest outcome; previously the MCP row alone produced a monthly model bar.
+    expect(result.reports).toEqual([]);
   });
 
   test("Z.AI quota does not fall back to legacy fields when limits is present but empty", async () => {
@@ -1158,7 +1162,7 @@ describe("fetchProviderQuotaReports", () => {
     expect(result.reports).toEqual([]);
   });
 
-  test("Z.AI quota renders a real v2 coding-plan response (monthly MCP TIME_LIMIT)", async () => {
+  test("Z.AI quota ignores the monthly MCP TIME_LIMIT row in a real v2 response", async () => {
     // Sanitized live response captured from the /api/monitor/usage/quota/limit probe
     // (level=max, v2 protocol): the TIME_LIMIT row is the 30-day MCP tool budget
     // (search-prime / web-reader / zread), independent of the token windows.
@@ -1181,9 +1185,99 @@ describe("fetchProviderQuotaReports", () => {
       fiveHourResetAt: 1787056863927,
       weeklyPercent: 20,
       weeklyResetAt: 1787641095989,
-      monthlyPercent: 0,
-      monthlyResetAt: 1788073095998,
     });
+    // The MCP allowance is untouched here (percentage 0) while the five-hour model
+    // window is fully consumed. Reporting the MCP row as monthly model quota is what
+    // issue #1168 removes: headroomOf() takes the MAX across windows, so an exhausted
+    // MCP budget would otherwise be read as exhausted model capacity.
+    expect(result.reports[0]?.quota.monthlyPercent).toBeUndefined();
+    expect(result.reports[0]?.quota.monthlyResetAt).toBeUndefined();
+  });
+
+  test("a later MCP-only refresh clears the cached Z.AI model windows", async () => {
+    // Sequential forced refreshes. The first returns real token windows, so a last-good row
+    // exists; the second is a SUCCESSFUL response that authoritatively reports no model
+    // windows. Treating that as a transient failure would preserve the stale token windows
+    // for up to 30 minutes, so the dashboard and quota-aware routing would keep acting on a
+    // report the provider has already superseded.
+    let call = 0;
+    globalThis.fetch = (async () => {
+      call += 1;
+      const limits = call === 1
+        ? [
+          { type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 40, nextResetTime: 1789000000000 },
+          { type: "TOKENS_LIMIT", unit: 6, number: 1, percentage: 52, nextResetTime: 1789600000000 },
+        ]
+        : [
+          { type: "TIME_LIMIT", unit: 5, number: 1, usage: 100, currentValue: 20, remaining: 80, percentage: 20, nextResetTime: 1788921262994 },
+        ];
+      return new Response(JSON.stringify({ success: true, data: { limits, level: "lite" } }), { status: 200 });
+    }) as typeof fetch;
+
+    const cfg = keyQuotaConfig("zhipu-bigmodel-coding", "https://open.bigmodel.cn/api/coding/paas/v4", "zai-secret");
+
+    const first = await fetchProviderQuotaReports(cfg, true);
+    expect(first.reports).toHaveLength(1);
+    expect(first.reports[0]?.quota).toMatchObject({ fiveHourPercent: 40, weeklyPercent: 52 });
+
+    const second = await fetchProviderQuotaReports(cfg, true);
+    expect(second.reports).toEqual([]);
+  });
+
+  test("Z.AI quota reports no model window when the payload carries only an MCP TIME_LIMIT row", async () => {
+    // A BigModel V1 Lite plan whose MCP allowance is fully spent but whose model tokens
+    // are untouched. Before issue #1168 this produced monthlyPercent: 100, and because
+    // headroomOf() in src/oauth/account-quota-rank.ts takes the MAX across every window,
+    // the account ranked as having ZERO model headroom — a healthy account demoted, or
+    // skipped, over a spent web-search budget.
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      success: true,
+      data: {
+        limits: [
+          { type: "TIME_LIMIT", unit: 5, number: 1, usage: 100, currentValue: 100, remaining: 0, percentage: 100, nextResetTime: 1788921262994,
+            usageDetails: [{ modelCode: "search-prime", usage: 60 }, { modelCode: "web-reader", usage: 40 }, { modelCode: "zread", usage: 0 }] },
+        ],
+        level: "lite",
+      },
+    }), { status: 200 })) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("zhipu-bigmodel-coding", "https://open.bigmodel.cn/api/coding/paas/v4", "zai-secret"),
+      true,
+    );
+
+    expect(result.reports).toEqual([]);
+  });
+
+  test("Z.AI quota omits absent windows rather than reporting them as zero", async () => {
+    // Real V1 Lite shape from issue #1168: one five-hour token window plus the MCP row.
+    // Weekly and monthly must be ABSENT, not 0 — a synthesized 0 would draw a
+    // full-capacity weekly bar for a plan that never reported one.
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      code: 200,
+      msg: "操作成功",
+      success: true,
+      data: {
+        limits: [
+          { type: "TIME_LIMIT", unit: 5, number: 1, usage: 100, currentValue: 0, remaining: 100, percentage: 0, nextResetTime: 1788921262994,
+            usageDetails: [{ modelCode: "search-prime", usage: 0 }, { modelCode: "web-reader", usage: 0 }, { modelCode: "zread", usage: 0 }] },
+          { type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 1, nextResetTime: 1786626122911 },
+        ],
+        level: "lite",
+      },
+    }), { status: 200 })) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(
+      keyQuotaConfig("zhipu-bigmodel-coding", "https://open.bigmodel.cn/api/coding/paas/v4", "zai-secret"),
+      true,
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]?.quota).toMatchObject({ fiveHourPercent: 1, fiveHourResetAt: 1786626122911 });
+    expect(result.reports[0]?.quota.weeklyPercent).toBeUndefined();
+    expect(result.reports[0]?.quota.weeklyResetAt).toBeUndefined();
+    expect(result.reports[0]?.quota.monthlyPercent).toBeUndefined();
+    expect(result.reports[0]?.quota.monthlyResetAt).toBeUndefined();
   });
 
   test("Z.AI quota renders a real new-protocol response without the monthly MCP row", async () => {
@@ -1765,6 +1859,12 @@ describe("fetchProviderQuotaReports", () => {
     expect(JSON.stringify(openai?.aggregation)).not.toMatch(/(?:total|consumed|remaining)Weight|projectedUsedPercent/i);
   });
 
+  // #3198 changed what "tolerate" means here: an uncalibrated plan — a name the weight map
+  // does not list, or a malformed non-string value like the `{ tier: "pro" }` below (both
+  // normalize to undefined via codexPlanKey) — is now counted at the baseline seat weight
+  // instead of being excluded from the aggregate. Exclusion silently overstated coverage;
+  // baseline counting is the visibly conservative estimate. The account still shows up in
+  // `unknownPlanAccounts` so the operator can see the estimate is conservative for that seat.
   test("pool reports tolerate a malformed persisted plan through cache and aggregation", async () => {
     saveCodexAccountCredential("added", {
       accessToken: "added-access",
@@ -1793,12 +1893,14 @@ describe("fetchProviderQuotaReports", () => {
 
     const refreshed = await fetchProviderQuotaReports(config, true);
     const openai = refreshed.reports.find(row => row.provider === "openai");
-    expect(openai?.quota.weeklyPercent).toBe(11);
+    // Both seats weigh the same (malformed -> baseline, "plus" -> calibrated baseline), so the
+    // blend of 77 and 11 lands at 44 — not the 11 the old exclusion contract produced.
+    expect(openai?.quota.weeklyPercent).toBe(44);
     expect(openai?.aggregation).toMatchObject({
-      includedAccounts: 1,
-      excludedAccounts: 1,
+      includedAccounts: 2,
+      excludedAccounts: 0,
       unknownPlanAccounts: 1,
-      incomplete: true,
+      incomplete: false,
       currentAccount: { quota: { weeklyPercent: 77 } },
     });
     expect(openai?.aggregation?.currentAccount).not.toHaveProperty("plan");
@@ -2393,6 +2495,12 @@ describe("fetchProviderQuotaReports", () => {
       percent: 0,
       resetAt: Date.parse("2026-08-15T13:05:52.277209Z"),
     });
+    expect(parseXaiCreditsResponse({
+      config: {
+        creditUsagePercent: 42,
+        currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: 1e20 },
+      },
+    })).toEqual({ percent: 42 });
     expect(parseXaiCreditsResponse({
       config: {
         creditUsagePercent: 10,

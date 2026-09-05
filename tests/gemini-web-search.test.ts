@@ -10,6 +10,7 @@ mock.module("../src/oauth/store", () => ({
 
 import { mapCcaGroundedResponse } from "../src/web-search/gemini-executor";
 import { findGeminiSidecarProvider, planWebSearch } from "../src/web-search";
+import { resolveAntigravityEffortWireModel } from "../src/providers/antigravity-models";
 import { parseRequest } from "../src/responses/parser";
 import type { OcxConfig, OcxProviderConfig } from "../src/types";
 
@@ -72,12 +73,23 @@ describe("mapCcaGroundedResponse (002 live capture shape)", () => {
 describe("planWebSearch gemini arm (L8)", () => {
   const healthy = { accounts: [{ id: "a1", credential: { projectId: "proj-1" } }], activeAccountId: "a1" };
 
-  test("explicit gemini + OAuth + projectId -> plan with geminiSidecar and 3.7-flash default", () => {
+  test("explicit gemini + OAuth + projectId -> plan with geminiSidecar and 3.8-flash default", () => {
     accountSets = { "google-antigravity": healthy };
     const plan = planWebSearch(config({ webSearchSidecar: { backend: "gemini" } }), parsedWithWebSearch(), false, routed, "model", undefined);
     expect(plan?.backend).toBe("gemini");
     expect(plan?.geminiSidecar?.providerName).toBe("google-antigravity");
-    expect(plan?.settings.model).toBe("gemini-3.7-flash");
+    // Tracks the Antigravity default: the sidecar runs google_search grounding over the same
+    // CCA transport, so a sidecar pinned to the previous generation would drift from it.
+    expect(plan?.settings.model).toBe("gemini-3.8-flash");
+  });
+
+  test("a 3.8 sidecar call rides the suffix wire id with no thinking level", async () => {
+    // The 3.7 case below sends gemini-3.7-flash-tiered plus thinkingLevel because that model
+    // carries its tier in the request. 3.8 carries it in the wire id instead, so the envelope
+    // must differ — this asserts the suffix-tier decision actually reached the sidecar path.
+    const { wireModelId, thinkingLevel } = resolveAntigravityEffortWireModel("gemini-3.8-flash", "low");
+    expect(wireModelId).toBe("gemini-3.8-flash-low");
+    expect(thinkingLevel).toBeUndefined();
   });
 
   test.each([
@@ -129,9 +141,12 @@ describe("runGeminiWebSearch request shape (review P1)", () => {
       expect(new URL(req.url).origin).toBe("https://daily-cloudcode-pa.googleapis.com");
       expect(req.url).toContain("/v1internal:generateContent");
       expect(req.init.redirect).toBe("manual");
-      const headers = req.init.headers as Record<string, string>;
-      expect(headers["Authorization"]).toBe("Bearer gem-token-abc");
-      expect(headers["User-Agent"]).toContain("antigravity");
+      // Read through Headers so the credential assertion holds whether the init carries a plain
+      // record or a Headers instance: the reset-recovery helper normalizes headers on the send
+      // path, and this canary is about WHICH bearer goes out, not how the init spells it.
+      const headers = new Headers(req.init.headers);
+      expect(headers.get("Authorization")).toBe("Bearer gem-token-abc");
+      expect(headers.get("User-Agent")).toContain("antigravity");
       const body = JSON.parse(String(req.init.body));
       expect(body.project).toBe("proj-9");
       expect(body.userAgent).toBe("antigravity");
@@ -176,7 +191,7 @@ describe("runGeminiWebSearch request shape (review P1)", () => {
     try {
       const out = await runGeminiWebSearch("q", "google-antigravity", cca, { model: "gemini-3.7-flash", reasoning: "low", timeoutMs: 5000 });
       expect(out.text).toBe("ok");
-      expect((request!.headers as Record<string, string>)["Authorization"]).toBe("Bearer token-a");
+      expect(new Headers(request!.headers).get("Authorization")).toBe("Bearer token-a");
       expect(JSON.parse(String(request!.body)).project).toBe("project-a");
       expect(accountSets["google-antigravity"]!.activeAccountId).toBe("account-b");
     } finally {

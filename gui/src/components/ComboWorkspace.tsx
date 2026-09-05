@@ -109,6 +109,8 @@ export default function ComboWorkspace({
             <IconPlus width={14} height={14} /> {t("cws.add")}
           </button>
         </div>
+        {/* Search has no decision value until at least one combo exists. */}
+        {combos.length > 0 && (
         <div className="cwi-search-row">
           <div className="cwi-search-wrap">
             <IconSearch className="cwi-search-icon" aria-hidden="true" />
@@ -121,6 +123,7 @@ export default function ComboWorkspace({
             />
           </div>
         </div>
+        )}
         <div className="combos-workspace-rail-list">
           {filtered.length === 0 && combos.length > 0 ? (
             <p className="muted" style={{ padding: "16px" }}>{t("cws.noSearchResults")}</p>
@@ -129,6 +132,7 @@ export default function ComboWorkspace({
               {([
                 ["failover", sections.failover, "cws.group.failover"],
                 ["round-robin", sections.roundRobin, "cws.group.roundRobin"],
+                ["other", sections.other, "cws.group.other"],
               ] as const).map(([key, items, labelKey]) => (
                 items.length > 0 ? (
                   <div key={key} className="combos-workspace-rail-group">

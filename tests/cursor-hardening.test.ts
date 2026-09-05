@@ -424,6 +424,25 @@ describe("Cursor discovery bounded retry", () => {
     expect(result).toEqual({ ok: true, models: ["gpt-5.5-high"] });
   });
 
+  test("retries an HTTP/2 stream that ends before response headers", async () => {
+    const body = toBinary(GetUsableModelsResponseSchema, create(GetUsableModelsResponseSchema, {
+      models: [create(ModelDetailsSchema, { modelId: "gpt-5.5-high" })],
+    }));
+    let requests = 0;
+    const result = await withDiscoveryServer(stream => {
+      requests += 1;
+      if (requests === 1) {
+        stream.close(http2.constants.NGHTTP2_NO_ERROR);
+        return;
+      }
+      stream.respond({ ":status": 200, "content-type": "application/proto" });
+      stream.end(body);
+    }, baseUrl => fetchCursorUsableModels({ apiKey: "test-token", baseUrl }));
+
+    expect(requests).toBe(2);
+    expect(result).toEqual({ ok: true, models: ["gpt-5.5-high"] });
+  });
+
   test("does not retry deterministic auth failures", async () => {
     let requests = 0;
     const result = await withDiscoveryServer(stream => {
@@ -748,8 +767,8 @@ describe("Cursor live transport unexpected EOF", () => {
                   case: "mcpToolCall",
                   value: create(McpToolCallSchema, {
                     args: create(McpArgsSchema, {
-                      name: "get_time",
-                      toolName: "get_time",
+                      name: "ocx_client_get_time",
+                      toolName: "ocx_client_get_time",
                       toolCallId: "call_1",
                       providerIdentifier: "opencodex-responses",
                     }),

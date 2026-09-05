@@ -38,6 +38,8 @@ Usage:
   ocx codex-shim <sub>        Auto-start proxy when \`codex\` launches (install|status|uninstall|remove)
   ocx tray <sub>              Windows status tray (install|start|stop|status|uninstall)
   ocx ensure                  Ensure the proxy is running and Codex config/cache are current
+  ocx connect <url>           Connect this machine to a remote OpenCodex hub (credential via stdin)
+  ocx disconnect              Restore local state and clear the hub connection
   ocx sync [--restart-codex]  Fetch models from providers and inject into Codex config
   ocx sync-cache [--restart-codex]
                               Refresh Codex's model cache from the active catalog
@@ -50,7 +52,8 @@ Usage:
   ocx debug <scope>           provider/usage/injection/claude on|off|status|reset
   ocx login <provider>        OAuth or API-key provider login
   ocx logout <provider>       Remove a stored OAuth login
-  ocx gui                     Open the opencodex dashboard
+  ocx gui [pair --origin <browser-origin> [--json]]
+                              Open the dashboard or create a single-use remote pairing grant
   ocx update [--tag <tag>]    Update opencodex (keeps preview installs on @preview)
   ocx restart                  Stop and restart the proxy
   ocx v2 <sub>                multi_agent_v2 surface (status|on|off|mode|keep-native-v1|threads|mode-hint)
@@ -61,7 +64,7 @@ Usage:
   ocx account <sub>           Accounts, login/reauth, key pools, and quota controls
   ocx models <sub>            Live/custom models, visibility, context, and shadow calls
   ocx alias <sub>             Short names for providers and models (list, set, rm, defaults)
-  ocx combo <sub>             Combo failover/round-robin routing
+  ocx combo <sub>             Combo routing strategies and failover
   ocx agent <sub>             Subagents, injection, effort caps, and sidecars
   ocx observe <sub>           Logs, usage, storage, memory, and debug data
   ocx inspect <sub>           Effective config, catalog, analytics, pacing, client-config
@@ -73,10 +76,10 @@ Usage:
   ocx memory [--json]         Alias of ocx observe memory
   ocx api-key <sub>           Alias of ocx access key
   ocx access <sub>            External API keys and endpoint information
-  ocx export --client <id>    Print a client config wired to the running proxy (11 clients)
+  ocx export --client <id>    Print a client config wired to the running proxy (12 clients)
   ocx integration client <sub> Enable, disable, inspect or roll back a client integration
   ocx grok <sub>              Grok Build model selection and apply
-  ocx system <sub>            Runtime settings, startup, sync, and updates
+  ocx system <sub>            Runtime settings, startup, sync, OpenCodex updates, and Codex CLI inspection
   ocx config <sub>            Validated configuration show/get/set/import/export
   ocx lab <sub>               Read-only Compatibility Lab projection inspection
   ocx claude [args...]        Launch Claude Code wired to the proxy (model discovery on)

@@ -344,7 +344,8 @@ do not silently widen the synchronization scope.
 ```bash
 bun install
 bun run typecheck      # bun x tsc --noEmit (strict)
-bun run test           # full tests/ suite
+bun run test:changed   # import-graph tests against the resolved `dev` merge base
+bun run test           # full tests/ suite (PR-ready / explicit ask only)
 bun run lint:gui       # GUI eslint
 bun run privacy:scan   # credential/privacy scan used by CI
 bun run build:gui      # Vite GUI build
@@ -364,16 +365,54 @@ also if the hand-written pages name a command the registry does not have. That s
 hypothetical: it caught a documented `ocx request-history` that never existed.
 
 During implementation, use the smallest focused checks that directly cover the
-changed subsystem. Do not run repository-wide `bun run typecheck` or
-`bun run test` for a scoped change unless the change affects shared runtime,
-routing, config, server behavior, a focused result is failed or ambiguous, or
-the user explicitly asks for full validation.
+changed subsystem. Prefer `bun test tests/<name>.test.ts` for a known file, or
+`bun run test:changed` when the touch set is broader than one file. Do **not**
+run repository-wide `bun run test` or a bare `bun test` with no file arguments
+for a scoped change by default. `bun run test:changed` follows Bun's parsed module graph: it
+selects test files that import changed modules, but it cannot see dependencies
+expressed through subprocesses, source files read as data, or golden/derived
+files. Run the relevant focused tests explicitly for those paths; if no reliable
+focused set covers them, the full suite is required even for a scoped change.
+That indirect-dependency case is the explicit exception to the scoped-change
+default. The full suite is ~850 files, so otherwise reserve it for a failed or
+ambiguous focused result, an explicit user request, or the PR-ready gate below.
 
 Before creating or updating a non-trivial PR as review-ready, or before
 approving such a PR, run `bun run typecheck` and `bun run test`. CI runs these
 on Linux, Windows, and macOS.
 
 Do not rerun passing checks on unchanged code merely for additional confidence.
+
+## Minimal containers and agent sandboxes
+
+Fresh dev containers and agent sandboxes (Cursor Cloud, devcontainers, CI
+images) often ship Node but not Bun. Install it first:
+
+```bash
+curl -fsSL https://bun.sh/install | bash   # installs ~/.bun/bin/bun
+export PATH="$HOME/.bun/bin:$PATH"
+bun install && (cd gui && bun install)
+```
+
+Run the proxy with `bun run src/cli/index.ts start --port <port>`. `/healthz`
+reports status, `/` serves the dashboard, and the management API requires the
+admin token the server writes to `$OPENCODEX_HOME/admin-api-token` at startup.
+
+`bun run test` has five known environment-only failures in such containers.
+They are not regressions; do not re-investigate them:
+
+- `service diagnostics > status summary exposes the service log path`,
+  `CLI subcommand help > status prints diagnostics without starting the proxy`,
+  and `CLI subcommand help > invalid service and codex-shim usage include
+  remove alias` require a running systemd init; in a container PID 1 is
+  typically `tini` or another minimal init, so service commands report
+  "systemd not found".
+- `package tree integrity > an in-place rewrite of the same byte length is
+  still a replacement` and `Codex Log Guard inspection > repeat inspection is
+  memoized and invalidated by a write` rely on filesystem mtime granularity
+  that some container filesystems do not provide.
+
+Everything else passes (15480 pass / 16 skip / 5 fail as of 2.35.0).
 
 ## Issues and pull requests (agents)
 
@@ -397,6 +436,17 @@ than nudged.
   `Closes #<number>` to link it. GitHub auto-closes the linked issue only
   when the PR merges into the default branch (`main`); PRs here target
   `dev`, so close the issue manually once the change is on `dev`.
+- **Landing another author's work:** reimplementing, superseding, carrying, or
+  rebasing someone else's pull request requires a `Co-authored-by` trailer
+  naming that author, in the description or in a branch commit so it survives
+  the squash. Saying it in prose is not equivalent — the trailer is what GitHub
+  reads for the contributor graph, and a sentence in a commit body is read by
+  nothing. This repository did it both ways for months: `53c09a247` says "Clean
+  reimplementation of #3193" and names the author in a trailer, `5734a1caf` says
+  "Reimplements #2797 by @rrmlima" and names nobody, so that contribution is
+  invisible on its author's profile. The 27 landings already in that state are
+  recorded in [`CREDITS.md`](./CREDITS.md); `missing_coauthor_credit` in
+  `.github/scripts/pr-carry-attribution.cjs` is why the list should not grow.
 
 ## Branch policy
 
@@ -439,8 +489,11 @@ repository CI; a maintainer has to — so the gate never disproves it; a new
 push still resets every box. A disproved claim unticks the matching box and
 keeps the PR a draft.
 Authors with repository push permission skip the ancestry heuristic only. As with approval requirements in
-[`MAINTAINERS.md`](./MAINTAINERS.md), this is enforced by convention until
-branch protection is configured.
+[`MAINTAINERS.md`](./MAINTAINERS.md), the ancestry heuristic is a CI check
+rather than a branch rule. The branches themselves are protected: `dev`,
+`main`, and `preview` each carry an active ruleset requiring a reviewed pull
+request and blocking force-pushes and deletion, so a direct push to `dev` is
+rejected regardless of `--no-verify`.
 
 [`MAINTAINERS.md`](./MAINTAINERS.md) is authoritative for review and merge
 policy (approvals, CI requirements, security review, promotion). This file
@@ -468,8 +521,9 @@ reviewers (Codex, CodeRabbit).
   assumptions about a compile step, or code paths that break `bun run
   typecheck` / `bun run test`.
 - **Tests:** behavior changes in `src/` need a focused regression test near
-  the existing tests for that subsystem. Shared routing, adapter, config, or
-  server changes need the full suite green.
+  the existing tests for that subsystem. During implementation, run the relevant
+  focused files and use `bun run test:changed` for import-connected coverage as
+  described above; the full suite is the PR-ready gate.
 - **Docs sync:** user-facing behavior changes should update `docs-site/` (and
   keep translated locales from contradicting the English source).
 - **Privacy:** `bun run privacy:scan` must stay green; never introduce logging

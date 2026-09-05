@@ -24,7 +24,7 @@ ocx start --port 8080
 
 ### `ocx stop`
 
-実行中のプロキシを (PID によって) 停止し、PID ファイルを削除して、ネイティブ Codex を復元します。マネージド バックグラウンド サービスがインストールされている場合、`ocx stop` はそれを最初に停止するため、プロキシを再起動できません。同じアクションは、Web ダッシュボードの **停止** ボタン (`POST /api/stop`) から実行できます。
+実行中のプロキシを (PID によって) 停止し、PID ファイルを削除して、ネイティブ Codex を復元します。マネージド バックグラウンド サービスがインストールされている場合、`ocx stop` はそれを最初に停止するため、プロキシを再起動できません。Web ダッシュボードの **停止** ボタンは同じ処理 (`POST /api/stop`) を実行しますが、Windows タスク スケジューラだけは例外です。タスク終了後もラッパーがプロキシを再起動しうるため、ダッシュボードは `respawnable_service` で拒否し、何も変更せずに `ocx stop` の実行を促します。
 
 ### `ocx restart`
 
@@ -123,7 +123,7 @@ ocx status --json
 
 認証不要の `GET /readyz` エンドポイントで同期後の準備状態を確認します。準備完了時は `200`、
 `pending` または終端状態の `failed` では `Retry-After: 1` とともに `503` を返します。HTTP の
-サニタイズ済み識別フィールドは `{service, version, uptime, pid, port, status}` です。`/readyz` がない
+サニタイズ済み識別フィールドは `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}` です。`protocol` は hub の現在の remote protocol、`minimumClientProtocol` は互換性のある最小 client protocol、`managementUrl` は browser から見える canonical management origin です。`/readyz` がない
 旧プロキシは `unreachable` として fail-closed し、`/healthz` は readiness ではなく別の liveness 確認です。
 デフォルトでは 1 回だけ probe します。`--wait` は準備完了または timeout まで polling しますが、
 終端 `failed` を確認すると即座に終了します。デフォルト timeout は 45 秒で、`--timeout <seconds>` には
@@ -158,9 +158,9 @@ opencodex を、ログイン時に自動起動し、クラッシュ時に自動�
 
 |サブコマンド |アクション |
 | --- | --- |
-|なし |未インストールなら作成して開始し、既存なら再登録せずに更新して再起動します。 |
+|なし |未インストールなら作成して開始し、既存なら更新して再起動します。正常な Windows タスク スケジューラ定義は再利用しますが、古い定義は再登録され、昇格が必要になる場合があります。 |
 | `install` |サービスを作成して開始します。 |
-| `repair` | 既存のサービスを再登録せずに更新して再起動します。 |
+| `repair` | 既存のサービスを更新して再起動します。正常な Windows タスク スケジューラ定義は再利用しますが、古い定義は再登録され、昇格が必要になる場合があります。 |
 | `restart` | `repair` の別名です。 |
 | `start` |インストールされているサービスを開始します。 |
 | `stop` |サービスを停止し、ネイティブ Codex を復元します。 |
@@ -191,7 +191,7 @@ Windows では、タスク スケジューラ エントリを作成するには�
 
 アップグレード時には、現在の検証ガードを持たない既存の Unix shim を再生成して検証します。保存済みランチャーが安全でない場合、OpenCodex は危険な wrapper を残さず、古い shim を削除して元のランチャーを復元します。
 
-完了した外部 Codex アップデートがインストールされている shim を上書きした場合、次の通常の `ocx` コマンドは安定した新しいランチャーをバックアップし、ディスパッチ前に shim を復元します。まだ変更中のランチャーは変更されず、後で再試行されます。修復の失敗は、要求されたコマンドを失敗させることなく警告します。手動フォールバック: `ocx codex-shim install`。 `codexShimAutoRestore` を `false` に設定するか、プロセス レベルのオプトアウトの場合は `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` を設定します。
+完了した外部 Codex アップデートがインストールされている shim を上書きした場合、次の通常の `ocx` コマンドは安定した新しいランチャーをバックアップし、ディスパッチ前に shim を復元します。副作用のない検査コマンド `ocx system codex-cli-update check` と、予約された `ocx system codex-cli-update` 名前空間の不正な呼び出しは、この修復を行いません。まだ変更中のランチャーは変更されず、後で再試行されます。修復の失敗は、要求されたコマンドを失敗させることなく警告します。手動フォールバック: `ocx codex-shim install`。 `codexShimAutoRestore` を `false` に設定するか、プロセス レベルのオプトアウトの場合は `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` を設定します。
 
 |サブコマンド |アクション |
 | --- | --- |
@@ -222,6 +222,8 @@ Windows ステータス トレイ アイコンをインストールして制御�
 
 ## 更新
 
+`ocx update` は OpenCodex 自体を更新し、Codex CLI は更新しません。[system 検査コマンド](/ja/reference/cli/agents/)の `ocx system codex-cli-update check` を使用すると、設定済みの Codex CLI 候補の provenance を範囲を限定して読み取り専用で確認できます。このコマンドは package registry に問い合わせず、更新をインストールしません。
+
 ### `ocx update [--tag latest|preview]`
 
 npm から opencodex を自己更新します。安定したインストールでは `@latest` を使用します。 `--tag latest|preview` を渡さない限り、プレビュー インストールは `@preview` に残ります。ソース チェックアウトを検出し、代わりに `git pull && bun install` を使用するように指示しますが、そのタグの最新バージョンをすでに使用している場合は何もしません。npm インストールでは、何かを停止する前に Unix キャッシュの所有権とアクセスを上限付きで検査します。ネストされたシンボリックリンクは `lstat` で確認しますが追跡しません。Windows では、この Unix 専用検査を明示的にスキップします。検査に失敗した場合、トレイとプロキシを実行したまま更新を中止します。その後、実行中のプロキシはファイルが置き換えられる前に停止されます。インストールされたサービスは再構築されて自動的に開始されますが、フォアグラウンド インストールでは次のステップとして `ocx start` が出力されます。ダッシュボードの更新記録では、保存前にプロファイル／キャッシュのパスと UID/GID 値が秘匿されます。
@@ -232,3 +234,7 @@ ocx update --tag preview
 ```
 
 新しいバージョンは、[リリースワークフロー](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml) が npm に公開すると利用可能になります。
+
+## Remote Hub クライアントのライフサイクル
+
+`ocx connect <url> --pairing-code-stdin`、`ocx connect status`、`ocx sync`、`ocx connect rotate --pairing-code-stdin` を使います。`ocx disconnect` はオフラインでローカル状態を復元しますが hub のキーは失効させません。接続中は `ocx connect revoke --admin-token-stdin` が保存済み `apiKeyId` を失効させ、切断後は hub の **Integrations → API Keys** を使います。秘密値は stdin だけで渡し、argv には入れません。

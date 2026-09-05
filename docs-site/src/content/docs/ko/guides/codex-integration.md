@@ -16,11 +16,23 @@ opencodex는 Codex가 읽는 두 가지, 즉 설정(`$CODEX_HOME/config.toml`, �
 model_catalog_json = "/absolute/path/to/opencodex-catalog.json"
 # Auto-injected by opencodex
 openai_base_url = "http://127.0.0.1:10100/v1"
+# Auto-injected by opencodex
+experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"
 
 # fastMode를 설정했을 때만 들어갑니다. 설정하지 않으면 [features] 자체가 생기지 않습니다
 [features]
 fast_mode = true
 ```
+
+두 번째 키는 음성 sideband 오버라이드입니다. Codex는 WebRTC 음성 통화를 `openai_base_url`로 만들지만,
+codex 0.146(openai/codex#35830)부터는 `experimental_realtime_ws_base_url`이 없으면 그 통화의 sideband
+WebSocket을 `api.openai.com`에 직접 붙입니다. Pool 모드에서는 통화가 opencodex가 고른 계정으로
+만들어지므로, 앱 자체 로그인으로 직접 붙는 join은 `realtime websocket handshake failed`(404)로
+실패합니다. 주입된 키는 join을 다시 opencodex(`GET /v1/live/{callId}`)로 보내고, Pool은 그
+session/thread 쌍에 묶어 둔 계정(프로세스 로컬 바인딩)을 그대로 씁니다. Direct 모드는 두 요청 모두
+호출자의 현재 bearer를 쓰므로, 이 키는 join을 프록시 경로에 붙잡아 두는 역할만 합니다. 이 키는
+loopback `openai_base_url` 형태에서만 쓰이고, 그 키와 함께 제거되며, 사용자가 직접 적은
+`experimental_realtime_ws_base_url`은 덮어쓰지 않습니다.
 
 주입되는 `fast_mode`는 3-상태 `fastMode` 설정을 따릅니다. `true`면 `fast_mode = true`를 쓰고,
 `false`면 `fast_mode = false`를 쓰며, 설정하지 않으면 기존 `fast_mode`를 그대로 두고
@@ -37,6 +49,7 @@ Codex의 내장 `image_gen` 도구는 `/v1/responses`를 거치지 않습니다.
 - **모드 인식 forward 후보 하나:** Pool은 적격한 메인/추가 계정을 선택하고, Direct는 호출자 OAuth bearer를 사용합니다. 설정된 모드는 이미지 요청에도 일관되게 적용됩니다.
 - **OpenAI API-key provider:** forward 후보 중 누구도 인증 실패를 가지지 않을 때만 사용합니다. 고장 나거나 만료된 Pool credential을 별도로 청구되는 API 사용 뒤에 숨기지 않습니다.
 - **명시적 커스텀 provider:** `images.provider`를 OpenAI Images API를 구현한 커스텀 API-key `openai-responses` provider id로 설정할 수 있습니다. 명시적으로 선택한 provider는 닫힌 상태로 실패하며, 다른 유료 upstream으로 fallback하지 않습니다. registry-managed provider id는 여기서 허용하지 않습니다. 기본 제공 OpenAI tiers를 쓰려면 `images.provider`를 생략하세요.
+- **xAI Imagine (Grok OAuth) relay:** `images.bridgeEnabled`가 `true`이고 `images.provider`가 비어 있으며 `xai` provider가 설정되어 있으면 `/v1/images/generations`와 `/v1/images/edits`가 `https://api.x.ai/v1`로 전송됩니다. 어떤 credential을 쓰는지는 provider의 `authMode`가 정합니다. `"oauth"`면 `ocx login xai`로 받은 Grok CLI grant를 재사용하고, 그 외에는 provider의 API key를 씁니다. OAuth 로그인이 key 방식 provider를 활성화하지는 않으며 반대도 마찬가지입니다. ChatGPT credential은 전달되지 않습니다. credential이 없으면 프록시는 ChatGPT에 과금하지 않고 400을 반환합니다. `images.provider`를 명시하면 `/v1/images`는 그 provider가 맡고, 그 provider의 검증 오류가 그대로 반환되며 xAI relay는 시도되지 않습니다. relay는 Codex `size` / `aspect_ratio`를 xAI Imagine body에 매핑하고 같은 `{created, data:[{b64_json}]}` 형태를 반환합니다. 배치 전체(인라인 `b64_json`과 내려받은 URL)의 디코드 바이트와 base64 인코드 출력은 합쳐서 100 MiB 미만입니다. 한도를 넘는 배치는 502를 반환합니다. xAI가 인라인 바이트 대신 이미지 URL을 돌려주면 프록시가 credential 없이 직접 내려받습니다. URL은 공개 HTTPS여야 하고(리다이렉트, `file:`, loopback·사설 주소 불가), 파일당 50 MiB 상한이 있으며, 결과는 로컬 artifact로 저장되어 인증된 management endpoint로만 제공됩니다. 이 경로는 API-key-only Responses Image Bridge 루프와 별개입니다.
 - **Google Antigravity (CCA) fallback:** OpenAI forward 후보도 keyed provider도 없을 때, `/v1/images/generations`(`/images/edits`는 제외)는 `gemini-3.1-flash-image` 모델을 사용해서 Antigravity **Cloud Code Assist** endpoint로 fallback합니다. OpenAI 인증 해석이 실패할 때(예: 만료되었거나 누락된 ChatGPT credential)에도 이 fallback이 동작하며, OpenAI 후보가 아예 없을 때만 발생하는 것은 아닙니다. 이 기능은 `ocx login google-antigravity`를 필요로 합니다. OAuth token은 오직 고정된 CCA registry host로만 전송되며, config-level `baseUrl` override로는 가지 않습니다. 응답은 Codex가 기대하는 `{created, data:[{b64_json}]}` 형식으로 반환됩니다.
 - **둘 다 없음:** 프록시는 generic 404 대신 명확한 오류를 반환합니다. 라우팅되는 provider(Cursor, Gemini, Kiro 등)는 `image_generation` tool relay를 제공할 수 없습니다. 이 도구를 아예 노출하고 싶지 않다면 Codex에서 `codex features disable image_generation`(`config.toml`의 `[features] image_generation = false`)으로 끄세요.
 
@@ -153,13 +166,13 @@ CLI에서 표시 이름을 추가할 수 있습니다(proxy가 live 상태면 ca
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
-원격 Codex client는 management API로 같은 생성된 catalog를 가져올 수 있습니다(다른 `/api/*` 경로와 같은 admission token을 사용합니다):
+원격 Codex client는 관리자 토큰이 아니라 일반 데이터 플레인 키(`/v1/responses`에 이미 사용하는 것과 같은 자격 증명)로 같은 생성된 catalog를 가져올 수 있습니다:
 
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/opencodex-catalog.json"
 tmp="$(mktemp "${dest}.XXXXXX")"
-curl -fsS -H "x-opencodex-api-key: $OPENCODEX_ADMIN_AUTH_TOKEN" \
-  "https://proxy.example.com/api/catalog" > "$tmp" \
+curl -fsS -H "x-opencodex-api-key: $OPENCODEX_API_AUTH_TOKEN" \
+  "https://proxy.example.com/v1/catalog" > "$tmp" \
   && mv "$tmp" "$dest"
 ocx sync-cache
 ```
@@ -167,6 +180,8 @@ ocx sync-cache
 응답은 원시 `opencodex-catalog.json` 문서입니다( provider credential 없음). 사용 가능할 때는 `x-opencodex-codex-version` header가 서버 쪽 Codex runtime version을 보고해서 client가 version skew를 알아볼 수 있습니다.
 
 또한 management API(`POST /api/custom-models`, `PUT /api/custom-models/<id>`의 `displayName` string)와 웹 대시보드에서도 설정하거나 수정할 수 있습니다. `/`는 routed-slug separator와 충돌하므로 거부됩니다.
+
+`GET /v1/catalog`은 모델 목록을 읽는 데 관리자 토큰이 필요하지 않도록 존재합니다. 읽기 전용(`GET`, `HEAD`)이며 `x-opencodex-api-key`, bearer 토큰, `x-api-key`를 허용하고 관리 라우트와 완전히 동일한 바이트를 제공합니다. 응답에는 강한 `ETag`가 포함되므로 `If-None-Match`로 다시 보내면 전체 문서 대신 `304`를 받고, `Cache-Control: private, no-cache`가 함께 설정됩니다. 여기서 허용된 데이터 플레인 키는 관리 플레인에서 **아무 권한도** 얻지 못합니다. `/api/catalog`을 비롯한 모든 `/api/*` 라우트는 여전히 관리자 토큰이나 대시보드 세션을 요구합니다.
 
 표시 이름은 **표시 전용이며 재생성 사이에서도 안정적**입니다. 모든 `ocx sync`와 catalog refresh는 `config.json`(`customModels` 포함)에서 routed entry를 다시 계산하므로, 설정된 이름이 라우팅 slug로 되돌아가지 않고 다시 적용됩니다. 관리형 service restart도 proxy가 bind된 직후 이 sync를 다시 시도합니다. 예를 들어 offline login 중이라 이 best-effort boot sync가 실패하면, 이전에 저장된 catalog는 유지되고 다음에 성공한 `ocx sync`가 설정된 이름을 다시 적용합니다. 진짜 upstream native name(예: `gpt-5.6-sol` → "GPT-5.6-Sol")은 고정된 upstream snapshot에서 오며, custom display name으로 덮어쓰지 않습니다.
 

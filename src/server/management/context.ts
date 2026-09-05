@@ -4,12 +4,15 @@ import type { CodexLogGuardProtectionDeps } from "../../codex/log-guard/protecti
 import type { CodexLogGuardMaintenanceDeps } from "../../codex/log-guard/maintenance";
 import type { StartupHealth } from "../../codex/autostart-health";
 import type { StartupInstallAction } from "../startup-action-control";
-import type { ManagementPrincipal } from "../management-auth";
+import type { ManagementPrincipal, ManagementSessionControl } from "../management-auth";
 import type { CatalogModel } from "../../codex/catalog";
 import type { Paths as CodexPromptPaths } from "../../codex/prompt-layers";
 import type { injectGrokConfig } from "../../grok/inject";
 import type { removeDesktop3pStandardPivot, writeDesktop3pConfig } from "../../claude/desktop-3p";
+import type { probeClaudeDesktopPolicy } from "../../claude/desktop-policy";
 import type { RuntimePortState } from "../../config/process-state";
+import type { CursorInstall } from "../../integrations/cursor-detect";
+import type { CursorEffortTable } from "../../integrations/cursor-effort-table";
 import type { CatalogDisposition, ConvergeCodex } from "../../codex/convergence-types";
 import type {
   performCodexRestart,
@@ -25,6 +28,8 @@ export interface ManagementApiDeps {
   createManagementConvergeCodex?: (config: Readonly<OcxConfig>) => ConvergeCodex;
   /** Codex integration sync seam keeps mode mutations isolated in route tests. */
   syncModelsToCodex?: typeof syncModelsToCodex;
+  /** Test-only destination for best-effort Claude agent-definition sync. */
+  claudeAgentConfigDir?: string;
   /** Startup-health seam keeps route tests from launching platform probes. */
   getCachedStartupHealth?: (config: Pick<OcxConfig, "codexAutoStart">) => Promise<StartupHealth>;
   /**
@@ -50,12 +55,15 @@ export interface ManagementApiDeps {
   /** Desktop mutation seams keep route tests inside temporary config libraries. */
   removeDesktop3pStandardPivot?: typeof removeDesktop3pStandardPivot;
   writeDesktop3pConfig?: typeof writeDesktop3pConfig;
+  /** Read-only Windows MDM policy seam for status/apply tests. */
+  probeClaudeDesktopPolicy?: typeof probeClaudeDesktopPolicy;
   /**
    * Runtime-state seam: the fence must name the host/port the RUNNING process
    * bound (agent-settings-routes.ts:99-103 pattern), and a test must not depend
    * on the developer's real runtime state file.
    */
   readRuntimePort?: (pid: number) => RuntimePortState | null;
+  loadCursorEffortTable?: (install: CursorInstall | undefined) => CursorEffortTable | null;
   clearThreadAccountMap?: () => void;
   clearProviderQuotaCache?: () => void;
   primeCodexPoolQuotas?: (config: OcxConfig, reason: string) => Promise<void> | void;
@@ -107,6 +115,8 @@ export interface ManagementContext {
   url: URL;
   config: OcxConfig;
   deps: ManagementApiDeps;
+  /** Installed package version projected through bounded system identity routes. */
+  version: string;
   /**
    * Which credential authorized this request, resolved by the auth gate before
    * dispatch. Routes that spend the USER's identity (not just the proxy's) must
@@ -116,6 +126,8 @@ export interface ManagementContext {
    * tests, which are treated as the untrusted `admin-token` case.
    */
   principal?: ManagementPrincipal;
+  /** Narrow current-session revocation seam; contains neither the token nor session map. */
+  sessionControl?: ManagementSessionControl;
   convergeCodexCatalog: () => Promise<CatalogDisposition>;
   syncClaudeAgentDefsBestEffort: () => Promise<void>;
 }

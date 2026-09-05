@@ -1,5 +1,8 @@
 import type { OcxComboTarget, OcxConfig } from "../types";
-import { coolComboTarget, isComboTargetInCooldown } from "./failover";
+import { getCachedProviderQuota } from "../providers/quota-routing-cache";
+import type { ProviderQuota } from "../providers/quota-types";
+import { coolComboTarget, isComboTargetInCooldown, type ComboFailureCooldownScope } from "./failover";
+import { quotaResetRemainingMs } from "./reset-window";
 import { getCombo, resolveComboId, targetKey } from "./types";
 import type { NormalizedComboConfig } from "./types";
 import {
@@ -19,6 +22,7 @@ interface SelectionState {
   activeKey?: string;
   successes: number;
   currentWeights: Map<string, number>;
+  successfulUses: Map<string, number>;
 }
 
 const selectionState = new Map<string, SelectionState>();
@@ -55,6 +59,28 @@ function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget): bool
     && config.providers[target.provider]?.disabled !== true;
 }
 
+function quotaWindowExhausted(percent: number | undefined, resetAt: number | undefined, now: number): boolean {
+  if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 100) return false;
+  return typeof resetAt !== "number" || !Number.isFinite(resetAt) || resetAt > now;
+}
+
+export function cachedProviderQuotaIsExhausted(
+  quota: ProviderQuota | null,
+  now = Date.now(),
+): boolean {
+  if (!quota) return false;
+  if (quotaWindowExhausted(quota.fiveHourPercent, quota.fiveHourResetAt, now)) return true;
+  if (quotaWindowExhausted(quota.weeklyPercent, quota.weeklyResetAt, now)) return true;
+  if (quotaWindowExhausted(quota.monthlyPercent, quota.monthlyResetAt, now)) return true;
+  if (quota.customWindows?.some(window => quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
+  if (quota.creditsUsd?.unlimited !== true
+      && typeof quota.creditsUsd?.percent === "number"
+      && Number.isFinite(quota.creditsUsd.percent)
+      && quota.creditsUsd.percent >= 100
+      && quota.creditsUsd.remaining <= 0) return true;
+  return false;
+}
+
 function smoothWeightedIndex(
   targets: Required<OcxComboTarget>[],
   state: SelectionState,
@@ -82,20 +108,53 @@ function smoothWeightedIndex(
   return best;
 }
 
+/**
+ * Select the eligible target whose earliest known quota reset is nearest.
+ *
+ * Only reads the last successfully cached provider-quota snapshot; it never
+ * triggers an upstream quota probe. When no target has fresh reset data,
+ * every remaining value is Infinity and configured order becomes the
+ * fallback. Targets with elapsed or stale reset timestamps are treated as
+ * unknown (Infinity).
+ */
+function resetWindowIndex(
+  targets: Required<OcxComboTarget>[],
+  eligible: (target: Required<OcxComboTarget>) => boolean,
+  now = Date.now(),
+): number {
+  let selected = -1;
+  let smallestRemaining = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < targets.length; index++) {
+    const target = targets[index]!;
+    if (!eligible(target)) continue;
+    const remaining = quotaResetRemainingMs(getCachedProviderQuota(target.provider, now), now);
+    // Strict comparison deliberately retains configured order for ties,
+    // including the no-snapshot fallback where every value is Infinity.
+    if (selected < 0 || remaining < smallestRemaining) {
+      selected = index;
+      smallestRemaining = remaining;
+    }
+  }
+  return selected;
+}
+
 export function pickComboTarget(
   config: OcxConfig,
   comboId: string,
   options: {
     exclude?: Iterable<string>;
     eligible?: (target: Required<OcxComboTarget>) => boolean;
+    now?: number;
   } = {},
 ): ComboPick | null {
   const writerGeneration = captureConfigGeneration();
   const combo = getCombo(config, comboId);
   if (!combo) throw new UnknownComboError(comboId);
   const excluded = new Set(options.exclude ?? []);
+  const now = options.now ?? Date.now();
   const eligible = (target: Required<OcxComboTarget>): boolean =>
     targetProviderIsUsable(config, target)
+    && !cachedProviderQuotaIsExhausted(getCachedProviderQuota(target.provider, now), now)
     && !excluded.has(targetKey(target))
     && (options.eligible?.(target) ?? true);
 
@@ -103,7 +162,7 @@ export function pickComboTarget(
   if (combo.strategy === "round-robin") {
     let state = selectionState.get(comboId);
     if (!state) {
-      state = { successes: 0, currentWeights: new Map() };
+      state = { successes: 0, currentWeights: new Map(), successfulUses: new Map() };
       selectionState.set(comboId, state);
     }
     if (state.activeKey) {
@@ -120,6 +179,41 @@ export function pickComboTarget(
         state.successes = 0;
       }
     }
+  } else if (combo.strategy === "random") {
+    // Weighted random selection happens independently for every request.
+    const eligibleTargets = combo.targets
+      .map((target, index) => ({ target, index }))
+      .filter(({ target }) => eligible(target));
+    if (eligibleTargets.length > 0) {
+      const totalWeight = eligibleTargets.reduce((sum, entry) => sum + entry.target.weight, 0);
+      let random = Math.random() * totalWeight;
+      for (const entry of eligibleTargets) {
+        random -= entry.target.weight;
+        if (random <= 0) {
+          targetIndex = entry.index;
+          break;
+        }
+      }
+      if (targetIndex < 0) targetIndex = eligibleTargets[eligibleTargets.length - 1]!.index;
+    }
+  } else if (combo.strategy === "least-used") {
+    let state = selectionState.get(comboId);
+    if (!state) {
+      state = { successes: 0, currentWeights: new Map(), successfulUses: new Map() };
+      selectionState.set(comboId, state);
+    }
+    let fewestUses = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < combo.targets.length; index++) {
+      const target = combo.targets[index]!;
+      if (!eligible(target)) continue;
+      const uses = state.successfulUses.get(targetKey(target)) ?? 0;
+      if (targetIndex < 0 || uses < fewestUses) {
+        targetIndex = index;
+        fewestUses = uses;
+      }
+    }
+  } else if (combo.strategy === "reset-window") {
+    targetIndex = resetWindowIndex(combo.targets, eligible, now);
   } else {
     targetIndex = combo.targets.findIndex(eligible);
   }
@@ -141,9 +235,18 @@ export function noteComboSuccess(
   target: Required<OcxComboTarget>,
   writerGeneration = captureConfigGeneration(),
 ): void {
-  if (combo.strategy !== "round-robin") return;
   const key = targetKey(target);
   if (!mayCommitComboState(comboId, key, writerGeneration)) return;
+  if (combo.strategy === "least-used") {
+    let state = selectionState.get(comboId);
+    if (!state) {
+      state = { successes: 0, currentWeights: new Map(), successfulUses: new Map() };
+      selectionState.set(comboId, state);
+    }
+    state.successfulUses.set(key, (state.successfulUses.get(key) ?? 0) + 1);
+    return;
+  }
+  if (combo.strategy !== "round-robin") return;
   const state = selectionState.get(comboId);
   if (!state || state.activeKey !== key) return;
   state.successes += 1;
@@ -173,15 +276,26 @@ export function advanceComboAfterFailure(
     retryAfter?: string | null;
     now?: number;
     eligible?: (target: Required<OcxComboTarget>) => boolean;
+    cooldownScope?: ComboFailureCooldownScope;
+    status?: number;
+    code?: string | null;
+    message?: string;
   } = {},
 ): ComboPick | null {
   noteComboFailure(pick.comboId, pick.target, pick.writerGeneration);
-  coolComboTarget(pick.comboId, pick.target, {
-    ...options,
-    writerGeneration: pick.writerGeneration,
-  });
+  const combo = getCombo(config, pick.comboId);
+  const cooldownTargets = options.cooldownScope === "provider" && combo
+    ? combo.targets.filter(target => target.provider === pick.target.provider)
+    : [pick.target];
+  for (const target of cooldownTargets) {
+    coolComboTarget(pick.comboId, target, {
+      ...options,
+      writerGeneration: pick.writerGeneration,
+    });
+  }
   return pickComboTarget(config, pick.comboId, {
     exclude: pick.attempted,
+    now: options.now,
     eligible: target => !isComboTargetInCooldown(pick.comboId, target, options.now)
       && (options.eligible?.(target) ?? true),
   });
@@ -204,6 +318,11 @@ export function reconcileComboRotationState(context: GenerationContext): number 
     for (const key of state.currentWeights.keys()) {
       if (context.comboTargets.has(comboTargetOwnerKey(comboId, key))) continue;
       state.currentWeights.delete(key);
+      removed += 1;
+    }
+    for (const key of state.successfulUses.keys()) {
+      if (context.comboTargets.has(comboTargetOwnerKey(comboId, key))) continue;
+      state.successfulUses.delete(key);
       removed += 1;
     }
   }

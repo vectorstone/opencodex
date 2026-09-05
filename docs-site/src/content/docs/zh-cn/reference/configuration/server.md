@@ -25,7 +25,7 @@ description: 监听、远程访问、准入密钥、超时、存储、侧车、�
 | `codexAutoStart?` | `boolean` | `true` | 允许 Codex shim 在启动 Codex 之前运行 `ocx ensure`。设为 false 会让 ensure 变成无操作。 |
 | `codexShimAutoRestore?` | `boolean` | `true` | 在完成外部 Codex 更新并覆盖安装的 shim 之后恢复该 shim。环境退出开关：`OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`。 |
 | `syncResumeHistory?` | `boolean` | `true` | 可逆的 Codex App 历史兼容性。原始元数据会被备份，并由 `ocx stop` / `ocx restore` 恢复。 |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 将识别出的 Codex 辅助/影子调用以低努力级别重定向到选定模型。默认源前缀为 `gpt-5.6-luna`；0.144.x 及更早客户端使用 `gpt-5.4-mini`，可通过 `sourceModels` 恢复。 |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 将识别出的 Codex 辅助/影子调用重定向到选定模型，并保留为请求配置的推理强度。默认源前缀为 `gpt-5.6-luna`；0.144.x 及更早客户端使用 `gpt-5.4-mini`，可通过 `sourceModels` 恢复。 |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | 在可用时启用 | Web 搜索侧车选项。 |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | 在可用时启用 | 图像描述侧车选项。 |
 | `images?` | `OcxImagesConfig` | 自动选择 OpenAI | 用于 Codex `image_gen` 的独立 Images 转发选项。 |
@@ -118,7 +118,7 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 ## 影子调用
 
 Codex 会为标题、提交信息等任务使用较小的辅助模型。启用
-`shadowCallIntercept` 后，可将识别出的源模型前缀重定向到另一个已配置模型。替换会以低努力级别运行。只有当客户端使用不同的辅助 ID 时，才设置 `sourceModels`。
+`shadowCallIntercept` 后，可将识别出的源模型前缀重定向到另一个已配置模型。替换后仍会保留为请求配置的推理强度。只有当客户端使用不同的辅助 ID 时，才设置 `sourceModels`。
 
 ```json
 {
@@ -175,3 +175,9 @@ routed 重放会把主 ChatGPT 认证注入内部请求。Anthropic 后端使用
 支持的等级受上游提供方能力与所选模型公布的推理阶梯限制。Vision 只会对发送给其提供方 `noVisionModels` 中模型的图像生效。OpenAI 具有与 search 相同的登录/forward 要求；显式选择的 Anthropic 在没有可用凭据时会失败并关闭。成功的 `data:` 描述会使用一个受限缓存，其键由后端、模型、detail、图像字节以及规范化消息上下文组成；OpenAI 的键还会额外包含推理强度（Anthropic 键不含）。命中和同轮重复不会消耗限额。远程 `https:` 图像以及失败或空的描述不会被缓存。
 
 Anthropic OAuth 侧车会复用 opencodex 现有的 Claude Code OAuth 指纹。请对目标账户和负载进行 soak 测试。
+
+## Remote Hub 密钥与默认值
+
+`runtimeRole` 默认为 `standalone`。Hub 使用 `hub.managementPublicOrigin`、仅回环的 `hub.managementIngress`（缺省为 `enabled:false`）和准确的 `remoteGui.allowedTailscaleUsers`（缺省为空）。客户端密钥保存在 `service-api-token` 而不是 `config.json`；轮换期间可能暂时存在 `service-api-token.prev`。使用记录不会镜像。
+
+`remoteGui.allowInsecureHttp` 是已弃用的 no-op，仅为让旧的严格 schema 配置继续加载而保留。请从配置中删除它：pairing grant 只接受 loopback 或已认证的 HTTPS；设为 `true` 也不会重新开放明文 HTTP pairing。

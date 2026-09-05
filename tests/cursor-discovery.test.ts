@@ -57,6 +57,12 @@ describe("Cursor discovery metadata", () => {
     expect(ids).toContain("glm-5.2");
     expect(ids).toContain("kimi-k2.7-code");
     expect(ids).toContain("kimi-k3");
+    // Fable 5.1 has one canonical picker row; saved/live spellings stay adapter aliases.
+    expect(ids.filter(id => id.includes("fable") && (id.includes("5-1") || id.includes("5.1"))))
+      .toEqual(["claude-fable-5-1"]);
+    expect(cursorModelContextWindows(CURSOR_STATIC_MODELS)["claude-fable-5-1"]).toBe(1_000_000);
+    // Any live Fable spelling the seed does not carry still infers a 1M window.
+    expect(inferCursorContextWindow("claude-fable-6")).toBe(1_000_000);
     // Umbrella merge (devlog 260828): fast duplicate rows folded into bases.
     expect(ids).not.toContain("claude-opus-4-7-fast");
     // 260709 refresh: stale ids dropped from the static seed (cursor.com docs); gpt-5.5-extra
@@ -83,6 +89,10 @@ describe("Cursor discovery metadata", () => {
     expect(isCursorModelAvailableForAccount("claude-4-sonnet", ["claude-4-sonnet-1m"])).toBe(false);
     expect(isCursorModelAvailableForAccount("gpt-5.5", ["gpt-5.5-extra-high"])).toBe(false);
     expect(isCursorModelAvailableForAccount("gpt-5.5-extra", ["gpt-5.5-extra-high"])).toBe(true);
+    expect(isCursorModelAvailableForAccount("claude-fable-5-1", ["claude-fable-5.1-thinking-high"])).toBe(true);
+    expect(isCursorModelAvailableForAccount("claude-fable-5-1", ["claude-5.1-fable-high-thinking"])).toBe(true);
+    expect(isCursorModelAvailableForAccount("claude-fable-5-1", ["claude-fable-5-2-thinking-high"])).toBe(false);
+    expect(isCursorModelAvailableForAccount("claude-fable-5-2", ["claude-fable-5-1-thinking-high"])).toBe(false);
 
     // Issue #117: Cursor GetUsableModels may return ids with a `cursor-` wire prefix.
     expect(isCursorModelAvailableForAccount("grok-4.5", ["cursor-grok-4.5-high"])).toBe(true);

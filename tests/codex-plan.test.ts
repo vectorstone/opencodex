@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../src/codex/account-store";
 import { getMainAccountPlan, setMainAccountPlan } from "../src/codex/main-account";
@@ -10,6 +10,7 @@ import {
 } from "../src/codex/plan-from-token";
 import { loadConfig, saveConfig } from "../src/config";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const TEST_DIR = join(import.meta.dir, ".tmp-codex-plan-test");
 const TEST_CODEX_HOME = join(TEST_DIR, "codex");
@@ -29,7 +30,7 @@ function chatgptPlanJwt(plan: string, accountId = "acct"): string {
 beforeEach(() => {
   previousOpencodexHome = process.env.OPENCODEX_HOME;
   previousCodexHome = process.env.CODEX_HOME;
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
   mkdirSync(TEST_CODEX_HOME, { recursive: true });
   process.env.OPENCODEX_HOME = TEST_DIR;
   process.env.CODEX_HOME = TEST_CODEX_HOME;
@@ -44,7 +45,7 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
   if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = previousCodexHome;
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
 });
 
 describe("extractChatgptPlanType", () => {
@@ -198,3 +199,52 @@ describe("WHAM-wins plan provenance gate (release-audit fix)", () => {
   });
 });
 
+
+describe("rotated-JWT plan reconciliation across propagated aliases (#2892 gap 3)", () => {
+  test("a plan-changing rotated JWT reconciles the alias, not just the refresh owner", async () => {
+    const { getValidCodexToken, readCodexAccountRecord } = await import("../src/codex/account-store");
+    const oldJwt = chatgptPlanJwt("plus");
+    const shared = { refreshToken: "plan-grant", expiresAt: 0, chatgptAccountId: "acct" };
+    saveCodexAccountCredential("plan-owner", { accessToken: oldJwt, ...shared });
+    saveCodexAccountCredential("plan-alias", { accessToken: oldJwt, ...shared });
+    // Advance the alias so its generation DIVERGES from the owner's. Without this both land on the
+    // same number and an assertion about the per-alias fence would pass even if the code used the
+    // owner's generation — a vacuous test. Re-saving the identical credential keeps the record an
+    // eligible untouched duplicate while bumping only its generation.
+    saveCodexAccountCredential("plan-alias", { accessToken: oldJwt, ...shared });
+    saveCodexAccountCredential("plan-alias", { accessToken: oldJwt, ...shared });
+    saveConfig({
+      ...loadConfig(),
+      codexAccounts: [
+        { id: "plan-owner", email: "owner@test", plan: "plus" },
+        { id: "plan-alias", email: "alias@test", plan: "plus" },
+      ],
+    } as OcxConfig);
+
+    const rotatedJwt = chatgptPlanJwt("pro");
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json({
+      access_token: rotatedJwt,
+      refresh_token: "plan-grant-rotated",
+      expires_in: 3600,
+    })) as typeof fetch;
+    try {
+      await getValidCodexToken("plan-owner");
+
+      // The alias holds the rotated Pro JWT after propagation...
+      const alias = readCodexAccountRecord("plan-alias")!;
+      expect(alias.credential?.accessToken).toBe(rotatedJwt);
+
+      // ...so its configured plan must be reconciled too. Reconciling only the owner left the alias
+      // on "plus" while carrying a Pro credential, and its cached-token fast path never repairs
+      // that, so quota scoring stayed wrong until a restart or a WHAM refresh.
+      const accounts = loadConfig().codexAccounts ?? [];
+      expect(accounts.find(a => a.id === "plan-owner")?.plan).toBe("pro");
+      expect(accounts.find(a => a.id === "plan-alias")?.plan).toBe("pro");
+      // The alias is fenced at its OWN committed generation, not the owner's.
+      expect(accounts.find(a => a.id === "plan-alias")?.planCredentialGeneration).toBe(alias.generation);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

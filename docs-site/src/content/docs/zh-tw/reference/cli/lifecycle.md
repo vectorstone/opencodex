@@ -24,7 +24,7 @@ ocx start --port 8080
 
 ### `ocx stop`
 
-停止執行中的代理（依 PID）、移除 PID 檔案，並還原原生 Codex。若已安裝受管背景服務，`ocx stop` 也會先停止它，使其無法重新生成代理。相同動作亦可從網頁儀表板的 **Stop** 按鈕執行（`POST /api/stop`）。
+停止執行中的代理（依 PID）、移除 PID 檔案，並還原原生 Codex。若已安裝受管背景服務，`ocx stop` 也會先停止它，使其無法重新生成代理。網頁儀表板的 **Stop** 按鈕在多數後端執行相同動作（`POST /api/stop`），但 Windows 工作排程器除外：工作結束後包裝程序仍可能重新啟動 Proxy，因此儀表板會以 `respawnable_service` 拒絕、不做任何變更，並請你改用 `ocx stop`。
 
 ### `ocx restart`
 
@@ -121,7 +121,7 @@ ocx status --json
 
 ### `ocx ready [--json] [--wait [--timeout <seconds>]]`
 
-透過免認證的 `GET /readyz` 端點檢查同步後的就緒狀態。就緒時回傳 `200`，或 `pending` 與終端 `failed` 時回傳附帶 `Retry-After: 1` 的 `503`。其淨化的 HTTP 身分為 `{service, version, uptime, pid, port, status}`。沒有 `/readyz` 的舊代理會以 `unreachable` 方式 fail closed；`/healthz` 是分開的存活檢查，而非就緒檢查。此指令預設執行一次探測；`--wait` 輪詢直到就緒或逾時，但在觀察到終端 `failed` 狀態時立即退出。預設逾時為 45 秒；`--timeout <seconds>` 需要 `--wait`，接受 1–300 的正整數秒。CLI JSON 輸出 `{ready, status, pid, port}`，其中 `status` 為 `ready`、`pending`、`failed` 或 `unreachable`。離開碼為：就緒 0；未就緒、pending、failed、逾時或 unreachable 1；無效引數 64。
+透過免認證的 `GET /readyz` 端點檢查同步後的就緒狀態。就緒時回傳 `200`，或 `pending` 與終端 `failed` 時回傳附帶 `Retry-After: 1` 的 `503`。其淨化的 HTTP 身分為 `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}`。`protocol` 是 Hub 目前的遠端協定版本，`minimumClientProtocol` 是相容的最低用戶端協定版本，`managementUrl` 是瀏覽器可見的標準管理 origin。沒有 `/readyz` 的舊代理會以 `unreachable` 方式 fail closed；`/healthz` 是分開的存活檢查，而非就緒檢查。此指令預設執行一次探測；`--wait` 輪詢直到就緒或逾時，但在觀察到終端 `failed` 狀態時立即退出。預設逾時為 45 秒；`--timeout <seconds>` 需要 `--wait`，接受 1–300 的正整數秒。CLI JSON 輸出 `{ready, status, pid, port}`，其中 `status` 為 `ready`、`pending`、`failed` 或 `unreachable`。離開碼為：就緒 0；未就緒、pending、failed、逾時或 unreachable 1；無效引數 64。
 
 ### `ocx doctor`
 
@@ -149,9 +149,9 @@ ocx status --json
 
 | 子指令 | 動作 |
 | --- | --- |
-| 無 | 服務不存在時安裝並啟動；已存在時不重新註冊，直接重新整理並重啟。 |
+| 無 | 服務不存在時安裝並啟動；已存在時重新整理並重啟。正常的 Windows 工作排程器定義會沿用；過時的定義可能會重新註冊並需要提高權限。 |
 | `install` | 建立並啟動服務。註冊它，在 Windows 上需要提高權限。 |
-| `repair` | 就地重新整理已安裝的服務並重啟它，而不重新註冊。 |
+| `repair` | 就地重新整理已安裝的服務並重啟它。正常的 Windows 工作排程器定義會沿用；過時的定義可能會重新註冊並需要提高權限。 |
 | `restart` | `repair` 的別名。 |
 | `start` | 啟動已安裝的服務。 |
 | `stop` | 停止服務並還原原生 Codex。 |
@@ -193,7 +193,7 @@ ocx service uninstall
 
 在 PATH 上以輕量自動啟動腳本包裝基於腳本的 `codex` 啟動器。真實的 `codex.exe` 目標保持不動，以避免破壞精確的可執行檔呼叫。
 
-若已完成的外部 Codex 更新覆寫了已安裝的 shim，下一個普通 `ocx` 指令會備份穩定的新啟動器並在分派前還原 shim。仍在變動中的啟動器保持不動並稍後重試。修復失敗會發出警告但不會使請求的指令失敗；手動後備：`ocx codex-shim install`。將 `codexShimAutoRestore` 設為 `false`，或設定 `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` 以進行行程層級的退出。
+若已完成的外部 Codex 更新覆寫了已安裝的 shim，下一個普通 `ocx` 指令會備份穩定的新啟動器並在分派前還原 shim。零副作用的檢查指令 `ocx system codex-cli-update check` 與保留的 `ocx system codex-cli-update` 命名空間中的無效呼叫都不會執行此修復。仍在變動中的啟動器保持不動並稍後重試。修復失敗會發出警告但不會使請求的指令失敗；手動後備：`ocx codex-shim install`。將 `codexShimAutoRestore` 設為 `false`，或設定 `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` 以進行行程層級的退出。
 
 | 子指令 | 動作 |
 | --- | --- |
@@ -224,6 +224,8 @@ ocx codex-shim uninstall
 
 ## 更新
 
+`ocx update` 更新的是 OpenCodex 本身，而不是 Codex CLI。請使用 [system 檢查指令](/zh-tw/reference/cli/agents/)中的 `ocx system codex-cli-update check`，對已設定的 Codex CLI 候選項進行有界、唯讀的 provenance 檢查。此命令不會查詢 package registry，也不會安裝更新。
+
 ### `ocx update [--tag latest|preview]`
 
 從 npm 自我更新 opencodex。穩定安裝使用 `@latest`；預覽安裝停留在 `@preview`，除非你傳入 `--tag latest|preview`。它偵測原始碼 checkout 並告訴你改用
@@ -235,3 +237,7 @@ ocx update --tag preview
 ```
 
 當 [Release workflow](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml) 將新版本發布到 npm 時，新版本即可使用。
+
+## Remote Hub 用戶端生命週期
+
+使用 `ocx connect <url> --pairing-code-stdin`、`ocx connect status`、`ocx sync` 與 `ocx connect rotate --pairing-code-stdin`。`ocx disconnect` 可離線還原本機狀態，但不會撤銷 hub 金鑰。仍連線時，`ocx connect revoke --admin-token-stdin` 會撤銷已保存的 `apiKeyId`；中斷後請使用 hub 的 **Integrations → API Keys**。秘密值只能透過 stdin 傳遞，不能放入 argv。

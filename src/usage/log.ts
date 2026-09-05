@@ -322,7 +322,8 @@ function normalizeAttemptTierOutcome(raw: unknown): AttemptTierOutcome | null {
   if ("wireKind" in outcome
     && outcome.wireKind !== null
     && outcome.wireKind !== "service-tier"
-    && outcome.wireKind !== "anthropic-speed") return null;
+    && outcome.wireKind !== "anthropic-speed"
+    && outcome.wireKind !== "cursor-variant") return null;
   if ("wireValue" in outcome && outcome.wireValue !== null && typeof outcome.wireValue !== "string") return null;
   if ("fastDowngradeReason" in outcome
     && (typeof outcome.fastDowngradeReason !== "string"
@@ -337,7 +338,10 @@ function normalizeAttemptTierOutcome(raw: unknown): AttemptTierOutcome | null {
   const responseServiceTier = sanitizeLogMetadataString(outcome.responseServiceTier);
   return {
     ...(outcome.canonical === "priority" ? { canonical: "priority" as const } : {}),
-    ...(outcome.wireKind === null || outcome.wireKind === "service-tier" || outcome.wireKind === "anthropic-speed"
+    ...(outcome.wireKind === null
+      || outcome.wireKind === "service-tier"
+      || outcome.wireKind === "anthropic-speed"
+      || outcome.wireKind === "cursor-variant"
       ? { wireKind: outcome.wireKind }
       : {}),
     ...(outcome.wireValue === null
@@ -1186,7 +1190,7 @@ export async function readUsageEntriesForManagement(): Promise<PersistedUsageEnt
 }
 
 /** Keep legacy optional fields permissive, but reject rows that cannot be safely attributed. */
-function normalizePersistedUsageRow(value: unknown): PersistedUsageEntry | undefined {
+export function normalizePersistedUsageRow(value: unknown): PersistedUsageEntry | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const row = value as Record<string, unknown>;
   if (typeof row.requestId !== "string" || typeof row.provider !== "string") return undefined;

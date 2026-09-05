@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KIRO_COMPLETION_TOOL_NAME } from "../src/adapters/kiro-constants";
@@ -9,6 +9,7 @@ import { startServer } from "../src/server";
 import { clearRequestLogsForTests, getRequestLogEntries } from "../src/server/request-log";
 import type { OcxConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const enc = new TextEncoder();
 const originalFetch = globalThis.fetch;
@@ -36,7 +37,7 @@ afterEach(() => {
   else process.env.KIRO_REGION = previousRegion;
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
-  rmSync(testDir, { recursive: true, force: true });
+  removeTreeWithRetry(testDir);
 });
 
 function eventFrame(eventType: string, payload: Record<string, unknown>): Uint8Array {
@@ -212,6 +213,58 @@ describe("Kiro completion through public server endpoints", () => {
       expect(upstream.requests).toHaveLength(2);
       expect(kiroToolNames(upstream.requests[0])).toEqual(["bash", KIRO_COMPLETION_TOOL_NAME]);
       expect(kiroToolNames(upstream.requests[1])).toEqual(["bash", KIRO_COMPLETION_TOOL_NAME]);
+    } finally {
+      await proxy.stop(true);
+      upstream.server.stop(true);
+    }
+  });
+
+
+  test("answer-like prose plus a completion answer in ONE inference renders exactly one answer", async () => {
+    // The user-visible defect: Kiro emits answer-shaped prose and then calls the private completion
+    // tool in the SAME inference. Releasing both made bridge.ts close the commentary message and
+    // open a second one with near-identical text, so the client rendered the answer twice.
+    // Adapter-event coverage cannot prove this is gone — the split happens in the bridge.
+    const upstream = scriptedKiroUpstream([
+      [textFrame("The workspace is ready."), ...completionFrames("The workspace is ready.")],
+    ]);
+    saveConfig(kiroConfig(upstream.server.url.toString()));
+    const proxy = startServer(0);
+    try {
+      const response = await originalFetch(new URL("/v1/responses", proxy.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "kiro-test/gpt-5.6-sol",
+          input: "Inspect the workspace",
+          stream: true,
+          tools: [{ type: "function", name: "bash", description: "Run a command", parameters: { type: "object" } }],
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      const wire = await response.text();
+      const events = responseEvents(wire);
+
+      // One inference only: the completion answer resolves the turn, so no bounded fallback runs.
+      expect(upstream.requests).toHaveLength(1);
+
+      // Exactly one visible assistant answer, and the prose is not repeated as its own message.
+      const completed = events.filter(event => event.name === "response.completed");
+      expect(completed).toHaveLength(1);
+      const messages = completed[0].data.response.output.filter((item: { type: string }) => item.type === "message");
+      expect(messages).toHaveLength(1);
+      expect(messages[0].phase).toBe("final_answer");
+      expect(messages[0].content.map((part: { text: string }) => part.text).join("")).toBe("The workspace is ready.");
+
+      // And the duplicate is gone at the delta level too, not merely coalesced into one message.
+      const deltas = events
+        .filter(event => event.name === "response.output_text.delta")
+        .map(event => event.data.delta);
+      expect(deltas.join("")).toBe("The workspace is ready.");
+
+      expect(events.at(-1)?.name).toBe("response.completed");
+      expect(wire).not.toContain(KIRO_COMPLETION_TOOL_NAME);
     } finally {
       await proxy.stop(true);
       upstream.server.stop(true);

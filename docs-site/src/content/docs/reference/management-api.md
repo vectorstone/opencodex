@@ -124,7 +124,7 @@ See [Combos](/guides/combos/) for target strategies, cooldowns, aliases, and rou
 | `GET /api/debug/usage-logs` | Read bounded usage-debug entries | — |
 | `GET /api/debug/injection-logs` | Read bounded guidance-injection debug entries | — |
 | `GET /api/claude/inbound-debug` | Read Claude inbound debug state and entries | — |
-| `GET /api/usage` | Summarize usage by range and client surface; Codex responses also include an `accounts` breakdown keyed by stable non-PII log labels | Returns an `error: "read_failed"` summary if storage cannot be read |
+| `GET /api/usage` | Stream the complete usage ledger into compact aggregates, then incrementally fold verified appends; summarize by range and client surface, with a Codex `accounts` breakdown keyed by stable non-PII log labels | Returns an `error: "read_failed"` summary if storage cannot be read |
 | `GET /api/storage` | Scan Codex storage usage by bucket | Returns an `error: "scan_failed"` payload on scan failure |
 | `POST /api/storage/cleanup/preview` | Preview archived-session cleanup and return a binding digest | 400 `invalid_json` or `invalid_percent` |
 | `POST /api/storage/cleanup` | Quarantine or permanently remove the previewed archived set | 400 invalid input; 409 stale/busy/referenced state; 500 filesystem/database failure |
@@ -135,6 +135,25 @@ See [Combos](/guides/combos/) for target strategies, cooldowns, aliases, and rou
 | `POST /api/storage/cleanup-policy/run` | Start a manual cleanup-policy run | 409 `already_running`; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | Test-only policy stream hook | 404 `not_found` when unavailable |
 
+`GET /api/usage` reads `~/.opencodex/usage.jsonl` from the beginning through the current ledger
+snapshot on a cold start. It processes fixed 1 MiB chunks and retains compact aggregate state rather
+than every normalized request row. Later refreshes validate the previous line boundary and fold only
+newly appended complete rows. Concurrent callers share the same refresh. Range and surface predicates
+are applied to the complete aggregate, so the former read-byte window and parsed-row cap cannot omit
+an earlier file prefix from 7-day, 30-day, or all-history totals. `managementUsageMaxReadBytes` remains
+accepted for compatibility with bounded legacy readers, but changing it no longer expands or reduces
+the history summarized by this endpoint.
+
+The runtime ledger is append-only. Replacing or truncating it, or changing local pricing/time-zone
+inputs, triggers a complete rebuild. If you manually edit an older row in place while the proxy is
+running, restart the proxy (or replace the file) before relying on the new total; incremental refreshes
+verify the append boundary, not every previously aggregated byte.
+
+The response still includes `historyTruncated`, `truncatedPrefixBytes`, `entriesTruncated`, and
+`entriesDropped` so older clients can consume the same wire shape. A successful whole-ledger scan
+reports `false`, `0`, `false`, and `0`, respectively. These are legacy compatibility fields, not a
+signal that the endpoint read only a configured-size tail.
+
 For `GET /api/usage?range=30d&surface=codex`, `accounts` contains one row per observed Codex
 pool label. Each row reports `accountLogLabel`, token totals, `usageCoverageRatio`, and an optional
 `estimatedCostUsd` based on the currently configured display pricing. Active user `modelCosts`
@@ -142,6 +161,12 @@ overlays take priority over bundled verified catalog and price fallbacks, and hi
 re-estimated from the pricing active when the summary is read. This is an API-equivalent estimate,
 not a subscription charge. New main-pool requests use the reserved `main` label; legacy bare
 `openai` rows remain in an ambiguous bucket instead of being reassigned from current configuration.
+
+Rows in `models`, `providers`, and `days[].models` also carry `cacheHitRate`: the share of input
+tokens served from the provider's prompt cache, clamped to `[0, 1]`. It is `null` — never `0` —
+when the provider reported no cache telemetry or the row has no input tokens, because "no cache
+data" and "a genuine 0% hit rate" are different facts and a chart that renders them alike is
+misleading.
 
 :::caution
 Storage cleanup endpoints can move or permanently remove archived session data. Always preview
@@ -152,7 +177,7 @@ first and submit the returned digest. Prefer quarantine when recovery may be nee
 
 | Method and path | Purpose | Notable errors |
 | --- | --- | --- |
-| `GET /api/catalog` | Return the installed Codex catalog document | 404 catalog not found |
+| `GET /api/catalog` | Return the installed Codex catalog document. Remote clients should prefer the data-plane `GET /v1/catalog`, which still requires an ordinary data-plane credential but not an admin token. | 404 catalog not found |
 | `GET /api/models` | Return the dashboard/CLI model rows | `catalog_busy` when gathering is saturated |
 | `GET /api/client-config?client=...` | Build a read-only client config for any supported file integration | 400 unsupported client; 503 catalog unavailable |
 | `PUT /api/disabled-models` | Replace the shared disabled-model list | 400 invalid JSON |
@@ -221,7 +246,7 @@ whether to star the repository.
 | --- | --- | --- |
 | `GET /api/system/memory` | Return scalar process, heap, stream, response-state, watchdog, and active-turn metrics | — |
 | `POST /api/system/restart` | Begin a drain-aware process restart without removing client injection | Returns 202; repeated calls report the existing drain |
-| `POST /api/stop` | Stop the service, restore native Codex, remove managed Grok injection, and drain the proxy | 409 service ownership conflict |
+| `POST /api/stop` | Stop the service, restore native Codex, remove managed Grok injection, and drain the proxy | 409 service ownership conflict; 409 `respawnable_service` when a Windows Task Scheduler wrapper could respawn the proxy and the caller is not `ocx stop` (nothing is changed); 409 when the installed manager refuses to stop; 409 `service_state_unknown` when the Task Scheduler state cannot be read (nothing is changed; repair the query and retry) |
 | `GET /api/system/codex-app-server` | Report whether running Codex app-servers predate the current model catalog | — |
 | `POST /api/system/codex-restart` | Refresh the catalog, then ask stale Codex app-servers to exit so the model picker reloads | Returns 200 with `code: partially_stopped` when a target survives |
 
@@ -280,3 +305,7 @@ For ordinary administration, the [Web Dashboard](/guides/web-dashboard/) gives t
 workflow. For headless hosts and automation, use the corresponding `ocx` commands: they call this
 same live API and return a nonzero result when the proxy is unreachable or the operation fails.
 Direct HTTP is most useful for integrations that need the exact endpoint contracts above.
+
+## Remote sessions and data-key rotation
+
+`POST /api/keys/rotate {id}` starts a ten-minute overlap and returns the new data secret once. `POST /api/keys/rotate/commit {id,rotationId}` commits it; `DELETE /api/keys/rotate {id,rotationId}` aborts it. All require management authentication; data keys cannot call them. `POST /api/session/logout` requires the current `gui-session`, matching Origin, and CSRF. An admin token receives 403 and can never mint or exchange into a consent session.

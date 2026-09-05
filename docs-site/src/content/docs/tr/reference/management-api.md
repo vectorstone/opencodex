@@ -153,6 +153,13 @@ abonelik ücreti değildir. Yeni ana havuz istekleri ayrılmış `main` etiketin
 kullanır; eski yalın `openai` satırları geçerli yapılandırmadan yeniden atanmak
 yerine belirsiz bir sepette kalır.
 
+`models`, `providers` ve `days[].models` içindeki satırlar da `cacheHitRate`
+taşır: sağlayıcının istem önbelleğinden sunulan girdi belirteçlerinin `[0, 1]`
+aralığıyla sınırlandırılmış payı. Sağlayıcı hiç önbellek telemetrisi
+bildirmediğinde veya satırda hiç girdi belirteci olmadığında bu değer `0` değil,
+`null` olur; çünkü "önbellek verisi yok" ile "gerçekten %0 isabet oranı" farklı
+olgulardır ve bunları aynı şekilde gösteren bir grafik yanıltıcıdır.
+
 :::caution
 Depolama temizleme uç noktaları arşivlenmiş oturum verilerini taşıyabilir veya
 kalıcı olarak kaldırabilir. Her zaman önce önizleyin ve döndürülen özeti
@@ -233,7 +240,7 @@ dolaşmamalıdır. Depoya yıldız verip vermeyeceğini kullanıcı seçmelidir.
 | --- | --- | --- |
 | `GET /api/system/memory` | Skaler süreç, yığın (heap), akış, yanıt durumu, denetleyici ve aktif tur metriklerini döndürün | — |
 | `POST /api/system/restart` | İstemci enjeksiyonunu kaldırmadan boşaltma duyarlı bir süreç yeniden başlatması başlatın | 202 döndürür; tekrarlanan çağrılar mevcut boşaltmayı bildirir |
-| `POST /api/stop` | Servisi durdurun, yerel Codex'i geri yükleyin, yönetilen Grok enjeksiyonunu kaldırın ve proxy'yi boşaltın | 409 servis sahipliği çakışması |
+| `POST /api/stop` | Servisi durdurun, yerel Codex'i geri yükleyin, yönetilen Grok enjeksiyonunu kaldırın ve proxy'yi boşaltın | 409 servis sahipliği çakışması; çağıran `ocx stop` değilken bir Windows Görev Zamanlayıcı sarmalayıcısı proxy'yi yeniden başlatabiliyorsa 409 `respawnable_service` (hiçbir şey değiştirilmez); kurulu yönetici durmayı reddederse 409; Görev Zamanlayıcı durumu okunamıyorsa 409 `service_state_unknown` (hiçbir şey değiştirilmez; sorguyu onarıp yeniden deneyin) |
 
 ### Codex kimlik doğrulama yetkilendirmesi
 
@@ -301,4 +308,7 @@ olduğunda veya işlem başarısız olduğunda sıfır olmayan bir sonuç dönd�
 Doğrudan HTTP, yukarıdaki tam uç nokta sözleşmelerine ihtiyaç duyan
 entegrasyonlar için en yararlıdır.
 
+## Uzak oturumlar ve veri anahtarı döndürme
+
+`POST /api/keys/rotate {id}` on dakikalık geçişi başlatır ve yeni sırrı yalnızca bir kez döndürür. `POST /api/keys/rotate/commit {id,rotationId}` onaylar, `DELETE /api/keys/rotate {id,rotationId}` iptal eder. Yönetim kimlik doğrulaması gerekir; veri anahtarı bunları çağıramaz. `POST /api/session/logout` mevcut `gui-session`, eşleşen Origin ve CSRF ister. Admin token 403 alır ve onay oturumu oluşturamaz.
 

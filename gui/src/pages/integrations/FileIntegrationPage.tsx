@@ -1,9 +1,14 @@
 import { useCallback, useState } from "react";
 import { useDataSurface } from "../../data-surface";
+import { DataSurfaceSkeleton } from "../../components/data-surface";
 import { useT, type TKey } from "../../i18n/shared";
 import { Notice, Switch } from "../../ui";
+import ClientMark from "../../components/ClientMark";
+import { markFor } from "../../components/integration-marks";
 import IntegrationStateBadge from "./IntegrationStateBadge";
+import ConsequenceDialog, { type ConsequenceCopy } from "./ConsequenceDialog";
 import RestoreDialog from "./RestoreDialog";
+import { RollbackHistory } from "./RollbackHistory";
 import { describeRefusal } from "./refusal-copy";
 import {
   loadIntegrationJournal,
@@ -15,6 +20,27 @@ import {
 } from "./integration-api";
 
 export type { FileIntegrationClientId };
+
+/*
+ * Copy for the overwrite dialog, selected on WHICH conflict it is.
+ *
+ * Same operation, materially different thing being lost: `unowned-key` means a
+ * block we did not write is in the way, `foreign-edit` means the user's own
+ * change inside our block is what gets discarded. One sentence covering both
+ * would have to be vague about the only part that matters.
+ */
+function overwriteCopy(reason: string | undefined, path: string): ConsequenceCopy {
+  return {
+    titleKey: "integrations.dialog.overwrite.title",
+    changesKey: reason === "foreign-edit"
+      ? "integrations.dialog.overwrite.changesForeign"
+      : "integrations.dialog.overwrite.changesUnowned",
+    breakageKey: "integrations.dialog.overwrite.breakage",
+    undoKey: "integrations.dialog.overwrite.undo",
+    confirmKey: "integrations.dialog.overwrite.confirm",
+    vars: { path },
+  };
+}
 
 const SEMANTICS_KEY: Record<FileIntegrationClientId, TKey> = {
   opencode: "integrations.semantics.opencode",
@@ -28,6 +54,7 @@ const SEMANTICS_KEY: Record<FileIntegrationClientId, TKey> = {
   mcode: "integrations.semantics.mcode",
   zcode: "integrations.semantics.zcode",
   prime: "integrations.semantics.prime",
+  aside: "integrations.semantics.aside",
 };
 
 const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
@@ -42,13 +69,7 @@ const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   mcode: "integrations.tab.mcode",
   zcode: "integrations.tab.zcode",
   prime: "integrations.tab.prime",
-};
-
-const KIND_KEY: Record<IntegrationJournalRow["kind"], TKey> = {
-  apply: "integrations.kind.apply",
-  disable: "integrations.kind.disable",
-  refresh: "integrations.kind.refresh",
-  restore: "integrations.kind.restore",
+  aside: "integrations.tab.aside",
 };
 
 export default function FileIntegrationPage({
@@ -64,6 +85,8 @@ export default function FileIntegrationPage({
   const [pending, setPending] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<IntegrationJournalRow | null>(null);
+  /* Open only while the user is confirming an overwrite. */
+  const [overwriting, setOverwriting] = useState(false);
 
   const fetchState = useCallback(
     (signal: AbortSignal) => loadIntegrationState(apiBase, client, signal),
@@ -118,6 +141,27 @@ export default function FileIntegrationPage({
   };
 
   /*
+   * The one way past a conflict. Separate from `mutate` because it must not be
+   * reachable from the switch: the switch is locked in this state precisely
+   * because we cannot know what the user wants kept, and the whole point of the
+   * escape hatch is that they say so.
+   *
+   * Errors are NOT swallowed here -- they propagate so ConsequenceDialog can
+   * render them inside the dialog, where the user still has the cancel button.
+   */
+  const overwrite = async () => {
+    if (!status) return;
+    setFailure(null);
+    try {
+      await toggleIntegration(apiBase, client, true, undefined, true);
+      refresh();
+    } catch (error) {
+      setFailure(describeRefusal(t, error));
+      throw error;
+    }
+  };
+
+  /*
    * The switch means exactly what its label says.
    *
    * `stale` also means our block is in the file, so the switch reads applied —
@@ -146,6 +190,7 @@ export default function FileIntegrationPage({
   return (
     <section className="integration-client-page">
       <div className="integration-client-head">
+        <ClientMark src={markFor(client)} label={t(TAB_LABEL_KEY[client])} size={24} />
         <h3>{t(TAB_LABEL_KEY[client])}</h3>
         <IntegrationStateBadge
           state={status.state}
@@ -176,6 +221,24 @@ export default function FileIntegrationPage({
         </button>
       )}
 
+      {/*
+        Conflict used to be a dead end: the switch locks, the page explains why,
+        and the only way forward was to open the file and edit it by hand -- which
+        is the thing a user came to a dashboard to avoid. The switch stays locked
+        and this is the one way past it, behind a dialog that names the file and
+        says what is lost.
+      */}
+      {status.installed && status.state === "conflict" && (
+        <button
+          type="button"
+          className="btn btn-danger"
+          onClick={() => setOverwriting(true)}
+          disabled={pending}
+        >
+          {t("integrations.action.overwrite")}
+        </button>
+      )}
+
       <p className="page-sub">{t(SEMANTICS_KEY[client])}</p>
       <p className="integration-path">{status.configPath}</p>
 
@@ -190,38 +253,24 @@ export default function FileIntegrationPage({
       {failure && <Notice tone="err">{failure}</Notice>}
 
       <h4>{t("integrations.rollback.title")}</h4>
-      {history.length === 0 ? (
+      {/*
+        Cold, failed and empty used to render identically, because `data ?? []`
+        collapses all three into an empty array and the empty state followed. A
+        user whose journal request failed was told they had no history.
+      */}
+      {historyResource.state.showSkeleton ? (
+        <DataSurfaceSkeleton label={t("integrations.rollback.title")} rows={2} />
+      ) : historyResource.state.kind === "failed-cold" ? (
+        <Notice tone="err">
+          {t("integrations.rollback.failed")}{" "}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void historyResource.refresh()}>
+            {t("common.retry")}
+          </button>
+        </Notice>
+      ) : history.length === 0 ? (
         <p className="page-sub">{t("integrations.rollback.empty")}</p>
       ) : (
-        <ul className="integration-history">
-          {history.map(row => (
-            <li key={row.opId}>
-              <span className="integration-history-kind">{t(KIND_KEY[row.kind])}</span>
-              <span className="integration-history-at">{new Date(row.at).toLocaleString()}</span>
-              {row.snapshot === "expired" ? (
-                // The only genuinely impossible case: the bytes are gone.
-                <span className="badge badge-muted">{t("integrations.action.snapshotExpired")}</span>
-              ) : (
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => setRestoring(row)}
-                >
-                  {/*
-                    `undoable` chooses the WORDING, not whether the action
-                    exists. Disabling everything else made the drift
-                    confirmation unreachable: an older row, or one whose file
-                    changed since, is exactly what a user reaches for, and the
-                    server accepts it after an explicit confirm.
-                  */}
-                  {row.undoable
-                    ? t("integrations.action.undo")
-                    : t("integrations.action.restorePoint")}
-                </button>
-              )}
-            </li>
-          ))}
-        </ul>
+        <RollbackHistory rows={history} onRestore={setRestoring} />
       )}
 
       {restoring && (
@@ -230,6 +279,16 @@ export default function FileIntegrationPage({
           row={restoring}
           onClose={() => setRestoring(null)}
           onRestored={refresh}
+        />
+      )}
+      {overwriting && (
+        <ConsequenceDialog
+          copy={overwriteCopy(status.reason, status.configPath)}
+          onClose={() => setOverwriting(false)}
+          onConfirm={async () => {
+            await overwrite();
+            setOverwriting(false);
+          }}
         />
       )}
     </section>

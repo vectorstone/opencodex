@@ -38,7 +38,7 @@ import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
-import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import {
@@ -88,6 +88,7 @@ import {
   type DebugFlag,
 } from "../../lib/debug-settings";
 import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import { shadowCallTargetError } from "./shadow-call-validation";
 import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
@@ -305,6 +306,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       // Absent means the historical auto-open, so the GUI can render the toggle
       // without having to know that `undefined` and `true` mean the same thing.
       oauthOpenBrowser: config.oauthOpenBrowser !== false,
+      // Absent means off (today's Design B injection), so the GUI/CLI render a plain switch.
+      codexDesktopAuthless: config.codexDesktopAuthless === true,
       startupHealth: await readStartupHealth(config),
       codexRuntime: {
         path: displayCodexRuntimePath(resolved.runtime.command),
@@ -391,14 +394,16 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       codexAccountPickerEnabled?: unknown;
       oauthOpenBrowser?: unknown;
       showCodexSparkQuota?: unknown;
+      codexDesktopAuthless?: unknown;
     };
     if (body.codexAutoStart === undefined
       && body.streamMode === undefined
       && body.appOwnedMemoryBudgetMb === undefined
       && body.codexAccountPickerEnabled === undefined
       && body.oauthOpenBrowser === undefined
-      && body.showCodexSparkQuota === undefined) {
-      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, codexAccountPickerEnabled, oauthOpenBrowser, or showCodexSparkQuota" }, 400);
+      && body.showCodexSparkQuota === undefined
+      && body.codexDesktopAuthless === undefined) {
+      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, codexAccountPickerEnabled, oauthOpenBrowser, showCodexSparkQuota, or codexDesktopAuthless" }, 400);
     }
     if (body.codexAutoStart !== undefined && typeof body.codexAutoStart !== "boolean") {
       return jsonResponse({ error: "codexAutoStart boolean is required" }, 400);
@@ -415,6 +420,9 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     }
     if (body.showCodexSparkQuota !== undefined && typeof body.showCodexSparkQuota !== "boolean") {
       return jsonResponse({ error: "showCodexSparkQuota boolean is required" }, 400);
+    }
+    if (body.codexDesktopAuthless !== undefined && typeof body.codexDesktopAuthless !== "boolean") {
+      return jsonResponse({ error: "codexDesktopAuthless boolean is required" }, 400);
     }
     if (body.appOwnedMemoryBudgetMb !== undefined && (
       typeof body.appOwnedMemoryBudgetMb !== "number"
@@ -439,9 +447,12 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       hasOauthOpenBrowser: Object.hasOwn(config, "oauthOpenBrowser"),
       showCodexSparkQuota: config.showCodexSparkQuota,
       hasShowCodexSparkQuota: Object.hasOwn(config, "showCodexSparkQuota"),
+      codexDesktopAuthless: config.codexDesktopAuthless,
+      hasCodexDesktopAuthless: Object.hasOwn(config, "codexDesktopAuthless"),
     };
     const pickerWasEnabled = codexAccountPickerEnabled(config);
     let pickerIsEnabled = pickerWasEnabled;
+    const authlessWasEnabled = config.codexDesktopAuthless === true;
     try {
       if (typeof body.codexAutoStart === "boolean") {
         config.codexAutoStart = body.codexAutoStart;
@@ -468,6 +479,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       if (typeof body.showCodexSparkQuota === "boolean") {
         config.showCodexSparkQuota = body.showCodexSparkQuota;
       }
+      if (body.codexDesktopAuthless === true) config.codexDesktopAuthless = true;
+      else if (body.codexDesktopAuthless === false) deleteConfigTopLevelKey(config, "codexDesktopAuthless");
       pickerIsEnabled = codexAccountPickerEnabled(config);
       (deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode)(config);
     } catch (error) {
@@ -490,13 +503,19 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       if (previousSettings.hasShowCodexSparkQuota) {
         config.showCodexSparkQuota = previousSettings.showCodexSparkQuota;
       } else deleteConfigTopLevelKey(config, "showCodexSparkQuota");
+      if (previousSettings.hasCodexDesktopAuthless) {
+        config.codexDesktopAuthless = previousSettings.codexDesktopAuthless;
+      } else deleteConfigTopLevelKey(config, "codexDesktopAuthless");
       throw error;
     }
     if (typeof body.appOwnedMemoryBudgetMb === "number") {
       configureAppOwnedMemoryBudget(resolveAppOwnedMemoryBudgetBytes(body.appOwnedMemoryBudgetMb));
       enforceAppOwnedMemoryBudget();
     }
-    const catalogRefresh = pickerWasEnabled !== pickerIsEnabled
+    // The authless switch changes the injected config.toml shape, so converge now rather than
+    // waiting for the next start; the injector re-reads config and rewrites the form.
+    const authlessIsEnabled = config.codexDesktopAuthless === true;
+    const catalogRefresh = pickerWasEnabled !== pickerIsEnabled || authlessWasEnabled !== authlessIsEnabled
       ? await convergeCodexCatalog()
       : undefined;
     const catalogRefreshPending = catalogRefresh
@@ -512,6 +531,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       oauthOpenBrowser: config.oauthOpenBrowser !== false,
       catalogRefreshPending,
       showCodexSparkQuota: config.showCodexSparkQuota === true,
+      codexDesktopAuthless: authlessIsEnabled,
       startupHealth: await readStartupHealth(config),
     });
   }
@@ -863,6 +883,13 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     if (body.model !== undefined && typeof body.model !== "string") {
       return jsonResponse({ error: "model must be a string" }, 400);
     }
+    const candidateModel = typeof body.model === "string"
+      ? body.model
+      : body.enabled === true
+        ? config.shadowCallIntercept?.model
+        : undefined;
+    const targetError = shadowCallTargetError(config, candidateModel);
+    if (targetError) return jsonResponse({ error: targetError }, 400);
     config.shadowCallIntercept = { ...config.shadowCallIntercept };
     if (typeof body.enabled === "boolean") config.shadowCallIntercept.enabled = body.enabled;
     if (typeof body.model === "string") {

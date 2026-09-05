@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const PROBE_TIMEOUT_MS = 3_000;
 
@@ -23,7 +24,7 @@ describe("Node launcher context transport", () => {
       + "process.stdout.write(JSON.stringify({ context, args: process.argv.slice(2), contextEnv: process.env.OCX_NODE_LAUNCH_CONTEXT ?? null }));\n",
   );
 
-  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  afterAll(() => removeTreeWithRetry(dir));
 
   const proof = "A".repeat(43);
   const context = JSON.stringify({
@@ -46,7 +47,16 @@ describe("Node launcher context transport", () => {
     if (result.error) throw result.error;
     expect(result.status).toBe(0);
     return JSON.parse(result.stdout) as {
-      context: { anthropicEnvSlots: string[] } | null;
+      context: {
+        anthropicEnvSlots: string[];
+        codexCliInspectionEnv: {
+          codexCliPath: string | null;
+          path: string | null;
+          pathExt: string | null;
+          managerRoots: Record<string, string> | null;
+          configDir: string;
+        } | null;
+      } | null;
       args: string[];
       contextEnv: string | null;
     };
@@ -64,6 +74,44 @@ describe("Node launcher context transport", () => {
     expect(seen.context).toBeNull();
     expect(seen.args).toEqual(["claude"]);
     expect(seen.contextEnv).toBeNull();
+  });
+
+  test("a proof-bound long parent PATH remains trusted for updater inspection", () => {
+    const longPath = Array.from({ length: 300 }, (_, index) => `C:\\Tools\\${index}`).join(";");
+    const payload = JSON.stringify({
+      version: 1,
+      proof,
+      anthropicEnvSlots: [],
+      codexCliInspectionEnv: {
+        codexCliPath: "C:\\npm\\codex.cmd",
+        path: longPath,
+        pathExt: ".EXE;.CMD",
+        managerRoots: { FNM_DIR: "C:\\Tools\\fnm-data" },
+        configDir: "C:\\Users\\person\\.opencodex",
+      },
+    });
+    expect(payload.length).toBeGreaterThan(2048);
+    const seen = run([`--ocx-internal-launch-proof=${proof}`, "system"], payload);
+    expect(seen.context?.codexCliInspectionEnv?.path).toBe(longPath);
+    expect(seen.context?.codexCliInspectionEnv?.managerRoots).toEqual({ FNM_DIR: "C:\\Tools\\fnm-data" });
+    expect(seen.context?.codexCliInspectionEnv?.configDir).toBe("C:\\Users\\person\\.opencodex");
+  });
+
+  test("an unknown manager-root key invalidates the trusted context", () => {
+    const payload = JSON.stringify({
+      version: 1,
+      proof,
+      anthropicEnvSlots: [],
+      codexCliInspectionEnv: {
+        codexCliPath: "C:\\npm\\codex.cmd",
+        path: "C:\\npm",
+        pathExt: ".CMD",
+        managerRoots: { UNBOUNDED_ROOT: "C:\\" },
+        configDir: "C:\\Users\\person\\.opencodex",
+      },
+    });
+    const seen = run([`--ocx-internal-launch-proof=${proof}`, "system"], payload);
+    expect(seen.context).toBeNull();
   });
 
   test("duplicate internal proofs fail closed and are removed from user argv", () => {
