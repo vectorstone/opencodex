@@ -1274,7 +1274,8 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                    customFormReasoningInitializedRef.current = false;
                    setCustomError("");
                    setCustomModalOpen(true);
-                 }}
+                }}
+                aria-label={t("models.customAdd")}
                 aria-haspopup="dialog"
               ><span aria-hidden="true">+</span> {t("models.customAdd")}</button>
              }
