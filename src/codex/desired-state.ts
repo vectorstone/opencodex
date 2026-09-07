@@ -20,12 +20,13 @@
  *
  * Design record: devlog/_fin/260803_codex_desktop_toggle/030_desired_state.md.
  */
-import { loadConfig, mutatePersistedConfig } from "../config";
+import { deleteConfigTopLevelKey, loadConfig, mutatePersistedConfig } from "../config";
 import type { OcxClientIntegrationsConfig, OcxConfig } from "../types";
 import { runStartupReadinessSync, type ReadinessGate, type SyncOutcomeLike } from "../server/readiness";
 
 /** Clients whose durable intent this module owns. */
 export type DurableIntentClientId = keyof OcxClientIntegrationsConfig;
+export type CodexIntegrationMode = "full" | "catalog-only" | "off";
 
 /** Injectable for tests; production passes the real sync. */
 /**
@@ -67,12 +68,38 @@ export function integrationEnabled(
 }
 
 export function codexIntegrationEnabled(config: Pick<OcxConfig, "clientIntegrations">): boolean {
-  return integrationEnabled(config, "codex");
+  return codexIntegrationMode(config) !== "off";
+}
+
+export function codexIntegrationMode(
+  config: Pick<OcxConfig, "clientIntegrations">,
+): CodexIntegrationMode {
+  const desired = config.clientIntegrations?.codex;
+  if (desired === false) return "off";
+  if (desired === "catalog-only") return "catalog-only";
+  return "full";
 }
 
 /** Whether a Codex sync is permitted for this admitted config snapshot. */
-export function shouldSyncCodexOnStart(config: Pick<OcxConfig, "clientIntegrations">): boolean {
-  return codexIntegrationEnabled(config);
+type LocalClientSyncConfig = Pick<
+  OcxConfig,
+  "clientIntegrations" | "runtimeRole" | "unauthenticatedLoopbackListener"
+>;
+
+function localClientSyncAllowed(config: LocalClientSyncConfig): boolean {
+  return config.runtimeRole !== "hub"
+    || config.unauthenticatedLoopbackListener?.enabled === true;
+}
+
+export function shouldSyncCodexOnStart(config: LocalClientSyncConfig): boolean {
+  // A hub is a server for OTHER machines: it must not rewrite its own host's
+  // Codex/Claude/Grok client configs on startup (interview decision Q6, and the
+  // first clisu-oracle dogfood boot proved the failure mode — the hub marked
+  // /readyz failed because it tried to run the full local client sync).
+  // A hub can be a local client only through its explicitly enabled loopback
+  // listener. The public hub bind remains outside this gate and still requires
+  // admission; an explicit client OFF continues to win.
+  return localClientSyncAllowed(config) && codexIntegrationEnabled(config);
 }
 
 /**
@@ -114,7 +141,7 @@ export function setIntegrationEnabled(
     }
     // Drop the key entirely once nothing is left in it, so enabling twice does
     // not leave `"clientIntegrations": {}` behind in the user's file.
-    if (Object.keys(integrations).length === 0) delete config.clientIntegrations;
+    if (Object.keys(integrations).length === 0) deleteConfigTopLevelKey(config, "clientIntegrations");
     else config.clientIntegrations = integrations;
     return { changed: true, value: enabled };
   });
@@ -140,7 +167,45 @@ export function setIntegrationEnabled(
 }
 
 export function setCodexIntegrationEnabled(enabled: boolean): CodexDesiredStateResult {
-  return setIntegrationEnabled("codex", enabled);
+  return setCodexIntegrationMode(enabled ? "full" : "off");
+}
+
+export type CodexIntegrationModeResult =
+  | { readonly ok: true; readonly status: "committed" | "unchanged"; readonly mode: CodexIntegrationMode; readonly enabled: boolean }
+  | Extract<CodexDesiredStateResult, { readonly ok: false }>;
+
+export function setCodexIntegrationMode(mode: CodexIntegrationMode): CodexIntegrationModeResult {
+  const outcome = mutatePersistedConfig(config => {
+    const persisted = config.clientIntegrations?.codex;
+    const alreadyCanonical = mode === "full"
+      ? persisted === undefined
+      : mode === "catalog-only"
+        ? persisted === "catalog-only"
+        : persisted === false;
+    if (alreadyCanonical) return { changed: false, value: mode };
+
+    const integrations = { ...(config.clientIntegrations ?? {}) };
+    if (mode === "full") delete integrations.codex;
+    else integrations.codex = mode === "catalog-only" ? "catalog-only" : false;
+    if (Object.keys(integrations).length === 0) deleteConfigTopLevelKey(config, "clientIntegrations");
+    else config.clientIntegrations = integrations;
+    return { changed: true, value: mode };
+  });
+
+  if (outcome.status !== "unavailable") {
+    return { ok: true, status: outcome.status, mode, enabled: mode !== "off" };
+  }
+  const retryable = outcome.reason === "conflict";
+  return {
+    ok: false,
+    reason: outcome.reason,
+    retryable,
+    message: outcome.reason === "conflict"
+      ? "Another process changed the config while this switch was being written."
+      : outcome.reason === "missing"
+        ? "No config file exists to record the switch in."
+        : "The config file is malformed; refusing to overwrite it.",
+  };
 }
 
 export function setGrokIntegrationEnabled(enabled: boolean): CodexDesiredStateResult {
@@ -182,7 +247,7 @@ export function setClaudeDesktopIntegrationEnabled(enabled: boolean): CodexDesir
  */
 export async function syncCodexOnStartIfEnabled(
   port: number,
-  config: Pick<OcxConfig, "clientIntegrations">,
+  config: LocalClientSyncConfig,
   sync: CodexStartupSync = defaultStartupSync,
   readinessGate?: ReadinessGate,
 ): Promise<{ ran: boolean; catalogWritten: boolean; cacheSynced: boolean }> {
@@ -225,6 +290,6 @@ async function defaultStartupSync(port: number): Promise<CodexStartupSyncOutcome
  * startup and its diagnostic is worth printing. This only answers whether to
  * attempt the sync at all.
  */
-export function shouldSyncGrokOnStart(config: Pick<OcxConfig, "clientIntegrations">): boolean {
-  return grokIntegrationEnabled(config);
+export function shouldSyncGrokOnStart(config: LocalClientSyncConfig): boolean {
+  return localClientSyncAllowed(config) && grokIntegrationEnabled(config);
 }

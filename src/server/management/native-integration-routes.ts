@@ -17,16 +17,19 @@
  * Design of record: devlog/_fin/260803_integrations_toggle_all/030 (routes),
  * 011 (Claude Code), 012 (Grok).
  */
-import { loadConfig, readRuntimePort, saveConfigPreservingClaudeCode } from "../../config";
-import { desktopVisibleNativeSlugs, filterCatalogVisibleModels, nativeContextLimits, nativeOpenAiContextWindow, visibleNativeSlugs } from "../../codex/catalog";
+import { loadConfig, saveConfigPreservingClaudeCode } from "../../config";
+import { readRuntimePort } from "../../config/process-state";
+import { desktopVisibleNativeSlugs, filterCatalogVisibleModels, nativeContextLimits } from "../../codex/catalog";
 import { providerContextCap } from "../../providers/context-cap";
 import { OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { inspectDesktop3pConfigLibrary, removeDesktop3pStandardPivot, writeDesktop3pConfig } from "../../claude/desktop-3p";
-import { injectGrokConfig, stripGrokConfig, type GrokInjectModel } from "../../grok/inject";
+import { projectGrokCatalog } from "../../grok/catalog";
+import { injectGrokConfig, stripGrokConfig } from "../../grok/inject";
 import { inspectGrokConfig } from "../../grok/inspect";
 import { grokConfigPath } from "../../grok/status";
 import { assertNativeTeardownOwned } from "../../integrations/native/ownership-preflight";
 import type { CodexNativeRestoreResult } from "../../codex/inject";
+import { codexIntegrationMode, type CodexIntegrationMode } from "../../codex/desired-state";
 import type { OcxConfig } from "../../types";
 import { jsonResponse } from "../auth-cors";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
@@ -51,6 +54,8 @@ export interface NativeStatus {
   installed: boolean;
   configPath: string;
   desiredEnabled: boolean;
+  /** Present only for Codex, whose integration intent is three-state. */
+  mode?: CodexIntegrationMode;
   /**
    * Set when a disable would be refused right now. ADVISORY: the file can
    * change before the PUT, which re-checks and whose answer is authoritative.
@@ -70,6 +75,8 @@ export interface NativeToggleEnvelope {
   state: NativeStatus["state"];
   message: string;
   desiredEnabled: boolean;
+  /** Present only for Codex, whose integration intent is three-state. */
+  mode?: CodexIntegrationMode;
   /** Present when the outcome needs more than success/failure to be honest. */
   reason?: string;
   artifacts?: CodexNativeRestoreResult["artifacts"];
@@ -160,13 +167,15 @@ function claudeStatus(config: ManagementContext["config"], configPath: string): 
 }
 
 function codexStatus(config: ManagementContext["config"], configPath: string): NativeStatus {
-  const desiredEnabled = config.clientIntegrations?.codex !== false;
+  const mode = codexIntegrationMode(config);
+  const desiredEnabled = mode !== "off";
   return {
     clientId: "codex",
     state: desiredEnabled ? "current" : "absent",
     installed: true,
     configPath,
     desiredEnabled,
+    mode,
     disableBlocked: null,
   };
 }
@@ -291,20 +300,37 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       "Another Codex change is already in flight. Nothing was written — try again in a moment.");
   }
   codexToggleFlight = (async (): Promise<Response> => {
-    let body: { enabled?: unknown };
+    let body: unknown;
     try {
       body = await readManagementJsonBody(req);
     } catch (error) {
       rethrowManagementBodyTooLarge(error);
       return jsonResponse({ error: "invalid JSON body" }, 400);
     }
-    if (typeof body.enabled !== "boolean") {
-      return jsonResponse({ error: "enabled must be a boolean" }, 400);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return jsonResponse({ error: "request body must be an object" }, 400);
     }
-    const enabled = body.enabled;
+    const payload = body as Record<string, unknown>;
+    const hasEnabled = Object.prototype.hasOwnProperty.call(payload, "enabled");
+    const hasMode = Object.prototype.hasOwnProperty.call(payload, "mode");
+    if (hasEnabled && hasMode) return jsonResponse({ error: "provide either enabled or mode, not both" }, 400);
 
-    const { setCodexIntegrationEnabled } = await import("../../codex/desired-state");
-    const persisted = setCodexIntegrationEnabled(enabled);
+    let mode: CodexIntegrationMode;
+    if (hasMode) {
+      if (payload.mode !== "full" && payload.mode !== "catalog-only" && payload.mode !== "off") {
+        return jsonResponse({ error: "mode must be full, catalog-only, or off" }, 400);
+      }
+      mode = payload.mode;
+    } else if (hasEnabled) {
+      if (typeof payload.enabled !== "boolean") return jsonResponse({ error: "enabled must be a boolean" }, 400);
+      mode = payload.enabled ? "full" : "off";
+    } else {
+      return jsonResponse({ error: "mode or enabled is required" }, 400);
+    }
+    const enabled = mode !== "off";
+
+    const { setCodexIntegrationMode } = await import("../../codex/desired-state");
+    const persisted = setCodexIntegrationMode(mode);
     /*
      * `missing` does not block the switch — see the Grok route for the reasoning.
      * A user with no config file yet still gets the artifact change; what they
@@ -321,19 +347,28 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
     }
     const durable = persisted.ok;
 
+    if (!durable && mode === "catalog-only") {
+      return jsonResponse({
+        ok: true, clientId: "codex", changed: false, state: "absent",
+        desiredEnabled: true, mode, reason: "not_durable",
+        message: "Catalog-only was not applied because no config file exists to preserve this mode across restart.",
+      } satisfies NativeToggleEnvelope);
+    }
+
     if (enabled) {
       // The port this process actually BOUND, not what config.json last recorded.
       // A stale config port would inject a base_url pointing at nothing — the
       // same trap `runGrokApplyFlight` documents below.
       const runtime = (ctx.deps.readRuntimePort ?? readRuntimePort)(process.pid);
       const port = runtime?.port ?? ctx.config.port;
-      const { syncModelsToCodex } = await import("../../codex/sync");
+      const syncModelsToCodex = ctx.deps.syncModelsToCodex
+        ?? (await import("../../codex/sync")).syncModelsToCodex;
       const applied = await syncModelsToCodex(port);
       if (applied.status === "skipped") {
         return jsonResponse({
           ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
           state: "absent",
-          desiredEnabled: enabled,
+          desiredEnabled: enabled, mode,
           message: "Codex integration is OFF; enable did not change Codex.",
           reason: "apply_incomplete",
         } satisfies NativeToggleEnvelope);
@@ -341,9 +376,11 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       return jsonResponse({
         ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
         state: applied.ok ? "current" : "absent",
-        desiredEnabled: enabled,
+        desiredEnabled: enabled, mode,
         message: applied.ok
-          ? "Codex now routes through opencodex"
+          ? mode === "catalog-only"
+            ? "Codex model catalog is managed by opencodex; provider routing and history remain user-owned"
+            : "Codex now routes through opencodex"
           : `Codex intent saved, but applying it did not complete: ${applied.message}`,
         ...(applied.ok
           ? (durable ? {} : { reason: "not_durable" })
@@ -356,7 +393,7 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       const { classifyNativeRoutedResidue } = await import("../../codex/native-residue");
       if (classifyNativeRoutedResidue().kind === "clean") {
         return jsonResponse({
-          ok: true, clientId: "codex", changed: false, state: "absent", desiredEnabled: false,
+          ok: true, clientId: "codex", changed: false, state: "absent", desiredEnabled: false, mode,
           message: "Codex integration is already OFF and native; no Codex files changed.",
         } satisfies NativeToggleEnvelope);
       }
@@ -366,7 +403,7 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
     return jsonResponse({
       ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
       state: restored.success ? "absent" : "unsafe",
-      desiredEnabled: enabled,
+      desiredEnabled: enabled, mode,
       message: restored.success
         ? "Codex restored to its native path; the proxy is still serving other clients"
         : `Codex intent saved, but restoring the native path did not complete: ${restored.message}`,
@@ -501,21 +538,10 @@ async function handleGrokToggle(ctx: ManagementContext): Promise<Response> {
      * synchronous from entry (012 §One preflight is not enough).
      */
     const fetchModels = deps.fetchAllModels ?? defaultFetchAllModels;
-    let models: GrokInjectModel[];
+    let projection: ReturnType<typeof projectGrokCatalog>;
     try {
-      const routed = filterCatalogVisibleModels(await fetchModels(config), config);
-      models = [
-        // Native slugs carry their context window: without it Grok falls back
-        // to its own 200k default and understates a 372k model.
-        ...visibleNativeSlugs(config).map(id => {
-          const contextWindow = nativeOpenAiContextWindow(id, nativeContextLimits(config));
-          return { id, ...(contextWindow !== undefined ? { contextWindow } : {}) };
-        }),
-        ...routed.map(m => ({
-          id: m.alias ?? `${m.provider}/${m.id}`,
-          ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
-        })),
-      ];
+      const allRouted = await fetchModels(config);
+      projection = projectGrokCatalog(allRouted, config);
     } catch (error) {
       // A catalog failure must never write an empty fence (syncGrokConfig
       // guards this; the route inherits the rule). Nothing was written.
@@ -528,12 +554,17 @@ async function handleGrokToggle(ctx: ManagementContext): Promise<Response> {
     if (recheck.kind === "orphaned_marker") return postCommitRefusal(409, "grok", "orphaned_marker", ORPHANED_MARKER_MESSAGE, { desiredEnabled });
 
     const inject = deps.injectGrokConfig ?? injectGrokConfig;
-    const result = inject(port, models, {
+    const result = inject(port, projection.models, {
       ...(hostname !== undefined ? { hostname } : {}),
       // The FULL list plus the exclusion set, never a pre-filtered list: the
       // writer allocates aliases over everything, so a model's alias never
       // depends on its neighbours' switches.
       excluded: new Set(config.grokExcludedModels ?? []),
+      // Visibility filters decide what to emit, not whether an owned pre-fence table is still
+      // current. Otherwise a hidden model is mistaken for retired state and survives outside.
+      catalogModelIds: projection.catalogModelIds,
+      disabledProviderNamespaces: projection.disabledProviderNamespaces,
+      comboPublicModelIds: projection.comboPublicModelIds,
     });
 
     if (result.skippedReason === "non-loopback") {
@@ -687,7 +718,7 @@ export async function handleNativeIntegrationRoutes(ctx: ManagementContext): Pro
   if (url.pathname === "/api/native-integrations" && req.method === "GET") {
     const { getConfigPath } = await import("../../config");
     return jsonResponse({
-      clients: [claudeStatus(config, getConfigPath()), grokStatus(config), codexStatus(config, getConfigPath()), desktopStatus(config)],
+      clients: [claudeStatus(config, getConfigPath()), grokStatus(config), codexStatus(loadConfig(), getConfigPath()), desktopStatus(config)],
     } satisfies NativeStatusListEnvelope);
   }
 

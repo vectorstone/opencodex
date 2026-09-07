@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../src/config";
+import {
+  resetCodexModelEntitlementCacheForTests,
+} from "../src/codex/model-entitlements";
 import { handleManagementAPI } from "../src/server/management-api";
 import { startServer } from "../src/server";
 import type { OcxConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 import { ManagementRequest } from "./helpers/management-auth";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 // Full-suite Windows load: startServer + discovery GETs exceed the default 5s budget
 // (same flake class as 810fa115 / claude-management-api).
@@ -25,11 +29,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetCodexModelEntitlementCacheForTests();
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
-  if (testDir) rmSync(testDir, { recursive: true, force: true });
+  if (testDir) removeTreeWithRetry(testDir);
 });
 
 function configWithStaticModels(claudeCode?: OcxConfig["claudeCode"]): OcxConfig {
@@ -159,6 +164,23 @@ test("OpenAI list shape and Codex catalog shape stay unchanged", async () => {
 });
 
 test("Codex discovery applies the OpenAI context cap to native rows (#1430)", async () => {
+  writeFileSync(join(isolatedCodexHome!.path, "auth.json"), JSON.stringify({
+    tokens: { access_token: "context-cap-access", account_id: "context-cap-account" },
+  }), "utf8");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/backend-api/codex/models") {
+      const entitled = request.headers.get("authorization") === "Bearer context-cap-access"
+        && request.headers.get("chatgpt-account-id") === "context-cap-account";
+      const slugs = entitled ? ["gpt-5.6-sol"] : [];
+      return Response.json({
+        models: slugs.map(slug => ({ slug, supported_in_api: true, visibility: "list" })),
+      });
+    }
+    return originalFetch(request);
+  }) as typeof fetch;
   const config = configWithStaticModels();
   config.providers.openai = {
     adapter: "openai-responses",
@@ -186,6 +208,7 @@ test("Codex discovery applies the OpenAI context cap to native rows (#1430)", as
     });
   } finally {
     await server.stop(true);
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -370,16 +393,33 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
       opencodex_account_observed_native: true,
     }],
   }), "utf8");
+  writeFileSync(join(isolatedCodexHome!.path, "auth.json"), JSON.stringify({
+    tokens: { access_token: "main-token", account_id: "main-account" },
+  }), "utf8");
 
   const { resetCatalogRuntimeStateForTests } = await import("../src/codex/catalog");
+  const { resetCodexModelEntitlementCacheForTests } = await import("../src/codex/model-entitlements");
   resetCatalogRuntimeStateForTests();
+  resetCodexModelEntitlementCacheForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+    if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
+      return Response.json({ models: [{
+        slug: "gpt-daybreak-blue-latest",
+        supported_in_api: true,
+        visibility: "list",
+      }] });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
   const server = startServer(0);
   try {
     const plain = await fetch(new URL("/v1/models", server.url))
       .then(response => response.json()) as { data: Array<{ id: string }> };
     expect(plain.data).toContainEqual(expect.objectContaining({ id: "team/gpt-daybreak-blue-latest" }));
-    // Daybreak is globally allowlisted (owner decision, devlog 260816_.../011), so the bare
-    // id is now discoverable too, exactly once.
+    // Main's authenticated roster confirmed Daybreak above, so the bare id is discoverable
+    // exactly once alongside the mapped selector row.
     expect(plain.data.filter(model => model.id === "gpt-daybreak-blue-latest")).toHaveLength(1);
 
     const managementUrl = new URL("http://localhost/api/models");
@@ -389,9 +429,8 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
       config,
     );
     const management = await managementResponse!.json() as Array<{ id: string; native?: boolean }>;
-    // Once Daybreak is globally allowlisted the management surface reports it under its
-    // GLOBAL bare identity rather than as an account-qualified discovery row
-    // (model-rows.ts:59 / metadata.ts:243). Exactly one row, and no selector duplicate.
+    // The confirmed main entitlement makes the management surface report the bare native row.
+    // Management rows intentionally use the bare identity rather than duplicating selector rows.
     expect(management).toContainEqual(expect.objectContaining({
       id: "gpt-daybreak-blue-latest",
       native: true,
@@ -417,6 +456,7 @@ test("Codex discovery exposes the observed native as a selector row plus one glo
     expect(anthropic.data.some(model => model.id === claudeCodeNativeAlias("gpt-daybreak-blue-latest"))).toBe(false);
     expect(anthropic.data.some(model => model.id === claudeCodeNativeAlias("team/gpt-daybreak-blue-latest"))).toBe(false);
   } finally {
+    globalThis.fetch = originalFetch;
     await server.stop(true);
   }
 });
@@ -473,5 +513,118 @@ test("disabled canonical OpenAI preserves bare bootstrap rows without advertisin
     expect(catalog.models.some(model => model.slug.startsWith("team/"))).toBe(false);
   } finally {
     await server.stop(true);
+  }
+});
+
+test("the request's client_version reaches entitlement discovery (#2886)", async () => {
+  // Codex sends client_version on this route and the value used to be discarded, so upstream
+  // was always asked as 0.0.0 — which it answers with a short roster, and the fail-closed gate
+  // reads that as a confirmed denial. This asserts the forwarding itself: the version observed
+  // on the OUTBOUND /codex/models request must be the one the client sent.
+  const config = configWithStaticModels();
+  config.providers.openai = {
+    adapter: "openai-responses",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    liveModels: false,
+  };
+  saveConfig(config);
+  writeFileSync(join(isolatedCodexHome!.path, "auth.json"), JSON.stringify({
+    tokens: { access_token: "main-token", account_id: "main-account" },
+  }), "utf8");
+
+  const { resetCatalogRuntimeStateForTests } = await import("../src/codex/catalog");
+  resetCatalogRuntimeStateForTests();
+  resetCodexModelEntitlementCacheForTests();
+
+  const askedVersions: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+    if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
+      askedVersions.push(url.searchParams.get("client_version") ?? "");
+      return Response.json({ models: [{ slug: "gpt-5.5", supported_in_api: true, visibility: "list" }] });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  // Started INSIDE the try: if startServer throws, the mocked global fetch must still be
+  // restored, or every later test in this file inherits it.
+  let server: ReturnType<typeof startServer> | null = null;
+  try {
+    server = startServer(0);
+    await fetch(new URL("/v1/models?client_version=0.151.7", server.url))
+      .then(response => response.json());
+    expect(askedVersions.length).toBeGreaterThan(0);
+    // Forwarded verbatim, and in particular never the placeholder that caused #2886.
+    expect(askedVersions).toEqual(askedVersions.map(() => "0.151.7"));
+    expect(askedVersions).not.toContain("0.0.0");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (server) await server.stop(true);
+  }
+});
+
+test("with no inbound or runtime version, /v1/models still exposes the gated rows (#3022)", async () => {
+  // The #3022 path has no client to speak for it: background discovery on a host where the
+  // Codex runtime has never been resolved falls through to tier 3, the build's own gated floor.
+  // 2.36.0 derived that floor from the bundled snapshot (0.142.2) and upstream answers 0.142.2
+  // with no gpt-5.6 at all, so entitled accounts were classified as denying sol/terra/luna.
+  //
+  // The backend here is deliberately VERSION-SENSITIVE. A mock that answers the same roster for
+  // every version — like the no-inbound case earlier in this file — is green on both sides of
+  // the fix and proves nothing. This one returns the gated rows only at >= 0.144.0, which is
+  // what real upstream was measured to do.
+  const config = configWithStaticModels();
+  config.providers.openai = {
+    adapter: "openai-responses",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    liveModels: false,
+  };
+  saveConfig(config);
+  writeFileSync(join(isolatedCodexHome!.path, "auth.json"), JSON.stringify({
+    tokens: { access_token: "main-token", account_id: "main-account" },
+  }), "utf8");
+
+  const { resetCatalogRuntimeStateForTests } = await import("../src/codex/catalog");
+  const { resetCodexModelEntitlementCacheForTests } = await import("../src/codex/model-entitlements");
+  resetCatalogRuntimeStateForTests();
+  resetCodexModelEntitlementCacheForTests();
+
+  const askedVersions: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+    if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
+      const version = url.searchParams.get("client_version") ?? "";
+      askedVersions.push(version);
+      const minor = Number(version.split(".")[1] ?? "0");
+      const gated = minor >= 144
+        ? ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        : ["gpt-5.5"];
+      return Response.json({
+        models: gated.map(slug => ({ slug, supported_in_api: true, visibility: "list" })),
+      });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  let server: ReturnType<typeof startServer> | null = null;
+  try {
+    server = startServer(0);
+    // No client_version on the request, and no persisted runtime in this isolated home.
+    const catalog = await fetch(new URL("/v1/models", server.url))
+      .then(response => response.json()) as { data: Array<{ id: string }> };
+
+    expect(askedVersions.length).toBeGreaterThan(0);
+    // Never the placeholder, and never a version upstream answers without the gated rows.
+    expect(askedVersions).not.toContain("0.0.0");
+    for (const version of askedVersions) {
+      expect(Number(version.split(".")[1] ?? "0")).toBeGreaterThanOrEqual(144);
+    }
+    // And the rows the account actually owns reach the surface.
+    expect(catalog.data.some(model => model.id === "gpt-5.6-sol")).toBe(true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (server) await server.stop(true);
   }
 });

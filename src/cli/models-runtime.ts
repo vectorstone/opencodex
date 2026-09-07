@@ -12,16 +12,21 @@ import {
   takeOption,
   type RuntimeApiDeps,
 } from "./runtime-api";
+import { isModelsRuntimeSubcommand } from "./models-runtime-subcommands";
 
 const USAGE = `Usage:
   ocx models live [--provider <name>] [--json]
   ocx models edit <custom-id> [--model-id <id>] [--display-name <name|->]
-      [--context-window <tokens|0>] [--modalities <text,image,audio|->]
+      [--context-window <tokens|0>] [--max-output-tokens <tokens|0>] [--modalities <text,image,audio|->]
       [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra|->]
       [--default-reasoning-effort <level|->] [--json]
   ocx models <enable|disable> <provider/model|native-model> [--native] [--json]
   ocx models provider <name> <on|off> [--json]
   ocx models selected <provider> [--set <id,id...>|--clear] [--json]
+  ocx models preset show [--provider <name>] [--json]
+  ocx models preset apply <provider> [--all] [--json]
+  ocx models new-policy [on|off] [--provider <name>] [--json]
+  ocx models new-arrivals [--json]
   ocx models context <status|value <tokens> [--set-all]|provider <name> on [--value <tokens>]|provider <name> off|all <on|off>> [--json]
   ocx models shadow <status|set> [model|-] [--enabled <on|off>] [--json]`;
 
@@ -58,6 +63,7 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const modelId = takeOption(args, "--model-id");
   const displayName = takeOption(args, "--display-name");
   const contextRaw = takeOption(args, "--context-window");
+  const maxOutputRaw = takeOption(args, "--max-output-tokens");
   const modalitiesRaw = takeOption(args, "--modalities");
   const reasoningEffortsRaw = takeOption(args, "--reasoning-efforts");
   const defaultEffortRaw = takeOption(args, "--default-reasoning-effort");
@@ -68,6 +74,13 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
     const value = Number(contextRaw.replace(/[_,]/g, ""));
     if (!Number.isInteger(value) || value < 0) throw new CliUsageError("--context-window must be an integer >= 0", USAGE);
     patch.contextWindow = value === 0 ? null : value;
+  }
+  if (maxOutputRaw !== undefined) {
+    const value = Number(maxOutputRaw.replace(/[_,]/g, ""));
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new CliUsageError("--max-output-tokens must be a safe integer >= 0", USAGE);
+    }
+    patch.maxOutputTokens = value === 0 ? null : value;
   }
   if (modalitiesRaw !== undefined) patch.inputModalities = modalitiesRaw === "-" ? [] : csv(modalitiesRaw);
   // "-" restores inheritance by clearing the stored ladder (null); "" stores an explicit
@@ -162,6 +175,94 @@ async function selected(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   printData(result, wantsJson, [`${provider}: ${models.length ? models.join(", ") : "all models"}`]);
 }
 
+
+interface ModelPresetView {
+  mode: string;
+  appliedVersion?: number;
+  availableVersion: number;
+  presetIds: string[];
+  presetCount: number;
+  totalCount: number;
+  fallback?: string;
+}
+
+function presetLine(name: string, view: ModelPresetView): string {
+  const parts = [`${name}: mode=${view.mode}`];
+  if (view.appliedVersion !== undefined && view.appliedVersion !== view.availableVersion) {
+    parts.push(`applied v${view.appliedVersion}, available v${view.availableVersion}`);
+  } else {
+    parts.push(`preset v${view.availableVersion}`);
+  }
+  parts.push(`(${view.presetCount} of ${view.totalCount} models)`);
+  if (view.fallback) parts.push(`fallback=${view.fallback}`);
+  return parts.join(" ");
+}
+
+async function preset(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv];
+  const action = (args.shift() ?? "show").toLowerCase();
+  const wantsJson = takeFlag(args, "--json");
+  if (action === "show") {
+    const only = takeOption(args, "--provider")?.trim();
+    rejectArgs(args, USAGE);
+    const result = await runtimeRequest<{ providers?: Record<string, ModelPresetView> }>("/api/model-presets", {}, deps);
+    const providers = result.providers ?? {};
+    const entries = Object.entries(providers).filter(([name]) => !only || name === only);
+    const lines = entries.length > 0
+      ? entries.map(([name, view]) => presetLine(name, view))
+      // A provider with no shipped preset is not an error: it simply has nothing to curate.
+      : [only ? `${only}: no model preset is shipped for this provider` : "no providers have a shipped model preset"];
+    printData(only ? providers[only] ?? {} : result, wantsJson, lines);
+    return;
+  }
+  if (action !== "apply") throw new CliUsageError(`unknown preset action '${action}'`, USAGE);
+  const provider = args.shift()?.trim();
+  const all = takeFlag(args, "--all");
+  if (!provider) throw new CliUsageError("provider is required", USAGE);
+  rejectArgs(args, USAGE);
+  const mode = all ? "all" : "preset";
+  const result = await runtimeRequest<{ selected?: string[]; fallback?: string; appliedVersion?: number }>(
+    "/api/model-presets",
+    { method: "PUT", body: JSON.stringify({ provider, mode }) },
+    deps,
+  );
+  const selectedIds = result.selected ?? [];
+  const line = result.fallback === "preset-empty"
+    // Never silently narrow to nothing: empty means ALL, so a zero-match preset keeps what was
+    // there and says so.
+    ? `${provider}: preset matched no models — selection unchanged (fallback to all)`
+    : all
+      ? `${provider}: showing all models (allowlist cleared)`
+      : `${provider}: preset v${result.appliedVersion ?? "?"} applied — ${selectedIds.length} models selected`;
+  printData(result, wantsJson, [line]);
+}
+
+async function newPolicy(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv];
+  const state = args[0] && !args[0].startsWith("--") ? args.shift()!.toLowerCase() : undefined;
+  const provider = takeOption(args, "--provider")?.trim();
+  const wantsJson = takeFlag(args, "--json");
+  if (state !== undefined && state !== "on" && state !== "off") throw new CliUsageError("new policy must be on or off", USAGE);
+  rejectArgs(args, USAGE);
+  if (!state) {
+    const result = await runtimeRequest<{ policy: string; providers: Record<string, string> }>("/api/model-discovery", {}, deps);
+    const value = provider ? result.providers[provider] ?? "inherit" : result.policy;
+    printData(provider ? { provider, policy: value } : result, wantsJson, [`${provider ?? "global"}: ${value}`]);
+    return;
+  }
+  const result = await runtimeRequest<{ baselineBootstrapped?: boolean }>("/api/model-discovery", {
+    method: "PUT", body: JSON.stringify({ policy: state, provider: provider ?? null }),
+  }, deps);
+  printData(result, wantsJson, [`${provider ?? "global"}: ${state}${result.baselineBootstrapped ? " (current models recorded as known)" : ""}`]);
+}
+
+async function newArrivals(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv]; const wantsJson = takeFlag(args, "--json"); rejectArgs(args, USAGE);
+  const result = await runtimeRequest<{ recentArrivals: Record<string, Array<{ id: string; at: string; state: string }>> }>("/api/model-discovery", {}, deps);
+  const lines = Object.entries(result.recentArrivals).flatMap(([provider, rows]) => rows.map(row => `${provider}/${row.id}  [${row.state}]  ${row.at}`));
+  printData(result.recentArrivals, wantsJson, lines.length ? lines : ["no recent model arrivals"]);
+}
+
 async function context(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const args = [...argv];
   const action = (args.shift() ?? "status").toLowerCase();
@@ -229,6 +330,9 @@ async function shadow(argv: string[], deps: RuntimeApiDeps): Promise<void> {
 }
 
 export async function handleModelsRuntimeCommand(sub: string, argv: string[], deps: RuntimeApiDeps = {}): Promise<number | null> {
+  // The dispatch below and MODELS_RUNTIME_SUBCOMMANDS must name the same set;
+  // tests/cli-models-runtime-dispatch.test.ts fails if they drift (#3094).
+  if (!isModelsRuntimeSubcommand(sub)) return null;
   let action: (() => Promise<void>) | undefined;
   if (sub === "live") action = () => live(argv, deps);
   else if (sub === "edit") action = () => edit(argv, deps);
@@ -236,6 +340,9 @@ export async function handleModelsRuntimeCommand(sub: string, argv: string[], de
   else if (sub === "disable") action = () => visibility(false, argv, deps);
   else if (sub === "provider") action = () => providerVisibility(argv, deps);
   else if (sub === "selected") action = () => selected(argv, deps);
+  else if (sub === "preset") action = () => preset(argv, deps);
+  else if (sub === "new-policy") action = () => newPolicy(argv, deps);
+  else if (sub === "new-arrivals") action = () => newArrivals(argv, deps);
   else if (sub === "context") action = () => context(argv, deps);
   else if (sub === "shadow") action = () => shadow(argv, deps);
   if (!action) return null;

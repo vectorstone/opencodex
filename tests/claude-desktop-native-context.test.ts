@@ -1,11 +1,16 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildClaudeDesktopState } from "../src/server/management/shared";
 import { nativeOpenAiContextWindow, visibleNativeSlugs } from "../src/codex/catalog";
 import { generateDesktop3pModels } from "../src/claude/desktop-3p";
+import {
+  resetCodexModelEntitlementCacheForTests,
+  seedCodexModelEntitlementsForTests,
+} from "../src/codex/model-entitlements";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * D1b: native Desktop models carry their real context window, and the DTO and the
@@ -24,6 +29,8 @@ const config = {
 } as unknown as OcxConfig;
 
 test("buildClaudeDesktopState gives native rows their real context window", async () => {
+  // Sol/Terra/Luna are account-gated; this test is about window metadata, so confirm them.
+  seedCodexModelEntitlementsForTests("main", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
   const home = tempHome();
   const prev = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
   process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = home;
@@ -43,7 +50,8 @@ test("buildClaudeDesktopState gives native rows their real context window", asyn
   } finally {
     if (prev === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
     else process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = prev;
-    rmSync(home, { recursive: true, force: true });
+    removeTreeWithRetry(home);
+    resetCodexModelEntitlementCacheForTests();
   }
 });
 

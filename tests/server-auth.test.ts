@@ -1,5 +1,6 @@
 import { waitForNativeMainStartupGate } from "../src/codex/native-profile-startup";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { logsFromApiBody } from "./helpers/logs-api";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
@@ -35,6 +36,7 @@ import {
   startServer,
 } from "../src/server";
 import { clearRequestLogsForTests, getRequestLogEntries } from "../src/server/request-log";
+import { readUsageEntries } from "../src/usage/log";
 import { handleManagementAPI } from "../src/server/management-api";
 import { handleResponses } from "../src/server/responses";
 import type { OcxConfig } from "../src/types";
@@ -44,8 +46,12 @@ import { ownedServiceHomeInspection } from "./helpers/owned-service-home-inspect
 import { configuredAdminToken } from "../src/lib/admin-secrets";
 import { SYSTEM_RESTART_CAPABILITY_VERSION } from "../src/lib/system-restart-contract";
 import { LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION } from "../src/lib/local-provider-reload-contract";
-
+import { GUI_PAIR_CAPABILITY_VERSION } from "../src/lib/gui-pair-capability";
+import { resetCodexModelEntitlementCacheForTests } from "../src/codex/model-entitlements";
+import { getDebugLogEntries, resetDebugLogBufferForTests } from "../src/lib/debug-log-buffer";
+import { resetDebugSettingsForTests, setDebugSettings } from "../src/lib/debug-settings";
 import { watchdogMs } from "./helpers/ci-watchdog";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
 const originalGlobalFetch = globalThis.fetch;
@@ -76,6 +82,22 @@ function config(hostname?: string): OcxConfig {
       },
     },
   };
+}
+
+const REMOTE_CATALOG_BYTES = '{"models":[{"slug":"fixture/model","display_name":"Fixture Model","priority":1,"visibility":"list","base_instructions":"Fixture instructions","input_modalities":["text"]}]}';
+const REMOTE_DATA_KEY = "ocx_data_remote_catalog";
+
+function remoteCatalogConfig(keyId = "remote-key"): OcxConfig {
+  return {
+    ...config("0.0.0.0"),
+    port: 0,
+    apiKeys: [{ id: keyId, name: "remote", key: REMOTE_DATA_KEY, createdAt: "2026-08-28T00:00:00.000Z" }],
+  };
+}
+
+function writeRemoteCatalog(): void {
+  if (!isolatedCodexHome) throw new Error("isolated Codex home is not installed");
+  writeFileSync(join(isolatedCodexHome.path, "opencodex-catalog.json"), REMOTE_CATALOG_BYTES);
 }
 
 function managementHeaders(initial?: HeadersInit): Headers {
@@ -141,10 +163,13 @@ afterEach(() => {
   clearAccountNeedsReauth("pool-a");
   clearAccountNeedsReauth("pool-b");
   clearAccountQuota();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  resetCodexModelEntitlementCacheForTests();
+  resetDebugSettingsForTests();
+  resetDebugLogBufferForTests();
+  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
 });
 
-const POOL_RETRY_MODEL = "gpt-5.6-sol";
+const POOL_RETRY_MODEL = "gpt-5.5";
 
 function unsupportedModelBody(model = POOL_RETRY_MODEL): string {
   return JSON.stringify({
@@ -161,6 +186,8 @@ type PoolRetryHarness = {
     model?: string;
     path?: "/v1/responses" | "/v1/responses/compact";
     callerBearer?: boolean;
+    headers?: Record<string, string>;
+    extraBody?: Record<string, unknown>;
   }) => Promise<Response>;
   restoreFetch: () => void;
   server: ReturnType<typeof startServer>;
@@ -173,7 +200,7 @@ async function removeTestDirBestEffort(dir: string): Promise<void> {
   // stop; a single EBUSY must not take down the rest of the file.
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
       return;
     } catch (err) {
       const code = err && typeof err === "object" && "code" in err ? String((err as { code: unknown }).code) : "";
@@ -181,7 +208,7 @@ async function removeTestDirBestEffort(dir: string): Promise<void> {
       await Bun.sleep(25 * (attempt + 1));
     }
   }
-  rmSync(dir, { recursive: true, force: true });
+  removeTreeWithRetry(dir);
 }
 
 async function startPoolRetryHarness(
@@ -200,6 +227,7 @@ async function startPoolRetryHarness(
     reauthAccountIds?: string[];
     omitCredentialAccountIds?: string[];
     combos?: OcxConfig["combos"];
+    modelRosterByAccount?: Record<string, string[]>;
   } = {},
 ): Promise<PoolRetryHarness> {
   await removeTestDirBestEffort(TEST_DIR);
@@ -208,6 +236,7 @@ async function startPoolRetryHarness(
   clearCodexUpstreamHealth();
   clearThreadAccountMap();
   clearAccountQuota();
+  resetCodexModelEntitlementCacheForTests();
   clearRequestLogsForTests();
   clearAccountNeedsReauth("pool-a");
   clearAccountNeedsReauth("pool-b");
@@ -223,6 +252,15 @@ async function startPoolRetryHarness(
     port: 0,
     async fetch(request) {
       const accountId = request.headers.get("chatgpt-account-id") ?? "missing";
+      if (new URL(request.url).pathname === "/models") {
+        return Response.json({
+          models: (options.modelRosterByAccount?.[accountId] ?? []).map(slug => ({
+            slug,
+            supported_in_api: true,
+            visibility: "list",
+          })),
+        });
+      }
       dispatches.push(accountId);
       return reply(accountId, request);
     },
@@ -296,13 +334,16 @@ async function startPoolRetryHarness(
       model = POOL_RETRY_MODEL,
       path = "/v1/responses",
       callerBearer = true,
+      headers = {},
+      extraBody = {},
     } = {}) => originalGlobalFetch(new URL(path, server.url), {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...(callerBearer ? { authorization: "Bearer inbound-token" } : {}),
+        ...headers,
       },
-      body: JSON.stringify({ model, input: path.endsWith("/compact") ? [] : "hello", stream }),
+      body: JSON.stringify({ model, input: path.endsWith("/compact") ? [] : "hello", stream, ...extraBody }),
       signal,
     }),
   };
@@ -327,6 +368,172 @@ async function expectOriginal400(response: Response, body: string): Promise<void
   expect(response.headers.get("x-pool-retry-test")).toBe("original");
   expect(await response.text()).toBe(body);
 }
+
+describe("Responses request identity handoff", () => {
+  test("returns the generated request id and overwrites an upstream value", async () => {
+    const harness = await startPoolRetryHarness(() => Response.json({
+      id: "resp_request_identity",
+      object: "response",
+      status: "completed",
+      output: [],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }, {
+      headers: { "x-opencodex-request-id": "upstream-spoofed-value" },
+    }), { secondAccount: false });
+    try {
+      const response = await harness.request({
+        headers: { "x-opencodex-request-id": "caller-injected-value" },
+      });
+      const requestId = response.headers.get("x-opencodex-request-id");
+      expect(requestId).toMatch(/^ocx-[a-f0-9]{32}$/);
+      expect(requestId).not.toBe("upstream-spoofed-value");
+      expect(requestId).not.toBe("caller-injected-value");
+      await response.text();
+      expect(getRequestLogEntries().filter(entry => entry.requestId === requestId)).toHaveLength(1);
+      expect(readUsageEntries().filter(entry => entry.requestId === requestId)).toHaveLength(1);
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  }, { timeout: SERVER_BUDGET_MS });
+
+  test("names the request id in Access-Control-Expose-Headers so browser JS can read it", async () => {
+    const harness = await startPoolRetryHarness(() => Response.json({
+      id: "resp_request_identity_expose",
+      object: "response",
+      status: "completed",
+      output: [],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }), { secondAccount: false });
+    try {
+      const response = await harness.request();
+      const requestId = response.headers.get("x-opencodex-request-id");
+      expect(requestId).toMatch(/^ocx-[a-f0-9]{32}$/);
+
+      // The header being present above is not enough: cross-origin JavaScript may read only
+      // the CORS-safelisted response headers plus whatever the expose-list names, so without
+      // this the id ships on every response and no browser caller can ever see it.
+      const exposed = (response.headers.get("Access-Control-Expose-Headers") ?? "")
+        .split(",")
+        .map(name => name.trim().toLowerCase());
+      expect(exposed).toContain("x-opencodex-request-id");
+      await response.text();
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  }, { timeout: SERVER_BUDGET_MS });
+
+  test("binds the same generated request id on a streaming terminal", async () => {
+    let releaseTerminal!: () => void;
+    let terminalReleased = false;
+    const terminalGate = new Promise<void>(resolve => {
+      releaseTerminal = () => {
+        terminalReleased = true;
+        resolve();
+      };
+    });
+    const createdPayload = JSON.stringify({
+      type: "response.created",
+      response: { id: "resp_request_identity_sse", object: "response", status: "in_progress", output: [] },
+    });
+    const completedPayload = JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_request_identity_sse",
+        object: "response",
+        status: "completed",
+        output: [],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      },
+    });
+    const encoder = new TextEncoder();
+    const harness = await startPoolRetryHarness(() => new Response(
+      new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(encoder.encode(`event: response.created\ndata: ${createdPayload}\n\n`));
+          await terminalGate;
+          controller.enqueue(encoder.encode(`event: response.completed\ndata: ${completedPayload}\n\n`));
+          controller.close();
+        },
+      }),
+      { headers: { "content-type": "text/event-stream", "x-opencodex-request-id": "upstream-spoofed-value" } },
+    ), { secondAccount: false });
+    try {
+      const response = await harness.request({ stream: true });
+      const requestId = response.headers.get("x-opencodex-request-id");
+      expect(requestId).toMatch(/^ocx-[a-f0-9]{32}$/);
+      expect(requestId).not.toBe("upstream-spoofed-value");
+      const reader = response.body!.getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toContain("response.created");
+      expect(terminalReleased).toBe(false);
+      releaseTerminal();
+      while (!(await reader.read()).done) { /* drain */ }
+      expect(getRequestLogEntries().filter(entry => entry.requestId === requestId)).toHaveLength(1);
+      expect(readUsageEntries().filter(entry => entry.requestId === requestId)).toHaveLength(1);
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  }, { timeout: SERVER_BUDGET_MS });
+
+  test("binds the same generated request id on an upstream error", async () => {
+    const harness = await startPoolRetryHarness(() => Response.json(
+      { error: { type: "upstream_error", message: "bounded test error" } },
+      {
+        status: 503,
+        headers: { "x-opencodex-request-id": "upstream-spoofed-value" },
+      },
+    ), { secondAccount: false });
+    try {
+      const response = await harness.request();
+      const requestId = response.headers.get("x-opencodex-request-id");
+      expect(requestId).toMatch(/^ocx-[a-f0-9]{32}$/);
+      expect(requestId).not.toBe("upstream-spoofed-value");
+      await response.text();
+      expect(getRequestLogEntries().filter(entry => entry.requestId === requestId)).toHaveLength(1);
+      expect(readUsageEntries().filter(entry => entry.requestId === requestId)).toHaveLength(1);
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  }, { timeout: SERVER_BUDGET_MS });
+
+  test("does not issue a request id before authentication and origin admission", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
+    clearRequestLogsForTests();
+    saveConfig({ ...config("0.0.0.0"), port: 0 });
+
+    const server = startServer(0);
+    const url = `http://127.0.0.1:${server.port}/v1/responses`;
+    const body = JSON.stringify({ model: "gpt-test", input: "hello" });
+    try {
+      const missingAuth = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(missingAuth.status).toBe(401);
+      expect(missingAuth.headers.get("x-opencodex-request-id")).toBeNull();
+
+      const rejectedOrigin = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencodex-api-key": "local-secret",
+          origin: "https://attacker.test",
+        },
+        body,
+      });
+      expect(rejectedOrigin.status).toBe(403);
+      expect(rejectedOrigin.headers.get("x-opencodex-request-id")).toBeNull();
+      expect(getRequestLogEntries()).toHaveLength(0);
+      expect(readUsageEntries()).toHaveLength(0);
+    } finally {
+      await server.stop(true);
+    }
+  }, { timeout: SERVER_BUDGET_MS });
+});
 
 describe("server local API auth", () => {
   test("responses timeout helper disables Bun request timeout when available", () => {
@@ -523,7 +730,7 @@ describe("server local API auth", () => {
   });
 
   test("CORS preflight echoes vendor SDK request headers only for an allowed origin (#1773)", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     saveConfig(config("127.0.0.1"));
@@ -755,7 +962,7 @@ describe("server local API auth", () => {
   });
 
   test("/v1/models requires API auth and local Origin on non-loopback bindings", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
@@ -812,7 +1019,7 @@ describe("server local API auth", () => {
     expect(dto.providers.venice.freeTier).toBeUndefined();
   });
   test("management GET rejects non-local Origin even with a valid API key", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
@@ -839,7 +1046,7 @@ describe("server local API auth", () => {
   });
 
   test("/api/system/memory stays gated while /healthz exposes only bounded capability metadata (#314 WP3)", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
@@ -866,6 +1073,7 @@ describe("server local API auth", () => {
       expect(health.status).toBe(200);
       const healthBody = await health.json() as Record<string, unknown>;
       expect(Object.keys(healthBody).sort()).toEqual([
+        "guiPairCapability",
         "pid",
         "port",
         "providerReloadCapability",
@@ -877,6 +1085,7 @@ describe("server local API auth", () => {
       ]);
       expect(healthBody.restartCapability).toBe(SYSTEM_RESTART_CAPABILITY_VERSION);
       expect(healthBody.providerReloadCapability).toBe(LOCAL_PROVIDER_RELOAD_CAPABILITY_VERSION);
+      expect(healthBody.guiPairCapability).toBe(GUI_PAIR_CAPABILITY_VERSION);
       expect("rss" in healthBody).toBe(false);
     } finally {
       await server.stop(true);
@@ -884,7 +1093,7 @@ describe("server local API auth", () => {
   });
 
   test("OPTIONS preflight rejects non-local Origin before CORS headers are trusted", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     saveConfig(config("127.0.0.1"));
@@ -910,13 +1119,17 @@ describe("server local API auth", () => {
       });
       expect(accepted.status).toBe(204);
       expect(accepted.headers.get("access-control-allow-origin")).toBe(loopbackOrigin);
+      const allowedHeaders = accepted.headers.get("access-control-allow-headers") ?? "";
+      expect(allowedHeaders).toContain("X-OpenCodex-GUI-Origin");
+      expect(allowedHeaders).toContain("X-OpenCodex-CSRF-Token");
+      expect(allowedHeaders).not.toContain("X-Unrelated-Custom-Header");
     } finally {
       await server.stop(true);
     }
   });
 
   test("extension allowlist gates preflight and data-plane requests by authority", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     const extensionOrigin = "chrome-extension://modkelfkcfjpgbfmnbnllalkiogfofh";
@@ -960,6 +1173,30 @@ describe("server local API auth", () => {
       });
       expect(managementPreflight.status).toBe(204);
       expect(managementPreflight.headers.get("access-control-allow-origin")).toBe(extensionOrigin);
+      expect(managementPreflight.headers.get("access-control-allow-headers")).toContain("X-OpenCodex-GUI-Origin");
+      expect(managementPreflight.headers.get("access-control-allow-headers")).toContain("X-OpenCodex-CSRF-Token");
+
+      const managementUnrelated = await fetch(managementUrl, {
+        method: "OPTIONS",
+        headers: {
+          origin: extensionOrigin,
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "X-Unrelated-Custom-Header",
+        },
+      });
+      expect(managementUnrelated.status).toBe(204);
+      expect(managementUnrelated.headers.get("access-control-allow-headers")).not.toContain("X-Unrelated-Custom-Header");
+
+      const dataPlaneDynamic = await fetch(modelsUrl, {
+        method: "OPTIONS",
+        headers: {
+          origin: extensionOrigin,
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "X-Unrelated-Custom-Header",
+        },
+      });
+      expect(dataPlaneDynamic.status).toBe(204);
+      expect(dataPlaneDynamic.headers.get("access-control-allow-headers")).toContain("X-Unrelated-Custom-Header");
 
       const managementRejected = await fetch(managementUrl, {
         method: "OPTIONS",
@@ -978,7 +1215,7 @@ describe("server local API auth", () => {
   });
 
   test("loopback management API rejects host-header same-origin rebinding", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     saveConfig(config("127.0.0.1"));
@@ -1001,7 +1238,7 @@ describe("server local API auth", () => {
   });
 
   test("management CORS echoes validated loopback Origin and covers delegated codex-auth responses", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     saveConfig(config("127.0.0.1"));
@@ -1027,7 +1264,7 @@ describe("server local API auth", () => {
   });
 
   test("non-loopback management API allows same-origin GUI requests with API token", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
@@ -1061,7 +1298,7 @@ describe("server local API auth", () => {
   });
 
   test("websocket upgrade rejects hostile Origin even with a valid API token", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     process.env.OPENCODEX_API_AUTH_TOKEN = "local-secret";
@@ -1118,7 +1355,7 @@ describe("server local API auth", () => {
   });
 
   test("websocket upgrade returns 426 when the WS transport is disabled", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -1145,7 +1382,7 @@ describe("server local API auth", () => {
   });
 
   test("after a 426'd upgrade the same client can immediately fall back to HTTP POST", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -1190,7 +1427,7 @@ describe("server local API auth", () => {
   });
 
   test("compact v1 on a routed model propagates a summarizer failure instead of fabricating history", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -1230,7 +1467,7 @@ describe("server local API auth", () => {
   });
 
   test("unknown /v1/* paths return JSON 404, never GUI index.html", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -1252,7 +1489,7 @@ describe("server local API auth", () => {
   });
 
   test("POST /v1/responses/compact on a routed model returns v1 replacement history", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -1323,7 +1560,7 @@ describe("server local API auth", () => {
   const inspectNativeCodexOwnership = ownedServiceHomeInspection("OpenAI option auth matrix test");
 
   test("OpenAI option auth matrix keeps direct, pool, and API credentials independent", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearThreadAccountMap();
@@ -1334,12 +1571,35 @@ describe("server local API auth", () => {
     const upstream = Bun.serve({
       port: 0,
       fetch(req) {
-        seen.push({
+        const observed = {
           host: req.headers.get("x-test-original-host") ?? "",
           authorization: req.headers.get("authorization"),
           chatgptAccountId: req.headers.get("chatgpt-account-id"),
-        });
-        return Response.json({ id: "resp_tier", object: "response", status: "completed", output: [] });
+        };
+        seen.push(observed);
+        const status = observed.authorization === "Bearer caller-invalid-401"
+          ? 401
+          : observed.authorization === "Bearer caller-invalid-403"
+            ? 403
+            : observed.authorization === "Bearer caller-quota-429"
+              ? 429
+              : observed.authorization === "Bearer caller-transient-500"
+                ? 500
+                : 200;
+        const quotaHeaders = observed.authorization === "Bearer caller-quota-headers"
+          || observed.authorization === "Bearer caller-quota-429"
+          ? {
+              "x-codex-primary-used-percent": "100",
+              "x-codex-primary-window-minutes": "300",
+              "x-codex-primary-reset-at": "1900000000",
+            }
+          : observed.authorization === "Bearer caller-transient-500"
+            ? { "retry-after": "0" }
+            : undefined;
+        return Response.json(
+          { id: "resp_tier", object: "response", status: "completed", output: [] },
+          { status, headers: quotaHeaders },
+        );
       },
     });
     let whamRequests = 0;
@@ -1491,7 +1751,83 @@ describe("server local API auth", () => {
       }
       clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
       clearCodexUpstreamHealth();
+      clearAccountQuota();
       rmSync(join(isolatedCodexHome!.path, "auth.json"), { force: true });
+
+      const nativeCallerConfig = {
+        ...mainOnlyConfig(),
+        hostname: "0.0.0.0",
+      } as OcxConfig;
+      saveConfig(nativeCallerConfig);
+      const beforeNativeCaller = seen.length;
+      const nativeCaller = startServer(0, { inspectNativeCodexOwnership });
+      try {
+        await waitForNativeMainStartupGate();
+
+        expect((await request(nativeCaller, {
+          authorization: "Bearer local-secret",
+          "chatgpt-account-id": "must-not-forward",
+        })).status).toBe(401);
+        expect(seen).toHaveLength(beforeNativeCaller);
+        writeMainToken("opaque-file-main-token");
+
+        const fileMainBaseline = {
+          reauth: isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID),
+          quota: structuredClone(getAccountQuota(MAIN_CODEX_ACCOUNT_ID)),
+          health: structuredClone(getCodexUpstreamHealth(MAIN_CODEX_ACCOUNT_ID)),
+          active: loadConfig().activeCodexAccountId,
+        };
+        const expectFileMainUnchanged = () => {
+          expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(fileMainBaseline.reauth);
+          expect(getAccountQuota(MAIN_CODEX_ACCOUNT_ID)).toEqual(fileMainBaseline.quota);
+          expect(getCodexUpstreamHealth(MAIN_CODEX_ACCOUNT_ID)).toEqual(fileMainBaseline.health);
+          expect(loadConfig().activeCodexAccountId).toBe(fileMainBaseline.active);
+        };
+        const isolatedCallerFailures = [
+          ["caller-invalid-401", 401],
+          ["caller-invalid-403", 403],
+          ["caller-quota-429", 429],
+          ["caller-transient-500", 500],
+        ] as const;
+        for (const [token, status] of isolatedCallerFailures) {
+          const headers = {
+            authorization: `Bearer ${token}`,
+            "chatgpt-account-id": `${token}-account`,
+          };
+          expect((await request(nativeCaller, headers)).status).toBe(status);
+          expect((await compact(nativeCaller, headers)).status).toBe(status);
+          expect(await wsTurn(nativeCaller, headers)).toContain(String(status));
+          expectFileMainUnchanged();
+        }
+        const quotaOnlyHeaders = {
+          authorization: "Bearer caller-quota-headers",
+          "chatgpt-account-id": "caller-quota-headers-account",
+        };
+        expect((await request(nativeCaller, quotaOnlyHeaders)).status).toBe(200);
+        expect((await compact(nativeCaller, quotaOnlyHeaders)).status).toBe(200);
+        expect(await wsTurn(nativeCaller, quotaOnlyHeaders)).toContain("resp_tier");
+        expectFileMainUnchanged();
+
+        markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+
+        const nativeHeaders = {
+          authorization: "Bearer caller-keyring-token",
+          "chatgpt-account-id": "caller-keyring-account",
+        };
+        const beforeHealthyNativeCaller = seen.length;
+        expect((await request(nativeCaller, nativeHeaders)).status).toBe(200);
+        expect((await compact(nativeCaller, nativeHeaders)).status).toBe(200);
+        expect(seen.slice(beforeHealthyNativeCaller)).toEqual(Array.from({ length: 2 }, () => ({
+          host: "chatgpt.com",
+          authorization: "Bearer caller-keyring-token",
+          chatgptAccountId: "caller-keyring-account",
+        })));
+        expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+      } finally {
+        await nativeCaller.stop(true);
+        clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+        rmSync(join(isolatedCodexHome!.path, "auth.json"), { force: true });
+      }
 
       saveConfig({
         port: 0,
@@ -1668,7 +2004,7 @@ describe("server local API auth", () => {
   }, { timeout: SERVER_BUDGET_MS });
 
   test("internal web-search and vision never forward a non-ChatGPT bearer as Direct sidecar auth", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     process.env.OPENCODEX_API_AUTH_TOKEN = "dedicated-x-key";
@@ -1730,7 +2066,7 @@ describe("server local API auth", () => {
   });
 
   test("internal vision sidecar still accepts a canonical ChatGPT bearer for Direct sidecar auth", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     process.env.OPENCODEX_API_AUTH_TOKEN = "dedicated-x-key";
@@ -1801,7 +2137,7 @@ describe("server local API auth", () => {
   });
 
   test("expired thread affinity returns 409 before HTTP passthrough and WS resolves auth per frame", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearCodexUpstreamHealth();
@@ -1837,12 +2173,19 @@ describe("server local API auth", () => {
       expiresAt: now + CODEX_THREAD_AFFINITY_IDLE_TTL_MS + 10 * 60_000,
       chatgptAccountId: "acct-pool-a",
     });
-    updateAccountQuota("pool-a", 10, 5);
-
     const originalNow = Date.now;
+    // Pin the clock BEFORE startServer, not after. `startServer` returns synchronously but
+    // arms an async pool-quota prime (src/server/index.ts:2054-2064) that outlives its
+    // return, and that prime decides staleness with `Date.now() - quota.updatedAt >=
+    // POOL_CACHE_TTL` (src/codex/auth-api.ts:1334-1337), where a MISSING entry is stale too.
+    // Seeding the quota after the pin is what actually keeps the prime quiet: a seed written
+    // before the pin stamps `updatedAt` with the real clock, which reads as months of cache
+    // age against this 2027 `now` and sends the prime off to fetch and rotate the credential
+    // out from under the assertions.
+    Date.now = () => now;
+    updateAccountQuota("pool-a", 10, 5);
     const server = startServer(0);
     try {
-      Date.now = () => now;
       for (const threadId of ["expired-http", "expired-compact", "expired-ws"]) {
         const response = await fetch(new URL("/v1/responses", server.url), {
           method: "POST",
@@ -1912,7 +2255,7 @@ describe("server local API auth", () => {
   });
 
   test("websocket passthrough refreshes pool auth for each response.create turn", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearCodexUpstreamHealth();
@@ -1942,8 +2285,29 @@ describe("server local API auth", () => {
         { id: "main", email: "main@example.test", isMain: true },
         { id: "pool-a", email: "pool@example.test", isMain: false, chatgptAccountId: "acct-pool-a" },
       ],
+      codexAccountNamespaces: { "ws-refresh": "pool-a" },
       activeCodexAccountId: "pool-a",
     } as OcxConfig);
+    const originalNow = Date.now;
+    const originalFetch = globalThis.fetch;
+    // Both the clock and the fetch stub go up before `startServer`. The async pool-quota
+    // prime it arms (src/server/index.ts:2054-2064) reads the clock AND fetches, so leaving
+    // either real for the width of two dynamic `import()` resolutions is what made this test
+    // fail on loaded CI runners while passing locally: the prime judged `pool-a` stale
+    // against a 2027 clock versus a `updatedAt` stamped in real time, then refreshed the
+    // credential before the first turn was served — so `seenAuth[0]` was already the new
+    // token. The failure diff was always the first element, never the second.
+    Date.now = () => now;
+    // Seed the credential and quota AFTER the clock is pinned.
+    //
+    // Both writes stamp real time when they run before the pin: `updateAccountQuota` sets
+    // `updatedAt: Date.now()`, and `saveCodexAccountCredential` sets `replacedAt`. The
+    // startup pool-quota prime then compares those stamps
+    // against this 2027 `now` and judges stale — so it refreshes the credential before the
+    // first turn is served and `seenAuth[0]` is already the new token. Pinning the clock
+    // and the fetch stub first (#3139) closed the window for the prime's own reads, but not
+    // for a timestamp written before either was in place, which is why this kept flaking on
+    // loaded runners after that fix.
     saveCodexAccountCredential("pool-a", {
       accessToken: "old-access-token",
       refreshToken: "old-refresh-token",
@@ -1951,15 +2315,7 @@ describe("server local API auth", () => {
       chatgptAccountId: "acct-pool-a",
     });
     updateAccountQuota("pool-a", 10, 5);
-
-    const originalNow = Date.now;
-    const originalFetch = globalThis.fetch;
-    const server = startServer(0);
-    const wsUrl = new URL("/v1/responses", server.url);
-    wsUrl.protocol = "ws:";
-    try {
-      Date.now = () => now;
-      globalThis.fetch = (async (input, init) => {
+    globalThis.fetch = (async (input, init) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         if (url === "https://auth.openai.com/oauth/token") {
           return new Response(JSON.stringify({
@@ -1969,8 +2325,11 @@ describe("server local API auth", () => {
           }), { status: 200 });
         }
         return originalFetch(input, init);
-      }) as typeof fetch;
-
+    }) as typeof fetch;
+    const server = startServer(0);
+    const wsUrl = new URL("/v1/responses", server.url);
+    wsUrl.protocol = "ws:";
+    try {
       const ws = new WebSocket(wsUrl);
       const waitForOpen = new Promise<void>((resolve, reject) => {
         ws.addEventListener("open", () => resolve(), { once: true });
@@ -1990,10 +2349,10 @@ describe("server local API auth", () => {
       });
 
       await waitForOpen;
-      ws.send(JSON.stringify({ type: "response.create", model: "gpt-test", input: "hello" }));
+      ws.send(JSON.stringify({ type: "response.create", model: "ws-refresh/gpt-test", input: "hello" }));
       await waitForTerminal();
       Date.now = () => now + 180_000;
-      ws.send(JSON.stringify({ type: "response.create", model: "gpt-test", input: "again" }));
+      ws.send(JSON.stringify({ type: "response.create", model: "ws-refresh/gpt-test", input: "again" }));
       await waitForTerminal();
       ws.close();
 
@@ -2009,7 +2368,7 @@ describe("server local API auth", () => {
   });
 
   test("websocket routed adapter records completed usage in request logs", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
 
@@ -2092,6 +2451,7 @@ describe("server local API auth", () => {
   });
 
   test("Activation A: allow-listed 400 retries once on another eligible pool account", async () => {
+    setDebugSettings({ debug: true });
     const harness = await startPoolRetryHarness(accountId => accountId === "acct-pool-a"
       ? rejectionResponse(unsupportedModelBody())
       : Response.json({ id: "retry-success", status: "completed", output: [] }));
@@ -2103,6 +2463,215 @@ describe("server local API auth", () => {
       expect(getCodexUpstreamHealth("pool-a")).toBeNull();
       expect(getCodexUpstreamHealth("pool-b")).toBeNull();
       expect(harness.config.activeCodexAccountId).toBe("pool-a");
+      const affinity = getDebugLogEntries()
+        .map(entry => entry.line)
+        .filter(line => line.startsWith("[ocx:codex:affinity] "))
+        .map(line => JSON.parse(line.slice("[ocx:codex:affinity] ".length)) as {
+          status: number;
+          authKind: string;
+          credentialSubstituted: boolean;
+        });
+      expect(affinity).toEqual([
+        expect.objectContaining({ status: 400, authKind: "pool", credentialSubstituted: true }),
+        expect.objectContaining({ status: 200, authKind: "pool", credentialSubstituted: true }),
+      ]);
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  });
+
+  test("#2097: account-gated model selection skips an unentitled active Pool account", async () => {
+    const model = "gpt-daybreak-blue-latest";
+    const harness = await startPoolRetryHarness(
+      accountId => Response.json({ id: accountId, status: "completed", output: [] }),
+      {
+        modelRosterByAccount: {
+          "acct-pool-a": ["gpt-5.6-sol"],
+          "acct-pool-b": ["gpt-5.6-sol", model],
+        },
+      },
+    );
+    try {
+      const response = await harness.request({ model });
+      expect(response.status).toBe(200);
+      expect((await response.json() as { id: string }).id).toBe("acct-pool-b");
+      expect(harness.dispatches).toEqual(["acct-pool-b"]);
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  });
+
+  test("#2097: Daybreak keeps its entitlement identity but uses the stable wire model", async () => {
+    const model = "gpt-daybreak-blue-latest";
+    let upstreamBody: Record<string, unknown> | undefined;
+    const harness = await startPoolRetryHarness(
+      async (_accountId, request) => {
+        upstreamBody = await request.json() as Record<string, unknown>;
+        return Response.json(
+          { id: "canonical-wire-success", status: "completed", output: [], usage: { input_tokens: 1000, output_tokens: 100 } },
+          { headers: { "openai-model": "gpt-5.6-sol" } },
+        );
+      },
+      {
+        secondAccount: false,
+        modelRosterByAccount: { "acct-pool-a": ["gpt-5.6-sol", model] },
+      },
+    );
+    try {
+      const response = await harness.request({
+        model,
+        extraBody: { prompt_cache_retention: "24h" },
+      });
+      expect(response.status).toBe(200);
+      expect(upstreamBody?.model).toBe("gpt-5.6-sol");
+      expect(upstreamBody).not.toHaveProperty("prompt_cache_retention");
+      expect(harness.dispatches).toEqual(["acct-pool-a"]);
+
+      const logs = logsFromApiBody(await fetch(new URL("/api/logs?tail=1", harness.server.url), { headers: managementHeaders() }).then(r => r.json()));
+      expect(logs.at(-1)).toMatchObject({
+        model: "gpt-daybreak-blue-latest",
+        status: 200,
+      });
+      expect(logs.at(-1)?.resolvedModel).toBeUndefined();
+      expect(logs.at(-1)?.displayMetrics?.cost?.kind).toBe("value");
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  });
+
+  test("#2097: Daybreak compact uses the stable wire model without retention", async () => {
+    const model = "gpt-daybreak-blue-latest";
+    let upstreamBody: Record<string, unknown> | undefined;
+    let upstreamUrl = "";
+    const harness = await startPoolRetryHarness(
+      async (_accountId, request) => {
+        upstreamUrl = request.url;
+        upstreamBody = await request.json() as Record<string, unknown>;
+        return new Response([
+          'event: response.output_item.done',
+          'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","encrypted_content":"gAAAAAB-test-opaque"}}',
+          '',
+          'event: response.completed',
+          'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+          '',
+          'data: [DONE]',
+          '',
+        ].join("\n"), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+      {
+        secondAccount: false,
+        modelRosterByAccount: { "acct-pool-a": ["gpt-5.6-sol", model] },
+      },
+    );
+    try {
+      const response = await harness.request({
+        model,
+        path: "/v1/responses/compact",
+        extraBody: { prompt_cache_retention: "24h" },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        output: [{ type: "compaction", encrypted_content: "gAAAAAB-test-opaque" }],
+      });
+      expect(upstreamUrl).toEndWith("/responses");
+      expect(upstreamBody?.model).toBe("gpt-5.6-sol");
+      expect(upstreamBody?.stream).toBe(true);
+      expect(upstreamBody).not.toHaveProperty("prompt_cache_retention");
+      expect(harness.dispatches).toEqual(["acct-pool-a"]);
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+    // Same budget as the other harness cases in this file: this one starts a real server and
+    // was left on Bun's 5s default, so it timed out at 5003ms under full-suite parallel load
+    // while passing 3/3 in isolation on two machines. A server-backed case measured against a
+    // default meant for pure unit tests is a load flake, not a signal.
+  }, { timeout: SERVER_BUDGET_MS });
+
+  test("#2097: a confirmed entitled account survives two transient unsupported-model 400s in place", async () => {
+    const model = "gpt-daybreak-blue-latest";
+    let attempts = 0;
+    const harness = await startPoolRetryHarness(
+      () => ++attempts <= 2
+        ? rejectionResponse(unsupportedModelBody(model))
+        : Response.json({ id: "same-account-success", status: "completed", output: [] }),
+      {
+        secondAccount: false,
+        modelRosterByAccount: { "acct-pool-a": ["gpt-5.6-sol", model] },
+      },
+    );
+    try {
+      const response = await harness.request({ model });
+      expect(response.status).toBe(200);
+      expect((await response.json() as { id: string }).id).toBe("same-account-success");
+      expect(harness.dispatches).toEqual(["acct-pool-a", "acct-pool-a", "acct-pool-a"]);
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  });
+
+  test("#2097: an exact account-gated selector may retry only its confirmed account in place", async () => {
+    const model = "gpt-daybreak-blue-latest";
+    let attempts = 0;
+    const harness = await startPoolRetryHarness(
+      () => ++attempts <= 2
+        ? rejectionResponse(unsupportedModelBody(model))
+        : Response.json({ id: "same-exact-account-success", status: "completed", output: [] }),
+      {
+        accountMode: "direct",
+        activeAccountId: "pool-b",
+        accountNamespaces: { side: "pool-a" },
+        modelRosterByAccount: { "acct-pool-a": ["gpt-5.6-sol", model] },
+      },
+    );
+    try {
+      const response = await harness.request({ model: `side/${model}`, callerBearer: false });
+      expect(response.status).toBe(200);
+      expect((await response.json() as { id: string }).id).toBe("same-exact-account-success");
+      expect(harness.dispatches).toEqual(["acct-pool-a", "acct-pool-a", "acct-pool-a"]);
+      expect(loadConfig().activeCodexAccountId).toBe("pool-b");
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  });
+
+  test("#2097: repeated gated-model rejection remains bounded at eight total sends", async () => {
+    const model = "gpt-daybreak-blue-latest";
+    const body = unsupportedModelBody(model);
+    const harness = await startPoolRetryHarness(
+      () => rejectionResponse(body),
+      {
+        secondAccount: false,
+        modelRosterByAccount: { "acct-pool-a": ["gpt-5.6-sol", model] },
+      },
+    );
+    try {
+      const response = await harness.request({ model });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe(body);
+      expect(harness.dispatches).toEqual(Array(8).fill("acct-pool-a"));
+    } finally {
+      await stopPoolRetryHarness(harness);
+    }
+  });
+
+  test("#2097: an account-gated model with no confirmed grant fails before upstream dispatch", async () => {
+    const model = "gpt-daybreak-blue-latest";
+    const harness = await startPoolRetryHarness(
+      () => Response.json({ id: "must-not-dispatch" }),
+      {
+        modelRosterByAccount: {
+          "acct-pool-a": ["gpt-5.6-sol"],
+          "acct-pool-b": ["gpt-5.6-sol"],
+        },
+      },
+    );
+    try {
+      const response = await harness.request({ model });
+      expect(response.status).toBe(401);
+      expect(await response.text()).toContain("No eligible Codex account supports this model");
+      expect(harness.dispatches).toEqual([]);
     } finally {
       await stopPoolRetryHarness(harness);
     }
@@ -2510,6 +3079,121 @@ describe("server local API auth", () => {
     }
   });
 
+  test.each([429, 402] as const)(
+    "a pre-stream %i from the only Pool account retries once with the validated caller main",
+    async rejection => {
+      setDebugSettings({ debug: true });
+      const model = "gpt-daybreak-blue-latest";
+      const observed: Array<{ authorization: string | null; accountId: string | null }> = [];
+      const harness = await startPoolRetryHarness((_accountId, request) => {
+        observed.push({
+          authorization: request.headers.get("authorization"),
+          accountId: request.headers.get("chatgpt-account-id"),
+        });
+        if (observed.length === 1) {
+          return new Response(JSON.stringify({ error: { message: "pool account unavailable" } }), {
+            status: rejection,
+            headers: { "content-type": "application/json", "retry-after": "60" },
+          });
+        }
+        return Response.json({ id: "caller-main-success", status: "completed", output: [] });
+      }, {
+        secondAccount: false,
+        modelRosterByAccount: {
+          "acct-pool-a": [model],
+          "acct-caller-main": [model],
+        },
+      });
+      try {
+        const response = await harness.request({
+          model,
+          headers: { "chatgpt-account-id": "acct-caller-main" },
+        });
+        expect(response.status).toBe(200);
+        expect((await response.json() as { id: string }).id).toBe("caller-main-success");
+        expect(observed).toEqual([
+          { authorization: "Bearer pool-a-token", accountId: "acct-pool-a" },
+          { authorization: "Bearer inbound-token", accountId: "acct-caller-main" },
+        ]);
+        expect(harness.dispatches).toEqual(["acct-pool-a", "acct-caller-main"]);
+        expect(loadConfig().activeCodexAccountId).toBe("pool-a");
+        const affinity = getDebugLogEntries()
+          .map(entry => entry.line)
+          .filter(line => line.startsWith("[ocx:codex:affinity] "))
+          .map(line => JSON.parse(line.slice("[ocx:codex:affinity] ".length)) as {
+            status: number;
+            authKind: string;
+            credentialSubstituted: boolean;
+          });
+        expect(affinity.slice(-2)).toEqual([
+          expect.objectContaining({ status: rejection, authKind: "pool", credentialSubstituted: true }),
+          expect.objectContaining({ status: 200, authKind: "main", credentialSubstituted: false }),
+        ]);
+      } finally {
+        await stopPoolRetryHarness(harness);
+      }
+    },
+    { timeout: SERVER_BUDGET_MS },
+  );
+
+  test.each([429, 402] as const)(
+    "compact %i from the only Pool account retries once with the validated caller main",
+    async rejection => {
+      const model = "gpt-daybreak-blue-latest";
+      const observed: Array<{ authorization: string | null; accountId: string | null }> = [];
+      const harness = await startPoolRetryHarness((_accountId, request) => {
+        observed.push({
+          authorization: request.headers.get("authorization"),
+          accountId: request.headers.get("chatgpt-account-id"),
+        });
+        if (observed.length === 1) {
+          return new Response(JSON.stringify({ error: { message: "pool account unavailable" } }), {
+            status: rejection,
+            headers: { "content-type": "application/json", "retry-after": "60" },
+          });
+        }
+        return new Response([
+          "event: response.output_item.done",
+          'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","encrypted_content":"gAAAAAB-caller-main"}}',
+          "",
+          "event: response.completed",
+          'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+          "",
+          "data: [DONE]",
+          "",
+        ].join("\n"), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }, {
+        secondAccount: false,
+        modelRosterByAccount: {
+          "acct-pool-a": [model],
+          "acct-caller-main": [model],
+        },
+      });
+      try {
+        const response = await harness.request({
+          model,
+          path: "/v1/responses/compact",
+          headers: { "chatgpt-account-id": "acct-caller-main" },
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          output: [{ type: "compaction", encrypted_content: "gAAAAAB-caller-main" }],
+        });
+        expect(observed).toEqual([
+          { authorization: "Bearer pool-a-token", accountId: "acct-pool-a" },
+          { authorization: "Bearer inbound-token", accountId: "acct-caller-main" },
+        ]);
+        expect(harness.dispatches).toEqual(["acct-pool-a", "acct-caller-main"]);
+        expect(loadConfig().activeCodexAccountId).toBe("pool-a");
+      } finally {
+        await stopPoolRetryHarness(harness);
+      }
+    },
+    { timeout: SERVER_BUDGET_MS },
+  );
+
   test("#584: Retry-After cools the first account even when its account retry fails", async () => {
     const harness = await startPoolRetryHarness(accountId => accountId === "acct-pool-a"
       ? new Response(JSON.stringify({ error: { message: "rate limited" } }), {
@@ -2743,11 +3427,29 @@ describe("server local API auth", () => {
     }
   }, { timeout: SERVER_BUDGET_MS });
 
+  // #2398 changed what the caller sees here, and this test had to move with it.
+  //
+  // The invariant this test exists for is unchanged and still asserted: an oversized 400
+  // must NOT authorize a pool retry, so exactly one account is dispatched and neither
+  // account is marked unhealthy. What changed is the body. Relaying 65 KiB of
+  // attacker-controlled bytes back to the client is precisely what #2398 stopped, so the
+  // caller now gets #452's bounded status-only JSON instead of the original prefix
+  // (pinned from the other side by "oversized passthrough errors become bounded
+  // status-only JSON" in tests/issue-452-empty-503.test.ts).
+  //
+  // The upstream's own headers still survive, which is what keeps pool-retry diagnostics
+  // honest — that part is still checked below.
   test("oversized 400 body never authorizes a pool retry", async () => {
-    const body = `${unsupportedModelBody()}${"x".repeat(65_536)}`;
+    const hostileSuffix = "x".repeat(65_536);
+    const body = `${unsupportedModelBody()}${hostileSuffix}`;
     const harness = await startPoolRetryHarness(() => rejectionResponse(body));
     try {
-      await expectOriginal400(await harness.request(), body);
+      const response = await harness.request();
+      expect(response.status).toBe(400);
+      const text = await response.text();
+      expect(text).not.toContain(hostileSuffix);
+      expect(text.length).toBeLessThan(1_024);
+
       expect(harness.dispatches).toEqual(["acct-pool-a"]);
       expect(getCodexUpstreamHealth("pool-a")).toBeNull();
       expect(getCodexUpstreamHealth("pool-b")).toBeNull();
@@ -2986,7 +3688,7 @@ describe("server local API auth", () => {
   }, { timeout: 30_000 });
 
   test("passthrough connect failure records selected pool account health", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearCodexUpstreamHealth();
@@ -3041,7 +3743,7 @@ describe("server local API auth", () => {
   });
 
   test("passthrough pool send relays a 307 with Location and records no health evidence (#914)", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearCodexUpstreamHealth();
@@ -3115,7 +3817,7 @@ describe("server local API auth", () => {
   });
 
   test("passthrough SSE terminal failure is recorded without clearing health on initial 200", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearCodexUpstreamHealth();
@@ -3183,10 +3885,10 @@ describe("server local API auth", () => {
       await server.stop(true);
       await upstream.stop(true);
     }
-  });
+  }, { timeout: SERVER_BUDGET_MS });
 
   test("passthrough SSE cyber terminal is logged as 400 cyber_policy", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearRequestLogsForTests();
@@ -3258,7 +3960,7 @@ describe("server local API auth", () => {
   });
 
   test("native passthrough SSE records completed usage without pool terminal tracking", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
 
@@ -3342,7 +4044,7 @@ describe("server local API auth", () => {
   });
 
   test("passthrough SSE client cancel aborts the upstream request", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
 
@@ -3414,7 +4116,7 @@ describe("server local API auth", () => {
   });
 
   test("non-forward generated stream does not mutate active pool health", async () => {
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     clearCodexUpstreamHealth();
@@ -3477,6 +4179,248 @@ describe("server local API auth", () => {
     } finally {
       await server.stop(true);
       await upstream.stop(true);
+    }
+  });
+});
+
+describe("GET /v1/catalog remote data plane", () => {
+  test("management and data-plane routes return byte-identical catalog bodies", async () => {
+    saveConfig(remoteCatalogConfig());
+    writeRemoteCatalog();
+    const server = startServer(0);
+    try {
+      const management = await fetch(new URL("/api/catalog", server.url), { headers: managementHeaders() });
+      const remote = await fetch(new URL("/v1/catalog", server.url), {
+        headers: { "x-opencodex-api-key": REMOTE_DATA_KEY },
+      });
+      const managementBytes = new Uint8Array(await management.arrayBuffer());
+      const remoteBytes = new Uint8Array(await remote.arrayBuffer());
+      expect(management.status).toBe(200);
+      expect(remote.status).toBe(200);
+      expect(remoteBytes).toEqual(managementBytes);
+      expect(new TextDecoder().decode(remoteBytes)).toBe(REMOTE_CATALOG_BYTES);
+      // Management ETag spelling is hex, per the shipped catalogEtag() in
+      // src/server/catalog-download.ts. An earlier revision of this phase used a
+      // "sha256-<base64url>" spelling from its own serializer, which no longer exists.
+      const expectedEtag = `"${createHash("sha256").update(remoteBytes).digest("hex")}"`;
+      // The bytes are identical across planes, but the caching contract is not: the
+      // management route may carry a validator because its representation does not vary by
+      // data-key identity, while this one must not. Asserting the management ETag here keeps
+      // the byte-identity claim honest without implying the remote route offers one.
+      expect(management.headers.get("etag")).toBe(expectedEtag);
+      expect(remote.headers.get("etag")).toBeNull();
+      expect(remote.headers.get("cache-control")).toBe("no-store");
+      expect(remote.headers.get("x-opencodex-key-id")).toBe("remote-key");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("admission accepts configured dedicated and bearer keys, and rejects every foreign class", async () => {
+    saveConfig(remoteCatalogConfig());
+    writeRemoteCatalog();
+    const server = startServer(0);
+    try {
+      const cases = [
+        [{ "x-opencodex-api-key": REMOTE_DATA_KEY }, 200, "remote-key"],
+        [{ authorization: `Bearer ${REMOTE_DATA_KEY}` }, 200, "remote-key"],
+        // Accepted, matching /v1/models and the AUTH_MATRIX row this route shipped with in
+        // #809. An earlier revision of this phase rejected x-api-key here for least-privilege
+        // reasons, but this route forwards no caller credential upstream, so the header
+        // carries no extra authority — and rejecting it 401s Anthropic-SDK clients holding a
+        // perfectly valid data credential. The narrowing was a behavior regression against
+        // shipped code, not a hardening.
+        [{ "x-api-key": REMOTE_DATA_KEY }, 200, "remote-key"],
+        [{ authorization: "Bearer foreign-key" }, 401, null],
+        [{ authorization: `Bearer ${configuredAdminToken() ?? "missing-admin"}` }, 401, null],
+        [{ "x-opencodex-api-key": REMOTE_DATA_KEY, origin: "https://attacker.test" }, 403, null],
+        [{}, 401, null],
+      ] as const;
+      for (const [headers, status, keyId] of cases) {
+        const response = await fetch(new URL("/v1/catalog", server.url), { headers });
+        expect(response.status).toBe(status);
+        expect(response.headers.get("x-opencodex-key-id")).toBe(keyId);
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("environment-token and loopback admission never emit a configured key id", async () => {
+    process.env.OPENCODEX_API_AUTH_TOKEN = "environment-catalog-token";
+    saveConfig(remoteCatalogConfig());
+    writeRemoteCatalog();
+    const remote = startServer(0);
+    try {
+      const response = await fetch(new URL("/v1/catalog", remote.url), {
+        headers: { "x-opencodex-api-key": "environment-catalog-token" },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-opencodex-key-id")).toBeNull();
+    } finally {
+      await remote.stop(true);
+    }
+
+    const loopbackConfig = remoteCatalogConfig();
+    loopbackConfig.hostname = "127.0.0.1";
+    saveConfig(loopbackConfig);
+    const loopback = startServer(0);
+    try {
+      const response = await fetch(new URL("/v1/catalog", loopback.url));
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-opencodex-key-id")).toBeNull();
+    } finally {
+      await loopback.stop(true);
+    }
+  });
+
+  test("an unsafe configured key id is omitted with one id-free warning", async () => {
+    const unsafeId = "unsafe key id";
+    saveConfig(remoteCatalogConfig(unsafeId));
+    writeRemoteCatalog();
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const server = startServer(0);
+    try {
+      const response = await fetch(new URL("/v1/catalog", server.url), {
+        headers: { "x-opencodex-api-key": REMOTE_DATA_KEY },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-opencodex-key-id")).toBeNull();
+      // Other subsystems (config repair, provider migration) may warn during startup;
+      // this contract is about the remote-catalog warning specifically: exactly one,
+      // and it never echoes the unsafe id.
+      const remoteCatalogWarns = warnSpy.mock.calls
+        .map(call => call.map(String).join(" "))
+        .filter(line => line.includes("[remote-catalog]"));
+      expect(remoteCatalogWarns).toHaveLength(1);
+      expect(remoteCatalogWarns[0]).not.toContain(unsafeId);
+      expect(warnSpy.mock.calls.flat().map(String).join(" ")).not.toContain(unsafeId);
+    } finally {
+      await server.stop(true);
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("no conditional request can elicit a 304, and no validator is offered to build one from", async () => {
+    // The response body varies by key identity, so a shared strong validator would let a
+    // store revalidate one identity's representation for another. The route therefore
+    // carries no ETag at all: there is nothing for a client to send back, and every
+    // If-None-Match spelling — including ones that would match a validator if one existed —
+    // gets the full body. An earlier revision of this phase asserted the opposite here.
+    saveConfig(remoteCatalogConfig());
+    writeRemoteCatalog();
+    const server = startServer(0);
+    try {
+      const first = await fetch(new URL("/v1/catalog", server.url), {
+        headers: { "x-opencodex-api-key": REMOTE_DATA_KEY },
+      });
+      expect(first.status).toBe(200);
+      expect(first.headers.get("etag")).toBeNull();
+      expect(first.headers.get("cache-control")).toBe("no-store");
+
+      for (const validator of ['"sha256-anything"', 'W/"sha256-anything"', '"stale", "other"', "*", "malformed"]) {
+        const response = await fetch(new URL("/v1/catalog", server.url), {
+          headers: { "x-opencodex-api-key": REMOTE_DATA_KEY, "if-none-match": validator },
+        });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe(REMOTE_CATALOG_BYTES);
+        expect(response.headers.get("etag")).toBeNull();
+        expect(response.headers.get("cache-control")).toBe("no-store");
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("method and path matching stay exact ahead of the unknown-v1 guard", async () => {
+    saveConfig(remoteCatalogConfig());
+    writeRemoteCatalog();
+    const server = startServer(0);
+    try {
+      for (const [path, method] of [
+        ["/v1/catalog", "POST"],
+        ["/v1/catalog/", "GET"],
+        ["/v1/does-not-exist", "GET"],
+      ] as const) {
+        const response = await fetch(new URL(path, server.url), {
+          method,
+          headers: { "x-opencodex-api-key": REMOTE_DATA_KEY },
+        });
+        expect(response.status).toBe(404);
+        expect(response.headers.get("content-type")).toContain("application/json");
+        expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
+        expect(response.headers.get("x-opencodex-key-id")).toBeNull();
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+});
+
+describe("POST /opencodex-session pairing body bound", () => {
+  // This endpoint is reachable without a credential, so the body bound has to hold against a
+  // caller who controls the framing. The pre-check reads Content-Length, which the caller
+  // chooses: omit it and `Number(null ?? "0")` is 0, or send chunked and there is no header
+  // to read. Both used to pass the check and reach `req.text()`, which buffers whatever
+  // arrives — an unauthenticated caller decided how much memory the process spent.
+
+  test("a chunked body with no Content-Length is bounded rather than buffered whole", async () => {
+    saveConfig(remoteCatalogConfig());
+    const server = startServer(0);
+    try {
+      // 512 KiB against a 4 KiB limit, streamed so no Content-Length is sent. The stream
+      // reports how many chunks the server actually pulled: a bounded read stops early, an
+      // unbounded one drains all of them.
+      const chunkCount = 128;
+      const chunkBytes = 4 * 1024;
+      let pulled = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulled >= chunkCount) {
+            controller.close();
+            return;
+          }
+          pulled += 1;
+          controller.enqueue(new Uint8Array(chunkBytes).fill(0x61));
+        },
+      });
+
+      const response = await fetch(new URL("/opencodex-session", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json", Origin: "http://localhost" },
+        body,
+        // Required by fetch for a streaming request body.
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+
+      expect(response.status).toBe(413);
+      // The bound is what stopped it, not the peer running out of data.
+      expect(pulled).toBeLessThan(chunkCount);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a body exactly at the limit is still accepted for parsing", async () => {
+    saveConfig(remoteCatalogConfig());
+    const server = startServer(0);
+    try {
+      // Exactly 4096 bytes of valid JSON: the bound must reject over-limit bodies without
+      // also rejecting one that sits on the limit.
+      const filler = "a".repeat(4096 - '{"grant":""}'.length);
+      const atLimit = `{"grant":"${filler}"}`;
+      expect(Buffer.byteLength(atLimit)).toBe(4096);
+
+      const response = await fetch(new URL("/opencodex-session", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json", Origin: "http://localhost" },
+        body: atLimit,
+      });
+
+      // 401, not 413: the body was read and parsed, and the grant simply does not exist.
+      expect(response.status).toBe(401);
+    } finally {
+      await server.stop(true);
     }
   });
 });

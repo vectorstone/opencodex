@@ -1,8 +1,11 @@
 import {
   CANONICAL_EFFORT_SUFFIXES,
   cursorModelEffortLadder,
+  cursorModelHasEffortTiers,
   cursorWireModelIdWithEffort,
+  CURSOR_THINKING_MODEL_IDS,
 } from "./effort-map";
+import { cursorUmbrellaRows, parseCursorVariantId } from "./catalog";
 
 export interface CursorModelInfo {
   id: string;
@@ -27,6 +30,8 @@ export function inferCursorContextWindow(modelId: string): number {
   if (id.includes("1m")) return CONTEXT_1M;
   if (id.startsWith("gemini-")) return CONTEXT_1M;
   if (id === "glm-5.3" || id === "glm-5.2") return CONTEXT_1M;
+  // 260902: every Fable is a 1M model; catch live spellings the seed does not carry.
+  if (id.includes("fable")) return CONTEXT_1M;
   if (id.startsWith("gpt-5.6-")) return CONTEXT_1M;
   if (id.startsWith("gpt-5") || id === "gpt-5-codex") return CONTEXT_272K;
   if (id.startsWith("grok-4.5") || id.startsWith("grok-4.6")) return 500_000;
@@ -74,9 +79,16 @@ function stripCursorWirePrefix(id: string): string {
  * ordinary `{base}-{effort}` form, or Cursor's current `{base-without-fast}-{effort}-fast` form.
  */
 export function isCursorModelAvailableForAccount(modelId: string, liveIds: readonly string[]): boolean {
+  // Umbrella matching (devlog 260828_cursor_umbrella_catalog): a live suffix
+  // id counts toward its BASE — any variant dimension (thinking/fast/effort)
+  // proves the account can reach the umbrella. Unknown ids fall back to the
+  // legacy exact/suffix comparison so non-cataloged rows keep matching.
+  const parsedTarget = parseCursorVariantId(modelId);
   return liveIds.some(raw => {
     const id = stripCursorWirePrefix(raw);
     if (id === modelId) return true;
+    const parsedLive = parseCursorVariantId(id);
+    if (parsedLive.known && parsedTarget.known && parsedLive.baseId === parsedTarget.baseId) return true;
     for (const effort of CANONICAL_EFFORT_SUFFIXES) {
       if (
         id === `${modelId}-${effort}` ||
@@ -101,6 +113,28 @@ export type CursorRoutingLevel = typeof CURSOR_ROUTING_LEVELS[number];
 export const CURSOR_ROUTER_MODEL_IDS = [
   CURSOR_AUTO_MODEL_ID,
   ...CURSOR_ROUTING_LEVELS.map(level => `${CURSOR_AUTO_MODEL_ID}-${level}`),
+] as const;
+
+/**
+ * Cursor models that cannot see images natively. OpenCodex routes them through the vision
+ * sidecar (the catalog still advertises image so Codex can attach). Evidence:
+ * - Composer family: Cursor staff — text-only; "Model does not support images"
+ * - Auto / router modes: Cursor docs omit Images for Auto Cost; staff — pick Claude/GPT for images
+ * - glm-5.2: Cursor docs omit Images; Z.ai GLM-5.2 is text-only (vision is GLM-5V)
+ * - glm-5.3: same family; seeded as text-only ahead of Cursor's lineup update
+ *
+ * Composer ids are enumerated explicitly — prefix wildcard matching is deliberately out of
+ * scope here; a live-discovered new Composer slug stays native-path until curated. Everyone
+ * else in the static seed (Claude, Gemini, GPT, Kimi, Grok) takes SelectedImage. Other
+ * live-discovered ids stay unclassified (native path) until curated.
+ */
+export const CURSOR_NO_VISION_MODELS = [
+  ...CURSOR_ROUTER_MODEL_IDS,
+  "composer-1",
+  "composer-2.5",
+  "composer-2.5-fast",
+  "glm-5.2",
+  "glm-5.3",
 ] as const;
 
 /** Wire id Cursor Connect expects for the auto-router (GetUsableModels returns `default`, not `auto`). */
@@ -131,6 +165,25 @@ export function cursorCodexToWireModelId(modelId: string): string {
 }
 
 /**
+ * Synthetic ultra/big-context picker marker (devlog 260826 070). A `cursor/<base>-1m` row is a
+ * picker-only variant: the wire request keeps `<base>` (plus effort suffix) and turns on Cursor
+ * Max Mode instead. Only ids listed here are treated as synthetic — a real upstream wire id that
+ * happens to end in `-1m` never collides because it will not be in this set.
+ */
+export const CURSOR_ULTRA_1M_MODEL_IDS: ReadonlySet<string> = new Set([
+  "kimi-k3-1m",
+]);
+
+const CURSOR_ULTRA_1M_SUFFIX = "-1m";
+
+/** Resolve a synthetic ultra marker id to its wire base, or undefined for ordinary ids. */
+export function cursorUltraBaseModelId(modelId: string): string | undefined {
+  const normalized = modelId.startsWith("cursor/") ? modelId.slice("cursor/".length) : modelId;
+  if (!CURSOR_ULTRA_1M_MODEL_IDS.has(normalized)) return undefined;
+  return normalized.slice(0, -CURSOR_ULTRA_1M_SUFFIX.length);
+}
+
+/**
  * Cursor-native wire models keep server-side conversation state reliably.
  * External models (gpt/claude/gemini/grok families and similar) are more brittle on resumeAction.
  */
@@ -146,6 +199,24 @@ export function isCursorExternalWireModel(modelId: string): boolean {
   return !isCursorNativeWireModel(modelId);
 }
 
+/**
+ * Native composer models whose tool-result continuation must still be sent as a
+ * userMessageAction with the plain "Continue:" text instead of a bare resumeAction.
+ *
+ * Observed on live Cursor Connect traffic (2026-08-20): `composer-2.5` (the
+ * standard, non-fast build) resumes a tool-result turn with server-side native
+ * tool calls (read/grep/exec) instead of answering, or completes with zero text
+ * (empty `content` + `stop`). `composer-2.5-fast` answers correctly on the same
+ * resumeAction path, so only the affected id is listed here. Sending the same
+ * continuation as an explicit user message (external path) makes the model
+ * answer reliably.
+ */
+export function cursorNeedsExternalToolContinuation(modelId: string): boolean {
+  if (isCursorExternalWireModel(modelId)) return true;
+  const wire = cursorCodexToWireModelId(modelId).trim().toLowerCase();
+  return wire === "composer-2.5";
+}
+
 function stripCursorEffortSuffix(wireModelId: string): string {
   const suffixes = [...CANONICAL_EFFORT_SUFFIXES].sort((a, b) => b.length - a.length);
   for (const suffix of suffixes) {
@@ -153,6 +224,13 @@ function stripCursorEffortSuffix(wireModelId: string): string {
     if (wireModelId.endsWith(marker)) return wireModelId.slice(0, -marker.length);
   }
   return wireModelId;
+}
+
+/** Compare Cursor wire models without effort suffix or the grok cursor- request prefix. */
+export function cursorCheckpointModelAffinityId(modelId: string): string {
+  const wire = cursorCodexToWireModelId(modelId).trim().toLowerCase();
+  const withoutPrefix = wire.startsWith("cursor-") ? wire.slice("cursor-".length) : wire;
+  return stripCursorEffortSuffix(withoutPrefix);
 }
 
 export function isCursorRouterModelId(modelId: string): boolean {
@@ -165,87 +243,117 @@ export function filterCursorConfiguredModelsByLiveDiscovery<T extends { id: stri
   liveIds: readonly string[],
 ): T[] {
   return configured.filter(model =>
-    isCursorRouterModelId(model.id) || isCursorModelAvailableForAccount(model.id, liveIds),
+    !CURSOR_KNOWN_UNCALLABLE_MODEL_IDS.has(model.id)
+    && (
+      isCursorRouterModelId(model.id)
+      // Synthetic ultra rows ride their base model's account availability.
+      || isCursorModelAvailableForAccount(cursorUltraBaseModelId(model.id) ?? model.id, liveIds)
+    ),
   );
 }
 
+/**
+ * Models GetUsableModels advertises but whose every Run returns not_found (catalog honesty,
+ * devlog 260826_cursor_responses_gap 060). The claude-opus-5 REGULAR wire family is the known
+ * case (probes 2026-08-26: 100% not_found while -fast/-thinking succeed) — under the umbrella
+ * catalog (devlog 260828) that quarantine moved to the RESOLVER level: the capability marks the
+ * regular VARIANT quarantined, the bare slug routes the healthy thinking variant, and the base
+ * row stays in the seed. This row-level set stays for future whole-base quarantines.
+ */
+export const CURSOR_KNOWN_UNCALLABLE_MODEL_IDS: ReadonlySet<string> = new Set([]);
+
+/**
+ * Cursor products that are NOT a dimension of any capability base. Each carries its own
+ * label because there is no capability record to read one from. A row belongs here only
+ * when Cursor ships it as a distinct product; a variant of a cataloged base does not.
+ */
+export const CURSOR_PRODUCT_MODELS: readonly (CursorModelInfo & { displayName: string })[] = [
+  { id: "claude-4.5-haiku", displayName: "Claude Haiku 4.5", contextWindow: CONTEXT_200K },
+  { id: "composer-1", displayName: "Composer 1", contextWindow: CONTEXT_200K },
+  { id: "composer-2.5", displayName: "Composer 2.5", contextWindow: CONTEXT_200K },
+  { id: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash", contextWindow: CONTEXT_GEMINI },
+  { id: "gemini-3-flash", displayName: "Gemini 3 Flash", contextWindow: CONTEXT_GEMINI },
+  { id: "gemini-3-pro", displayName: "Gemini 3 Pro", contextWindow: CONTEXT_GEMINI },
+  { id: "gemini-3-pro-image-preview", displayName: "Gemini 3 Pro Image", contextWindow: CONTEXT_200K },
+  { id: "gemini-3.1-pro", displayName: "Gemini 3.1 Pro", contextWindow: CONTEXT_GEMINI },
+  { id: "gemini-3.5-flash", displayName: "Gemini 3.5 Flash", contextWindow: CONTEXT_200K },
+  { id: "gpt-5-codex", displayName: "GPT-5 Codex", contextWindow: CONTEXT_272K },
+  { id: "gpt-5-mini", displayName: "GPT-5 Mini", contextWindow: CONTEXT_272K },
+  { id: "gpt-5.1-codex", displayName: "GPT-5.1 Codex", contextWindow: CONTEXT_272K },
+  { id: "kimi-k2.7-code", displayName: "Kimi K2.7 Code", contextWindow: CONTEXT_262K },
+];
+
+/**
+ * Real upstream wire ids that LOOK like a dimension of a cataloged base but are served as
+ * their own catalog row by Cursor, so they stay rows rather than folding into a base.
+ *
+ * - `claude-4-sonnet-1m`: a distinct 1M-window row upstream, not `claude-4-sonnet` + ultra.
+ *   claude-4-sonnet carries no maxMode evidence, so folding it would invent a capability.
+ *   `REAL_1M_WIRE_IDS` in catalog.ts already stops the parser reading it as the synthetic
+ *   marker.
+ * - `gpt-5-fast`: there is no `gpt-5` capability base for it to be a dimension of.
+ * - `composer-2.5-fast`: composer-2.5 has no effort or variant dimensions at all.
+ */
+export const CURSOR_REAL_ID_EXCEPTIONS: readonly (CursorModelInfo & { displayName: string })[] = [
+  { id: "claude-4-sonnet-1m", displayName: "Claude Sonnet 4 (1M)", contextWindow: CONTEXT_1M },
+  { id: "gpt-5-fast", displayName: "GPT-5 Fast", contextWindow: CONTEXT_272K },
+  { id: "composer-2.5-fast", displayName: "Composer 2.5 Fast", contextWindow: CONTEXT_200K },
+];
+
+/** Picker labels for the auto-router rows, which have no capability record. */
+const CURSOR_ROUTER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  auto: "Auto",
+  "auto-cost": "Auto (Cost)",
+  "auto-balance": "Auto (Balanced)",
+  "auto-intelligence": "Auto (Intelligence)",
+};
+
+/**
+ * The published Cursor row set. DERIVED from CURSOR_CAPABILITIES via cursorUmbrellaRows()
+ * (devlog 260902_cursor_unified_identity) so the capability table and the picker can no
+ * longer disagree: one row per base, with thinking / fast / synthetic -1m remaining
+ * routable aliases that add no rows.
+ *
+ * Before this, the seed was a hand-maintained list that drifted from the capability table —
+ * `cursorUmbrellaRows()` existed but only tests called it, so collapsing a variant changed
+ * routing without changing what Codex listed.
+ *
+ * Windows and effort ladders come from the capability record; the two lists below carry the
+ * ids that have no capability record, each with its own label and window.
+ */
 export const CURSOR_STATIC_MODELS: readonly CursorModelInfo[] = normalizeCursorModels([
-  // Context windows and the model lineup mirror Cursor's public models/pricing docs plus the jawcode
-  // SOT (../jawcode/packages/ai/src/models.json, `cursor` provider), which mirrors the real
-  // GetUsableModels catalog. Live discovery is the preferred path when logged in; these ids seed the
-  // routed Codex catalog and provide a static fallback. Cursor base ids carry no effort suffix here —
-  // the request builder appends the per-model suffix (see effort-map.ts) and reasoning models
-  // advertise effort so Codex exposes the tier picker. `supportsReasoningEffort` tracks whether the
-  // model has *selectable effort tiers* (CURSOR_MODEL_EFFORT_TIERS), NOT merely whether it reasons:
-  // gemini/grok/kimi-k2.7/gpt-5-mini are reasoning models in the SOT but are sent bare (no tier picker).
   ...CURSOR_ROUTER_MODEL_IDS.map(id => ({ id, contextWindow: CONTEXT_200K, supportsReasoningEffort: false })),
-
-  { id: "claude-sonnet-5", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  { id: "claude-4-sonnet", contextWindow: CONTEXT_200K },
-  { id: "claude-4-sonnet-1m", contextWindow: CONTEXT_1M },
-  { id: "claude-4.5-haiku", contextWindow: CONTEXT_200K },
-  { id: "claude-4.5-sonnet", contextWindow: CONTEXT_200K },
-  { id: "claude-4.5-opus", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  { id: "claude-4.6-opus", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  { id: "claude-4.6-sonnet", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  { id: "claude-opus-4-7", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  // opus-4-7-fast: effort-suffix tiers unverified -> no tier picker; sent bare like live-only ids.
-  { id: "claude-opus-4-7-fast", contextWindow: CONTEXT_200K },
-  { id: "claude-opus-4-8", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  { id: "claude-opus-5", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  { id: "claude-fable-5", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-
-  { id: "composer-1", contextWindow: CONTEXT_200K },
-  { id: "composer-2.5", contextWindow: CONTEXT_200K },
-  { id: "composer-2.5-fast", contextWindow: CONTEXT_200K },
-
-  { id: "gemini-2.5-flash", contextWindow: CONTEXT_GEMINI },
-  { id: "gemini-3-flash", contextWindow: CONTEXT_GEMINI },
-  { id: "gemini-3-pro", contextWindow: CONTEXT_GEMINI },
-  { id: "gemini-3-pro-image-preview", contextWindow: CONTEXT_200K },
-  { id: "gemini-3.1-pro", contextWindow: CONTEXT_GEMINI },
-  { id: "gemini-3.5-flash", contextWindow: CONTEXT_200K },
-
-  { id: "gpt-5-codex", contextWindow: CONTEXT_272K },
-  { id: "gpt-5-fast", contextWindow: CONTEXT_272K },
-  { id: "gpt-5-mini", contextWindow: CONTEXT_272K },
-  { id: "gpt-5.1", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.1-codex", contextWindow: CONTEXT_272K },
-  { id: "gpt-5.1-codex-max", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.1-codex-mini", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.2", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.2-codex", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.3-codex", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.4", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.4-mini", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.4-nano", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  { id: "gpt-5.5", contextWindow: CONTEXT_272K, supportsReasoningEffort: true },
-  // gpt-5.5-extra: absent from cursor.com docs but SURVIVES the live GetUsableModels filter
-  // (account-verified 260709, devlog/model_update/260709_model_refresh/004_live_snapshot.md).
-  { id: "gpt-5.5-extra", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
-  { id: "gpt-5.6-sol", contextWindow: CONTEXT_1M, supportsReasoningEffort: true },
-  { id: "gpt-5.6-terra", contextWindow: CONTEXT_1M, supportsReasoningEffort: true },
-  { id: "gpt-5.6-luna", contextWindow: CONTEXT_1M, supportsReasoningEffort: true },
-
-  // 260709 refresh: stale grok/composer/kimi/gpt ids dropped per current cursor.com docs; the
-  // 260709 note: grok-4.5 was deferred; confirmed live 260708 (cursor.com/models, xAI launch).
-
-  // Conflict resolution (260709): keep the refreshed 1M context + kimi-k2.7-code from de12fc8,
-  // take PR #73's supportsReasoningEffort for glm-5.2 (its effort-map tiers landed with the PR).
-  { id: "glm-5.2", contextWindow: CONTEXT_1M, supportsReasoningEffort: true },
-  // 260814 preemptive: glm-5.3 seeded ahead of Cursor's lineup update (mirrors glm-5.2).
-  { id: "glm-5.3", contextWindow: CONTEXT_1M, supportsReasoningEffort: true },
-  { id: "kimi-k2.7-code", contextWindow: CONTEXT_262K },
-  // kimi-k3: cursor.com/docs/models/kimi-k3; account-verified via GetUsableModels (2026-07-28) —
-  // ships only as effort-suffixed kimi-k3-{low,high,max}, so the tier picker is exposed.
-  { id: "kimi-k3", contextWindow: CONTEXT_262K, supportsReasoningEffort: true },
-
-  { id: "grok-4.5", contextWindow: 500_000, supportsReasoningEffort: true },
-  { id: "grok-4.5-fast", contextWindow: 500_000, supportsReasoningEffort: true },
-  // 260813 preemptive: grok-4.6 seeded ahead of Cursor's lineup update (mirrors grok-4.5).
-  { id: "grok-4.6", contextWindow: 500_000, supportsReasoningEffort: true },
-  { id: "grok-4.6-fast", contextWindow: 500_000, supportsReasoningEffort: true },
+  ...cursorUmbrellaRows().map(row => ({
+    id: row.id,
+    contextWindow: row.window,
+    supportsReasoningEffort: row.efforts.length > 0,
+  })),
+  ...CURSOR_PRODUCT_MODELS,
+  ...CURSOR_REAL_ID_EXCEPTIONS,
 ]);
+
+/**
+ * Picker labels for providers.cursor.modelDisplayNames.
+ *
+ * Only labels that carry Cursor's own product name ("Cursor Grok 4.6") are published. Every
+ * other row keeps the routed `cursor/<id>` slug that the rest of the picker uses, so a Cursor
+ * row reads like its siblings from other providers instead of an unprefixed marketing name.
+ * #3222 labeled every row and that dropped the `cursor/` prefix from the picker.
+ */
+export function cursorModelDisplayNames(): Record<string, string> {
+  const labels: (readonly [string, string])[] = [
+    ...CURSOR_ROUTER_MODEL_IDS.map(id => [id, CURSOR_ROUTER_DISPLAY_NAMES[id] ?? id] as const),
+    ...cursorUmbrellaRows().map(row => [row.id, row.displayName] as const),
+    ...CURSOR_PRODUCT_MODELS.map(model => [model.id, model.displayName] as const),
+    ...CURSOR_REAL_ID_EXCEPTIONS.map(model => [model.id, model.displayName] as const),
+  ];
+  return Object.fromEntries(labels.filter(([, label]) => isCursorBrandedLabel(label)));
+}
+
+/** A label Cursor itself brands with its name, e.g. "Cursor Grok 4.6". */
+export function isCursorBrandedLabel(label: string): boolean {
+  return /^cursor\b/i.test(label.trim());
+}
 
 export function cursorModelIds(models: readonly CursorModelInfo[] = CURSOR_STATIC_MODELS): string[] {
   return normalizeCursorModels(models).map(model => model.id);

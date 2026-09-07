@@ -18,6 +18,10 @@ archaeology, debugging, or source research.
 | [`06_docs-and-release.md`](06_docs-and-release.md) | Public docs site, GitHub Pages, the workflow map, branch and devlog policy, README ownership, release flow. |
 | [`07_design-methodology.md`](07_design-methodology.md) | Design process discipline for new GUI, CLI, and user-facing surfaces. |
 | [`08_openai-provider-tiers.md`](08_openai-provider-tiers.md) | OpenAI Pool/Direct account-mode and API credential/routing invariants. |
+| [`09_client-integrations.md`](09_client-integrations.md) | Third-party client config ownership, state classification, snapshots, refresh, disable, and restore. |
+| [`09_compatibility-lab.md`](09_compatibility-lab.md) | Optional Compatibility Lab evidence, automation, and core-runtime isolation. |
+| [`10_adapter-registry.md`](10_adapter-registry.md) | Adapter construction authority and registry-derived contract inheritance. |
+| [`11_compatibility-contracts.md`](11_compatibility-contracts.md) | Versioned provider compatibility claims and fixture-evidence boundaries. |
 
 ## Product boundary
 
@@ -80,7 +84,7 @@ opencodex state root does not undo those writes. Putting native Codex back is th
 | `~/.opencodex/ocx.pid`, `runtime-port.json`, `system-env-port` | opencodex runtime | Live process identity and the port a client should reach; rewritten on start. `runtime-port.json` also carries the protected per-process listener-attestation key used before CLI diagnostics attach a management bearer. |
 | `~/.opencodex/codex-runtime.json`, `codex-runtime-clamp.json` | opencodex Codex runtime | Selected Codex executable/version state and effort-clamp diagnostics. Not process identity: these persist a resolved choice and a diagnostic, so losing them changes behavior until re-resolved. |
 | `~/.opencodex/service-state.json`, `service.log`, `service-api-token`, `opencodex-service-launcher.vbs`, `opencodex-service-task.xml`, `opencodex-service.cmd`, `winsw`, `tray-state.json`, `tray-heartbeat.json`, `opencodex-tray.ps1`, `opencodex-tray-*.ico`, `update-job.json` | opencodex operators | Installed-service, Windows tray, and self-update artifacts and bookkeeping. The update record carries its worker PID so a dead worker recovers instead of blocking later runs. |
-| `~/.opencodex/responses-state.json`, `usage-debug.jsonl`, `crash.log`, `artifacts/` | opencodex diagnostics and artifacts | Bounded caches, diagnostics, and generated image/video artifacts served locally. |
+| `~/.opencodex/responses-state.json`, `responses-state-spill/`, `usage-debug.jsonl`, `crash.log`, `artifacts/` | opencodex diagnostics and artifacts | Bounded caches, diagnostics, and generated image/video artifacts served locally. The spill directory holds continuation state demoted out of the in-memory cap and is bounded in aggregate, not only per file. |
 | `~/.opencodex/codex-shim.json`, `*.lock`, `kimi-device-id`, `mimo-client-id`, `.star-prompted` | opencodex bookkeeping | Shim restore obligations, cross-process locks, per-install client identifiers, one-shot UI flags. |
 | `~/.opencodex/.opencodex-owner.json`, `.opencodex-uninstall.json` | opencodex | Ownership marker and the manifest that bounds what uninstall may remove. Both live in the OpenCodex state root, not in `$CODEX_HOME`. |
 | `$CODEX_HOME/config.toml` | Codex, edited by opencodex | Active provider and provider table. |

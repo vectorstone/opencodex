@@ -5,13 +5,13 @@ description: 透過原生 ChatGPT sidecar，讓路由模型獲得真實 web sear
 
 不同路由模型對託管 **Web Search** 和原生**圖像輸入**的支援並不相同。opencodex 透過兩個
 sidecar 補齊這些能力；它們可以使用 ChatGPT 登入（`forward`）provider，也可以使用已儲存的
-Anthropic OAuth provider。Sidecar 錯誤會轉換成長度受限的工具結果或圖像提示，不會讓整個 turn
+Anthropic OAuth provider；web search 還可透過明確的 `xai` backend 使用已儲存的 Grok OAuth。Sidecar 錯誤會轉換成長度受限的工具結果或圖像提示，不會讓整個 turn
 失敗。
 
 :::note[自動選擇後端]
-顯式 `backend` 設定優先。省略時，如果已啟用 Anthropic OAuth provider 的活動帳號未標記
-`needsReauth`，則使用 `anthropic`；否則使用 `openai`。顯式選擇 `anthropic` 但沒有可用憑證時
-會關閉失敗。`openai` 同時需要 ChatGPT 登入和已啟用的 `forward` provider。
+明確的 `backend` 設定優先。Web search 省略時一律使用 `openai`；Vision 有可用 Anthropic
+OAuth 帳號時使用 `anthropic`，否則使用 `openai`。明確選擇 `anthropic` 或 `xai` 但沒有可用憑證時
+會關閉失敗且不回退。`openai` 同時需要 ChatGPT 登入和已啟用的 `forward` provider。
 :::
 
 ## Web-search sidecar
@@ -22,7 +22,8 @@ Anthropic OAuth provider。Sidecar 錯誤會轉換成長度受限的工具結果
    `web_search(query)` function 工具。原託管工具的選項會保留並用於 sidecar 呼叫。
 2. 讓路由模型在一個小型 **agentic 迴圈**中執行。模型呼叫 `web_search` 時，opencodex 使用所選
    後端：OpenAI 預設以 `gpt-5.6-luna` 執行託管 `web_search`；Anthropic 預設以
-   `claude-sonnet-5` 執行 `web_search_20250305`。Streaming 答案及引用會解析為工具結果。
+   `claude-sonnet-5` 執行 `web_search_20250305`。xAI 預設以 `grok-4.6` 執行託管 `web_search`，
+   並在 `xSearch.enabled` 為 true 時將 `x_search` 加入同一請求。Streaming 答案及引用會解析為工具結果。
 3. **迴圈**直到模型回答，或真實查詢總數達到 `maxSearchesPerTurn`（預設 3）。達到上限後會移除
    search 工具並強制生成最終答案。如果模型呼叫 `apply_patch` 或 shell 等真實用戶端工具，目前
    turn 會結束，以便這些呼叫到達 Codex。
@@ -63,10 +64,13 @@ Anthropic OAuth provider。Sidecar 錯誤會轉換成長度受限的工具結果
 
 ## Vision sidecar
 
-當路由模型列在其 provider 的 `noVisionModels` 中，並且請求包含圖像時，opencodex 會在主呼叫
-**之前**描述每張圖像，並用文字替換圖像。Dashboard 和管理 API 目前顯示的預設值是
+當路由模型列在其 provider 的 `noVisionModels` 中，或該模型在 `modelInputModalities` 中被宣告為僅文字，
+且請求包含圖像時，只要有可用的 vision sidecar plan，opencodex 就會在主呼叫**之前**描述每張圖像並用文字替換圖像。
+若沒有可用 plan，原始圖像會被移除，不會繼續轉送給純文字後端。模型目錄會為每個由 sidecar 處理的模型宣告圖像輸入。
+只有當每個 combo 成員都能原生或透過 sidecar 接受圖像，且 combo 的 `imageInput` 設定未停用時，combo 才會宣告圖像輸入；
+如此 Codex 應用程式等用戶端會允許附件，而不會在 sidecar 執行前阻擋它們。Dashboard 和管理 API 目前顯示的預設值是
 `gpt-5.6-luna`，啟動時也會把明確儲存的舊 `gpt-5.4-mini` 值遷移到 Luna。只有在
-`visionSidecar.model` 欄位完全不存在時，vision 執行路徑才會使用程式碼中的 `gpt-5.4-mini` 回退值。
+`visionSidecar.model` 欄位不存在或為空字串時，vision 執行路徑才會使用程式碼中的 `gpt-5.4-mini` 回退值。
 
 - 圖像可以來自 user、developer 和 tool-result message，也包括 Codex 的 `view_image` 結果。
 - 每張圖像會以 `reasoning.effort: "low"` 傳送給設定的原生 vision 模型，描述結果會就地替換
@@ -79,8 +83,8 @@ Anthropic OAuth provider。Sidecar 錯誤會轉換成長度受限的工具結果
   而不是代理。
 - `noVisionModels` 匹配會忽略 Ollama 風格的 `:size` 字尾，因此一個 `gpt-oss` 條目也能覆蓋
   `gpt-oss:120b`。
-- 如果描述失敗，模型會收到簡短的處理錯誤提示。若根本無法建立 sidecar plan，原始圖像會被
-  移除，而不會繼續轉發給純文字後端。
+- 如果描述失敗，模型會收到簡短的處理錯誤提示。（如果沒有可用的 sidecar plan，就不會嘗試描述，
+  原始圖像會依上文所述被移除。）
 - `maxDescriptionsPerTurn`（預設 8）限制每個主模型 turn 的新增描述次數。快取命中和同一 turn
   的重複請求不會消耗配額。成功的 `data:` 圖像描述會按後端、模型、detail、圖像位元組和訊息上下文
   快取；內容可變的 `https:` 圖像不會快取。
@@ -103,7 +107,6 @@ Anthropic OAuth provider。Sidecar 錯誤會轉換成長度受限的工具結果
 {
   "providers": {
     "ollama-cloud": {
-      "adapter": "openai-chat",
       "baseUrl": "https://ollama.com/v1",
       "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
     }

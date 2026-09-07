@@ -48,6 +48,21 @@ function hasExactShellCommand(run: string | undefined, expected: string): boolea
     .includes(expected);
 }
 
+/**
+ * Same intent as {@link hasExactShellCommand}, but for a command that is the HEAD of a
+ * pipeline. The retry loops capture the suite with `… 2>&1 | tee "$suite_log"`, so an exact
+ * whole-line match would reject the very shape the retry requires. Anchoring at the start of
+ * the line still rejects an `echo` of the command or a commented-out copy, which is what the
+ * exact match was protecting against.
+ */
+function hasShellCommandHead(run: string | undefined, expected: string): boolean {
+  return (run ?? "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0 && !line.startsWith("#"))
+    .some(line => line === expected || line.startsWith(`${expected} `));
+}
+
 function expectSecureLinuxKeyringBootstrap(workflow: string): void {
   const smokeStep = workflow
     .split("- name: OS keyring create/read/delete smoke")[1]
@@ -86,7 +101,9 @@ describe("GitHub Actions hardening", () => {
     expect(ci.jobs?.test?.["timeout-minutes"]).toBe(15);
     expect(ci.jobs?.gates?.["timeout-minutes"]).toBe(15);
     expect(ci.jobs?.["platform-macos"]?.["timeout-minutes"]).toBe(30);
-    expect(ci.jobs?.["platform-windows"]?.["timeout-minutes"]).toBe(15);
+    // Higher than the Linux shards on purpose: at 15 the Windows leg cancelled a
+    // shard mid-suite, which reports as neither pass nor fail (#2152).
+    expect(ci.jobs?.["platform-windows"]?.["timeout-minutes"]).toBe(25);
     expect(ci.jobs?.["keyring-smoke"]?.["timeout-minutes"]).toBe(8);
     expect(ci.jobs?.["npm-global-smoke"]?.["timeout-minutes"]).toBe(8);
     expect(ci.jobs?.ci?.["timeout-minutes"]).toBe(5);
@@ -116,7 +133,13 @@ describe("GitHub Actions hardening", () => {
       expect(`${name}:${typeof job?.["timeout-minutes"]}`).toBe(`${name}:number`);
     }
     expect(workflow).toContain("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
-    expect(workflow).toContain("oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6");
+    // Bun setup moved into .github/actions/setup-project-bun so the runtime
+    // version has a single source (package.json). The SHA pin still has to
+    // exist — it just lives in the composite action now, and this workflow
+    // must reference that local action rather than a third-party one.
+    expect(workflow).toContain("./.github/actions/setup-project-bun");
+    expect(await readText(".github/actions/setup-project-bun/action.yml"))
+      .toContain("oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6");
     expect(workflow).toContain("actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e");
     expect(workflow).toContain("bun test --isolate tests");
     expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
@@ -128,6 +151,20 @@ describe("GitHub Actions hardening", () => {
       ?.strategy?.matrix?.shard ?? [];
     expect(linuxShards).toEqual([1, 2, 3, 4]);
     expect(workflow).toContain(`--shard=\${{ matrix.shard }}/${linuxShards.length}`);
+
+    // Every job that runs tests/ must fetch tags, because one of those tests reads
+    // them. tests/release-version-line.test.ts compares package.json against the
+    // newest release tag, and actions/checkout brings no tags by default: git is
+    // present, `git tag --list` exits 0, and stdout is empty. The check then has an
+    // empty set, cannot fail, and a version regression rides through green. That is
+    // how the first cut of that test shipped, so pin the flag rather than trusting a
+    // comment. Asserted per job so a future edit cannot drop it from one leg while
+    // the other still carries it.
+    for (const jobName of ["test", "platform-macos", "platform-windows"]) {
+      const steps = (ci.jobs?.[jobName] as { steps?: Array<{ uses?: string; with?: Record<string, unknown> }> })?.steps ?? [];
+      const checkout = steps.find(step => typeof step.uses === "string" && step.uses.includes("actions/checkout"));
+      expect(`${jobName}:${String(checkout?.with?.["fetch-tags"])}`).toBe(`${jobName}:true`);
+    }
 
     // Windows uses the same shard matrix after the single-leg isolate budget was
     // replaced. Keep the two matrices equal so a future edit cannot reintroduce
@@ -144,8 +181,9 @@ describe("GitHub Actions hardening", () => {
     // keys closes all three — a hardcoded list rots on the next job added.
     const gate = ci.jobs?.ci as { if?: unknown; needs?: string[] } | undefined;
     expect(gate?.if).toBe("always()");
+    const ungated = new Set(["ci"]);
     expect([...(gate?.needs ?? [])].sort())
-      .toEqual(Object.keys(ci.jobs ?? {}).filter(name => name !== "ci").sort());
+      .toEqual(Object.keys(ci.jobs ?? {}).filter(name => !ungated.has(name)).sort());
 
     // The focused doctor contract config is ADDITIVE evidence. It must never
     // replace the repository-wide strict typecheck: doing so made the aggregate
@@ -224,16 +262,51 @@ describe("GitHub Actions hardening", () => {
     // Three composed-acceptance failures were that default firing on tests still working
     // at 41s. Pin the flag so the leg cannot silently drift back to the default.
     const windowsTestCommand = `bun test --isolate --timeout 60000 tests --shard=\${{ matrix.shard }}/${windowsShards.length}`;
-    expect(hasExactShellCommand(`echo ${windowsTestCommand}`, windowsTestCommand)).toBe(false);
+    expect(hasShellCommandHead(`echo ${windowsTestCommand}`, windowsTestCommand)).toBe(false);
     // Binding the assertion to an executable line is only half the guarantee: a
     // step carrying the exact command still runs nothing under `if: false`, and
     // the suite would stay green against a Windows leg that never tests. Require
     // the matching step to be unconditional.
-    const windowsTestSteps = winSteps.filter(step => hasExactShellCommand(step.run, windowsTestCommand));
+    const windowsTestSteps = winSteps.filter(step => hasShellCommandHead(step.run, windowsTestCommand));
     expect(windowsTestSteps.length).toBeGreaterThan(0);
     expect(windowsTestSteps.every(step => step.if === undefined)).toBe(true);
     expect(winSteps.some(step => step.if === "runner.environment == 'self-hosted'"
       && step.run?.includes("git clean -xffd"))).toBe(true);
+
+    // The three crash-signature lists must stay identical, and they must not key on
+    // `panic(thread`.
+    //
+    // Bun emits BOTH `panic(thread 2852)` and `panic(main thread)` for the same class of
+    // failure, so a grep anchored on the numbered form silently misses half of them and the
+    // shard fails on a crash it was supposed to retry. This repository already learned that
+    // once — `devlog/_fin/260731_pr_issue_triage_round/050_windows_ci_flake_rca.md` names
+    // `Internal assertion failure` as the stable fingerprint — and #2152 reintroduced it.
+    // Three copies of one list is the real hazard, so pin the sync rather than the text.
+    const crashSignatures = [
+      "oh no: Bun has crashed",
+      "Internal assertion failure",
+      "Segmentation fault at address",
+      "Illegal instruction",
+      "Bus error",
+    ];
+    const windowsTestRun = windowsTestSteps[0]?.run ?? "";
+    const batchScript = await readText("scripts/ci/run-bun-test-batches.sh");
+    for (const signature of crashSignatures) {
+      expect(`macos:${signature}:${macosTestRun.includes(signature)}`).toBe(`macos:${signature}:true`);
+      expect(`windows:${signature}:${windowsTestRun.includes(signature)}`).toBe(`windows:${signature}:true`);
+      expect(`script:${signature}:${batchScript.includes(signature)}`).toBe(`script:${signature}:true`);
+    }
+    // The thread-numbered form must not be the anchor anywhere.
+    expect(macosTestRun).not.toContain("panic\\(thread");
+    expect(windowsTestRun).not.toContain("panic\\(thread");
+    expect(batchScript).not.toContain("panic\\(thread");
+
+    // Windows carries the same bounded retry as macOS: one attempt, crash-only.
+    expect(hasExactShellCommand(windowsTestRun, "set +e")).toBe(true);
+    expect(windowsTestRun).toContain("for attempt in 1 2");
+    expect(windowsTestRun).not.toContain("while true");
+    expect(windowsTestRun).toContain("assertion failures are not retried");
+    expect(windowsTestRun).toContain("failing after one retry");
 
     // Every job that runs the root suite must build the GUI first, unconditionally.
     // Tests that fetch the served dashboard read their session bootstrap out of
@@ -328,7 +401,8 @@ describe("GitHub Actions hardening", () => {
       };
       jobs?: Record<string, Record<string, unknown> | undefined>;
     };
-    expect([...(ci.on?.push?.branches ?? [])].sort()).toEqual(["dev", "main", "preview"]);
+    expect([...(ci.on?.push?.branches ?? [])].sort())
+      .toEqual(["dev", "main", "preview"]);
 
     // The PR trigger must carry NO base-branch filter, and the two triggers
     // differ on purpose. GitHub matches `branches:` against the BASE ref, so
@@ -648,7 +722,11 @@ describe("GitHub Actions hardening", () => {
 
     // Immutable action references.
     expect(workflow).toContain("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
-    expect(workflow).toContain("oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6");
+    // Same move as the CI workflow: the pinned setup-bun reference now lives in
+    // the shared composite action.
+    expect(workflow).toContain("./.github/actions/setup-project-bun");
+    expect(await readText(".github/actions/setup-project-bun/action.yml"))
+      .toContain("oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6");
     expect(workflow).toContain("actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e");
     expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
 
@@ -823,6 +901,8 @@ describe("GitHub Actions hardening", () => {
     "require",
     "require",
     "require",
+    // pr-referenced-authors.cjs, for the carry-attribution assessor.
+    "require",
   ] as const;
 
   /** Reads every allowed-base PR performs before any enforcement writes. */
@@ -837,6 +917,9 @@ describe("GitHub Actions hardening", () => {
       "pulls.get",
       "pulls.listFiles",
       "pulls.get",
+      // The carry-attribution assessor reads the branch's commit messages: a
+      // Co-authored-by trailer can live in a commit rather than the body.
+      "pulls.listCommits",
       ...tail,
     ];
   }
@@ -852,6 +935,7 @@ describe("GitHub Actions hardening", () => {
       "pulls.get",
       "pulls.listFiles",
       "pulls.get",
+      "pulls.listCommits",
       ...tail,
     ];
   }
@@ -872,6 +956,8 @@ describe("GitHub Actions hardening", () => {
       "pulls.listFiles",
       "pulls.listFiles",
       "pulls.get",
+      "pulls.listCommits",
+      "pulls.listCommits",
       ...tail,
     ];
   }
@@ -1265,7 +1351,9 @@ describe("GitHub Actions hardening", () => {
           name !== "github.rest.repos.listPullRequestsAssociatedWithCommit" &&
           name !== "github.rest.issues.listEvents" &&
           // Hygiene reassessment reads the changed-file list; not a write.
-          name !== "github.rest.pulls.listFiles",
+          name !== "github.rest.pulls.listFiles" &&
+          // Carry attribution reads the branch's commit messages; not a write.
+          name !== "github.rest.pulls.listCommits",
       );
     expect([...new Set(restWrites)].sort()).toEqual([
       "github.rest.issues.addLabels",
@@ -5096,5 +5184,90 @@ describe("lint-gui-if-changed", () => {
     });
     expect(run.exitCode).toBe(0);
     expect(run.stdout.toString()).toContain("lint:gui: skip");
+  });
+});
+
+describe("gui exhaustive-deps suppression stays scoped and effective", () => {
+  // `bun run doctor:gui` exited 1 on dev for one deliberate exception at
+  // gui/src/pages/Models.tsx, and doctor:gui runs inside `prepush`, so every
+  // gui-touching push needed --no-verify. Two config edits fixed it, and each has a
+  // failure mode that is silent rather than loud, which is what these assertions cover.
+
+  test("the oxlint override carries its own react plugin, or it resolves to nothing", async () => {
+    const oxlintrc = JSON.parse(await readText("gui/.oxlintrc.json")) as {
+      overrides?: Array<{ files?: string[]; rules?: Record<string, unknown>; plugins?: string[] }>;
+    };
+    const overrides = oxlintrc.overrides ?? [];
+    const scoped = overrides.filter(entry => (entry.files ?? []).includes("src/pages/Models.tsx"));
+
+    expect(scoped).toHaveLength(1);
+    const override = scoped[0]!;
+
+    // Rule id must match the style the rest of this config uses ("react/..."). The
+    // eslint-style "react-hooks/..." id silently matches nothing here.
+    expect(override.rules?.["react/exhaustive-deps"]).toBe("off");
+    expect(override.rules).not.toHaveProperty("react-hooks/exhaustive-deps");
+
+    // Without a per-override plugins key the override is inert: the rule stays on and
+    // the warning comes back. This is the assertion that catches a well-meaning cleanup
+    // that deletes a key looking redundant next to the top-level plugin list.
+    expect(override.plugins).toContain("react");
+
+    // Narrow by construction: the override turns off exactly one rule. rules-of-hooks and
+    // react-compiler must keep firing in that file, and a probe confirmed they do.
+    expect(Object.keys(override.rules ?? {})).toEqual(["react/exhaustive-deps"]);
+  });
+
+  test("react-doctor scopes the ignore to one file instead of going blind everywhere", async () => {
+    const config = JSON.parse(await readText("gui/doctor.config.json")) as {
+      blocking?: string;
+      ignore?: { overrides?: Array<{ files?: string[]; rules?: string[] }> };
+      rules?: Record<string, unknown>;
+    };
+
+    // A global rules entry was tried first and rejected: it silenced the rule repo-wide,
+    // proven by injecting a missing-dep violation into Startup.tsx and watching doctor
+    // report "No issues". ignore.overrides keeps that violation failing.
+    expect(config.rules).not.toHaveProperty("react-doctor/exhaustive-deps");
+    expect(config.rules).not.toHaveProperty("react-hooks/exhaustive-deps");
+
+    const overrides = config.ignore?.overrides ?? [];
+    const scoped = overrides.filter(entry => (entry.files ?? []).includes("src/pages/Models.tsx"));
+    expect(scoped).toHaveLength(1);
+    expect(scoped[0]!.rules).toContain("react-hooks/exhaustive-deps");
+
+    // Every ignore override must name at least one file. An empty or missing files list
+    // would apply the ignore to the whole scan, which is the failure this pair guards.
+    for (const entry of overrides) {
+      expect((entry.files ?? []).length).toBeGreaterThan(0);
+      expect((entry.rules ?? []).length).toBeGreaterThan(0);
+    }
+
+    // blocking must stay at warning; flipping it to error would hide the next finding
+    // instead of this one. scripts/doctor-gui-if-changed.ts documents that contract.
+    expect(config.blocking).toBe("warning");
+  });
+
+  test("the effect keeps the in-file record of why the dep array stays short", async () => {
+    const models = await readText("gui/src/pages/Models.tsx");
+    const effectEnd = models.indexOf("}, [catalogActive, loadShadowCall, loadV2]);");
+    expect(effectEnd).toBeGreaterThan(-1);
+
+    // The reasoning has to sit on the effect, not in a commit message. Read the comment
+    // block immediately above the dep array rather than the whole file, or this passes on
+    // any incidental mention elsewhere.
+    const preceding = models.slice(0, effectEnd).split(/\r?\n/).slice(-8).join("\n");
+    expect(preceding).toContain("PreserveManualMemo");
+    expect(preceding).toContain("five react-compiler");
+
+    // Both suppressions are config-side, so the note must point at the two files a reader
+    // would otherwise have to find by grep.
+    expect(preceding).toContain("gui/.oxlintrc.json");
+    expect(preceding).toContain("gui/doctor.config.json");
+
+    // An in-file react-doctor disable was tried and removed: doctor passes without it, and
+    // react/react-compiler penalises a component merely for carrying suppressions. If one
+    // reappears, the config route has been misunderstood.
+    expect(models).not.toContain("react-doctor-disable-next-line");
   });
 });

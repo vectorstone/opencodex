@@ -90,7 +90,7 @@ Inspectez les requêtes de proxy, l’utilisation, le stockage, la mémoire et l
 | Alias ​​| Ressource équivalente |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json\|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d\|30d\|all>] [--surface <all\|codex\|claude\|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today\|1d\|7d\|30d\|all>] [--surface <all\|codex\|claude\|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
@@ -156,7 +156,7 @@ restent soutenus. Utilisez `ocx claude config <status|set> ...` pour les réglag
 
 ### `ocx opencode [opencode args...]`
 
-Vérifiez que le proxy est actif, puis lancez opencode avec un bloc `provider.opencodex` généré dans la couche d’exécution intégrée d’OpenCode (`OPENCODE_CONFIG_CONTENT`). La configuration intégrée existante est préservée et seul `provider.opencodex` est remplacé pour ce lancement. Les fichiers `opencode.json` globaux ou propres au projet peuvent être lus afin de signaler une substitution existante, mais les fichiers sur disque ne sont jamais modifiés. Les modèles routés apparaissent sous la forme `opencodex/<provider>/<model>`. Un lancement ultérieur de `opencode` sans intermédiaire se comporte exactement comme auparavant.
+Vérifiez que le proxy est actif, puis lancez opencode avec les blocs `provider.opencodex` et `providers.opencodex` générés dans la couche d’exécution intégrée d’OpenCode (`OPENCODE_CONFIG_CONTENT`). La configuration intégrée existante est préservée et seules ces deux clés sont remplacées pour ce lancement. Les fichiers `opencode.json` globaux ou propres au projet peuvent être lus afin de signaler une substitution existante, mais les fichiers sur disque ne sont jamais modifiés. Les modèles routés apparaissent sous la forme `opencodex/<provider>/<model>`. Un lancement ultérieur de `opencode` sans intermédiaire se comporte exactement comme auparavant.
 
 ### `ocx grok <status|exclude|include|set|clear|apply> ...`
 
@@ -164,7 +164,7 @@ Gérez et appliquez la clôture du modèle Grok Build.
 
 ## Exportation de la configuration client
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime>`
 
 Imprimez une configuration client connectée au proxy en cours d'exécution. La commande sérialise le
 bloc fournisseur `opencodex` — URL de base, liste de modèles et référence d’identifiant du client
@@ -175,7 +175,7 @@ les modèles Codex peuvent actuellement voir.
 
 | Option | Actions |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | Requis. Sélectionne le dialecte de configuration client. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime>` | Requis. Sélectionne le dialecte de configuration client. |
 | `--json` | Imprimez le document généré en tant que JSON sur la sortie standard pour les scripts. Il s'agit de JSON même lorsque le format natif du client sélectionné est YAML, TOML ou JSON5. |
 | `--out <path>` | Écrivez le format de configuration natif du client dans `<path>`. Refuse de remplacer un fichier existant. |
 | `--force` | Autoriser `--out` à remplacer un fichier existant. |
@@ -195,13 +195,16 @@ propres valeurs par défaut à ces lignes.
 | Client | Destination canonique | Télécharger le nom du fichier | Var.environnement |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json` (`XDG_CONFIG_HOME` gagne une fois défini) | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | none — le bloc porte le littéral `opencodex-loopback` |
+| `pi` | `~/.pi/agent/models.json` (`PI_CODING_AGENT_DIR` l'emporte une fois défini ; une valeur relative est refusée) | `pi-models.json` | none — le bloc porte le littéral `opencodex-loopback` |
 | `omp` | `~/.omp/agent/models.yml` (`OMP_PROFILE` l'emporte sur `PI_PROFILE`, même lorsqu'il est vide ; les profils nommés utilisent le nom du répertoire `PI_CONFIG_DIR` relatif à la maison et ignorent `PI_CODING_AGENT_DIR`, tandis que le profil par défaut laisse `PI_CODING_AGENT_DIR` gagner) | `omp-models.yaml` | aucun — espace réservé de bouclage |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | aucun — espace réservé de bouclage |
 | `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
 | `dsh` | `$DSH_HOME/settings.yaml` (`~/.dsh/settings.yaml` par défaut) | `settings.yaml` | none — espace réservé pour le porteur de bouclage non secret |
+| `mcode` | `~/.minimax/config.yaml` (`MINIMAX_DATA_DIR`, puis l'ancien `MAVIS_DATA_DIR`, l'emportent une fois définis ; une valeur relative est refusée) | `mcode-config.yaml` | aucun — espace réservé de bouclage |
+| `zcode` | `~/.zcode/v2/config.json` (`ZCODE_DATA_DIR` l'emporte une fois défini ; une valeur relative est refusée) | `config.json` | aucun — espace réservé de bouclage |
+| `prime` | `~/.prime/agent/models.json` (`PRIME_AGENT_CODING_AGENT_DIR` l'emporte une fois défini ; une valeur relative est refusée) | `prime-models.json` | aucun — espace réservé de bouclage |
 
 L'exportation DSH gérée nécessite DSH 0.1.0-rc.6 ou plus récent et ne possède que
 `llm-pi-ai.providers.opencodex`. DSH recharge à chaud ce fournisseur ; le modèle par défaut de l'utilisateur et
@@ -236,13 +239,21 @@ le CLI, l’API, et le GUI utilisent les mêmes octets.
 
 ## Exécution et configuration
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 Gérez les paramètres d'exécution sans tête, le démarrage, la synchronisation, les diagnostics et les mises à jour.
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update` met à jour OpenCodex lui-même. Utilisez cette commande distincte et en lecture seule pour Codex CLI :
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` n’interroge aucun registre de paquets et inspecte, dans des limites strictes, les éléments de provenance du candidat d’installation configuré, notamment l’emplacement expurgé de l’exécutable et les preuves de propriété. Le contexte de confiance du lanceur publié authentifie uniquement cet instantané du candidat, et non l’exécution réussie de Codex. Comme cette commande ponctuelle n’exécute jamais Codex, les candidats issus de l’environnement ou de l’état persistant restent purement informatifs (`managed: false`, normalement `selection_unattested`) et `selectionAttested` reste `false`. La sortie JSON contient `candidateAvailable`, `candidateVersion`, `candidateSource` et `selectionAttested: false`. Une exécution directe via Bun ou depuis les sources ne fournit pas la preuve du lanceur, ignore les candidats issus de l’environnement ou de l’état persistant et peut signaler `candidate_unavailable`. Sous Windows, cette première étape n’effectue aucune E/S de système de fichiers sur les chemins du candidat ou de configuration. Seul un candidat d’environnement absolu capturé par le lanceur de confiance peut recevoir une étiquette lexicale de bundle d’application ou de gestionnaire de versions ; tous les autres candidats Windows échouent de manière fermée. La commande n’exécute ni Codex ni aucun gestionnaire de paquets, ne répare aucun shim, n’écrit ni dans la configuration ni dans le cache, n’arrête aucun processus et n’installe rien. Les candidats intégrés à une application, issus d’un gestionnaire de versions reconnu, autonomes mais non vérifiés, ou associés à un état de shim ambigu sont signalés comme non gérés ou inconnus et ne sont jamais classés comme gérés.
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

@@ -109,7 +109,10 @@ export type CodexHistoryJobOutcome =
   | { readonly kind: "skipped" }
   | { readonly kind: "blocked"; readonly reason: "busy" | "database" | "unsafe-path" | "desired_disabled" | "desired_enabled" }
   | { readonly kind: "failed"; readonly reason: "worker-error" | "worker-died" | "timeout";
-      readonly message: string; readonly historyFailureReason?: CodexHistoryFailureReason };
+      readonly message: string; readonly historyFailureReason?: CodexHistoryFailureReason;
+      /** Specific integrity condition when `historyFailureReason` is `"integrity"`. */
+      readonly historyIntegrityCode?: string;
+      readonly rows?: number; readonly files?: number };
 
 /**
  * Derive the durable history operation from admitted intent.
@@ -174,7 +177,14 @@ function isPlausibleWorkerResult(
         || message.reason === "desired_disabled" || message.reason === "desired_enabled";
     case "error":
       return typeof message.message === "string"
-        && (message.reason === undefined || message.reason === "busy" || message.reason === "permission");
+        && (message.rows === undefined || (Number.isSafeInteger(message.rows) && Number(message.rows) >= 0))
+        && (message.files === undefined || (Number.isSafeInteger(message.files) && Number(message.files) >= 0))
+        && ((message.rows === undefined && message.files === undefined)
+          || (message.rows !== undefined && message.files !== undefined))
+        && (message.reason === undefined
+          || message.reason === "busy"
+          || message.reason === "permission"
+          || message.reason === "integrity");
     default:
       return false;
   }
@@ -224,6 +234,7 @@ export function describeHistoryJobFailure(
     : surface === "recover-legacy"
       ? "the Codex history DB is locked (Codex app/IDE open?). Close it and rerun this command."
       : "the Codex app appears to be holding the history database. Close Codex and run `ocx restore` again.";
+  const busyStateText = "Codex history state is busy (database, backup manifest, or rollout file); this is not enough evidence to blame the Codex app. It is retried automatically while the proxy runs; run 'ocx doctor' before forcing another attempt.";
   if (outcome.kind === "blocked") {
     if (outcome.reason === "busy") return busyText;
     switch (outcome.reason) {
@@ -237,9 +248,28 @@ export function describeHistoryJobFailure(
         return "Codex integration is enabled, so the history operation was skipped.";
     }
   }
-  if (outcome.historyFailureReason === "busy") return busyText;
+  const partiallyChanged = (outcome.rows ?? 0) > 0 || (outcome.files ?? 0) > 0;
+  if (partiallyChanged && outcome.historyFailureReason === "busy") {
+    return "Codex history metadata changed but did not converge because manifest finalization remained busy; the manifest was retained for review and safe retry. Run 'ocx doctor'.";
+  }
+  if (partiallyChanged && outcome.historyFailureReason === "permission") {
+    return "Codex history metadata changed but did not converge because permission was denied while finalizing the manifest; the manifest was retained for review and safe retry. Run 'ocx doctor'.";
+  }
+  if (outcome.historyFailureReason === "busy") return busyStateText;
   if (outcome.historyFailureReason === "permission") {
     return "permission was denied while writing Codex history; this is not a Codex app lock. Run 'ocx doctor'.";
+  }
+  if (outcome.historyFailureReason === "integrity") {
+    // Not every integrity stop is a retry. An ambiguous reroute means two histories
+    // produced the same row and no durable fact separates them, so retrying reaches the
+    // same refusal - the manifest needs a person, and saying "run doctor" sends them the
+    // wrong way.
+    if (outcome.historyIntegrityCode === "history_apply_ambiguous_reroute") {
+      return "a Codex history entry could not be re-routed because its manifest cannot prove whether an earlier relabel was undone; nothing was changed and the manifest was kept. Resolve it manually rather than retrying.";
+    }
+    return partiallyChanged
+      ? "the history backup or its restore target changed after a partial restore; the manifest was retained for review and safe retry. Run 'ocx doctor'."
+      : "the history backup or its restore target failed integrity checks; no unverified provider metadata was applied. Run 'ocx doctor'.";
   }
   switch (outcome.reason) {
     case "worker-error":
@@ -277,11 +307,20 @@ function classifyWorkerResult(result: HistoryWorkerResult): CodexHistoryJobOutco
       reason: "worker-error",
       message: redactWorkerMessage(result.message),
       ...(result.reason ? { historyFailureReason: result.reason } : {}),
+      ...(result.integrityCode ? { historyIntegrityCode: result.integrityCode } : {}),
+      ...(result.rows !== undefined && result.files !== undefined
+        ? { rows: result.rows, files: result.files }
+        : {}),
     };
   }
   return result.outcome === "skipped"
     ? { kind: "skipped" }
     : { kind: "converged", rows: result.rows, files: result.files, ...(result.proof ? { proof: result.proof } : {}) };
+}
+
+/** Test seam for the parent-side Worker result classification contract. */
+export function classifyWorkerResultForTests(result: HistoryWorkerResult): CodexHistoryJobOutcome {
+  return classifyWorkerResult(result);
 }
 
 /**

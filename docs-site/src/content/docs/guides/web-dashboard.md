@@ -53,7 +53,7 @@ the browser or password manager's decision.
 | **Logs** | Auto-refresh recent requests with tokens, requested effort and (when available) effective outbound effort, resolved model, provider, status, request id, duration, and error details. The detail view includes the exact reasoning wire field when the adapter emits one. Filter by opaque conversation/session id (when the client sends one) to total tokens and estimated list-price cost for the currently loaded Logs ring. |
 | **Usage / Debug** | Inspect token-usage coverage and trends, or enable opt-in provider transport and usage-extraction diagnostics. |
 | **Storage** | Read-only CODEX_HOME disk breakdown (sessions, archives, DBs, attachments). Optional archived cleanup: preview the oldest N%, then quarantine to `CODEX_HOME/.trash` (default) or permanently delete behind an explicit checkbox. **Auto-cleanup policy** is opt-in and **default OFF** (`storageCleanupPolicy.enabled`); configure threshold/target/schedule/mode on the Storage page, or trigger **Run now**. Quarantined entries can be restored from the Storage page (JSONL + threads). Active sessions stay read-only. Cleanup and restore are refused while Codex holds the newest/active `state_*.sqlite` locked. |
-| **Stop** | Gracefully stop the proxy and installed background service, restore native Codex, and exit (`POST /api/stop`). |
+| **Stop** | Gracefully stop the proxy and installed background service, restore native Codex, and exit (`POST /api/stop`). On Windows with the Task Scheduler backend the dashboard refuses and asks you to run `ocx stop` instead: that wrapper can respawn the proxy after the task ends, and only a stop running outside this process can verify the restart window before restoring your client config. Nothing is changed when it refuses. |
 
 ### Linking to a section
 
@@ -92,6 +92,10 @@ they have been synchronized. See
 [Sub-agent Surface](/guides/sub-agent-surface/) for the canonical v1/base/v2 behavior.
 :::
 
+## Remote Hub sessions, keys, and usage
+
+The dashboard's management plane is separate from direct client→hub model traffic. **Integrations → API Keys** shows pending rotations, displays a replacement secret only once, and requires explicit commit or abort. Browser logout invalidates only the current remote session. Connected usage is the hub store filtered by the client's `apiKeyId`; disconnected usage is local, with no mirroring.
+
 The spawn override guarantee applies to the **built-in** v2 guidance text. A custom
 `injectionPrompt` replaces that text entirely and must include `{{model}}` and `{{effort}}`
 placeholders (and optionally `{{roster}}`) or those values will not appear in the injected
@@ -109,6 +113,17 @@ Pool mode selects across the main and added Codex accounts; Direct uses only the
 In-flight requests keep their captured credentials, and a 401/403 reauthentication or 429 cooldown
 may clear affinity and rotate to another eligible Pool account. This is separate from `openai-apikey`
 and other providers.
+
+:::caution[Provider-policy responsibility]
+The account pool is a technical account-management, routing, and resilience feature. It does not
+claim that having multiple accounts is itself prohibited; compliance depends on the account setup and
+use pattern. OpenCodex does not endorse using additional accounts to circumvent rate limits, quotas,
+plan limits, or other provider restrictions, or sharing account credentials between people. You are
+responsible for complying with the provider's current terms for every connected account and use
+pattern. Provider restrictions, suspension, or termination are outside OpenCodex's control;
+maintainers do not provide policy advice and cannot resolve provider enforcement. Review
+[OpenAI's current Terms of Use](https://openai.com/policies/terms-of-use/).
+:::
 
 - Manually choosing an account applies immediately: an already-bound thread moves to it on its next
   request, and only requests already in flight keep the account they captured. A manual choice is also
@@ -206,7 +221,7 @@ The GUI is a thin client over the proxy's JSON management API. Useful endpoints 
 | `POST /api/codex-auth/login` · `GET /api/codex-auth/login-status` | Add a pool account through browser login. |
 | `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | Read recent request metadata with optional tail, provider, and exact/class status filters. With `limit`/`offset`, paging walks backward from the newest row (`offset=0` returns the latest page). Response shape: `{ timeZone, total, logs }` where `total` is the filtered row count before pagination. |
 | `GET` / `PUT /api/subagent-models` | Read or set the five featured `spawn_agent` override models. |
-| `POST /api/stop` | Stop the proxy/service, restore native Codex, and exit. |
+| `POST /api/stop` | Stop the proxy/service, restore native Codex, and exit. Refused with `respawnable_service` on the Windows Task Scheduler backend, and with `service_state_unknown` when that state cannot be read; nothing is changed either way. |
 
 :::tip
 Adding **Ollama Cloud** or another catalog provider from the dashboard copies its text-versus-vision

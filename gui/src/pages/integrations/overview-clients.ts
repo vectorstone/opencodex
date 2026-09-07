@@ -17,15 +17,18 @@ import type { VisualIntegrationState } from "./IntegrationStateBadge";
 import {
   FILE_INTEGRATION_CLIENTS,
   type FileIntegrationClientId,
+  type IntegrationJournalRow,
   type IntegrationStatus,
 } from "./integration-api";
 import type { NativeIntegrationClientId, NativeStatus } from "./native-api";
+import { CURSOR_SEEN_WINDOW_MS, type CursorIntegrationStatus } from "./cursor-api";
 
 export type OverviewClientId =
   | "codex"
   | "claude"
   | "claudeDesktop"
   | "grok"
+  | "cursor"
   | FileIntegrationClientId;
 
 /** How far the `/api/keys` read has got, since the count alone cannot say. */
@@ -107,6 +110,8 @@ export interface ClaudeDesktopPayload {
   observedKind?: string;
   applied?: boolean;
   stale?: boolean;
+  drift?: boolean;
+  driftReason?: string | null;
   activeProfile?: boolean | null;
   appliedAt?: string | null;
 }
@@ -129,6 +134,7 @@ export interface OverviewSources {
   claude: ClaudeCodePayload | null;
   claudeDesktop: ClaudeDesktopPayload | null;
   grok: GrokPayload | null;
+  cursor: CursorIntegrationStatus | null;
   native: NativeStatus[] | null;
   nativeSettled: boolean;
 }
@@ -144,9 +150,31 @@ const FILE_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   dsh: "integrations.tab.dsh",
   mcode: "integrations.tab.mcode",
   zcode: "integrations.tab.zcode",
+  prime: "integrations.tab.prime",
+  aside: "integrations.tab.aside",
 };
 
 /** A file client's block is in the file for both `current` and `stale`. */
+/**
+ * Journal operation kinds to their labels.
+ *
+ * Lives here rather than beside the rollback components because a module that
+ * exports both a component and a constant breaks React fast refresh, and both
+ * Integrations surfaces plus their tests need this map.
+ */
+export const JOURNAL_KIND_KEY: Record<IntegrationJournalRow["kind"], TKey> = {
+  apply: "integrations.kind.apply",
+  disable: "integrations.kind.disable",
+  refresh: "integrations.kind.refresh",
+  restore: "integrations.kind.restore",
+  /*
+   * Distinct from `apply` on purpose. This row is the only signal that an
+   * operation replaced a block somebody else wrote, and it sits in the one list
+   * a user reads after a mistake.
+   */
+  overwrite: "integrations.kind.overwrite",
+};
+
 export function isAppliedState(state: VisualIntegrationState): boolean {
   return state === "current" || state === "stale";
 }
@@ -160,7 +188,11 @@ export function isAppliedState(state: VisualIntegrationState): boolean {
  * page's question, so a `protected` status with no injected routing still
  * reads as not applied here.
  */
-function codexRow(payload: CodexRoutingPayload | null): OverviewRow {
+function codexRow(
+  payload: CodexRoutingPayload | null,
+  native: NativeStatus | undefined,
+  nativeSettled: boolean,
+): OverviewRow {
   const base = {
     id: "codex" as const,
     hash: "integrations/codex",
@@ -172,6 +204,15 @@ function codexRow(payload: CodexRoutingPayload | null): OverviewRow {
     detail: null,
     detailVars: null,
   };
+  if (nativeSettled && native) {
+    const mode = native.mode ?? (native.desiredEnabled ? "full" : "off");
+    if (mode === "off") {
+      return { ...base, state: "absent", installed: true, applied: false, toggleOn: false, detailKey: "integrations.detail.codexAbsent" };
+    }
+    if (mode === "catalog-only") {
+      return { ...base, state: "current", installed: true, applied: true, toggleOn: true, detailKey: "integrations.detail.codexCatalogOnly" };
+    }
+  }
   if (!payload) return { ...base, state: "unknown", installed: false, applied: false, detailKey: null };
   // The proxy answering at all means Codex CLI is present: it is the client
   // this product exists for, and there is no separate detection probe.
@@ -304,6 +345,30 @@ function claudeDesktopRow(
     return { ...base, toggle: null, state: "unknown", installed: false, applied: false, detailKey: null };
   }
   const toggleOn = payload.desiredEnabled;
+  // Desired OFF keeps the switch off, but a still-selected gateway is not
+  // "absent": Desktop is still routing through OpenCodex until cleanup lands.
+  if (!toggleOn) {
+    const gatewayStillSelected = payload.applied === true
+      || payload.driftReason === "desired_off_gateway_selected";
+    if (gatewayStillSelected) {
+      return {
+        ...base,
+        state: "stale",
+        installed: payload.installed === true,
+        applied: true,
+        toggleOn: false,
+        detailKey: "integrations.detail.desktopDesiredOffCleanupPending",
+      };
+    }
+    return {
+      ...base,
+      state: "absent",
+      installed: payload.installed === true,
+      applied: false,
+      toggleOn: false,
+      detailKey: "integrations.detail.desktopDesiredOff",
+    };
+  }
   if (payload.applied !== true) {
     return {
       ...base,
@@ -311,7 +376,7 @@ function claudeDesktopRow(
       installed: payload.installed === true,
       applied: false,
       toggleOn,
-      detailKey: toggleOn ? "integrations.detail.desktopDesiredOnNotApplied" : "integrations.detail.desktopDesiredOff",
+      detailKey: "integrations.detail.desktopDesiredOnNotApplied",
     };
   }
   const drifted = payload.stale === true || payload.activeProfile === false;
@@ -384,6 +449,37 @@ function grokRow(
   };
 }
 
+
+/**
+ * Cursor has no switch: its gateway is configured inside Cursor, and this proxy never
+ * writes there. "Applied" therefore means a Cursor client actually called us recently.
+ */
+function cursorRow(payload: CursorIntegrationStatus | null, now = Date.now()): OverviewRow {
+  const base = {
+    id: "cursor" as const,
+    hash: "integrations/cursor",
+    labelKey: "integrations.tab.cursor" as TKey,
+    toggle: null,
+    toggleBlocked: null,
+    togglePath: null,
+    status: null,
+    detail: null,
+    detailVars: null,
+  };
+  if (!payload) return { ...base, state: "unknown", installed: false, applied: false, detailKey: null };
+  if (!payload.privateInference.installed) {
+    return { ...base, state: "not-installed", installed: false, applied: false, detailKey: "integrations.detail.cursorAbsent" };
+  }
+  const seenRecently = payload.lastSeen !== null && now - payload.lastSeen.at < CURSOR_SEEN_WINDOW_MS;
+  return {
+    ...base,
+    state: seenRecently ? "current" : "absent",
+    installed: true,
+    applied: seenRecently,
+    detailKey: seenRecently ? "integrations.detail.cursorSeen" : "integrations.detail.cursorNeverSeen",
+  };
+}
+
 function fileRow(status: IntegrationStatus): OverviewRow {
   return {
     id: status.clientId,
@@ -415,7 +511,7 @@ export function buildOverviewRows(sources: OverviewSources): OverviewRows {
   // One lookup table, not a find per client (react-doctor js-index-maps).
   const statusByClient = new Map(sources.clients.map(status => [status.clientId, status]));
   const rows: OverviewRow[] = [
-    codexRow(sources.codex),
+    codexRow(sources.codex, sources.native?.find(status => status.clientId === "codex"), sources.nativeSettled),
     claudeRow(sources.claude, nativeClaude, sources.nativeSettled),
     claudeDesktopRow(
       sources.claudeDesktop,
@@ -423,6 +519,7 @@ export function buildOverviewRows(sources: OverviewSources): OverviewRows {
       sources.nativeSettled,
     ),
     grokRow(sources.grok, nativeGrok, sources.nativeSettled),
+    cursorRow(sources.cursor),
   ];
   for (const clientId of FILE_INTEGRATION_CLIENTS) {
     const status = statusByClient.get(clientId);

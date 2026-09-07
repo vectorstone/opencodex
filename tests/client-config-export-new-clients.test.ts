@@ -47,8 +47,8 @@ const LOOPBACK: OcxConfig = {
 const REMOTE: OcxConfig = { ...LOOPBACK, hostname: "0.0.0.0" } as OcxConfig;
 
 const MODELS: ExportModel[] = [
-  { namespaced: "anthropic/claude-opus-4-8", provider: "anthropic", id: "claude-opus-4-8", contextWindow: 200_000, displayName: "Claude Opus 4.8" },
-  { namespaced: "gpt-5.5", provider: "openai", id: "gpt-5.5", native: true, contextWindow: 400_000 },
+  { namespaced: "anthropic/claude-opus-4-8", provider: "anthropic", id: "claude-opus-4-8", contextWindow: 200_000, displayName: "Claude Opus 4.8", inputModalities: ["text", "image"] },
+  { namespaced: "gpt-5.5", provider: "openai", id: "gpt-5.5", native: true, contextWindow: 400_000, inputModalities: ["text"] },
   { namespaced: "local/no-window", provider: "local", id: "no-window" },
 ];
 
@@ -58,11 +58,12 @@ function ctx(config: OcxConfig = LOOPBACK): ExportContext {
 
 describe("no secret reaches a client config", () => {
   test("the generated client support policy identifies every loopback-only integration", () => {
-    // Pi, Kimi and Gajae cannot emit the dedicated admission header. OMP can
-    // carry provider headers, but remote credential wiring is deliberately
-    // deferred from this initial generated integration.
+    // Pi, Kimi, Gajae and Aside cannot emit the dedicated admission header --
+    // Aside's observed provider block has four keys and none is `headers`. OMP
+    // and Prime can carry provider headers, but remote credential wiring is
+    // deliberately deferred from those initial generated integrations.
     const loopbackOnly = EXPORT_CLIENT_IDS.filter(id => EXPORT_CLIENTS[id].loopbackOnly);
-    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode"]);
+    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
   });
 
   test("every client that is not loopback-only carries the header on a remote bind", () => {
@@ -96,8 +97,20 @@ describe("hermes", () => {
     expect(block.api_key).toBe(HERMES_API_KEY_ENV_REF);
     expect(block.api_mode).toBe("chat_completions");
     expect(block.discover_models).toBe(false);
-    expect(block.models).toEqual(["anthropic/claude-opus-4-8", "gpt-5.5", "local/no-window"]);
+    expect(block.models).toEqual({
+      "anthropic/claude-opus-4-8": { supports_vision: true },
+      "gpt-5.5": { supports_vision: false },
+      "local/no-window": {},
+    });
     expect(doc).not.toHaveProperty("model");
+  });
+
+  test("capability metadata survives the generated YAML round-trip", () => {
+    const built = buildClientConfigText("hermes", ctx());
+    const parsed = Bun.YAML.parse(built.text) as HermesGeneratedConfig;
+    expect(parsed.providers[OPENCODE_PROVIDER_ID]!.models).toEqual(
+      (built.document as HermesGeneratedConfig).providers[OPENCODE_PROVIDER_ID]!.models,
+    );
   });
 
   test("a non-loopback bind adds the admission header, loopback does not", () => {
@@ -267,9 +280,19 @@ describe("gajae", () => {
 
 describe("contributions name every fragment we own", () => {
   test("single-entry clients own exactly one path", () => {
-    for (const id of ["opencode", "pi", "omp", "hermes", "openclaw", "gajae", "dsh", "mcode", "zcode"] as const) {
+    for (const id of ["pi", "omp", "hermes", "openclaw", "gajae", "dsh", "mcode", "zcode"] as const) {
       expect(buildClientContribution(id, ctx()).fragments).toHaveLength(1);
     }
+  });
+
+  test("opencode owns both provider generations, legacy block first", () => {
+    // opencode V2 reads `providers` and V1 reads `provider`; only the V2 block's variants
+    // are applied, so both have to be written and both have to be ours to keep in sync.
+    // Which generation wins the merge is opencode's call — this pins the paths we own.
+    expect(buildClientContribution("opencode", ctx()).fragments.map(f => f.path)).toEqual([
+      ["provider", OPENCODE_PROVIDER_ID],
+      ["providers", OPENCODE_PROVIDER_ID],
+    ]);
   });
 
   test("kimi owns its provider block AND one entry per emitted model", () => {

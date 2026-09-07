@@ -15,7 +15,7 @@ src/
 ├── server/             # Bun.serve, /v1/* proxy, /api/* management API, WS bridge
 ├── codex/              # Codex config injection, catalog sync, auth/account integration
 ├── providers/          # provider metadata, API-key pool, quota and labels
-├── adapters/           # seven wire adapters, shared guards/utilities, Cursor protobuf transport
+├── adapters/           # wire adapters, shared guards/utilities, Cursor protobuf transport
 ├── oauth/              # OAuth providers, API-key catalog, token store/refresh
 ├── usage/              # request usage extraction, JSONL logs, summaries, totals
 ├── lib/                # runtime, process, retry, privacy, token estimate helpers
@@ -59,7 +59,7 @@ the `server/responses.ts` facade and its `server/responses/*.ts` modules:
 4. Before the main call, `vision/` describes images for models in `noVisionModels`; if no safe
    sidecar path exists, images are removed rather than sent to a text-only upstream.
 5. `server/adapter-resolve.ts` applies any model-specific wire override and constructs one of the
-   seven adapters. Responses passthrough relays the native body, Cursor runs its bidirectional
+   registered adapters. Responses passthrough relays the native body, Cursor runs its bidirectional
    `runTurn` transport, and translated adapters build/fetch/parse an upstream request.
 6. For routed models with a hosted `web_search` tool, `web-search/` exposes a synthetic function,
    executes the real search through the configured backend (the OpenAI/ChatGPT sidecar or Anthropic),
@@ -149,6 +149,12 @@ Bundled Bun 1.3.14, prereleases, and unverifiable runtime identities use HTTP/SS
 upstream WS responses keep the downstream SSE contract and bypass `tee()` through a bounded eager
 single-reader relay (4 MiB per raw/enveloped frame and an 8 MiB producer queue). Queue overflow
 closes the upstream and emits a terminal downstream `response.failed` event followed by `[DONE]`.
+
+When a provider rejects a streaming request with HTTP 413 before SSE begins, OpenCodex emits one
+terminal `response.failed` event with `context_length_exceeded` instead of relaying the retryable
+unknown status. This lets Codex stop its reconnect loop and apply its own context-compaction policy
+on the next turn. OpenCodex does not silently delete prompts or images; reduce the current input or
+retry after compaction. Non-streaming API callers continue to receive the provider's HTTP 413.
 
 Codex context compaction works for routed models. `server/responses/compact.ts` handles
 `POST /v1/responses/compact` by running an internal routed summarization turn and returning compacted

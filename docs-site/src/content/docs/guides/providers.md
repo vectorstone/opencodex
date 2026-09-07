@@ -110,7 +110,7 @@ ocx logout <provider>
 
 | Provider | Adapter | Base URL | Notes |
 | --- | --- | --- | --- |
-| `xai` | `openai-chat` | `https://api.x.ai/v1` | Live-first Grok catalog; `grok-4.5` is the fallback default. |
+| `xai` | `openai-chat` | `https://cli-chat-proxy.grok.com/v1` | OAuth uses the separate Grok CLI subscription gateway. The API-key override uses `https://api.x.ai/v1` and may inject Priority Processing. Live-first Grok catalog; `grok-4.5` is the fallback default. |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | Claude models; live model list fetched from `/v1/models`. |
 | `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi K2.7/K2.6/K2.5 coding models. |
 | `nous` | `openai-chat` | `https://inference-api.nousresearch.com/v1` | Nous Research subscription gateway (same backend Hermes Agent uses). Device-grant login against `portal.nousresearch.com`; the access token is the per-request inference JWT. Mixed paid + `:free` model catalog (`tencent/hy3:free`, `stepfun/step-3.7-flash:free`, ...) discovered live from the signed-in account. Refresh tokens are single-use and rotated on every refresh. |
@@ -128,7 +128,67 @@ cache hit rates, while requests without a key remain keyless. If an opted-in ups
 field, opencodex does not strip it and retry or mutate saved configuration. Other providers remain
 deny-by-default.
 
+A custom `openai-chat` provider can opt in when its upstream documents support for
+`prompt_cache_key`:
+
+```json
+{
+  "providers": {
+    "example-compatible-provider": {
+      "adapter": "openai-chat",
+      "baseUrl": "https://api.example.com/v1",
+      "apiKey": "${EXAMPLE_API_KEY}",
+      "promptCacheKey": true
+    }
+  }
+}
+```
+
+The adapter forwards the key it is given and never invents one. It can still receive a key the
+caller did not send: Claude Messages translation derives one from `metadata.user_id`, or from a
+model/system/tools cohort when the client sends no metadata, because the OpenAI backends report
+`cached_tokens: 0` for every keyless turn. So "forwarded, not fabricated" describes this adapter,
+not the whole request path.
+
+Preserve the rest of the provider configuration when adding the option, then reload or restart
+opencodex. To validate caching, compare the initial cold request with later requests carrying the
+same stable key. Leave the option omitted or set it to `false` for incompatible upstreams, and
+disable or remove it if a strict gateway returns an HTTP 400 unknown-field error.
+
 You can also start OAuth from the [web dashboard](/guides/web-dashboard/).
+
+### Logging in from another browser profile, or another machine
+
+When a login starts, the proxy opens the authorization URL on **its own** machine, using the OS
+default browser — and therefore the default profile. That is the right behavior for a local
+desktop and the wrong one in two common cases: you need a different browser profile (a work
+identity, a second account), or the dashboard is open against a proxy running somewhere else.
+
+Every login surface shows the authorization URL with a copy button, the device code when the
+provider issues one, and a field to paste the redirect URL or authorization code back. So you can
+always finish a login by hand.
+
+To stop the proxy from opening a browser at all, tick **Don't open a browser on the proxy machine**
+beside the login button, or set it permanently:
+
+```json
+{ "oauthOpenBrowser": false }
+```
+
+Absent and `true` both open, so nothing changes for an existing install; only an explicit
+`false` declines. `POST /api/oauth/login` and `POST /api/codex-auth/login` also accept a
+per-request `openBrowser` boolean that overrides the stored setting for that login.
+
+Two cases behave differently, and it is worth knowing which you are in:
+
+- **A different browser profile on the same machine** works with the copied link alone. The
+  loopback callback on `127.0.0.1` still completes the flow.
+- **A browser on a different machine** also needs the paste fallback, because the redirect URI is
+  still `http://127.0.0.1:<port>/callback` on the proxy's host. Finish the login there, then paste
+  the redirect URL (or just the code) back into the dashboard or `ocx account code`.
+
+Device-code providers never open a browser from the proxy in either case: they show a code and a
+verification URL to open wherever you are signed in.
 
 ### Multiple OAuth accounts
 
@@ -188,6 +248,15 @@ headers — see [Adapters](/reference/adapters/)). Pool mode overwrites only aut
 `chatgpt-account-id` to match the selected credential. opencodex does **not** fabricate official
 client identity (for example `originator`, session, or thread headers) when the caller did not send
 them.
+
+For account-switch compatibility diagnosis, enabling provider debug (`ocx debug provider on`) adds
+one `[ocx:codex:affinity]` line per canonical ChatGPT forward response. The line contains header
+presence, coarse size buckets, process-local HMAC equality tags, safe summaries of known top-level
+turn fields, and a count of unknown turn fields. It never includes raw credentials, account ids,
+attestation values, thread/session ids, turn metadata, or request bodies; the tags intentionally
+change after every proxy restart. Use `ocx debug provider logs -f` while
+reproducing the two requests, then run `ocx debug provider off`. This capture is observation-only and
+does not strip metadata, retry a request, switch accounts, reset a thread, or otherwise affect routing.
 
 **Diagnostics and reauth.** Human `ocx status` prints an OAuth health block (redacted account ids,
 no tokens). `ocx doctor` adds an OAuth reliability section with writable-store / single-flight checks
@@ -274,6 +343,8 @@ free-experimentation model.
 | Vultr Serverless Inference | `https://api.vultrinference.com/v1` |
 | Baseten Model APIs | `https://inference.baseten.co/v1` |
 | Command Code | `https://api.commandcode.ai/provider/v1` |
+| Meta Model API | `https://api.meta.ai/v1` |
+| Meta Muse Code (CLI credential) | `https://api.meta.ai/v1` |
 | SambaNova Cloud | `https://api.sambanova.ai/v1` |
 | Nebius Token Factory | `https://api.tokenfactory.nebius.com/v1` |
 | DigitalOcean Serverless Inference | `https://inference.do-ai.run/v1` |
@@ -367,6 +438,49 @@ account-scoped and comes from the authenticated discovery endpoint after login. 
 preset (`commandcode`) uses the active configured Bearer key for chat requests; the OAuth preset
 (`command-code`) uses the stored account bearer for authenticated discovery and chat. Create
 Provider-API keys at [Command Code Studio](https://commandcode.ai/studio/).
+
+**Meta Model API (`meta-model`).** Muse Spark on Meta's own OpenAI-compatible endpoint,
+served over `/v1/responses`. Create a key in
+[the Meta developer console](https://dev.meta.ai/docs/authentication) — Meta calls this
+variable `MODEL_API_KEY`, but opencodex derives the env var from the provider id, so
+export it as **`META_MODEL_API_KEY`** (or paste it during `ocx init`). The account needs a
+payment method before it will serve requests, and every call is metered per token. Two
+models are seeded — `meta-model/muse-spark-1.3` and `meta-model/muse-spark-1.3-contributor`
+— with the vendor's `minimal`/`low`/`medium`/`high`/`xhigh` ladder and a 1M context window.
+Discovery stays off until an authenticated roster is verified, because Meta serves image and
+voice models on the same host.
+
+Two things worth knowing before you pick it. **A Muse Code subscription does not apply
+here:** Meta scopes that credential to the Muse Code CLI and bills any other key
+pay-as-you-go. And the Contributor tier is cheap because Meta trains on your prompts —
+roughly 92% off input, 95% off output, and 99% off cached input — so keep confidential
+material off it. Muse Spark is also reachable through resellers, with a narrower roster:
+`command-code` carries both tiers, while `opencode-go` serves only
+`muse-spark-1.3-contributor`.
+
+**Meta Muse Code (`meta-muse`).** If you already use the Muse Code CLI, this imports the
+API key it stored after `muse login` instead of asking you to provision a second one.
+macOS only — the CLI keeps that key in the macOS Keychain, and no other platform's
+storage has been verified. OpenCodex never launches the CLI: if no credential is present
+it tells you to run `muse login` yourself.
+
+**Read this before enabling it.** Meta scopes that credential to the Muse Code CLI, so
+using it here is an *unsupported* path. Meta does not authorize subscription coverage
+outside its own client, how these calls settle is not observable from the API, and you
+should treat every call as billable against your account. The imported key is copied into
+OpenCodex's auth store (`~/.opencodex/auth.json`, mode 0600) like every other OAuth
+credential. The dashboard shows a Terms-of-Service warning before the first login and
+before any reauthentication — the same treatment Anthropic and Google Antigravity get.
+
+Meta reports subscription window usage inside streaming responses, and OpenCodex reads it
+from there. The account row shows the last observed 5-hour and weekly windows with how old
+that reading is — Meta publishes no endpoint to query them on demand, so a value is only
+refreshed by another streaming turn through this provider, and a turn that goes through
+request translation rather than passthrough reports none. An account that has not yet
+served a streaming turn simply shows no quota, which is not an error. Rate limits apply
+per team, not per key.
+
+For a supported setup, use `meta-model` above with your own key.
 
 **Command Code quota.** The dashboard and `ocx account refresh` probe Command Code's
 `/alpha/billing/credits` windows (5-hour and weekly) on the canonical
@@ -533,13 +647,21 @@ Cursor is still not shown in key-login lists.
 
 ### Ollama Cloud
 
-Ollama Cloud is a hosted (not local) Ollama, OpenAI-compatible at `https://ollama.com/v1` with a key
-from [ollama.com/settings/keys](https://ollama.com/settings/keys). opencodex classifies its cloud
+Ollama Cloud is a hosted (not local) Ollama. Configure it at `https://ollama.com/v1` with a key
+from [ollama.com/settings/keys](https://ollama.com/settings/keys). opencodex reaches it over
+Ollama's own REST API (`POST /api/chat`) rather than the OpenAI-compatible surface, and discovers
+the live model roster from the provider, so new Ollama Cloud models appear without a config
+change. opencodex classifies its cloud
 lineup by vision capability so the [vision sidecar](/guides/sidecars/) only kicks in for
 text-only models. Text-only models (e.g. `glm-5.2`, `deepseek-v4-pro`, `gpt-oss`, `qwen3-coder`,
 `minimax-m2.x`, `nemotron-3-*`) are listed in `noVisionModels`; vision-native models (e.g.
 `kimi-k2.6`, `minimax-m3`, `gemma4`, `qwen3.5`, `gemini-3-flash-preview`) are not. Matching is
 tolerant of Ollama's `:size` tags, so `gpt-oss` covers `gpt-oss:120b` and `gpt-oss:20b`.
+
+Ollama currently documents structured outputs as unsupported on Ollama Cloud. For canonical
+`ollama-cloud`, opencodex therefore refuses structured-output requests (`text.format`) with a clear
+error instead of silently returning unconstrained prose; local and custom `ollama-native`
+endpoints keep Ollama's native `format` behavior.
 
 ## 4. Local providers
 
@@ -576,3 +698,24 @@ does not follow redirects. The response's rolling, weekly, and monthly `percent`
 already-consumed utilization: rolling maps to the 5-hour bar, while weekly and monthly keep
 their matching bars. OpenCodex does not reconstruct dollar caps from local usage logs, and a
 provider using a non-canonical `baseUrl` is never sent the key for this probe.
+
+**Z.AI GLM Coding Plan quota.** The `zai`, `glm`, `glm-cn`, and `zhipu-bigmodel-coding`
+presets read `GET /api/monitor/usage/quota/limit` and do not follow redirects. The probe
+runs against the region the provider points at:
+`api.z.ai` (bare or `/api/coding/paas/v4`) or `open.bigmodel.cn` (bare,
+`/api/coding/paas/v4`, or the OpenAI Responses endpoint `/api/v1`).
+
+Authentication differs by region: `api.z.ai` takes the key as a Bearer token, while
+`open.bigmodel.cn` expects the key directly in `Authorization` with no scheme prefix and
+rejects a Bearer header. The response's `limits` rows fill the utilization bars:
+`TOKENS_LIMIT` / `CREDIT_LIMIT` rows with `unit` 3 / `number` 5 fill the 5-hour bar and
+`unit` 6 / `number` 1 the weekly bar.
+
+`TIME_LIMIT` rows are **not** model quota and are ignored. They are the shared monthly
+MCP call allowance for Web Search, Web Reader, and Zread, so treating them as a model
+window would let a spent web-search budget read as exhausted model capacity in
+quota-aware account ranking. A plan that reports only `TIME_LIMIT` rows therefore shows
+no quota bars rather than a fabricated one, and windows the plan does not report stay
+absent instead of rendering as 0%.
+
+A provider using a non-canonical `baseUrl` is never sent the key for this probe.

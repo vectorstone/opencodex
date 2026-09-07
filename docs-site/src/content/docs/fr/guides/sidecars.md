@@ -5,13 +5,13 @@ description: Dotez les modèles routés d’une véritable recherche web et donn
 
 Tous les modèles routés ne proposent pas une **recherche web** hébergée ni une **entrée d’image** native. opencodex complète
 ces capacités au moyen de deux services auxiliaires. Chacun peut s’appuyer sur un fournisseur connecté à ChatGPT (`forward`) ou sur un
-fournisseur Anthropic OAuth enregistré. Les erreurs des services auxiliaires sont converties en résultats d’outil limités ou en marqueurs d’image,
+fournisseur Anthropic OAuth enregistré ; la recherche web peut aussi utiliser un OAuth Grok enregistré via le moteur `xai` explicite. Les erreurs des services auxiliaires sont converties en résultats d’outil limités ou en marqueurs d’image,
 au lieu de faire échouer l’intégralité du tour.
 
 :::note[Sélection automatique du moteur]
-Une valeur `backend` explicite est prioritaire. Lorsqu'elle est omise, opencodex utilise `anthropic` si un fournisseur OAuth Anthropic actif
-possède un compte actif qui n'est pas marqué `needsReauth` ; sinon, il utilise `openai`. Une sélection explicite de
-`anthropic` sans ces identifiants échoue de manière sûre. `openai` exige à la fois une connexion ChatGPT et un
+Une valeur `backend` explicite est prioritaire. Sans valeur, la recherche web utilise toujours `openai` ; Vision utilise
+`anthropic` si un compte OAuth Anthropic utilisable existe, sinon `openai`. Une sélection explicite de
+`anthropic` ou `xai` sans identifiants utilisables échoue sans repli. `openai` exige à la fois une connexion ChatGPT et un
 fournisseur `forward` actif.
 :::
 
@@ -24,7 +24,8 @@ Lorsque Codex demande un hébergement `web_search` pour un modèle routé sans p
 2. Exécute le modèle routé dans une petite **boucle d'agent**. Lorsqu'il appelle `web_search`, opencodex utilise le
    moteur du service auxiliaire sélectionné : OpenAI exécute l'outil hébergé `web_search` avec `gpt-5.6-luna` par défaut ;
    Anthropic exécute `web_search_20250305` avec `claude-sonnet-5` par défaut. La réponse en streaming et
-   les citations deviennent le résultat d’un outil.
+   les citations deviennent le résultat d’un outil. xAI exécute `web_search` avec `grok-4.6` par défaut et ajoute
+   `x_search` à la même requête lorsque `xSearch.enabled` vaut true.
 3. **Répète la boucle** jusqu'à ce que le modèle réponde ou que le nombre total de recherches réelles atteigne `maxSearchesPerTurn`
    (par défaut 3), supprime ensuite l'outil de recherche et force une réponse finale. De vrais outils clients tels que
    `apply_patch` ou le shell mettent fin au tour afin que ces appels parviennent à Codex.
@@ -84,9 +85,14 @@ les échecs de génération postérieurs à l'envoi des en-têtes sont transmis 
 
 ## Service auxiliaire de vision
 
-Lorsque le modèle routé est répertorié dans le `noVisionModels` de son fournisseur et qu'une requête porte une image,
-opencodex décrit chaque image **avant** l'appel principal et la remplace par du texte. Quand
-si `visionSidecar.model` est absent ou vide, le chemin d'exécution OpenAI, le tableau de bord et l'API de gestion
+Lorsqu'un modèle routé figure dans le `noVisionModels` de son fournisseur — ou est déclaré texte seul pour ce modèle
+via `modelInputModalities` — et qu'une requête porte une image, opencodex décrit chaque image **avant** l'appel principal
+et la remplace par du texte, à condition qu'un plan de sidecar vision soit disponible. Sans plan disponible, l'image brute
+est supprimée au lieu d'être transmise à un backend texte seul. Le catalogue de modèles annonce l'entrée image pour chaque
+modèle couvert par le sidecar. Les combos annoncent l'entrée image seulement lorsque chaque membre accepte les images,
+nativement ou via un sidecar, et que le paramètre `imageInput` du combo n'est pas désactivé, afin que des clients comme
+l'application Codex autorisent les pièces jointes au lieu de les bloquer avant l'exécution du sidecar. Lorsque
+`visionSidecar.model` est absent ou vide, le chemin d'exécution OpenAI, le tableau de bord et l'API de gestion
 utilisent le modèle de repli `gpt-5.4-mini`. Au démarrage, une ancienne valeur `gpt-5.4-mini` explicitement enregistrée
 est toujours migrée vers `gpt-5.6-luna` ; cette migration s'applique à une valeur stockée, et non à l'absence du
 champ du modèle.
@@ -107,8 +113,8 @@ champ du modèle.
   les images distantes `https` sont récupérées par le moteur OpenAI, et non par le proxy.
 - La correspondance `noVisionModels` ignore un suffixe `:size` de style Ollama, donc une entrée `gpt-oss` couvre également
   `gpt-oss:120b`.
-- Si la description échoue, le modèle reçoit un bref marqueur d'erreur de traitement. Si aucun service auxiliaire n'est
-  disponible, l'image brute est supprimée plutôt que transmise à un moteur limité au texte.
+- Si la description échoue, le modèle reçoit un bref marqueur d'erreur de traitement. (Sans plan de sidecar disponible,
+  aucune description n'est tentée : l'image brute est supprimée comme indiqué ci-dessus.)
 - `maxDescriptionsPerTurn` (8 par défaut) limite les nouvelles descriptions par tour du modèle principal. Les résultats du cache et
   les doublons au même tour ne le consomment pas. Les descriptions d'images `data:` réussies sont mises en cache par
   moteur, modèle, niveau de détail, octets de l'image et contexte du message — ainsi que l'effort de raisonnement dans les
@@ -139,7 +145,6 @@ Un modèle est marqué en texte uniquement par fournisseur :
 {
   "providers": {
     "ollama-cloud": {
-      "adapter": "openai-chat",
       "baseUrl": "https://ollama.com/v1",
       "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
     }

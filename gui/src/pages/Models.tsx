@@ -4,7 +4,7 @@ import type { AppServerStateOutcome } from "../codex-app-server-state";
 import { useCodexRestart } from "../use-codex-restart";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Switch, Notice, EmptyState, Select, Tooltip } from "../ui";
-import { IconChevron, IconBoxes, IconInfo, IconCheck, IconAlert, IconRefresh } from "../icons";
+import { IconChevron, IconBoxes, IconInfo, IconCheck, IconAlert, IconRefresh, IconPencil } from "../icons";
 import { useT } from "../i18n/shared";
 import type { TFn, TKey } from "../i18n/shared";
 import { modelLabel } from "../model-display";
@@ -100,6 +100,29 @@ function parseContextWindowDraft(raw: string): number | null | undefined {
   if (!normalized) return null;
   const value = Number(normalized);
   return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+
+/** #2465 per-provider model-preset view, as `GET /api/model-presets` returns it. */
+interface ModelPresetView {
+  mode: "preset" | "all" | "custom";
+  appliedVersion?: number;
+  availableVersion: number;
+  presetIds: string[];
+  presetCount: number;
+  totalCount: number;
+  fallback?: string;
+}
+interface ModelDiscoveryView {
+  policy: "on" | "off";
+  providers: Record<string, "on" | "off" | "inherit">;
+  recentArrivals: Record<string, Array<{ id: string; at: string; state: string }>>;
+}
+
+interface AliasView {
+  providers: Record<string, string>;
+  models: Record<string, Record<string, { alias: string; source: "user" | "builtin"; stale?: boolean }>>;
+  defaults: { global: boolean; providers: Record<string, boolean> };
 }
 
 export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string; restartEpoch?: number }) {
@@ -225,6 +248,13 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
   const loadPendingRef = useRef(false);
   // multi_agent_v2 / ultra gate. null = endpoint unavailable (older proxy build) -> section hidden.
   const [v2, setV2] = useState<V2Status | null>(null);
+  // #2465: per-provider model-preset state. Keyed by provider so one card's busy state cannot
+  // freeze the others.
+  const [presets, setPresets] = useState<Record<string, ModelPresetView>>({});
+  const [modelDiscovery, setModelDiscovery] = useState<ModelDiscoveryView | null>(null);
+  const [aliases, setAliases] = useState<AliasView>({ providers: {}, models: {}, defaults: { global: false, providers: {} } });
+  const [showAliases, setShowAliases] = useState(false);
+  const [presetBusy, setPresetBusy] = useState<string | null>(null);
   const [v2Loading, setV2Loading] = useState(true);
   const [v2Busy, setV2Busy] = useState(false);
   const [v2Note, setV2Note] = useState("");
@@ -233,12 +263,55 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
   const [showThreadsCustom, setShowThreadsCustom] = useState(false);
   const [v2HelpOpen, setV2HelpOpen] = useState(false);
   const [customModalOpen, setCustomModalOpen] = useState(false);
+
+  const reloadAliases = useCallback(async (signal?: AbortSignal) => {
+    const response = await fetch(`${apiBase}/api/aliases`, { signal });
+    const data = await readJsonIfOk<AliasView>(response);
+    if (data && !signal?.aborted) setAliases(data);
+  }, [apiBase]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void reloadAliases(controller.signal);
+    return () => controller.abort();
+  }, [reloadAliases]);
+
+  const saveProviderAlias = async (provider: string) => {
+    const entered = window.prompt(t("models.aliasPrompt"), aliases.providers[provider] ?? "");
+    if (entered === null) return;
+    const response = await fetch(`${apiBase}/api/providers/${encodeURIComponent(provider)}/alias`, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ alias: entered.trim() || null }),
+    });
+    if (!response.ok) { publishFeedback(false, t("models.aliasConflict")); return; }
+    await reloadAliases();
+    publishFeedback(true, t("models.aliasSaved"));
+  };
+
+  const saveModelAlias = async (provider: string, model: string) => {
+    const current = aliases.models[provider]?.[model]?.alias ?? "";
+    const entered = window.prompt(t("models.modelAliasPrompt"), current);
+    if (entered === null) return;
+    const body = entered.trim() ? { set: { [model]: entered.trim() } } : { remove: [model] };
+    const response = await fetch(`${apiBase}/api/providers/${encodeURIComponent(provider)}/model-aliases`, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!response.ok) { publishFeedback(false, t("models.aliasConflict")); return; }
+    await reloadAliases();
+    publishFeedback(true, t("models.aliasSaved"));
+  };
+
+  const setDefaultAliases = async (enabled: boolean, provider?: string) => {
+    const response = await fetch(`${apiBase}/api/default-aliases`, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled, ...(provider ? { provider } : {}) }),
+    });
+    if (response.ok) await reloadAliases();
+  };
   const [customModalMode, setCustomModalMode] = useState<"add" | "edit">("add");
   const [customModalProvider, setCustomModalProvider] = useState("");
   const [customModalId, setCustomModalId] = useState("");
   const [customFormModelId, setCustomFormModelId] = useState("");
   const [customFormDisplayName, setCustomFormDisplayName] = useState("");
   const [customFormContextWindow, setCustomFormContextWindow] = useState("");
+  const [customFormMaxOutputTokens, setCustomFormMaxOutputTokens] = useState("");
   const [customFormShowCustomCtx, setCustomFormShowCustomCtx] = useState(false);
   const [customFormModalities, setCustomFormModalities] = useState<string[]>(["text"]);
   const [customFormReasoning, setCustomFormReasoning] = useState(false);
@@ -286,8 +359,12 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
   );
   const shadowCallOptions = useMemo(() => {
     const activeNamespaced = new Set(shadowModelOptions.map(option => option.value));
-    return shadowCallModelOptions(models.filter(model => activeNamespaced.has(model.namespaced)), shadowCall?.model);
-  }, [models, shadowCall?.model, shadowModelOptions]);
+    return shadowCallModelOptions(
+      models.filter(model => activeNamespaced.has(model.namespaced)),
+      shadowCall?.model,
+      shadowCall?.sourceModels,
+    );
+  }, [models, shadowCall?.model, shadowCall?.sourceModels, shadowModelOptions]);
 
   const loadShadowCall = useCallback(async () => {
     const bounded = createBoundedFetch(15_000);
@@ -421,6 +498,10 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
     const timeout = window.setTimeout(() => {
       void loadShadowCall();
       void loadV2();
+      // Preset previews belong to the same tab. Loaded once rather than polled: the rules are
+      // shipped code and the catalog poll above already refreshes the rows they describe.
+      void loadPresets();
+      void loadModelDiscovery();
     }, 0);
     // Hidden tab: no timer, no /api/v2 traffic; the make-up tick refreshes on return.
     const stop = startVisibilityPoll(() => {
@@ -430,6 +511,17 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
       window.clearTimeout(timeout);
       stop();
     };
+    // oxlint-disable-next-line react/react-compiler -- existing exhaustive-deps exception is intentional
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadPresets is a plain async loader
+    // like the rest of this file's; a useCallback wrapper trips PreserveManualMemo, and the
+    // effect only ever needs the current closure. Verified 2026-08-27: converting both loaders
+    // to useCallback and completing the dep array turns ONE warning into five react-compiler
+    // errors - two PreserveManualMemo, two Immutability (they are declared ~430 lines below this
+    // effect), and one EffectSetState - so the note above still holds against oxlint 1.78.
+    // Both gates suppress this one rule for this one file by config rather than by comment:
+    // gui/.oxlintrc.json (override) and gui/doctor.config.json (ignore.overrides). An in-file
+    // react-doctor-disable comment was tried and removed - it changed nothing, and
+    // react/react-compiler penalises a component for carrying suppressions at all.
   }, [catalogActive, loadShadowCall, loadV2]);
 
   const groups = useMemo(
@@ -840,6 +932,69 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
     await putV2Setting({ multiAgentMode: mode });
   };
 
+
+  /**
+   * #2465: load the per-provider preset preview. Rules are evaluated server-side against the
+   * CURRENT catalog, so the count shown is the count an apply would produce.
+   */
+  const loadPresets = async () => {
+    try {
+      const bounded = createBoundedFetch(15_000);
+      const r = await fetch(`${apiBase}/api/model-presets`, { signal: bounded.signal });
+      const data = await readJsonIfOk<{ providers?: Record<string, ModelPresetView> }>(r);
+      setPresets(data?.providers ?? {});
+    } catch {
+      // A preset preview is decoration on top of a working Models page; failing to load it must
+      // not take the page down.
+      setPresets({});
+    }
+  };
+
+  const loadModelDiscovery = async () => {
+    try {
+      const r = await fetch(`${apiBase}/api/model-discovery`);
+      setModelDiscovery((await readJsonIfOk<ModelDiscoveryView>(r)) ?? null);
+    } catch { setModelDiscovery(null); }
+  };
+
+  const saveModelDiscovery = async (policy: "on" | "off", provider?: string) => {
+    const r = await fetch(`${apiBase}/api/model-discovery`, {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ policy, provider: provider ?? null }),
+    });
+    await readJsonIfOk(r);
+    await Promise.all([loadModelDiscovery(), load()]);
+  };
+
+  const applyPreset = async (provider: string, mode: "preset" | "all") => {
+    if (presetBusy) return;
+    setPresetBusy(provider);
+    try {
+      const bounded = createBoundedFetch(30_000);
+      const r = await fetch(`${apiBase}/api/model-presets`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider, mode }),
+        signal: bounded.signal,
+      });
+      const res = await readJsonIfOk<{ fallback?: string; selected?: string[] }>(r) ?? {};
+      if (res.fallback === "preset-empty") {
+        // Never silently narrow to nothing: the server kept the previous selection, so say so
+        // rather than showing a success that changed nothing.
+        publishFeedback(false, t("models.presetEmpty", { provider }));
+      } else {
+        publishFeedback(true, mode === "all"
+          ? t("models.presetClearedToast", { provider })
+          : t("models.presetAppliedToast", { provider, count: String(res.selected?.length ?? 0) }));
+      }
+      await Promise.all([loadPresets(), load()]);
+    } catch (error) {
+      publishFeedback(false, error instanceof Error ? error.message : String(error));
+    } finally {
+      setPresetBusy(null);
+    }
+  };
+
   const setKeepNativeChatGptOnV1 = async (next: boolean) => {
     if (!v2 || v2.keepNativeChatGptOnV1 === next) return;
     await putV2Setting({ keepNativeChatGptOnV1: next });
@@ -923,6 +1078,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
     modelId: string,
     displayName?: string,
     contextWindow?: number,
+    maxOutputTokens?: number,
     inputModalities?: string[],
     reasoningEfforts?: string[],
   ) => {
@@ -932,7 +1088,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
       const r = await fetch(`${apiBase}/api/custom-models`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, modelId, displayName, contextWindow, inputModalities, reasoningEfforts }),
+        body: JSON.stringify({ provider, modelId, displayName, contextWindow, maxOutputTokens, inputModalities, reasoningEfforts }),
       });
       try {
         await readJsonOrThrow(r, t("models.customSaveFailed"));
@@ -1019,6 +1175,8 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
       disabled.has(model.namespaced),
     );
     const activeCount = rows.filter(isVisible).length;
+    const recentForProvider = modelDiscovery?.recentArrivals[provider] ?? [];
+    const recentIds = new Set(recentForProvider.map(row => row.id));
     const capOn = contextCaps[provider] !== undefined;
     const providerCap = contextCaps[provider] ?? contextCapValue;
     // With the cap off, `providerCap` is only the value a future toggle would apply — for the
@@ -1070,10 +1228,11 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
             className="row models-provider-toggle"
             onClick={() => toggleCollapse(provider)}
             aria-expanded={!isCollapsed}
-            style={{ flex: 1, border: 0, background: "transparent", padding: 0, color: "inherit", cursor: "pointer", textAlign: "left" }}
+            style={{ flex: "1 1 auto", border: 0, background: "transparent", padding: 0, color: "inherit", cursor: "pointer", textAlign: "left" }}
           >
           <IconChevron style={{ width: 14, height: 14, color: "var(--muted)", transform: isCollapsed ? "none" : "rotate(90deg)", transition: "transform .12s" }} />
-          <span className="text-body font-semibold">{providerDisplaySlug(provider)}</span>
+          <span className="text-body font-semibold" style={{ whiteSpace: "nowrap" }}>{providerDisplaySlug(provider)}</span>
+          {aliases.providers[provider] && <span className="models-chip mono text-caption">{aliases.providers[provider]}</span>}
           {nativeProviderGroup && <span className="models-chip muted mono text-caption">{t("models.nativeGroupLabel")}</span>}
          {discoveryFailure && (
            <span
@@ -1085,19 +1244,17 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
            </span>
          )}
           <span className="muted mono text-label">{t("models.active", { active: activeCount, total: rows.length })}</span>
+          {recentForProvider.length > 0 && <span className="models-chip mono text-caption">{t("models.newCount", { count: recentForProvider.length })}</span>}
           </button>
            <div className="row models-provider-actions">
-             {/* Available on every card, including the native one: the canonical `openai` seed
-                 check now admits contextWindow/modelContextWindows as user-owned overlays, and
-                 the native accessors only ever narrow the measured window with them. The cap
-                 next to it is the coarser sibling — one value for the whole provider. */}
-             <button
-               type="button"
-               className="btn btn-ghost btn-sm text-caption"
-               onClick={() => openContextSettings(group)}
-               aria-haspopup="dialog"
-             >{t("models.contextSettings")}</button>
-             {
+             <button type="button" className="btn btn-ghost btn-sm models-alias-edit" aria-label={t("models.editProviderAlias")} title={t("models.editProviderAlias")} onClick={() => void saveProviderAlias(provider)}><IconPencil style={{ width: 14, height: 14 }} /></button>
+            <Switch
+              on={aliases.defaults.providers[provider] ?? aliases.defaults.global}
+              onClick={() => void setDefaultAliases(!(aliases.defaults.providers[provider] ?? aliases.defaults.global), provider)}
+              label={t("models.useDefaultAliases")}
+              showLabel
+            />
+            {
               <button
                 type="button"
                 className="btn btn-ghost btn-sm text-caption"
@@ -1109,6 +1266,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                    setCustomFormModelId("");
                    setCustomFormDisplayName("");
                    setCustomFormContextWindow("");
+                   setCustomFormMaxOutputTokens("");
                    setCustomFormShowCustomCtx(false);
                    setCustomFormModalities(["text"]);
                    setCustomFormReasoning(false);
@@ -1116,38 +1274,114 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                    customFormReasoningInitializedRef.current = false;
                    setCustomError("");
                    setCustomModalOpen(true);
-                 }}
+                }}
                 aria-label={t("models.customAdd")}
                 aria-haspopup="dialog"
-              >+</button>
+              ><span aria-hidden="true">+</span> {t("models.customAdd")}</button>
              }
-             <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={busy || allOn} onClick={() => bulkToggle(true)}>{t("models.allOn")}</button>
-             <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={busy || allOff} onClick={() => bulkToggle(false)}>{t("models.allOff")}</button>
-             <>
-               <Switch on={capOn} onClick={() => toggleProviderCap(provider, nativeProviderGroup)} disabled={busy} label={t("models.capValue", { value: fmtK(capDisplayValue) })} />
-               {/* The native group keeps the value visible with the cap off: its rows always
-                   advertise SOME window, so hiding the number leaves the card saying nothing
-                   about the context Codex will actually see. Routed providers keep the old
-                   behaviour, where an off cap genuinely means "no opinion". */}
-               {(capOn || nativeProviderGroup) && (
+             {(() => {
+               // #2465: Preset / All / Custom. Only providers with a shipped preset get the
+               // control — a provider with nothing to curate would show a dead switch.
+               const preset = presets[provider];
+               if (!preset) return null;
+               const busyHere = presetBusy === provider;
+               const stale = preset.mode === "custom"
+                 && preset.appliedVersion !== undefined
+                 && preset.appliedVersion < preset.availableVersion;
+               return (
                  <>
-                   <Select
-                     // A saved cap outside CAP_OPTIONS is still a real selectable option
-                     // (inserted below), so select it instead of falling back to "Custom";
-                     // otherwise the trigger hides the persisted 128k value behind the
-                     // custom-editor label.
-                    value={providerCapCustomOpen[provider] ? CUSTOM_OPTION : String(capDisplayValue)}
+                   <div className="segmented models-segmented" role="radiogroup" aria-label={t("models.presetLabel")}>
+                     {(["preset", "all"] as const).map(mode => (
+                       <button
+                         key={mode}
+                         type="button"
+                         role="radio"
+                         aria-checked={preset.mode === mode}
+                         className={`btn btn-sm${preset.mode === mode ? " btn-primary" : " btn-ghost"}`}
+                         style={{
+                           background: preset.mode === mode ? undefined : "transparent",
+                           color: preset.mode === mode ? undefined : "var(--muted)",
+                         }}
+                         disabled={busy || busyHere}
+                         onClick={(e) => {
+                           e.stopPropagation();
+                           // Switching from a custom selection destroys it, so confirm first.
+                           if (mode === "preset" && preset.mode === "custom"
+                             && !confirm(t("models.presetConfirmReplace", { count: String(preset.presetCount) }))) return;
+                           void applyPreset(provider, mode);
+                         }}
+                       >
+                         {t(`models.presetMode_${mode}` as TKey)}
+                       </button>
+                     ))}
+                     {/* Custom is a STATE, not a destination: it activates on edit. Shown as a
+                         disabled segment so the current mode is never ambiguous. */}
+                     {preset.mode === "custom" && (
+                       <button
+                         type="button"
+                         role="radio"
+                         aria-checked
+                         className="btn btn-sm btn-primary"
+                         disabled
+                       >{t("models.presetMode_custom")}</button>
+                     )}
+                   </div>
+                   {preset.mode === "preset" && (
+                     <span className="muted mono text-label">
+                       {t("models.presetSummary", {
+                         count: String(preset.presetCount),
+                         total: String(preset.totalCount),
+                         version: String(preset.availableVersion),
+                       })}
+                     </span>
+                   )}
+                   {stale && (
+                     <span className="badge badge-amber" role="status">
+                       {t("models.presetUpdateAvailable", { version: String(preset.availableVersion) })}
+                     </span>
+                   )}
+                 </>
+               );
+             })()}
+             <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={busy || allOn} onClick={() => bulkToggle(true)}>{t("models.allOn")}</button>
+            <button type="button" className="btn btn-ghost btn-sm text-caption" disabled={busy || allOff} onClick={() => bulkToggle(false)}>{t("models.allOff")}</button>
+            <div className="models-cap-cluster">
+              {/* The label names the FUNCTION. It used to be `models.capValue` -
+                  "기본 128k" - which is a value masquerading as a name: even a
+                  screen-reader user was not told this governs the context window.
+                  The number belongs to the adjacent Select, which is where a value
+                  goes (020_control_affordances.md). */}
+              <Switch on={capOn} onClick={() => toggleProviderCap(provider, nativeProviderGroup)} disabled={busy} label={t("models.contextCapLabel")} showLabel />
+              {/* Always rendered, disabled when the cap is off. A cap-off provider used to
+                  drop this control entirely, which is the defect the user reported: openai
+                  showed 1.05M and anthropic showed nothing, so the two rows started at
+                  different left edges. Disabled-with-a-value is honest — it says "no
+                  opinion", which is what an off cap means — and it keeps the slot occupied
+                  on every card (040_cap_cluster_and_occupied_slot.md). */}
+              <>
+                  <Select
+                    // A saved cap outside CAP_OPTIONS is still a real selectable option
+                    // (inserted below), so select it instead of falling back to "Custom";
+                    // otherwise the trigger hides the persisted 128k value behind the
+                    // custom-editor label.
+                   value={providerCapCustomOpen[provider] ? CUSTOM_OPTION : String(capDisplayValue)}
                     options={[
                       ...(!capOptionSet.has(capDisplayValue) && !providerCapCustomOpen[provider]
                         ? [{ value: String(capDisplayValue), label: fmtK(capDisplayValue) }] : []),
                       ...capOptions.map(v => ({ value: String(v), label: fmtK(v) })),
                       { value: CUSTOM_OPTION, label: t("models.custom") },
                     ]}
-                     onChange={v => onSelectProviderCap(provider, v)}
-                     disabled={busy || !capOn}
-                     label={t("models.capValue", { value: fmtK(capDisplayValue) })}
-                   />
-                   {providerCapCustomOpen[provider] && (
+                    onChange={v => onSelectProviderCap(provider, v)}
+                    disabled={busy || !capOn}
+                    label={t("models.capValue", { value: fmtK(capDisplayValue) })}
+                    title={t("models.contextCapLabel")}
+                  />
+                   {/* `capOn &&` is load-bearing now that the Select no longer disappears with
+                       the cap. providerCapCustomOpen is independent state: with Custom already
+                       open, flipping the cap off used to leave this input and its Apply button
+                       standing, and Apply sends enabled: true — turning the cap back on from a
+                       field that looks like part of an off cluster. */}
+                   {capOn && providerCapCustomOpen[provider] && (
                      <>
                        <input
                          className="input"
@@ -1160,17 +1394,48 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                          disabled={busy}
                          aria-label={t("models.customPlaceholder")}
                        />
-                       <button type="button" onClick={() => applyProviderCustomCap(provider)} disabled={busy} className="btn btn-ghost btn-sm">{t("models.customApply")}</button>
-                     </>
-                   )}
-                 </>
-               )}
-             </>
-           </div>
+                      <button type="button" onClick={() => applyProviderCustomCap(provider)} disabled={busy} className="btn btn-ghost btn-sm">{t("models.customApply")}</button>
+                    </>
+                  )}
+                </>
+              {/* Available on every card, including the native one: the canonical `openai` seed
+                  check now admits contextWindow/modelContextWindows as user-owned overlays, and
+                  the native accessors only ever narrow the measured window with them. The cap
+                  beside it is the coarser sibling — one value for the whole provider.
+
+                  It sits in the cluster for VISUAL grouping only. This is deliberately not a
+                  functional merge: this button opens PER-MODEL overrides while the switch and
+                  select are the provider-wide default, and two different scopes cannot honestly
+                  become one control. Three separate tab stops remain. Moving it here from
+                  beside the alias controls does change tab order — switch, then select when
+                  enabled, then this — which reads in the order the controls are now seen. */}
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm text-caption"
+                onClick={() => openContextSettings(group)}
+                aria-haspopup="dialog"
+              >{t("models.contextSettings")}</button>
+            </div>
+          </div>
         </div>
         {!isCollapsed && (
           <div className="models-provider-body">
             {nativeProviderGroup && <p className="muted text-label models-provider-hint">{t("models.nativeHint")}</p>}
+            {!nativeProviderGroup && modelDiscovery && (
+              <div className="row models-provider-hint">
+                <span className="muted text-label">{t("models.newPolicyProvider")}</span>
+                <div className="segmented models-segmented" role="radiogroup" aria-label={t("models.newPolicyProvider")}>
+                  {(["off", "on"] as const).map(mode => (
+                    <button key={mode} type="button" role="radio"
+                      aria-checked={(modelDiscovery.providers[provider] ?? "inherit") === mode}
+                      className={`btn btn-sm${(modelDiscovery.providers[provider] ?? "inherit") === mode ? " btn-primary" : " btn-ghost"}`}
+                      onClick={() => void saveModelDiscovery(mode, provider)}>
+                      {t(`models.newPolicy_${mode}` as TKey)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             {rows.length === 0 && (
               <EmptyProviderHint liveModels={liveModels} discovery={discovery} showFailureBadge={false} />
             )}
@@ -1199,12 +1464,16 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                  >
                    <div className="row models-model-row">
                      <Switch on={!off} onClick={() => void applyVisibility("models", provider, [{ id: m.id, native: m.native === true }], off)} disabled={busy} label={m.native ? m.id : m.namespaced} />
+                     {aliases.models[provider]?.[m.id] && <strong className="mono text-control">{aliases.models[provider][m.id].alias}</strong>}
                       <code className="mono text-control" style={{ color: off ? "var(--faint)" : "var(--text)", textDecoration: off ? "line-through" : "none" }}>{m.native ? modelLabel(m.id) : formatNamespacedModelId(m.namespaced, t)}</code>
+                     {aliases.models[provider]?.[m.id]?.source === "builtin" && <span className="models-chip muted text-caption">{t("models.aliasAuto")}</span>}
+                     <button type="button" className="btn btn-ghost btn-sm" aria-label={t("models.editModelAlias")} title={t("models.editModelAlias")} onClick={() => void saveModelAlias(provider, m.id)}><IconPencil style={{ width: 13, height: 13 }} /></button>
                      {m.custom && (
                        <span className="models-chip muted mono text-caption">
                          {t("models.customBadge")}
                        </span>
                      )}
+                     {!m.custom && recentIds.has(m.id) && <span className="badge badge-amber">{t("models.newBadge")}</span>}
                      {m.contextCapped && <span className="models-chip muted mono text-caption">{t("models.contextCappedValue", { value: fmtK(m.contextCap ?? contextCapValue) })}</span>}
                    </div>
                    {hoveredModel?.namespaced === m.namespaced && (() => {
@@ -1241,6 +1510,12 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                                <span className="model-tip-val">{fmtK(m.contextWindow ?? m.contextCap ?? 0)}</span>
                              </>
                            )}
+                           {m.maxOutputTokens && (
+                             <>
+                               <span className="model-tip-key">{t("models.tipMaxOutput")}</span>
+                               <span className="model-tip-val">{fmtK(m.maxOutputTokens)}</span>
+                             </>
+                           )}
                            {m.inputModalities && m.inputModalities.length > 0 && (
                              <>
                                <span className="model-tip-key">{t("models.tipModalities")}</span>
@@ -1262,6 +1537,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                                  setCustomFormModelId(m.id);
                                  setCustomFormDisplayName(m.displayName ?? "");
                                  setCustomFormContextWindow(m.contextWindow ? String(m.contextWindow) : "");
+                                 setCustomFormMaxOutputTokens(m.maxOutputTokens ? String(m.maxOutputTokens) : "");
                                  setCustomFormShowCustomCtx(false);
                                  setCustomFormModalities(m.inputModalities ?? ["text"]);
                                  // Only a STORED ladder counts as "configured": an inherited one
@@ -1316,6 +1592,16 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
   const controlsBlock = (
     <>
       <div className="models-control-top-row">
+        {modelDiscovery && (
+          <div className="models-shadow-row row muted text-control">
+            <span className="models-shadow-label">{t("models.newPolicyGlobal")}</span>
+            <Switch on={modelDiscovery.policy === "off"} onClick={() => void saveModelDiscovery(modelDiscovery.policy === "off" ? "on" : "off")} label={t("models.newPolicyGlobal")} />
+          </div>
+        )}
+        <div className="row">
+          <Switch on={aliases.defaults.global} onClick={() => void setDefaultAliases(!aliases.defaults.global)} label={t("models.useDefaultAliasesGlobal")} />
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowAliases(value => !value)}>{t("models.aliases")}</button>
+        </div>
         <div className="models-shadow-row row muted text-control" aria-busy={!shadowCall || undefined}>
           <span className="models-shadow-label">{t("models.shadowCallIntercept")} <Tooltip content={t("models.shadowCallInterceptHint", { models: shadowSourceModelLabel(shadowCall?.sourceModels) })} side="top" maxWidth={320}><span style={{ cursor: "help" }} aria-label={t("models.shadowCallInterceptHint", { models: shadowSourceModelLabel(shadowCall?.sourceModels) })}>ⓘ</span></Tooltip></span>
           <code className="text-caption models-shadow-warning" style={{ opacity: 0.6 }}>{t("models.shadowCallOriginal", { models: shadowSourceModelBadge(shadowCall?.sourceModels) })}</code>
@@ -1719,6 +2005,19 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                 </div>
               </label>
 
+              <label className="text-label models-field">
+                {t("models.customFieldMaxOutput")}
+                <input
+                  className="input"
+                  inputMode="numeric"
+                  value={customFormMaxOutputTokens}
+                  onChange={e => setCustomFormMaxOutputTokens(e.target.value)}
+                  disabled={customSaving}
+                  placeholder={t("models.customFieldMaxOutputPlaceholder")}
+                  aria-label={t("models.customFieldMaxOutput")}
+                />
+              </label>
+
               <div className="text-label models-field">
                 {t("models.customFieldModalities")}
                 <div className="row models-field-row">
@@ -1804,6 +2103,11 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                   const displayName = customFormDisplayName.trim();
                   const ctxVal = customFormContextWindow ? Number(customFormContextWindow.replace(/[_,\s]/g, "")) : undefined;
                   const contextWindow = ctxVal && ctxVal > 0 ? Math.floor(ctxVal) : undefined;
+                  const maxOutputTokens = parseContextWindowDraft(customFormMaxOutputTokens);
+                  if (maxOutputTokens === undefined) {
+                    setCustomError(t("models.customFieldMaxOutputInvalid"));
+                    return;
+                  }
                   if (customModalMode === "add") {
                     const reasoningEfforts = customFormReasoning ? customFormReasoningEfforts : undefined;
                     void addCustomModel(
@@ -1811,6 +2115,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                       modelId,
                       displayName || undefined,
                       contextWindow,
+                      maxOutputTokens ?? undefined,
                       customFormModalities.length > 0 ? customFormModalities : undefined,
                       reasoningEfforts,
                     );
@@ -1821,6 +2126,7 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
                       modelId,
                       displayName,
                       contextWindow: contextWindow ?? null,
+                      maxOutputTokens,
                       inputModalities: customFormModalities,
                       reasoningEfforts: customFormReasoning ? customFormReasoningEfforts : null,
                     });
@@ -1897,6 +2203,20 @@ export default function Models({ apiBase, restartEpoch = 0 }: { apiBase: string;
         <section className="models-workspace-main" aria-label={t("models.workspace.mainAria")}>
           {controlsBlock}
           {collapseControls}
+          {showAliases && (
+            <div className="card" aria-label={t("models.aliasesTable")}>
+              <div className="row group-head"><strong>{t("models.aliases")}</strong></div>
+              {Object.entries(aliases.models).flatMap(([provider, rows]) => Object.entries(rows).map(([model, value]) => (
+                <div className="row models-model-row" key={`${provider}/${model}`}>
+                  <code className="mono text-caption" style={{ flex: 1 }}>{provider}/{model}</code>
+                  <strong className="mono text-control">{value.alias}</strong>
+                  <span className="models-chip muted text-caption">{value.source === "builtin" ? t("models.aliasAuto") : t("models.aliasUser")}</span>
+                  {value.stale && <span className="badge badge-amber">{t("models.aliasStale")}</span>}
+                  <button type="button" className="btn btn-ghost btn-sm" aria-label={t("models.editModelAlias")} onClick={() => void saveModelAlias(provider, model)}><IconPencil style={{ width: 13, height: 13 }} /></button>
+                </div>
+              )))}
+            </div>
+          )}
           <div className="models-provider-list">
             {
               // eslint-disable-next-line react-hooks/refs, react/react-compiler -- The hover ref is only read by row event handlers nested in this renderer.

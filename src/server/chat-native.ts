@@ -6,14 +6,22 @@ import {
   collectChatCompletion,
   isChatCompletionsStreamError,
 } from "../chat/outbound";
-import { classifyError, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode } from "../lib/errors";
+import {
+  classifyError,
+  cyberPolicyErrorType,
+  CYBER_POLICY_ERROR_CODE,
+  isCyberPolicyCode,
+  isCyberPolicyMessage,
+} from "../lib/errors";
 import type { AdmissionLease } from "../lib/admission";
 import { readBoundedResponseBody } from "../lib/bounded-body";
 import { redactSecretString } from "../lib/redact";
 import { resolveClientRetryAfter } from "../lib/retry-after";
+import { isModelTextOnly } from "../vision";
 import {
   applyUpstreamRecoveryInit,
   fetchWithResetRetry,
+  fetchWithTransientRetry,
   prepareSameTarget429Wait,
   type UpstreamSendRecovery,
 } from "../lib/upstream-retry";
@@ -26,7 +34,9 @@ import {
   rateLimitRetryDelayMs,
   rateLimitRetryPolicyFor,
   rotateProviderTransportOn429,
+  transientRetryPolicyFor,
 } from "../providers/key-failover";
+import { fastPolicyForModel } from "../providers/service-tier";
 import type { RouteResult } from "../router";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel } from "./responses/fetch-helpers";
@@ -60,6 +70,12 @@ export function isNativeChatRouteEligible(route: RouteResult, rawBody: Rec): boo
   if (rawBody.store === true || rawBody.background === true) return false;
   if (typeof rawBody.previous_response_id === "string" && rawBody.previous_response_id.length > 0) return false;
   if (rawBody.compaction_trigger !== undefined) return false;
+  // Vision sidecar coverage (roadmap 180): a text-only routed model with an
+  // image-bearing body must go through the Responses pipeline, whose plan
+  // site describes or strips the image. The native fast path has no vision
+  // handling, so letting it keep such a request forwards raw pixels to a
+  // model the operator declared blind.
+  if (isModelTextOnly(provider, route.modelId) && chatBodyCarriesImage(rawBody)) return false;
   if (Array.isArray(rawBody.tools)) {
     for (const tool of rawBody.tools) {
       if (!isRec(tool)) continue;
@@ -69,6 +85,19 @@ export function isNativeChatRouteEligible(route: RouteResult, rawBody: Rec): boo
     }
   }
   return true;
+}
+
+/** Any messages[].content[] part of type image_url. */
+function chatBodyCarriesImage(rawBody: Rec): boolean {
+  const messages = rawBody.messages;
+  if (!Array.isArray(messages)) return false;
+  for (const message of messages) {
+    if (!isRec(message) || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (isRec(part) && part.type === "image_url") return true;
+    }
+  }
+  return false;
 }
 
 function chatCompletionJson(value: unknown): Rec | null {
@@ -154,8 +183,16 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
     translatorBudget.chargeRetained(bytes, { kind: "request_copies" });
     retainedRequestBytes = bytes;
   };
+  const buildActiveRequest = () => buildOpenAIChatPassthroughRequest(
+    activeProvider,
+    options.chatBody,
+    route.modelId,
+    requestedStream,
+    fastPolicyForModel(activeProvider, route.modelId, route.providerName, "chat"),
+    config.fastMode,
+  );
   try {
-    activeRequest = buildOpenAIChatPassthroughRequest(activeProvider, options.chatBody, route.modelId, requestedStream);
+    activeRequest = buildActiveRequest();
     retainRequest(activeRequest);
   } catch (error) {
     releaseRetainedRequest();
@@ -167,9 +204,25 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
     return fail(400, error instanceof Error ? error.message : String(error), "invalid_request_error");
   }
 
+  // One inbound request owns one transient send allowance. Capture the policy before any
+  // key rotation so recovery cannot replace the ceiling along with the active credential.
+  const requestTransientPolicy = transientRetryPolicyFor(activeProvider);
+  let transientSendsUsed = 0;
+  const remainingTransientSends = (): number => requestTransientPolicy
+    ? Math.max(0, requestTransientPolicy.attempts - transientSendsUsed)
+    : Number.POSITIVE_INFINITY;
+  const transientSendAvailable = (): boolean => remainingTransientSends() > 0;
+
   const send = async (request: AdapterRequest, recovery?: "rate-limit-429" | "key-429"): Promise<Response> => {
     try {
-      return await fetchWithResetRetry(
+      // #2643: opted-in key-auth openai-chat providers retry pre-stream transient statuses on
+      // the native chat lane too; everyone else keeps reset-only semantics.
+      const remaining = remainingTransientSends();
+      if (requestTransientPolicy && remaining <= 0) {
+        throw new Error("native Chat transient send budget exhausted before recovery dispatch");
+      }
+      const fetchWithPolicy = requestTransientPolicy ? fetchWithTransientRetry : fetchWithResetRetry;
+      return await fetchWithPolicy(
         (transportRecovery?: UpstreamSendRecovery) => {
           noteAttemptSend(attempt, logCtx.usageLogInputTokens, transportRecovery ?? recovery);
           return fetchWithHeaderTimeout(
@@ -188,7 +241,16 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
             }),
           );
         },
-        { abortSignal: upstream.signal, label: safeHostLabel(request.url) },
+        {
+          abortSignal: upstream.signal,
+          label: safeHostLabel(request.url),
+          ...(requestTransientPolicy
+            ? {
+              attempts: remaining,
+              onSendsConsumed: (sends: number) => { transientSendsUsed += Math.max(0, sends); },
+            }
+            : {}),
+        },
       );
     } finally {
       request.releaseBodyObservation?.();
@@ -200,7 +262,12 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
     response = await send(activeRequest);
     const retryPolicy = rateLimitRetryPolicyFor(activeProvider);
     let retries = 0;
-    while (response.status === 429 && retryPolicy && retries < retryPolicy.attempts) {
+    while (
+      response.status === 429
+      && retryPolicy
+      && retries < retryPolicy.attempts
+      && transientSendAvailable()
+    ) {
       retries += 1;
       for await (const _ of prepareSameTarget429Wait({
         body: response.body,
@@ -218,11 +285,15 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
         promptCacheKey: typeof options.chatBody.prompt_cache_key === "string" ? options.chatBody.prompt_cache_key : undefined,
       });
       if (!rotated) break;
+      // Rotation also records the failed key's cooldown and persists the next healthy key.
+      // Keep that bookkeeping when this request has spent its final send, but preserve the
+      // terminal 429 body and do not dispatch with the replacement credential.
+      if (!transientSendAvailable()) break;
       try { void response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
       activeProvider = rotated;
       activeAdapter = createOpenAIChatAdapter(activeProvider);
       releaseRetainedRequest();
-      activeRequest = buildOpenAIChatPassthroughRequest(activeProvider, options.chatBody, route.modelId, requestedStream);
+      activeRequest = buildActiveRequest();
       retainRequest(activeRequest);
       response = await send(activeRequest, "key-429");
     }
@@ -252,13 +323,24 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
     const detail = activeAdapter.formatErrorBody?.(response.status, response.headers, bodyText) ?? "";
     let upstreamType: string | undefined;
     let upstreamCode: string | null | undefined;
+    let upstreamMessage: string | undefined;
     try {
       const parsedError = JSON.parse(bodyText) as Rec;
       const nested = isRec(parsedError.error) ? parsedError.error : undefined;
-      if (typeof nested?.type === "string") upstreamType = nested.type;
-      if (nested?.code === null || typeof nested?.code === "string") upstreamCode = nested.code;
+      const details = nested ?? parsedError;
+      if (typeof details.type === "string") upstreamType = details.type;
+      if (details.code === null || typeof details.code === "string") upstreamCode = details.code;
+      const rawMessage = typeof details.message === "string"
+        ? details.message
+        : typeof parsedError.error === "string" ? parsedError.error : undefined;
+      if (rawMessage?.trim()) {
+        upstreamMessage = redactSecretString(rawMessage.trim());
+      }
     } catch { /* keep generic classification */ }
-    const message = detail ? `Provider error ${response.status}: ${detail}` : `Provider error ${response.status}`;
+    const message = upstreamMessage
+      && (isCyberPolicyCode(upstreamCode) || isCyberPolicyMessage(upstreamMessage))
+      ? upstreamMessage
+      : detail ? `Provider error ${response.status}: ${detail}` : `Provider error ${response.status}`;
     const classified = classifyError(
       response.status,
       upstreamType ?? (response.status === 401 ? "authentication_error"
@@ -266,9 +348,9 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
           : response.status >= 500 ? "server_error" : "invalid_request_error"),
       message,
     );
-    if (isCyberPolicyCode(upstreamCode)) {
+    if (isCyberPolicyCode(upstreamCode) || classified.code === CYBER_POLICY_ERROR_CODE) {
       classified.code = CYBER_POLICY_ERROR_CODE;
-      classified.type = "invalid_request_error";
+      classified.type = cyberPolicyErrorType(upstreamType);
     } else if (upstreamCode === "model_not_found") {
       classified.code = "model_not_found";
       classified.type = "invalid_request_error";
@@ -276,11 +358,13 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
       classified.code = upstreamCode;
     }
     const status = isCyberPolicyCode(classified.code) ? 400 : response.status;
-    const retryAfter = resolveClientRetryAfter({
-      status: response.status,
-      message: classified.message,
-      upstreamRetryAfter: response.headers.get("retry-after"),
-    });
+    const retryAfter = isCyberPolicyCode(classified.code)
+      ? undefined
+      : resolveClientRetryAfter({
+        status: response.status,
+        message: classified.message,
+        upstreamRetryAfter: response.headers.get("retry-after"),
+      });
     finishLog(status, classified.message);
     return new Response(JSON.stringify(chatCompletionsErrorBody(status, classified.message, classified.type, classified.code)), {
       status,

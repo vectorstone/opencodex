@@ -37,7 +37,9 @@ ocx claude
 
 `ocx stop` とプロキシ終了は**注入されたキーを解除します**。以前の値を復元せず、opencodex が
 注入したキーのみ削除します。プロキシは `~/.opencodex/claude-env.sh` も書き出し、`ocx start` はこのファイルを
-自動で読み込む `.zshrc` source hook をインストールします。
+自動で読み込む `.zshrc` source hook を、実行可能な Claude Code CLI が `PATH` にある場合にのみインストールします。
+Claude Code が存在しない場合、またはシステム環境連携が無効な場合、起動処理と `ocx ensure` は OpenCodex が追加した
+hook を削除します。Claude Desktop は独立した profile を使用し、shell hook のインストールを引き起こしません。
 
 設定で `claudeCode.systemEnv: false` に指定するか GUI トグルでオフにできます。この機能は macOS
 専用で、他のプラットフォームでは `ocx claude` を使ってください。
@@ -140,7 +142,7 @@ Claude ページで圧縮値を調整できます。**警告:** モデルの実�
 
 ## ロスターエージェント(injectAgents)
 
-`ocx claude` とシステム環境デーモンは推奨サブエージェントロスター(Subagents タブ、最大 5 モデル)と
+プロキシの起動/ensure、`ocx claude`、関連するダッシュボード保存は推奨サブエージェントロスター(Subagents タブ、最大 5 モデル)と
 `ocx-self` を `~/.claude/agents/ocx-*.md` に同期します。
 
 - **`ocx-self`** は `/model` ピッカーのデフォルトを固定し、値がない場合は `claudeCode.model` を使います。

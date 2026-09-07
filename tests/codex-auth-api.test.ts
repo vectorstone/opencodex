@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { ServerWebSocket } from "bun";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireNativeMainProfileDrain,
@@ -13,7 +14,7 @@ import {
   handleCodexAuthAPI, updateAccountQuota, getAccountQuota,
   checkAccountIdCollision, getMainChatgptAccountId,
   markAccountNeedsReauth, isAccountNeedsReauth, clearAccountNeedsReauth, clearAccountQuota,
-  clearMainAccountInfoCache, maskEmail,
+  clearMainAccountInfoCache, maskEmail, fetchMainAccountInfo,
   clearCodexQuotaPrimeState, primeCodexPoolQuotas, seedCodexAuthAdmissionForTests,
   type CodexAuthAccountDto,
   listCodexAuthAccounts,
@@ -71,10 +72,14 @@ import {
   resolveFirstUsableOpenAiSidecar,
 } from "../src/providers/openai-sidecar";
 import { BOUNDED_BODY_MAX_BYTES } from "../src/lib/bounded-body";
+import { flushConfigDirHardeningForTests } from "../src/config/paths";
+import { setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../src/lib/windows-secret-acl";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
-const TEST_DIR = join(import.meta.dir, ".tmp-codex-auth-api-test");
-const TEST_CODEX_HOME = join(TEST_DIR, "codex");
+let TEST_DIR = "";
+let TEST_CODEX_HOME = "";
 const MANUAL_IMPORT_ENV = "OPENCODEX_ENABLE_UNVERIFIED_CODEX_IMPORT";
+const ICACLS_OK = { success: true, exitCode: 0, timedOut: false, stdout: "" };
 let previousOpencodexHome: string | undefined;
 let previousCodexHome: string | undefined;
 let previousManualImportEnv: string | undefined;
@@ -256,7 +261,10 @@ beforeEach(() => {
   previousCodexHome = process.env.CODEX_HOME;
   previousManualImportEnv = process.env[MANUAL_IMPORT_ENV];
   previousFetch = globalThis.fetch;
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  setIcaclsRunnerForTests(() => ICACLS_OK);
+  setAsyncIcaclsRunnerForTests(async () => ICACLS_OK);
+  TEST_DIR = mkdtempSync(join(tmpdir(), "ocx-codex-auth-api-"));
+  TEST_CODEX_HOME = join(TEST_DIR, "codex");
   mkdirSync(TEST_CODEX_HOME, { recursive: true });
   process.env.OPENCODEX_HOME = TEST_DIR;
   process.env.CODEX_HOME = TEST_CODEX_HOME;
@@ -274,7 +282,7 @@ beforeEach(() => {
   resetJwtPlanNotesForTests();
 });
 
-afterEach(() => {
+afterEach(async () => {
   resetLifecycleDrainStateForTests();
   setPersistedConfigMutationBeforeCommitForTests(null);
   clearAccountNeedsReauth("__main__");
@@ -293,7 +301,12 @@ afterEach(() => {
   else process.env.CODEX_HOME = previousCodexHome;
   if (previousManualImportEnv === undefined) delete process.env[MANUAL_IMPORT_ENV];
   else process.env[MANUAL_IMPORT_ENV] = previousManualImportEnv;
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  await flushConfigDirHardeningForTests();
+  setIcaclsRunnerForTests(null);
+  setAsyncIcaclsRunnerForTests(null);
+  if (TEST_DIR) removeTreeWithRetry(TEST_DIR);
+  TEST_DIR = "";
+  TEST_CODEX_HOME = "";
 });
 
 describe("codex-auth API", () => {
@@ -858,6 +871,77 @@ describe("codex-auth API", () => {
     expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(false);
   });
 
+  test("a background main account refresh does not retract a reauth quarantine (#327)", async () => {
+    // #327's own repro: the token is valid, but its workspace can no longer be
+    // selected, so Responses traffic answers 403 and quarantines the account.
+    // /wham/usage is a different backend path and keeps answering 200 for that same
+    // token, so the periodic refresh must not read its own 200 as proof the account
+    // can serve traffic again — doing so returned the account to rotation, the next
+    // request failed identically and re-marked it, and needsReauth never settled.
+    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "live-main", account_id: "acct-main" },
+    }));
+    markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+    clearMainAccountInfoCache();
+    let usageCalls = 0;
+    globalThis.fetch = (async () => {
+      usageCalls += 1;
+      return Response.json({
+        email: "main@example.test",
+        plan_type: "pro",
+        rate_limit: { primary_window: { used_percent: 10, reset_at: 1783000000 } },
+      });
+    }) as typeof fetch;
+
+    expect((await fetchMainAccountInfo(false)).email).toBe("main@example.test");
+    // The probe really ran and really succeeded — the quarantine survives it anyway.
+    expect(usageCalls).toBe(1);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+
+    // An explicit refresh is an operator asking to re-evaluate, so it stays
+    // authoritative and still clears the flag (the test above pins that direction).
+    clearMainAccountInfoCache();
+    expect((await fetchMainAccountInfo(true)).email).toBe("main@example.test");
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(false);
+  });
+
+  test("an identity-change retry does not upgrade a background refresh into an explicit one (#327)", async () => {
+    // `retryMainAccountInfoIfIdentityChanged` re-enters with forceRefresh=true so it can
+    // re-read past a now-stale cache. That argument must not double as operator intent:
+    // a background poll that crosses an identity change would otherwise come back with
+    // the authority to retract a quarantine it was never allowed to touch.
+    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "live-main", account_id: "acct-before" },
+    }));
+    clearMainAccountInfoCache();
+    let usageCalls = 0;
+    globalThis.fetch = (async () => {
+      usageCalls += 1;
+      if (usageCalls === 1) {
+        // Identity changes on disk mid-probe. The retry's purge legitimately drops the
+        // *previous* identity's runtime state — that is not what this test is about.
+        writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+          tokens: { access_token: "live-main", account_id: "acct-after" },
+        }));
+      } else {
+        // Real traffic quarantines the *new* identity while the retry probe is in
+        // flight, exactly as recordCodexUpstreamOutcome does on a 401/403.
+        markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+      }
+      return Response.json({
+        email: "main@example.test",
+        plan_type: "pro",
+        rate_limit: { primary_window: { used_percent: 10, reset_at: 1783000000 } },
+      });
+    }) as typeof fetch;
+
+    await fetchMainAccountInfo(false);
+
+    // The retry really fired — otherwise this proves nothing about the retry path.
+    expect(usageCalls).toBeGreaterThan(1);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+  });
+
   test("BUG-R327: main account exposes and updates needsReauth from WHAM auth responses", async () => {
     writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
       tokens: {
@@ -1183,6 +1267,56 @@ describe("codex-auth API", () => {
     expect(getAccountQuota("preserve-valid")).toEqual(before);
   });
 
+  test("quota cache rebuilds preserve the short-window tuple", () => {
+    setAccountQuotaFromParsed("short-cache", {
+      weeklyPercent: 1,
+      weeklyResetAt: 2_000_586_800,
+      monthlyPercent: 3,
+      monthlyResetAt: 2_002_592_000,
+      shortPercent: 0,
+      shortResetAt: 2_000_000_000,
+      shortWindowSeconds: 18_000,
+    });
+    expect(getAccountQuota("short-cache")).toMatchObject({
+      weeklyPercent: 1,
+      shortPercent: 0,
+      shortResetAt: 2_000_000_000,
+      shortWindowSeconds: 18_000,
+    });
+
+    setAccountQuotaFromParsed("short-cache", {
+      shortPercent: 4,
+      shortResetAt: 2_000_000_100,
+      shortWindowSeconds: 18_000,
+    });
+    expect(getAccountQuota("short-cache")).toMatchObject({
+      weeklyPercent: 1,
+      monthlyPercent: 3,
+      shortPercent: 4,
+      shortResetAt: 2_000_000_100,
+      shortWindowSeconds: 18_000,
+    });
+
+    updateAccountQuota("short-cache", 2, 2_000_586_900);
+    expect(getAccountQuota("short-cache")).toMatchObject({
+      weeklyPercent: 2,
+      monthlyPercent: 3,
+      shortPercent: 4,
+      shortResetAt: 2_000_000_100,
+      shortWindowSeconds: 18_000,
+    });
+
+    setAccountQuotaFromParsed("short-cache", { resetCredits: 3 });
+    expect(getAccountQuota("short-cache")).toMatchObject({
+      weeklyPercent: 2,
+      monthlyPercent: 3,
+      shortPercent: 4,
+      shortResetAt: 2_000_000_100,
+      shortWindowSeconds: 18_000,
+      resetCredits: 3,
+    });
+  });
+
   test("GET /api/codex-auth/quota returns stored quotas", async () => {
     updateAccountQuota("q-test", 30);
     const req = new Request("http://localhost/api/codex-auth/quota", { method: "GET" });
@@ -1225,6 +1359,47 @@ describe("codex-auth API", () => {
       expect(pool?.quota).toMatchObject({ weeklyPercent: 64, weeklyResetAt: 1782628379 });
       expect(pool?.needsReauth).toBe(false);
       expect(calls).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("GET /api/codex-auth/accounts preserves a parsed K12 short window through cache and DTO", async () => {
+    const config = makeConfig();
+    seedPoolAccount(config, {
+      id: "pool-k12-short",
+      email: "pool-k12-short@example.com",
+      plan: "k12",
+      accessToken: "tok",
+      refreshToken: "ref",
+      chatgptAccountId: "acc-pool-k12-short",
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json({
+      plan_type: "k12",
+      rate_limit: {
+        primary_window: { used_percent: 0, reset_at: 2_000_000_000, limit_window_seconds: 18_000 },
+        secondary_window: { used_percent: 1, reset_at: 2_000_586_800, limit_window_seconds: 604_800 },
+      },
+    })) as typeof fetch;
+
+    try {
+      const req = new Request("http://localhost/api/codex-auth/accounts?refresh=1", { method: "GET" });
+      const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+      expect(resp!.status).toBe(200);
+      const data = await resp!.json() as {
+        accounts: Array<{ id: string; quota?: Record<string, unknown> }>;
+      };
+      const quota = data.accounts.find(account => account.id === "pool-k12-short")?.quota;
+      expect(quota).toMatchObject({
+        weeklyPercent: 1,
+        weeklyResetAt: 2_000_586_800,
+        shortPercent: 0,
+        shortResetAt: 2_000_000_000,
+        shortWindowSeconds: 18_000,
+      });
+      expect(getAccountQuota("pool-k12-short")).toMatchObject(quota!);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -2425,6 +2600,115 @@ describe("codex-auth API", () => {
     }
   });
 
+  test("the main account DTO keeps its resetCredits when a later WHAM usage omits the summary", async () => {
+    // /wham/usage carries rate_limit_reset_credits only intermittently. Pool DTOs survive
+    // that because they re-read the merged store; the main DTO used to serialize the raw
+    // parse result, so the ticket badge disappeared on every response that omitted it.
+    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-dto-credits", account_id: "acct-main-dto-credits" },
+    }));
+    reconcileMainCodexAccountRuntimeState();
+    const originalFetch = globalThis.fetch;
+    let includeCredits = true;
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/backend-api/wham/usage")) {
+          return Response.json({
+            email: "main@example.test",
+            plan_type: "pro",
+            rate_limit: { primary_window: { used_percent: 28, reset_at: 1788749167 } },
+            ...(includeCredits ? { rate_limit_reset_credits: { available_count: 1 } } : {}),
+          });
+        }
+        return originalFetch(input);
+      }) as typeof fetch;
+
+      const first = await listCodexAuthAccounts(makeConfig(), true);
+      expect(first.find(a => a.id === MAIN_CODEX_ACCOUNT_ID)!.quota?.resetCredits).toBe(1);
+
+      includeCredits = false;
+      const second = await listCodexAuthAccounts(makeConfig(), true);
+      const main = second.find(a => a.id === MAIN_CODEX_ACCOUNT_ID)!;
+      expect(main.quota?.resetCredits).toBe(1);
+      expect(main.quota?.weeklyPercent).toBe(28);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("the main account DTO never carries resetCredits across a main identity change", async () => {
+    // `__main__` is an alias: ~/.codex/auth.json can be swapped for another physical
+    // ChatGPT account, so a carried ticket count must be bound to the identity it was read
+    // from or one account's credits show up on another's card.
+    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-ident-a", account_id: "acct-main-ident-a" },
+    }));
+    reconcileMainCodexAccountRuntimeState();
+    const originalFetch = globalThis.fetch;
+    let includeCredits = true;
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/backend-api/wham/usage")) {
+          return Response.json({
+            email: "main@example.test",
+            plan_type: "pro",
+            rate_limit: { primary_window: { used_percent: 40, reset_at: 1788749167 } },
+            ...(includeCredits ? { rate_limit_reset_credits: { available_count: 5 } } : {}),
+          });
+        }
+        return originalFetch(input);
+      }) as typeof fetch;
+
+      const first = await listCodexAuthAccounts(makeConfig(), true);
+      expect(first.find(a => a.id === MAIN_CODEX_ACCOUNT_ID)!.quota?.resetCredits).toBe(5);
+
+      // The operator signs in as a different physical account and the next usage response
+      // happens not to carry the summary.
+      writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+        tokens: { access_token: "main-ident-b", account_id: "acct-main-ident-b" },
+      }));
+      includeCredits = false;
+      const second = await listCodexAuthAccounts(makeConfig(), true);
+      const main = second.find(a => a.id === MAIN_CODEX_ACCOUNT_ID)!;
+      expect(main.quota?.resetCredits).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("a freshly parsed main resetCredits of zero overrides the stored value", async () => {
+    // Zero is a real reading, not an absence: the DTO fill must never resurrect a stale
+    // non-zero ticket count over it.
+    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-dto-zero", account_id: "acct-main-dto-zero" },
+    }));
+    reconcileMainCodexAccountRuntimeState();
+    updateAccountQuota(MAIN_CODEX_ACCOUNT_ID, undefined, undefined, undefined, undefined, 3);
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/backend-api/wham/usage")) {
+          return Response.json({
+            email: "main@example.test",
+            plan_type: "pro",
+            rate_limit: { primary_window: { used_percent: 10, reset_at: 1788749167 } },
+            rate_limit_reset_credits: { available_count: 0 },
+          });
+        }
+        return originalFetch(input);
+      }) as typeof fetch;
+
+      const accounts = await listCodexAuthAccounts(makeConfig(), true);
+      const main = accounts.find(account => account.id === MAIN_CODEX_ACCOUNT_ID)!;
+      expect(main.quota?.resetCredits).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("reset-credit consume omits remaining when main WHAM refresh is non-2xx", async () => {
     writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
       tokens: { access_token: "main-reset-fail", account_id: "acct-main-reset-fail" },
@@ -3323,7 +3607,7 @@ describe("codex-auth API", () => {
       listOpenAiForwardSidecarCandidates(config),
       new Headers(),
       config,
-      { exactAccount: { accountId: "pool-delete", modelId: "gpt-5.6-sol" } },
+      { exactAccount: { accountId: "pool-delete", modelId: "gpt-5.5" } },
     );
     expect(exactSidecar?.authContext).toMatchObject({
       accountId: "pool-delete",
@@ -3506,6 +3790,53 @@ describe("codex-auth API", () => {
     const resp = await handleCodexAuthAPI(req, url, {} as any);
     const data = await resp!.json() as { status: string };
     expect(data.status).toBe("expired");
+  });
+
+  /**
+   * Device login (#3366): the route used to drop `deviceCode` and hand every
+   * non-empty URL to a local browser. On a headless hub that means no code to
+   * type and a browser spawn that cannot work.
+   */
+  test("POST /api/codex-auth/login with device:true returns the code and opens no browser", async () => {
+    const oauth = await import("../src/oauth");
+    const openUrlModule = await import("../src/lib/open-url");
+    const startSpy = spyOn(oauth, "startLoginFlow").mockImplementation(async () => ({
+      url: "https://auth.openai.com/codex/device",
+      instructions: "Enter code: ABCD-EFGH",
+      deviceCode: "ABCD-EFGH",
+    }));
+    const openSpy = spyOn(openUrlModule, "openUrl").mockImplementation(() => {});
+    try {
+      const req = new Request("http://localhost/api/codex-auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ device: true }),
+      });
+      const resp = await handleCodexAuthAPI(req, new URL(req.url), makeConfig());
+      const data = await resp!.json() as { deviceCode?: string; url?: string; flowId?: string };
+
+      expect(data.deviceCode).toBe("ABCD-EFGH");
+      expect(data.url).toBe("https://auth.openai.com/codex/device");
+      expect(data.flowId).toBeTruthy();
+      // The verification page belongs on the user's other device, not on the host.
+      expect(openSpy).not.toHaveBeenCalled();
+      expect(startSpy.mock.calls[0]?.[1]).toMatchObject({ flow: "device" });
+    } finally {
+      startSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  test("the device poll budget covers the 15-minute grant", async () => {
+    // The budget is a loop bound with no observable output, so a regression to
+    // the 5-minute browser budget would pass every behavioral test above.
+    const source = await Bun.file(new URL("../src/codex/auth-api.ts", import.meta.url)).text();
+    const budget = /const pollAttempts = useDeviceFlow \? (\d+) : (\d+);/.exec(source);
+    expect(budget).toBeTruthy();
+    // 900s is the grant; the extra margin covers post-grant settlement, so an
+    // exactly-900s budget (450 attempts) must fail this.
+    expect(Number(budget?.[1]) * 2).toBeGreaterThanOrEqual(960);
+    expect(budget?.[2]).toBe("150");
   });
 
   test("Codex OAuth login responses project raw provider errors", async () => {

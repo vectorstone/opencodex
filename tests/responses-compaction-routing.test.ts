@@ -5,7 +5,7 @@
  * fatals on a compaction turn that came back as an ordinary message.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleResponses, handleResponsesCompact } from "../src/server/responses";
@@ -19,7 +19,8 @@ import {
   resolveCodexAccountForThread,
 } from "../src/codex/routing";
 import { clearAccountQuota, updateAccountQuota } from "../src/codex/auth-api";
-import { MAIN_CODEX_ACCOUNT_ID } from "../src/codex/main-account";
+import { MAIN_CODEX_ACCOUNT_ID, MainAccountTokenRefreshError } from "../src/codex/main-account";
+import { NativeProfileError } from "../src/codex/native-profile-types";
 import { fallbackCodexAccountLogLabel } from "../src/codex/account-label";
 import * as authContextModule from "../src/codex/auth-context";
 import {
@@ -31,6 +32,7 @@ import { supportsNativeResponsesCompactEndpoint } from "../src/providers/openai-
 import type { RequestLogContext } from "../src/server/request-log";
 import { acquireNativeMainProfileDrain, tryAdmitTurn } from "../src/server/lifecycle";
 import type { OcxConfig, OcxProviderConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const originalFetch = globalThis.fetch;
 
@@ -171,6 +173,167 @@ describe("supportsNativeResponsesCompactEndpoint (#422)", () => {
   });
 });
 
+describe("Codex auth-context error parity (#2392)", () => {
+  const cases: Array<{
+    label: string;
+    createError: () => Error;
+    status: number;
+    retryAfter?: string;
+    regularLog: boolean;
+  }> = [
+    {
+      label: "account cooldown",
+      createError: () => new authContextModule.CodexAccountCooldownError(
+        "sensitive-account-id",
+        Date.now() + 120_000,
+        "retry-after",
+      ),
+      status: 429,
+      regularLog: false,
+    },
+    {
+      label: "native-main drain",
+      createError: () => new authContextModule.CodexMainProfileDrainingError(),
+      status: 503,
+      retryAfter: "1",
+      regularLog: false,
+    },
+    {
+      label: "expired thread affinity",
+      createError: () => new authContextModule.CodexThreadAffinityExpiredError("sensitive-account-id"),
+      status: 409,
+      regularLog: false,
+    },
+    {
+      label: "pool credential refresh failure",
+      createError: () => new authContextModule.CodexAuthContextError(
+        "sensitive-account-id",
+        new Error("private refresh detail"),
+      ),
+      status: 401,
+      regularLog: true,
+    },
+    {
+      label: "native-main claim contention",
+      createError: () => new authContextModule.CodexAuthContextError(
+        MAIN_CODEX_ACCOUNT_ID,
+        new NativeProfileError(
+          "NATIVE_MAIN_CLAIM_BUSY",
+          "Native-main credentials are in use.",
+          503,
+          true,
+        ),
+      ),
+      status: 503,
+      retryAfter: "1",
+      regularLog: true,
+    },
+    {
+      label: "native-main claim timeout",
+      createError: () => new authContextModule.CodexAuthContextError(
+        MAIN_CODEX_ACCOUNT_ID,
+        new MainAccountTokenRefreshError("transient"),
+      ),
+      status: 503,
+      retryAfter: "1",
+      regularLog: true,
+    },
+    {
+      label: "pool authentication failure",
+      createError: () => new authContextModule.CodexPoolAuthenticationError("Pool credential is unavailable"),
+      status: 401,
+      regularLog: false,
+    },
+    {
+      label: "direct authentication failure",
+      createError: () => new authContextModule.CodexDirectAuthenticationError(),
+      status: 401,
+      regularLog: false,
+    },
+    {
+      label: "main credential substitution failure",
+      createError: () => new authContextModule.CodexMainSubstitutionUnavailableError(),
+      status: 401,
+      regularLog: false,
+    },
+  ];
+
+  function regularAuthRequest(): Request {
+    return compactionRequest({ model: "gpt-5.5", input: "hello", stream: false });
+  }
+
+  function compactAuthRequest(): Request {
+    return compactionRequest(baseCompactionBody({ model: "gpt-5.5" }));
+  }
+
+  test.each(cases)("maps $label identically on regular and compact Responses", async testCase => {
+    let upstreamCalls = 0;
+    globalThis.fetch = (async () => {
+      upstreamCalls += 1;
+      return jsonResponse(completedPayload("unexpected upstream response"));
+    }) as typeof fetch;
+    const error = testCase.createError();
+    const authSpy = spyOn(authContextModule, "resolveCodexAuthContext").mockRejectedValue(error);
+    const errorLog = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const regular = await handleResponses(regularAuthRequest(), nativePoolConfig(), { model: "", provider: "" });
+      const regularLogCount = errorLog.mock.calls.length;
+      const compact = await handleResponsesCompact(compactAuthRequest(), nativePoolConfig(), { model: "", provider: "" });
+
+      expect(regular.status).toBe(testCase.status);
+      expect(compact.status).toBe(testCase.status);
+      expect(regular.headers.get("content-type")).toBe("application/json");
+      expect(compact.headers.get("content-type")).toBe("application/json");
+      expect(await regular.text()).toBe(await compact.text());
+      expect(compact.headers.get("retry-after")).toBe(regular.headers.get("retry-after"));
+      if (testCase.retryAfter) expect(regular.headers.get("retry-after")).toBe(testCase.retryAfter);
+      if (testCase.label === "account cooldown") expect(regular.headers.get("retry-after")).not.toBeNull();
+      if (testCase.label === "main credential substitution failure") expect(upstreamCalls).toBe(0);
+
+      expect(regularLogCount).toBe(testCase.regularLog ? 1 : 0);
+      expect(errorLog.mock.calls.length).toBe(regularLogCount);
+      if (testCase.regularLog) {
+        const line = errorLog.mock.calls[0]!.join(" ");
+        expect(line).toContain("[codex-auth] Pool account openai token failed; reauthentication required");
+        expect(line).not.toContain("sensitive-account-id");
+        expect(line).not.toContain("private refresh detail");
+      }
+    } finally {
+      errorLog.mockRestore();
+      authSpy.mockRestore();
+    }
+  });
+
+  test("unknown auth-resolution errors reject on both handlers instead of being mapped", async () => {
+    let upstreamCalls = 0;
+    globalThis.fetch = (async () => {
+      upstreamCalls += 1;
+      return jsonResponse(completedPayload("unexpected upstream response"));
+    }) as typeof fetch;
+    const authSpy = spyOn(authContextModule, "resolveCodexAuthContext");
+    try {
+      const regularError = new Error("unmapped regular auth failure");
+      authSpy.mockRejectedValueOnce(regularError);
+      await expect(handleResponses(
+        regularAuthRequest(),
+        nativePoolConfig(),
+        { model: "", provider: "" },
+      )).rejects.toBe(regularError);
+
+      const compactError = new Error("unmapped compact auth failure");
+      authSpy.mockRejectedValueOnce(compactError);
+      await expect(handleResponsesCompact(
+        compactAuthRequest(),
+        nativePoolConfig(),
+        { model: "", provider: "" },
+      )).rejects.toBe(compactError);
+      expect(upstreamCalls).toBe(0);
+    } finally {
+      authSpy.mockRestore();
+    }
+  });
+});
+
 describe("native compact usage reporting", () => {
   test("the buffered upstream body fills the request log usage and stays intact for the client", async () => {
     const config = {
@@ -230,7 +393,7 @@ describe("native compact usage reporting", () => {
     } finally {
       globalThis.fetch = originalFetch;
       clearAccountQuota();
-      rmSync(testDir, { recursive: true, force: true });
+      removeTreeWithRetry(testDir);
       if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousOpencodexHome;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -257,7 +420,16 @@ describe("native Codex pool compaction", () => {
         expiresAt: Date.now() + 300_000,
         chatgptAccountId: "pool_acc",
       });
-      globalThis.fetch = (async () => {
+      globalThis.fetch = (async (input, init) => {
+        const request = new Request(input, init);
+        const url = new URL(request.url);
+        if (request.method === "GET" && url.pathname === "/backend-api/codex/models") {
+          const accountId = request.headers.get("chatgpt-account-id");
+          const slugs = accountId === "pool_acc" ? ["gpt-5.6-terra"] : [];
+          return Response.json({
+            models: slugs.map(slug => ({ slug, supported_in_api: true, visibility: "list" })),
+          });
+        }
         if (sparkPhase) {
           return Response.json({ error: { message: "Spark quota exhausted" } }, {
             status: 429,
@@ -290,7 +462,7 @@ describe("native Codex pool compaction", () => {
     } finally {
       globalThis.fetch = originalFetch;
       clearCodexUpstreamHealth();
-      rmSync(testDir, { recursive: true, force: true });
+      removeTreeWithRetry(testDir);
       if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousOpencodexHome;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -360,7 +532,7 @@ describe("native Codex pool compaction", () => {
       Date.now = originalNow;
       globalThis.fetch = originalFetch;
       clearCodexUpstreamHealth();
-      rmSync(testDir, { recursive: true, force: true });
+      removeTreeWithRetry(testDir);
       if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousOpencodexHome;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -425,7 +597,7 @@ describe("native Codex pool compaction", () => {
       Date.now = originalNow;
       globalThis.fetch = originalFetch;
       clearCodexUpstreamHealth();
-      rmSync(testDir, { recursive: true, force: true });
+      removeTreeWithRetry(testDir);
       if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousOpencodexHome;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -554,6 +726,112 @@ describe("routed compaction for key-mode openai-responses (#422)", () => {
   });
 });
 
+describe("bare native compaction model without canonical openai (#2901)", () => {
+  /** A GitHub-Copilot-style operator: one third-party provider, no `openai` row at all. */
+  function copilotOnlyConfig(): OcxConfig {
+    return {
+      defaultProvider: "gw",
+      providers: {
+        gw: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.githubcopilot.com",
+          authMode: "key",
+          apiKey: "ghu_test",
+          models: ["gpt-5.6-sol"],
+        },
+      },
+    } as unknown as OcxConfig;
+  }
+
+  function chatCompletionPayload(text: string): Record<string, unknown> {
+    return {
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    };
+  }
+
+  test("v2 compaction_trigger turn summarizes through the default provider instead of 404", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
+      return jsonResponse(chatCompletionPayload("handoff summary"));
+    }) as typeof fetch;
+
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const res = await handleResponses(
+      compactionRequest(baseCompactionBody({ model: "gpt-5.6-sol" })),
+      copilotOnlyConfig(),
+      logCtx,
+    );
+
+    expect(res.status).toBe(200);
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.url.startsWith("https://api.githubcopilot.com")).toBe(true);
+    expect(calls[0]!.body.model).toBe("gpt-5.6-sol");
+    // Still the summarizer contract: no private trigger leaks to the third-party gateway.
+    expect(JSON.stringify(calls[0]!.body)).not.toContain("compaction_trigger");
+    expect(JSON.stringify(calls[0]!.body.messages)).toContain("CONTEXT CHECKPOINT COMPACTION");
+    expect(logCtx.provider).toBe("gw");
+    expect(logCtx.routeDecision?.selected).toMatchObject({ provider: "gw", reason: "compaction-default-provider" });
+    const json = await res.json() as { output?: Array<{ type?: string }> };
+    expect((json.output ?? []).filter(item => item.type === "compaction").length).toBe(1);
+  });
+
+  test("v1 /responses/compact takes the same fallback", async () => {
+    let upstreamCalls = 0;
+    globalThis.fetch = (async () => {
+      upstreamCalls += 1;
+      return jsonResponse(chatCompletionPayload("handoff summary"));
+    }) as typeof fetch;
+
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const res = await handleResponsesCompact(
+      compactionRequest(baseCompactionBody({ model: "gpt-5.6-sol" })),
+      copilotOnlyConfig(),
+      logCtx,
+    );
+
+    expect(res.status).toBe(200);
+    expect(upstreamCalls).toBe(1);
+    expect(logCtx.provider).toBe("gw");
+    expect(logCtx.requestedModel).toBe("gpt-5.6-sol");
+  });
+
+  test("ordinary turns on the same config keep the canonical-openai reservation", async () => {
+    let upstreamCalls = 0;
+    globalThis.fetch = (async () => {
+      upstreamCalls += 1;
+      return jsonResponse(chatCompletionPayload("must not be reached"));
+    }) as typeof fetch;
+
+    const body = baseCompactionBody({ model: "gpt-5.6-sol" });
+    body.input = (body.input as Array<Record<string, unknown>>).filter(item => item.type !== "compaction_trigger");
+    const res = await handleResponses(compactionRequest(body), copilotOnlyConfig(), { model: "", provider: "" });
+
+    expect(res.status).toBe(404);
+    expect(upstreamCalls).toBe(0);
+  });
+
+  test("an account-qualified native selector still fails closed on compaction", async () => {
+    let upstreamCalls = 0;
+    globalThis.fetch = (async () => {
+      upstreamCalls += 1;
+      return jsonResponse(chatCompletionPayload("must not be reached"));
+    }) as typeof fetch;
+
+    const config = copilotOnlyConfig();
+    (config as { codexAccountNamespaces?: Record<string, string> }).codexAccountNamespaces = { side: "side-account-id" };
+    const res = await handleResponsesCompact(
+      compactionRequest(baseCompactionBody({ model: "side/gpt-5.6-sol" })),
+      config,
+      { model: "", provider: "" },
+    );
+
+    expect(res.status).toBe(404);
+    expect(upstreamCalls).toBe(0);
+  });
+});
+
 describe("compaction terminal handling (#422)", () => {
   test("an upstream failure does not become an empty compaction", async () => {
     globalThis.fetch = (async () => jsonResponse({
@@ -660,7 +938,7 @@ describe("compact alternate-account attempt (#913)", () => {
       clearCodexUpstreamHealth();
       clearUpstreamHostHealth();
       clearAccountQuota();
-      rmSync(testDir, { recursive: true, force: true });
+      removeTreeWithRetry(testDir);
       if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousOpencodexHome;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -771,7 +1049,7 @@ describe("compact alternate-account attempt (#913)", () => {
         }) as typeof fetch;
 
         const res = await handleResponsesCompact(
-          compactionRequest(baseCompactionBody({ model: "side/gpt-5.6-sol" })),
+          compactionRequest(baseCompactionBody({ model: "side/gpt-5.5" })),
           config,
           { model: "", provider: "" },
         );
@@ -862,6 +1140,91 @@ describe("compact alternate-account attempt (#913)", () => {
       // Exactly one send, and the upstream succeeded, so nothing rotated.
       expect(bearers).toHaveLength(1);
       expect(res.status).toBe(200);
+    });
+  });
+
+  test("a quota-blocked previous-model compact retries the same thread's successful routed handoff target (#2723)", async () => {
+    await withPoolEnv("ocx-compact-routed-handoff-", async config => {
+      config.providers.deepseek = {
+        adapter: "openai-chat",
+        baseUrl: "https://api.deepseek.com",
+        authMode: "key",
+        apiKey: "deepseek-test-key",
+        models: ["deepseek-v4-flash"],
+      };
+      config.providers["openai-apikey"] = {
+        adapter: "openai-responses",
+        baseUrl: "https://api.openai.com/v1",
+        authMode: "key",
+        apiKey: "openai-test-key",
+        models: ["gpt-5.6-sol"],
+      };
+      const headers = { "x-codex-parent-thread-id": "compact-routed-handoff-thread" };
+      const calls: Array<{ model: string; nativeCompact: boolean }> = [];
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+        const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+        const nativeCompact = url.endsWith("/responses/compact");
+        calls.push({ model: body.model ?? "", nativeCompact });
+        if (nativeCompact) {
+          return Response.json({ error: { message: "The usage limit has been reached" } }, {
+            status: 502,
+          });
+        }
+        return jsonResponse(completedPayload("DeepSeek handoff summary"));
+      }) as typeof fetch;
+
+      const manual = await handleResponsesCompact(
+        compactionRequest(
+          baseCompactionBody({ model: "deepseek/deepseek-v4-flash" }),
+          undefined,
+          headers,
+        ),
+        config,
+        { model: "", provider: "" },
+      );
+      expect(manual.status).toBe(200);
+      expect(calls).toEqual([{ model: "deepseek-v4-flash", nativeCompact: false }]);
+      calls.length = 0;
+
+      const unrelated = await handleResponsesCompact(
+        compactionRequest(
+          baseCompactionBody({ model: "openai-apikey/gpt-5.6-sol" }),
+          undefined,
+          { "x-codex-parent-thread-id": "different-compact-thread" },
+        ),
+        config,
+        { model: "", provider: "" },
+      );
+      expect(unrelated.status).toBe(502);
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls.every(call => call.model === "gpt-5.6-sol" && call.nativeCompact)).toBe(true);
+      calls.length = 0;
+
+      const logCtx: RequestLogContext = { model: "", provider: "" };
+      const automatic = await handleResponsesCompact(
+        compactionRequest(
+          baseCompactionBody({ model: "openai-apikey/gpt-5.6-sol" }),
+          undefined,
+          headers,
+        ),
+        config,
+        logCtx,
+      );
+
+      expect(automatic.status).toBe(200);
+      const output = await automatic.json() as { output?: unknown[] };
+      expect(output.output?.length).toBeGreaterThan(0);
+      expect(logCtx.provider).toBe("deepseek");
+      expect(calls.at(-1)).toEqual({ model: "deepseek-v4-flash", nativeCompact: false });
+      expect(calls.slice(0, -1).length).toBeGreaterThan(0);
+      expect(calls.slice(0, -1).every(call => (
+        call.model === "gpt-5.6-sol" && call.nativeCompact
+      ))).toBe(true);
     });
   });
 
@@ -1055,7 +1418,7 @@ describe("compact alternate-account attempt (#913)", () => {
         const request = new Request("http://localhost/v1/responses", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ model: "gpt-5.6-sol", input: "hello", stream: false }),
+          body: JSON.stringify({ model: "gpt-5.5", input: "hello", stream: false }),
         });
         await expect(handleResponses(request, config, { model: "", provider: "" }))
           .rejects.toThrow("synthetic build failure");
@@ -1080,7 +1443,7 @@ describe("compact alternate-account attempt (#913)", () => {
       const request = () => new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "gpt-5.6-sol", input: "hello", stream: false }),
+        body: JSON.stringify({ model: "gpt-5.5", input: "hello", stream: false }),
       });
       const authSpy = spyOn(authContextModule, "resolveCodexAuthContext");
       try {

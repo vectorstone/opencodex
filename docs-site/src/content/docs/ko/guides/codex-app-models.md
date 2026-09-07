@@ -204,6 +204,26 @@ Desktop이 허용 목록을 제어할 수 있게 될 때까지:
   라우팅 모델을 정상적으로 나열합니다.
 
 ## 모델 상태 새로고침
+## 네이티브 쿼터 폴백 제한
+
+Codex 앱이 네이티브 5시간 쿼터를 다 쓰면 리저브 폴백 모델로 넘어가면서 피커의 다른 줄을 회색으로 만들 수 있습니다. [#2813](https://github.com/lidge-jun/opencodex/issues/2813)에 보고된 이 차단은 opencodex가 넣은 라우팅 줄까지 가립니다. 그 줄들은 관계없는 프로바이더 자격 증명을 쓰고 ChatGPT 쿼터를 전혀 쓰지 않습니다.
+
+이 차단은 요청이 프록시에 닿기 전에 클라이언트가 적용하므로 opencodex가 풀 수 없습니다. 라우팅 줄은 `visibility: "list"`로 기록되고, 카탈로그 필터링은 `disabledModels`와 프로바이더별 `selectedModels`만 봅니다. 쿼터 값은 라우팅 줄의 노출에 관여하지 않습니다.
+
+라우팅 모델을 직접 지정하는 경로는 피커를 거치지 않습니다. `config.toml`에 모델을 적습니다.
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+또는 바로 보냅니다.
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+두 경로 모두 **요청이 프록시에 도달한 뒤에는** 정상 라우팅되고, 이건 테스트로 덮여 있습니다. 다만 Codex 데스크톱 앱은 리저브 모드에서 설정한 모델을 보내지 않습니다. 앱이 자체 `wham/usage` 폴링(`luna_reserve` 업셀과 허용 상태의 `gpt-reserve` 추가 한도)으로 리저브를 판정하고, 요청이 나가기 전에 모델 설정을 `gpt-reserve`로 강제하기 때문에 `config.toml` 경로는 앱 안에서 덮어써집니다. 윈도우가 리셋될 때까지는 `ocx access test`, 프록시를 통한 Claude Code(`ocx claude`), 직접 `/v1` 클라이언트를 쓰세요. [Codex 리저브 모드에서의 라우팅 모델](/guides/codex-integration/#routed-models-during-codex-reserve-mode)도 참고하세요.
+
 
 picker에 오래된 항목이 계속 보이면 카탈로그를 새로 쓰고 대상 Codex 서피스를 다시 시작합니다:
 

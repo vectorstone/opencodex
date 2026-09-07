@@ -20,11 +20,12 @@
  * targeting it is the caller's explicit act.
  */
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { shouldInjectApiAuthHeader } from "../codex/inject";
+import { shouldInjectApiAuthHeader, standaloneCodexRoutingTarget } from "../codex/inject";
 import { FORMAT_MEDIA_TYPE, serializeDocument, type ConfigFormat } from "../integrations/serialize";
 import { providerCodexAccountMode } from "../providers/registry";
+import { canonicalizeReasoningEfforts, sanitizeCodexReasoningEfforts } from "../reasoning-effort";
 import { probeHostname } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 
@@ -63,28 +64,87 @@ export interface OpencodeCatalogModel {
   provider?: string;
   id?: string;
   contextWindow?: number;
+  maxOutputTokens?: number;
   displayName?: string;
+  /** Input modalities declared by the model (e.g. `["text","image"]`). */
+  inputModalities?: string[];
+  /** Declared effort ladder. Exported as opencode model variants where the client reads them. */
+  reasoningEfforts?: readonly string[];
+  /**
+   * Declared default effort. Carried so every client export reads one deduped, visibility-
+   * filtered ladder per model. The opencode serializer deliberately does NOT turn it into a
+   * model-level setting — see {@link opencodeEffortVariants} for why.
+  */
+  defaultReasoningEffort?: string;
 }
 
 export interface OpencodeModelEntry {
   name: string;
   limit?: { context: number; output: number };
+  /**
+   * Opencode v1 modality declaration. Only emitted when the catalog row
+   * carries at least one declared modality, so text-only models (which
+   * have no stored `inputModalities`) do not emit the block and opencode
+   * keeps its own defaults.
+   */
+  modalities?: { input: string[] };
 }
 
+/**
+ * One selectable reasoning effort.
+ *
+ * opencode V2 applies these only from the `providers` block: a `variants` array under the
+ * legacy `provider` block is parsed and then dropped, so the V1 block stays variant-free
+ * rather than carrying fields that look configured but never reach a request.
+ */
+export interface OpencodeModelVariant {
+  id: string;
+  settings: { reasoningEffort: string };
+}
+
+export interface OpencodeV2ModelEntry extends OpencodeModelEntry {
+  variants?: OpencodeModelVariant[];
+}
+
+/** Endpoint and admission, spelled once and shared by both block generations. */
+export interface OpencodeProviderConnection {
+  baseURL: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+}
+
+/** opencode V1 provider block: `npm` + `options`. */
 export interface OpencodeProviderBlock {
   npm: string;
   name: string;
-  options: {
-    baseURL: string;
-    apiKey?: string;
-    headers?: Record<string, string>;
-  };
+  options: OpencodeProviderConnection;
   models: Record<string, OpencodeModelEntry>;
+}
+
+/** opencode V2 provider block: `package` + `settings`. The only form whose variants apply. */
+export interface OpencodeV2ProviderBlock {
+  package: string;
+  name: string;
+  settings: OpencodeProviderConnection;
+  models: Record<string, OpencodeV2ModelEntry>;
+}
+
+/**
+ * Both generations, always built together: they are one document's two fragments and must
+ * agree on the model set, the names, and the connection. Building them in one pass is what
+ * makes that a fact rather than a convention.
+ */
+export interface OpencodeProviderBlocks {
+  v1: OpencodeProviderBlock;
+  v2: OpencodeV2ProviderBlock;
 }
 
 export interface OpencodeGeneratedConfig {
   $schema: string;
+  /** Legacy block. Kept so opencode V1 installs keep working; V2 merges both and this one loses. */
   provider: Record<string, OpencodeProviderBlock>;
+  /** opencode V2 block. */
+  providers: Record<string, OpencodeV2ProviderBlock>;
 }
 
 /** Provider key owned by this project; the only key any exporter ever emits. */
@@ -97,6 +157,21 @@ export const OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json";
  * the AI SDK's openai-compatible package (the same wiring users hand-write today).
  */
 const OPENCODE_PROVIDER_NPM = "@ai-sdk/openai-compatible";
+
+/**
+ * opencode V2's spelling of the same runtime. V2 resolves providers through its own
+ * package table and ignores the V1 `npm` field, so a V2 block has to name this package
+ * or the provider is not loaded at all.
+ *
+ * Verified end-to-end against opencode 0.0.0-beta-18684: `GET /api/model` resolves this
+ * package for the provider and applies the per-model `variants`. opencode changes its
+ * provider package table between releases, so re-verify the supported range whenever it
+ * moves; a stale string breaks only the V2 block, silently.
+ */
+const OPENCODE_V2_PROVIDER_PACKAGE = "@opencode-ai/ai/providers/openai-compatible";
+
+/** Display name for the provider block, identical in both generations. */
+const OPENCODE_PROVIDER_NAME = "OpenCodex";
 
 /**
  * Env var carrying the proxy admission key to opencode. The config only ever holds the
@@ -136,20 +211,6 @@ export const GAJAE_API_KEY_ENV = "OPENCODEX_GAJAE_API_KEY";
 
 /** Pi's wire-dialect selector for an OpenAI-compatible endpoint. */
 const PI_API_DIALECT = "openai-completions";
-
-/**
- * opencode's config schema rejects a `limit` block that carries `context` without
- * `output`, but CatalogModel has no authoritative per-model output field. Dropping
- * `limit` entirely would also throw away the authoritative context window we DO have,
- * so the block is emitted with this budget standing in for the missing half.
- *
- * The value matches REASONING_MAX_TOKENS_CEILING in src/adapters/anthropic.ts — the
- * project's existing "safe ceiling across current models" figure. It is a ceiling for
- * schema validity, NOT a claim about any specific model's true maximum, and it is
- * clamped to the context window so a small-context model can never be emitted with
- * output > context. Pi's `maxTokens` uses the same stand-in and the same clamp.
- */
-export const SCHEMA_REQUIRED_OUTPUT_BUDGET = 32_000;
 
 /** Deterministic loopback default for exported provider-block helpers in tests. */
 export const OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG: OcxConfig = {
@@ -192,6 +253,27 @@ function ompProfileName(env: OpencodeLaunchEnv): string | undefined {
   return profile;
 }
 
+/**
+ * Pi resolves its agent directory from `PI_CODING_AGENT_DIR`, falling back to
+ * `~/.pi/agent`. `ompAgentDir` below already reads that variable — OMP is a Pi
+ * derivative — so Pi's own resolver honoring it is what makes the two agree
+ * rather than a new claim about Pi's contract.
+ *
+ * A relative override is refused for the same reason MCode's and ZCode's are: a
+ * background proxy and a foreground client can have different working
+ * directories, and would otherwise disagree about which file is named.
+ */
+export function piAgentDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const override = env.PI_CODING_AGENT_DIR?.trim();
+  if (override) return absoluteClientPath(override, home, "PI_CODING_AGENT_DIR");
+  return join(home, ".pi", "agent");
+}
+
+/** Pi's canonical custom-provider catalog. */
+export function piConfigPath(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  return join(piAgentDir(env, home), "models.json");
+}
+
 /** Resolve the global Oh My Pi agent directory using OMP's own env precedence. */
 export function ompAgentDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
   const profile = ompProfileName(env);
@@ -215,7 +297,17 @@ export function ompModelsConfigPath(env: OpencodeLaunchEnv = process.env, home: 
 }
 
 /** Compose the OpenAI-compatible proxy base URL from a live probe result. */
-export function opencodeProxyBaseUrl(port: number, hostname?: string): string {
+export function opencodeProxyBaseUrl(
+  port: number,
+  hostname?: string,
+  config?: Pick<OcxConfig, "unauthenticatedLoopbackListener">,
+): string {
+  if (config?.unauthenticatedLoopbackListener?.enabled) {
+    return standaloneCodexRoutingTarget(port, {
+      hostname,
+      unauthenticatedLoopbackListener: config.unauthenticatedLoopbackListener,
+    }).baseUrl;
+  }
   return `http://${probeHostname(hostname)}:${port}/v1`;
 }
 
@@ -433,6 +525,104 @@ export function zcodeConfigPath(env: OpencodeLaunchEnv = process.env, home: stri
 }
 
 /**
+ * Prime Agent resolves its agent directory from `PRIME_AGENT_CODING_AGENT_DIR`
+ * — the brand-derived spelling of the `PI_CODING_AGENT_DIR` that `ompAgentDir`
+ * already honors, because the agent builds that variable name from its own
+ * `piConfig.name` — and otherwise falls back to `~/.prime/agent`. Relative
+ * overrides are refused for the same reason as MCode's and ZCode's: a
+ * background proxy and a foreground client can have different working
+ * directories.
+ */
+export function primeAgentDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const override = env.PRIME_AGENT_CODING_AGENT_DIR?.trim();
+  if (override) return absoluteClientPath(override, home, "PRIME_AGENT_CODING_AGENT_DIR");
+  return join(home, ".prime", "agent");
+}
+
+/** Prime Agent's canonical custom-provider catalog. */
+export function primeConfigPath(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  return join(primeAgentDir(env, home), "models.json");
+}
+
+/**
+ * Aside's state root. Unlike every other client here, Aside ships NO variable
+ * that relocates it: its CLI carries `ASIDE_DAEMON_BASE_URL`,
+ * `ASIDE_PRODUCT_VARIANT` and similar, and the only `.aside` path baked into the
+ * binary is its own update-check file under `~/.aside/cli`. So there is no
+ * client-owned override to mirror, and this registry does not invent one.
+ */
+export function asideHomeDir(_env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  return join(home, ".aside");
+}
+
+/**
+ * Which account's catalog we write.
+ *
+ * Aside is per-ACCOUNT: state lives under `~/.aside/u/<id>/` and the id comes
+ * from `accounts.json`, which Aside maintains. That makes this the only path
+ * resolver here that parses file CONTENTS rather than probing existence — the
+ * module already does the latter at four sites.
+ *
+ * It throws rather than defaulting. A machine can hold several accounts (both
+ * `u/0` and `u/1` existed on the machine this was developed against), so
+ * guessing `0` when the manifest cannot be read would name a real config file
+ * belonging to a DIFFERENT account, pass the installed-directory check, and
+ * write into somebody else's catalog. An unresolvable account is reported the
+ * same way an unresolvable `DSH_HOME` is.
+ *
+ * Callers that need BOTH the config path and the detect directory must derive
+ * them from ONE call to `asideAccountDir` rather than calling the two exported
+ * helpers in sequence: `resolveIntegrationPaths` in the integration registry is
+ * that seam. Caching here cannot substitute for it — a cache keyed on the
+ * manifest's mtime re-reads exactly when the manifest changes, which is the
+ * case the consistency is needed for.
+ */
+function asideCurrentAccountId(root: string): number {
+  const manifest = join(root, "accounts.json");
+  let raw: string;
+  try {
+    raw = readFileSync(manifest, "utf8");
+  } catch {
+    throw new ClientPathError(
+      `Aside's account manifest is missing or unreadable at ${manifest}, so opencodex cannot tell which `
+      + "account's model catalog to write. Launch Aside once to create it.",
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new ClientPathError(
+      `Aside's account manifest at ${manifest} is not readable JSON, so the account it names cannot be `
+      + "trusted. Writing a guessed account would target a different account's catalog.",
+    );
+  }
+  const id = (parsed as { currentAccountId?: unknown } | null)?.currentAccountId;
+  if (typeof id !== "number" || !Number.isInteger(id) || id < 0) {
+    throw new ClientPathError(
+      `Aside's account manifest at ${manifest} declares no usable currentAccountId, so opencodex cannot `
+      + "tell which account is current.",
+    );
+  }
+  return id;
+}
+
+/**
+ * The signed-in account's directory. This is also the install signal: the CLI
+ * creates `~/.aside/cli` for its own update check before any account exists, so
+ * the OUTER directory can be present on a machine that never signed in.
+ */
+export function asideAccountDir(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  const root = asideHomeDir(env, home);
+  return join(root, "u", String(asideCurrentAccountId(root)));
+}
+
+/** Aside's custom-provider catalog for the current account. */
+export function asideConfigPath(env: OpencodeLaunchEnv = process.env, home: string = homedir()): string {
+  return join(asideAccountDir(env, home), "models.json");
+}
+
+/**
  * One proxy-routed model destined for a client config. Deliberately narrower than
  * `CatalogModel` so a serializer cannot reach for a field that does not survive the
  * `/api/models` boundary.
@@ -446,6 +636,7 @@ export interface ExportModel {
   native?: boolean;
   displayName?: string;
   contextWindow?: number;
+  maxOutputTokens?: number;
   inputModalities?: string[];
   /** Optional effort ladder exported only to clients that support it. */
   reasoningEfforts?: string[];
@@ -473,7 +664,9 @@ export type ExportClientId =
   | "gajae"
   | "dsh"
   | "mcode"
-  | "zcode";
+  | "zcode"
+  | "prime"
+  | "aside";
 
 export interface ExportClientSpec {
   id: ExportClientId;
@@ -528,9 +721,15 @@ function authoritativeContextWindow(contextWindow: number | undefined): number |
   return undefined;
 }
 
-/** Schema-required output budget for a known context window. */
-function outputBudgetFor(context: number): number {
-  return Math.min(SCHEMA_REQUIRED_OUTPUT_BUDGET, context);
+/** Authoritative output-token capability, optionally clamped to a known context window. */
+function authoritativeMaxOutputTokens(
+  maxOutputTokens: number | undefined,
+  context?: number,
+): number | undefined {
+  if (typeof maxOutputTokens !== "number" || !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+    return undefined;
+  }
+  return context === undefined ? maxOutputTokens : Math.min(maxOutputTokens, context);
 }
 
 /**
@@ -608,8 +807,9 @@ function exportModelLabel(model: OpencodeCatalogModel): string {
   return `${id} (${providerLabel})`;
 }
 
-function opencodeProviderOptions(baseURL: string, config: OcxConfig): OpencodeProviderBlock["options"] {
-  const options: OpencodeProviderBlock["options"] = { baseURL };
+/** Endpoint plus admission, identical for the V1 `options` and V2 `settings` field. */
+function opencodeProviderConnection(baseURL: string, config: OcxConfig): OpencodeProviderConnection {
+  const options: OpencodeProviderConnection = { baseURL };
   // Non-loopback binds accept proxy admission only via x-opencodex-api-key so Authorization
   // stays free for Codex Direct upstream credentials when applicable.
   if (shouldInjectApiAuthHeader(config)) {
@@ -621,35 +821,101 @@ function opencodeProviderOptions(baseURL: string, config: OcxConfig): OpencodePr
 }
 
 /**
- * `opencodex` provider block for a resolved base URL.
+ * Selectable reasoning efforts for one model, in canonical ladder order.
+ *
+ * No model-level `settings.reasoningEffort` default is emitted: the proxy already applies
+ * its own configured default when a request carries no effort, and pinning one here would
+ * override a default the user controls in opencodex. Variants are opt-in per selection,
+ * which is the same reason we never emit `defaultModel` for MCode.
+ *
+ * `none` is dropped even when a ladder declares it. It is a valid *declared* effort, but the
+ * chat ingress filters wire efforts against `OUTPUT_CONFIG_EFFORTS`, which has no `none`, so
+ * selecting it would send no effort at all and silently fall back to the proxy default — a
+ * selectable value that cannot do what its label says. Same call MCode makes for its picker.
+ */
+function opencodeEffortVariants(model: OpencodeCatalogModel): OpencodeModelVariant[] | undefined {
+  if (model.reasoningEfforts === undefined) return undefined;
+  // Canonical order (none, minimal, then low..ultra) and dedupe, so the picker order does
+  // not depend on whatever order a provider listed its efforts in.
+  const efforts = canonicalizeReasoningEfforts(model.reasoningEfforts).filter(effort => effort !== "none");
+  if (efforts.length === 0) return undefined;
+  return efforts.map(effort => ({ id: effort, settings: { reasoningEffort: effort } }));
+}
+
+/**
+ * Both provider generations for one resolved base URL.
  *
  * `limit.context` is emitted ONLY from an authoritative context window — never guessed.
  * When none is available the whole `limit` block is dropped and opencode keeps its own
  * defaults; when one is present, `limit.output` rides along (opencode's schema requires
  * the pair) clamped to the context window.
+ *
+ * Two blocks instead of one because opencode V2 reads the `providers` map and V1 reads
+ * `provider`, and only the V2 form applies `variants`. Emitting both keeps V1 installs
+ * working: V2 merges them by provider id and model id, so a model listed in both blocks
+ * appears once, with the V2 entry's name, connection, and variants.
  */
+export function opencodeProviderBlocks(
+  baseURL: string,
+  catalogModels: readonly OpencodeCatalogModel[],
+  config: OcxConfig,
+): OpencodeProviderBlocks {
+  const v1Models: Record<string, OpencodeModelEntry> = {};
+  const v2Models: Record<string, OpencodeV2ModelEntry> = {};
+  for (const model of catalogModels) {
+    const key = model.namespaced;
+    if (v1Models[key]) continue; // first entry wins; native rows lead /api/models
+    const entry: OpencodeModelEntry = { name: exportModelLabel(model) };
+    const context = authoritativeContextWindow(model.contextWindow);
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined && output !== undefined) {
+      entry.limit = { context, output };
+    }
+    if (Array.isArray(model.inputModalities) && model.inputModalities.length > 0) {
+      entry.modalities = { input: [...model.inputModalities] };
+    }
+    v1Models[key] = entry;
+    const variants = opencodeEffortVariants(model);
+    // Own `limit` object, not a shared reference: the two blocks are serialized and reasoned
+    // about separately, and an in-place edit of one must never move the other.
+    v2Models[key] = {
+      ...entry,
+      ...(entry.limit ? { limit: { ...entry.limit } } : {}),
+      ...(variants ? { variants } : {}),
+    };
+  }
+  return {
+    v1: {
+      npm: OPENCODE_PROVIDER_NPM,
+      name: OPENCODE_PROVIDER_NAME,
+      options: opencodeProviderConnection(baseURL, config),
+      models: v1Models,
+    },
+    v2: {
+      package: OPENCODE_V2_PROVIDER_PACKAGE,
+      name: OPENCODE_PROVIDER_NAME,
+      settings: opencodeProviderConnection(baseURL, config),
+      models: v2Models,
+    },
+  };
+}
+
+/** `opencodex` provider block for a resolved base URL (opencode V1 shape). */
 function opencodeProviderBlock(
   baseURL: string,
   catalogModels: readonly OpencodeCatalogModel[],
   config: OcxConfig,
 ): OpencodeProviderBlock {
-  const models: Record<string, OpencodeModelEntry> = {};
-  for (const model of catalogModels) {
-    const key = model.namespaced;
-    if (models[key]) continue; // first entry wins; native rows lead /api/models
-    const entry: OpencodeModelEntry = { name: exportModelLabel(model) };
-    const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.limit = { context, output: outputBudgetFor(context) };
-    }
-    models[key] = entry;
-  }
-  return {
-    npm: OPENCODE_PROVIDER_NPM,
-    name: "OpenCodex",
-    options: opencodeProviderOptions(baseURL, config),
-    models,
-  };
+  return opencodeProviderBlocks(baseURL, catalogModels, config).v1;
+}
+
+/** `opencodex` provider block for a resolved base URL (opencode V2 shape, carries variants). */
+export function opencodeV2ProviderBlock(
+  baseURL: string,
+  catalogModels: readonly OpencodeCatalogModel[],
+  config: OcxConfig = OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG,
+): OpencodeV2ProviderBlock {
+  return opencodeProviderBlocks(baseURL, catalogModels, config).v2;
 }
 
 /**
@@ -683,14 +949,23 @@ export function normalizeExportModels(models: readonly ExportModel[]): ExportMod
   return unique.sort((a, b) => (a.namespaced < b.namespaced ? -1 : a.namespaced > b.namespaced ? 1 : 0));
 }
 
-/** OpenCode V1 document: our provider block plus `$schema`, and nothing else. */
+/**
+ * OpenCode document: both provider generations plus `$schema`, and nothing else.
+ *
+ * The order below fixes the order of the emitted keys and nothing else: the two blocks are
+ * disjoint top-level keys, and which generation opencode prefers when it merges them is
+ * opencode's decision, not a consequence of where we write it. Both blocks are generated in
+ * one pass so they cannot disagree about the model set, the names, or the connection.
+ */
 function buildOpencodeClientConfig(ctx: ExportContext): OpencodeGeneratedConfig {
-  const block = opencodeProviderBlock(
-    ctx.baseUrl,
-    normalizeExportModels(ctx.models),
-    ctx.config ?? OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG,
-  );
-  return { $schema: OPENCODE_CONFIG_SCHEMA, provider: { [OPENCODE_PROVIDER_ID]: block } };
+  const models = normalizeExportModels(ctx.models);
+  const config = ctx.config ?? OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG;
+  const blocks = opencodeProviderBlocks(ctx.baseUrl, models, config);
+  return {
+    $schema: OPENCODE_CONFIG_SCHEMA,
+    provider: { [OPENCODE_PROVIDER_ID]: blocks.v1 },
+    providers: { [OPENCODE_PROVIDER_ID]: blocks.v2 },
+  };
 }
 
 export interface PiModelEntry {
@@ -776,8 +1051,13 @@ export interface HermesProviderBlock {
   api_mode: "chat_completions";
   /** We supply the list, so skip their live `/models` probe. */
   discover_models: false;
-  models: string[];
+  models: Record<string, HermesModelEntry>;
   extra_headers?: Record<string, string>;
+}
+
+/** Capability metadata Hermes cannot discover for a custom local provider. */
+export interface HermesModelEntry {
+  supports_vision?: boolean;
 }
 
 export interface HermesGeneratedConfig {
@@ -886,7 +1166,14 @@ export interface McodeProviderBlock {
     baseURL: string;
     authMode: "api-key";
   };
-  models: Record<string, Record<string, never>>;
+  models: Record<string, McodeModelEntry>;
+}
+
+export interface McodeModelEntry {
+  /** MCode uses this value for context accounting and compaction. */
+  limit?: { context: number };
+  /** MCode exposes these exact levels in `/model` and sends the selected effort. */
+  thinking?: { effortOptions: string[] };
 }
 
 export interface McodeGeneratedConfig {
@@ -895,10 +1182,10 @@ export interface McodeGeneratedConfig {
 
 /**
  * ZCode's `~/.zcode/v2/config.json` provider entry (observed schema, validated
- * live against ZCode 3.7.7). `kind: "anthropic"` selects the Anthropic
- * Messages protocol, which the proxy serves at `/v1/messages`. `apiKeyRequired`
- * keeps ZCode's UI from prompting for a key it does not need on loopback; the
- * serialized key is always the non-secret loopback placeholder.
+ * live against ZCode 3.7.7 / 3.8.1). `kind: "openai-compatible"` selects the
+ * OpenAI Chat Completions protocol, which the proxy serves at `/v1/chat/completions`.
+ * `apiKeyRequired` keeps ZCode's UI from prompting for a key it does not need on
+ * loopback; the serialized key is always the non-secret loopback placeholder.
  */
 export interface ZcodeModelEntry {
   name?: string;
@@ -908,7 +1195,7 @@ export interface ZcodeModelEntry {
 
 export interface ZcodeProviderBlock {
   name: "OpenCodex";
-  kind: "anthropic";
+  kind: "openai-compatible";
   enabled: true;
   source: "custom";
   options: {
@@ -977,10 +1264,9 @@ function buildPiClientConfig(ctx: ExportContext): PiGeneratedConfig {
       };
     }
     const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.contextWindow = context;
-      entry.maxTokens = outputBudgetFor(context);
-    }
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined) entry.contextWindow = context;
+    if (output !== undefined) entry.maxTokens = output;
     models.push(entry);
   }
   return {
@@ -1012,10 +1298,9 @@ function buildOmpClientConfig(ctx: ExportContext): OmpGeneratedConfig {
       ...(model.native && model.provider === "openai" ? { api: "openai-responses" } : {}),
     };
     const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.contextWindow = context;
-      entry.maxTokens = outputBudgetFor(context);
-    }
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined) entry.contextWindow = context;
+    if (output !== undefined) entry.maxTokens = output;
     const efforts = ompEfforts(model);
     if (efforts.length > 0) {
       const defaultLevel = model.defaultReasoningEffort?.trim().toLowerCase();
@@ -1046,7 +1331,13 @@ function proxyAdmissionHeaders(config: OcxConfig | undefined, envRef: string): R
 }
 
 function buildHermesClientConfig(ctx: ExportContext): HermesGeneratedConfig {
-  const models = normalizeExportModels(ctx.models).map(model => model.namespaced);
+  const models: Record<string, HermesModelEntry> = {};
+  for (const model of normalizeExportModels(ctx.models)) {
+    const declared = model.inputModalities;
+    models[model.namespaced] = declared && declared.length > 0
+      ? { supports_vision: declared.includes("image") }
+      : {};
+  }
   const headers = proxyAdmissionHeaders(ctx.config, HERMES_API_KEY_ENV_REF);
   return {
     providers: {
@@ -1133,10 +1424,9 @@ function buildGajaeClientConfig(ctx: ExportContext): GajaeGeneratedConfig {
       input,
     };
     const context = authoritativeContextWindow(model.contextWindow);
-    if (context !== undefined) {
-      entry.contextWindow = context;
-      entry.maxTokens = outputBudgetFor(context);
-    }
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    if (context !== undefined) entry.contextWindow = context;
+    if (output !== undefined) entry.maxTokens = output;
     models.push(entry);
   }
   return {
@@ -1231,12 +1521,29 @@ function buildDshClientConfig(ctx: ExportContext): DshGeneratedConfig {
 
 /**
  * MiniMax Code's `provider add` command persists custom providers under
- * `custom_provider.<id>`. Do not emit `defaultModel`: connecting a client must
- * not silently replace the user's current model selection.
+ * `custom_provider.<id>`. Its current model schema reads `limit.context` for
+ * context accounting and `thinking.effortOptions` for the `/model` effort
+ * control. Do not emit the removed `thinking.effort` / `defaultEffort` fields:
+ * MCode 0.1.6 migrates those into options and keeps the selected effort in the
+ * session. Do not emit `defaultModel` either: connecting a client must not
+ * silently replace the user's current model selection.
  */
 function buildMcodeClientConfig(ctx: ExportContext): McodeGeneratedConfig {
-  const models: Record<string, Record<string, never>> = {};
-  for (const model of normalizeExportModels(ctx.models)) models[model.namespaced] = {};
+  const models: Record<string, McodeModelEntry> = {};
+  for (const model of normalizeExportModels(ctx.models)) {
+    const entry: McodeModelEntry = {};
+    const context = authoritativeContextWindow(model.contextWindow);
+    if (context !== undefined) entry.limit = { context };
+    // `none` is an internal Codex catalog sentinel, not an MCode effort. MCode
+    // forwards every option as `output_config.effort` while keeping adaptive
+    // thinking enabled, and the Anthropic ingress deliberately accepts only
+    // minimal..ultra. Advertising `none` would therefore create a selectable
+    // value that cannot disable reasoning and is not forwarded as an effort.
+    const efforts = sanitizeCodexReasoningEfforts(model.reasoningEfforts)
+      ?.filter(effort => effort !== "none");
+    if (efforts && efforts.length > 0) entry.thinking = { effortOptions: efforts };
+    models[model.namespaced] = entry;
+  }
   return {
     custom_provider: {
       [OPENCODE_PROVIDER_ID]: {
@@ -1256,10 +1563,10 @@ function buildMcodeClientConfig(ctx: ExportContext): McodeGeneratedConfig {
 }
 
 /**
- * ZCode dials the Anthropic Messages surface, so `baseURL` is the proxy origin
- * without the `/v1` suffix (ZCode appends `/v1/messages` itself — the same
- * shape its builtin Z.ai providers use). Model ids are the proxy's canonical
- * `provider/id` selectors, which `/v1/messages` resolves directly. Context
+ * ZCode dials the OpenAI Chat Completions surface (`openai-compatible`), which
+ * appends `/chat/completions` to `baseURL`. We supply `baseURL` with the `/v1`
+ * suffix so requests land on `/v1/chat/completions`. Model ids are the proxy's canonical
+ * `provider/id` selectors, which `/v1/chat/completions` resolves directly. Context
  * limits follow the authoritative-window rule: a model without one ships
  * without `limit` rather than guessing. Modalities are ZCode's observed
  * `text`-floor vocabulary; image-capable rows advertise image input.
@@ -1273,14 +1580,10 @@ function buildZcodeClientConfig(ctx: ExportContext): ZcodeGeneratedConfig {
       name: exportModelLabel(model),
       modalities: { input, output: ["text"] },
     };
-    // `limit.context` follows the authoritative-window rule. `output` is
-    // deliberately absent: ZCode's schema makes it optional and we have no
-    // authoritative output budget to assert (reviewer finding: an emitted
-    // stand-in would be a guessed capability, exactly what "no metadata is
-    // guessed" forbids).
     const context = authoritativeContextWindow(model.contextWindow);
+    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
     if (context !== undefined) {
-      entry.limit = { context };
+      entry.limit = { context, ...(output !== undefined ? { output } : {}) };
     }
     models[model.namespaced] = entry;
   }
@@ -1288,12 +1591,12 @@ function buildZcodeClientConfig(ctx: ExportContext): ZcodeGeneratedConfig {
     provider: {
       [OPENCODE_PROVIDER_ID]: {
         name: "OpenCodex",
-        kind: "anthropic",
+        kind: "openai-compatible",
         enabled: true,
         source: "custom",
         options: {
           apiKey: LOOPBACK_API_KEY_PLACEHOLDER,
-          baseURL: ctx.baseUrl.replace(/\/v1\/?$/, ""),
+          baseURL: ctx.baseUrl.replace(/\/v1\/?$/, "") + "/v1",
           apiKeyRequired: true,
         },
         models,
@@ -1315,18 +1618,18 @@ function summarizeOpencode(document: unknown): { modelCount: number; modelsWitho
 
 function summarizePi(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = (document as PiGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined || model.maxTokens === undefined).length };
 }
 
 function summarizeOmp(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = (document as OmpGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined || model.maxTokens === undefined).length };
 }
 
 function summarizeHermes(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
-  const models = (document as HermesGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
-  // Hermes carries selectors only; it has no per-model limit to be missing.
-  return { modelCount: models.length, modelsWithoutLimits: 0 };
+  const models = (document as HermesGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? {};
+  // Hermes carries capability metadata but no per-model limit to be missing.
+  return { modelCount: Object.keys(models).length, modelsWithoutLimits: 0 };
 }
 
 function summarizeOpenclaw(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
@@ -1343,7 +1646,7 @@ function summarizeKimi(document: unknown): { modelCount: number; modelsWithoutLi
 
 function summarizeGajae(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = (document as GajaeGeneratedConfig | undefined)?.providers?.[OPENCODE_PROVIDER_ID]?.models ?? [];
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.contextWindow === undefined || model.maxTokens === undefined).length };
 }
 
 function summarizeDsh(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
@@ -1353,13 +1656,12 @@ function summarizeDsh(document: unknown): { modelCount: number; modelsWithoutLim
 
 function summarizeMcode(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = Object.values((document as McodeGeneratedConfig | undefined)?.custom_provider?.[OPENCODE_PROVIDER_ID]?.models ?? {});
-  // MCode's custom-provider schema does not expose per-model context limits.
-  return { modelCount: models.length, modelsWithoutLimits: 0 };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => !model.limit).length };
 }
 
 function summarizeZcode(document: unknown): { modelCount: number; modelsWithoutLimits: number } {
   const models = Object.values((document as ZcodeGeneratedConfig | undefined)?.provider?.[OPENCODE_PROVIDER_ID]?.models ?? {});
-  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => !model.limit).length };
+  return { modelCount: models.length, modelsWithoutLimits: models.filter(model => model.limit?.output === undefined).length };
 }
 
 /** One fragment at `path`, built from this client's own document. */
@@ -1369,7 +1671,16 @@ function singleFragment(clientId: ExportClientId, path: readonly string[], value
 
 function buildOpencodeContribution(ctx: ExportContext): ManagedContribution {
   const doc = buildOpencodeClientConfig(ctx);
-  return singleFragment("opencode", ["provider", OPENCODE_PROVIDER_ID], doc.provider[OPENCODE_PROVIDER_ID]);
+  return {
+    clientId: "opencode",
+    fragments: [
+      // Legacy block first, so the emitted JSON reads the way a config migration does.
+      // opencode V1 reads only `provider`, V2 reads both, and the generation that wins the
+      // merge is decided by opencode — what we control is that both name the same models.
+      { path: ["provider", OPENCODE_PROVIDER_ID], value: doc.provider[OPENCODE_PROVIDER_ID] },
+      { path: ["providers", OPENCODE_PROVIDER_ID], value: doc.providers[OPENCODE_PROVIDER_ID] },
+    ],
+  };
 }
 
 function buildPiContribution(ctx: ExportContext): ManagedContribution {
@@ -1428,6 +1739,47 @@ function buildZcodeContribution(ctx: ExportContext): ManagedContribution {
   return singleFragment("zcode", ["provider", OPENCODE_PROVIDER_ID], doc.provider[OPENCODE_PROVIDER_ID]);
 }
 
+/**
+ * Prime Agent (PrimeIntellect) is the pi coding agent shipped under a different
+ * brand rather than a lookalike: its package declares a `piConfig` block, and
+ * the agent derives its config directory (`.prime/agent`) and env prefix from
+ * that block alone. `models.json` is therefore the SAME contract Pi reads, so
+ * this client reuses Pi's builder and summarizer verbatim. Restating the shape
+ * here would create a second copy of one fact, which is exactly how the
+ * "anything that is not OpenCode must be Pi" summarizer bug happened.
+ *
+ * The one thing that could still differ is the path we own, and it does not:
+ * Prime keeps our entries under the same `providers.<id>` key. So the only new
+ * code is stamping the right client id on the ownership record.
+ */
+function buildPrimeContribution(ctx: ExportContext): ManagedContribution {
+  const doc = buildPiClientConfig(ctx);
+  return singleFragment("prime", ["providers", OPENCODE_PROVIDER_ID], doc.providers[OPENCODE_PROVIDER_ID]);
+}
+
+/**
+ * Aside is the strongest case yet for reusing Pi's builder, because the
+ * evidence is a live file rather than a package manifest.
+ *
+ * The machine this landed on already had opencodex wired into Aside BY HAND:
+ * `~/.aside/u/0/models.json` carried a `providers.opencodex` block with the same
+ * four keys, the same `openai-completions` dialect, the same
+ * `opencodex-loopback` placeholder, and 24 models using the same
+ * `thinkingLevelMap` levels this builder emits. A user reproduced Pi's document
+ * from scratch because that is what Aside reads.
+ *
+ * Key ORDER differs (the hand-written file has `apiKey` before `api`), which is
+ * why the devlog claims compatibility rather than byte equality: JSON key order
+ * is not semantic and Aside parses this file rather than diffing it.
+ *
+ * As with prime, only the ownership stamp is Aside's own, so a disable removes
+ * the fragment this client recorded and not one another client wrote.
+ */
+function buildAsideContribution(ctx: ExportContext): ManagedContribution {
+  const doc = buildPiClientConfig(ctx);
+  return singleFragment("aside", ["providers", OPENCODE_PROVIDER_ID], doc.providers[OPENCODE_PROVIDER_ID]);
+}
+
 export const EXPORT_CLIENTS: Record<ExportClientId, ExportClientSpec> = {
   opencode: {
     id: "opencode",
@@ -1445,7 +1797,7 @@ export const EXPORT_CLIENTS: Record<ExportClientId, ExportClientSpec> = {
   pi: {
     id: "pi",
     filename: "pi-models.json",
-    destination: () => join(homedir(), ".pi", "agent", "models.json"),
+    destination: env => piConfigPath(env),
     apiKeyEnv: "",
     exportHint: "Pi reads a non-secret placeholder from models.json; loopback needs no key.",
     build: buildPiClientConfig,
@@ -1564,6 +1916,39 @@ export const EXPORT_CLIENTS: Record<ExportClientId, ExportClientSpec> = {
     // ZCode persists the credential in its own file and has no dedicated
     // proxy-admission header field, so real keys are never serialized and
     // remote binds refuse — same reasoning as MCode.
+    loopbackOnly: true,
+  },
+  prime: {
+    id: "prime",
+    filename: "prime-models.json",
+    destination: env => primeConfigPath(env),
+    apiKeyEnv: "",
+    exportHint: "Prime Agent reads a non-secret placeholder from models.json; loopback needs no key.",
+    build: buildPiClientConfig,
+    format: "json",
+    summarize: summarizePi,
+    buildContribution: buildPrimeContribution,
+    // Prime's provider block does accept `headers`, so a dedicated admission
+    // header has somewhere to live, but remote credential wiring is deferred
+    // from this initial loopback-only integration — same stance as OMP's.
+    loopbackOnly: true,
+  },
+  aside: {
+    id: "aside",
+    // Not a bare `models.json`: a download lands in the user's Downloads folder,
+    // where pi's and prime's files would collide with it. Prime set this
+    // precedent with `prime-models.json`.
+    filename: "aside-models.json",
+    destination: env => asideConfigPath(env),
+    apiKeyEnv: "",
+    exportHint: "Aside reads a non-secret placeholder from models.json; loopback needs no key.",
+    build: buildPiClientConfig,
+    format: "json",
+    summarize: summarizePi,
+    buildContribution: buildAsideContribution,
+    // The observed provider block has exactly four keys and none is `headers`,
+    // so the dedicated admission header has nowhere to live and a non-loopback
+    // bind would generate a config that 401s.
     loopbackOnly: true,
   },
 };

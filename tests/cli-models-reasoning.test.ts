@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseReasoningArgs, handleModels } from "../src/cli/models";
 import { handleModelsRuntimeCommand } from "../src/cli/models-runtime";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * The API validates reasoning ladders (9 tests in catalog-input-modality-enum.test.ts),
@@ -118,6 +119,11 @@ describe("ocx models edit reasoning flag mapping onto the PUT body", () => {
     expect(body.reasoningEfforts).toEqual(["low", "high"]);
     expect(body.defaultReasoningEffort).toBe("high");
   });
+
+  test("--max-output-tokens maps a value and zero clears it", async () => {
+    expect((await editWith(["--max-output-tokens", "128_000"])).maxOutputTokens).toBe(128_000);
+    expect((await editWith(["--max-output-tokens", "0"])).maxOutputTokens).toBeNull();
+  });
 });
 
 describe("ocx models add persists reasoning metadata into config.json", () => {
@@ -136,7 +142,7 @@ describe("ocx models add persists reasoning metadata into config.json", () => {
   afterAll(() => {
     if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousHome;
-    rmSync(home, { recursive: true, force: true });
+    removeTreeWithRetry(home);
   });
 
   function readConfig(): { customModels?: Array<Record<string, unknown>> } {
@@ -157,6 +163,12 @@ describe("ocx models add persists reasoning metadata into config.json", () => {
     expect(entry.defaultReasoningEffort).toBeUndefined();
   });
 
+  test("max output capability is stored independently from request defaults", async () => {
+    await handleModels(["add", "deepseek", "m3", "--max-output-tokens", "128000"]);
+    const entry = readConfig().customModels!.find(model => model.modelId === "m3")!;
+    expect(entry.maxOutputTokens).toBe(128_000);
+  });
+
   test("list-custom renders the stored ladder columns", async () => {
     const lines: string[] = [];
     const originalLog = console.log;
@@ -167,6 +179,7 @@ describe("ocx models add persists reasoning metadata into config.json", () => {
       console.log = originalLog;
     }
     const table = lines.join("\n");
+    expect(table).toContain("MAX OUTPUT");
     expect(table).toContain("EFFORTS");
     expect(table).toContain("low,high,max");
     expect(table).toContain("-"); // m2 has no ladder -> dash cell

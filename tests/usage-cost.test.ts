@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createAdapterTierMetadata } from "../src/providers/fastwire";
 import {
   calculateCost,
   estimateAttemptCost,
@@ -12,8 +13,10 @@ import {
 import {
   EXPECTED_PRICE_OVERLAYS,
   PRIORITY_MULTIPLIERS,
+  PRIORITY_PRICING_RULES,
   CONTEXT_TIERS,
   findExpectedPriceOverlay,
+  findPriorityPricingRule,
   resolvePriorityMultiplier,
   type ExpectedPriceOverlay,
 } from "../src/usage/expected-prices";
@@ -173,6 +176,34 @@ describe("resolveMatchedPrice", () => {
     expect(price!.cost4).toEqual({ input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 });
   });
 
+  // Claude Fable 5.1 (2026-09-02): 10 / 50 / 12.50 cache write, and a cache-hit rate of
+  // 0.025x base input (0.25) rather than the 0.1x every other family uses. There is no
+  // jawcode row yet, so both Anthropic surfaces resolve from the shipped overlay; an
+  // account-pool log label must collapse onto the same price.
+  test("claude-fable-5-1 resolves to the official Fable 5.1 price on both Anthropic surfaces", () => {
+    const COST4 = { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 };
+    for (const provider of ["anthropic", "anthropic-apikey"]) {
+      const price = resolveMatchedPrice(provider, "claude-fable-5-1");
+      expect(price, provider).toMatchObject({
+        provider,
+        modelId: "claude-fable-5-1",
+        cost4: COST4,
+        source: "expected",
+        status: "verified",
+      });
+      expect(price?.sourceRef).toContain("platform.claude.com");
+      expect(price?.sourceRef).toContain("0.025x");
+    }
+    expect(resolveMatchedPrice("anthropic-pb51d9b", "claude-fable-5-1")?.cost4).toEqual(COST4);
+    // Cursor accepts all three spellings but pricing stores one canonical overlay row.
+    for (const spelling of ["claude-fable-5-1", "claude-fable-5.1", "claude-5.1-fable"]) {
+      expect(resolveMatchedPrice("cursor", spelling), spelling).toMatchObject({ cost4: COST4, source: "expected", status: "verified-derived" });
+      expect(findExpectedPriceOverlay("cursor", spelling)?.modelId, spelling).toBe("claude-fable-5-1");
+    }
+    // The cheaper cache-hit rate must not leak onto Fable 5, which stays at 0.1x.
+    expect(resolveMatchedPrice("anthropic", "claude-fable-5")?.cost4.cacheRead).toBe(1);
+  });
+
   test("17b. model-level fallback: openai provider gets gpt prices from the openai bundle", () => {
     const price = resolveMatchedPrice("openai", "gpt-5.5");
     expect(price).not.toBeNull();
@@ -266,20 +297,37 @@ describe("resolveMatchedPrice", () => {
     expect(resolveMatchedPrice("openrouter", "anthropic-claude-3.5-sonnet")).toBeNull();
   });
 
-  test("16. shipped overlay membership: 55 keys, including Opus 5 and compatibility prices", () => {
-    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(55);
+  test("16. shipped overlay membership: 68 keys, including canonical Fable 5.1, Opus 5 and compatibility prices", () => {
+    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(68);
     expect(EXPECTED_PRICE_OVERLAYS.some(row => row.status === "unverified")).toBe(false);
     const keys = new Set(EXPECTED_PRICE_OVERLAYS.map(row => `${row.provider}/${row.modelId}`));
     for (const expected of [
+      "anthropic/claude-fable-5-1",
+      "anthropic-apikey/claude-fable-5-1",
+      "cursor/claude-fable-5-1",
       "anthropic/claude-opus-5",
       "cursor/claude-opus-5",
       "kiro/claude-opus-5",
+      "openai/gpt-daybreak-blue-latest",
       "openai-apikey/daybreak-red-latest",
       "openai-apikey/daybreak-blue-latest",
       "minimax/MiniMax-M2.1-highspeed",
       "minimax-cn/MiniMax-M2.1-highspeed",
       "deepseek/deepseek-chat",
       "deepseek/deepseek-reasoner",
+      "google-antigravity/gemini-3.8-flash",
+      "google-antigravity/gemini-3.8-flash-low",
+      "google-antigravity/gemini-3.8-flash-medium",
+      // meta-model has no jawcode alias, so these exact overlays are the only price
+      // source for the direct Meta provider.
+      "meta-model/muse-spark-1.3",
+      "meta-model/muse-spark-1.3-contributor",
+      // meta-muse reaches the same endpoint with the CLI credential; overlays resolve by
+      // exact provider id, so it needs its own rows or its cost column stays empty.
+      "meta-muse/muse-spark-1.3",
+      "meta-muse/muse-spark-1.3-contributor",
+      "google-antigravity/gemini-3.8-flash-high",
+      "google/gemini-3.8-flash",
       "google-antigravity/gemini-3.1-pro-low",
       "google-antigravity/gemini-3.1-pro-high",
       "google-antigravity/gemini-pro-agent",
@@ -323,6 +371,15 @@ describe("resolveMatchedPrice", () => {
       "cursor/auto",
     ]) {
       expect(keys.has(expected)).toBe(true);
+    }
+    for (const impossible of [
+      "openai/daybreak-blue-latest",
+      "openai/daybreak-red-latest",
+      "openai-apikey/gpt-daybreak-blue-latest",
+      "cursor/claude-fable-5.1",
+      "cursor/claude-5.1-fable",
+    ]) {
+      expect(keys.has(impossible)).toBe(false);
     }
 
     const direct = findExpectedPriceOverlay("google", "gemini-3.6-flash");
@@ -537,6 +594,8 @@ describe("priority (Fast) service tier multiplier", () => {
 
   test("P8. resolvePriorityMultiplier returns correct values", () => {
     expect(resolvePriorityMultiplier("gpt-5.6-sol")).toBe(2);
+    expect(resolvePriorityMultiplier("gpt-daybreak-blue-latest")).toBe(2);
+    expect(resolvePriorityMultiplier("daybreak-blue-latest")).toBe(2);
     expect(resolvePriorityMultiplier("gpt-5.6-terra")).toBe(2);
     expect(resolvePriorityMultiplier("gpt-5.6-luna")).toBe(2);
     expect(resolvePriorityMultiplier("gpt-5.5")).toBe(2.5);
@@ -547,12 +606,21 @@ describe("priority (Fast) service tier multiplier", () => {
   });
 
   test("P9. PRIORITY_MULTIPLIERS table has expected entries", () => {
-    expect(Object.keys(PRIORITY_MULTIPLIERS)).toHaveLength(6);
+    expect(Object.keys(PRIORITY_MULTIPLIERS)).toHaveLength(8);
     expect(PRIORITY_MULTIPLIERS["gpt-5.6-sol"]).toBe(2);
+    expect(PRIORITY_MULTIPLIERS["gpt-daybreak-blue-latest"]).toBe(2);
+    expect(PRIORITY_MULTIPLIERS["daybreak-blue-latest"]).toBe(2);
     expect(PRIORITY_MULTIPLIERS["gpt-5.6-terra"]).toBe(2);
     expect(PRIORITY_MULTIPLIERS["gpt-5.6-luna"]).toBe(2);
     expect(PRIORITY_MULTIPLIERS["gpt-5.5"]).toBe(2.5);
     expect(PRIORITY_MULTIPLIERS["gpt-5.4-mini"]).toBe(2);
+  });
+
+  test("P9b. Daybreak priority rules stay inside their routable provider namespace", () => {
+    expect(findPriorityPricingRule("openai", "gpt-daybreak-blue-latest")?.multiplier).toBe(2);
+    expect(findPriorityPricingRule("openai-apikey", "daybreak-blue-latest")?.multiplier).toBe(2);
+    expect(findPriorityPricingRule("openai-apikey", "gpt-daybreak-blue-latest")).toBeUndefined();
+    expect(findPriorityPricingRule("openai", "daybreak-blue-latest")).toBeUndefined();
   });
 
   test("P10. attempt cost with priority tier", () => {
@@ -561,6 +629,169 @@ describe("priority (Fast) service tier multiplier", () => {
     expect(base!.cost.total).toBeCloseTo(1.6, 9);
     expect(fast!.cost.total).toBeCloseTo(3.2, 9);
     expect(fast!.priorityMultiplier).toBe(2);
+  });
+});
+
+describe("xAI Priority Processing pricing", () => {
+  const usage = {
+    inputTokens: 100_000,
+    outputTokens: 10_000,
+    cacheReadInputTokens: 20_000,
+  };
+
+  function outcome(responseServiceTier?: string) {
+    const tracker = createAdapterTierMetadata(
+      {
+        capability: true,
+        eligibility: "eligible",
+        fastWire: {
+          kind: "service-tier",
+          canonicalToWire: { priority: "priority" },
+          foreignCallerTiers: "verbatim",
+        },
+        demandDecision: "force-fast",
+      },
+      { kind: "set", value: "priority" },
+      "service-tier",
+      "priority",
+    )!;
+    if (responseServiceTier !== undefined) tracker.observeResponseServiceTier(responseServiceTier);
+    return tracker.outcome;
+  }
+
+  function estimate(tierOutcome: ReturnType<typeof outcome>, requestUsage = usage) {
+    return estimateAttemptCost({
+      ordinal: 1,
+      provider: "xai",
+      model: "grok-4.6",
+      usageStatus: "reported",
+      usage: requestUsage,
+      tierOutcome,
+    })!;
+  }
+
+  test("xAI rules declare exact 2x premiums with official provenance", () => {
+    const xaiRules = PRIORITY_PRICING_RULES.filter(rule => rule.provider === "xai");
+    expect(xaiRules.map(rule => rule.modelId)).toEqual(["grok-4.5", "grok-4.6"]);
+    expect(xaiRules.every(rule => rule.multiplier === 2)).toBe(true);
+    expect(xaiRules.every(rule => rule.requiresResponseConfirmation === true)).toBe(true);
+    expect(xaiRules.every(rule => rule.source === "https://docs.x.ai/developers/advanced-api-usage/priority-processing")).toBe(true);
+    expect(findPriorityPricingRule("xai", "grok-4.6")?.multiplier).toBe(2);
+    expect(findPriorityPricingRule("openrouter", "grok-4.6")).toBeUndefined();
+    expect(resolveMatchedPrice("openrouter", "grok-4.6")?.cost4).toEqual({
+      input: 2,
+      output: 6,
+      cacheRead: 0.3,
+      cacheWrite: 0,
+    });
+    expect(resolveMatchedPrice("cursor", "grok-4.6")?.cost4).toEqual({
+      input: 2,
+      output: 6,
+      cacheRead: 0.3,
+      cacheWrite: 0,
+    });
+  });
+
+  test("grok-4.6 standard and confirmed priority prices include the official cache rate", () => {
+    expect(resolveMatchedPrice("xai", "grok-4.6")?.cost4).toEqual({
+      input: 2,
+      output: 6,
+      cacheRead: 0.5,
+      cacheWrite: 0,
+    });
+    const confirmedOutcome = outcome("priority");
+    const confirmed = estimate(confirmedOutcome);
+    expect(confirmedOutcome).toMatchObject({
+      canonical: "priority",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    });
+    expect(confirmed.cost.total).toBeCloseTo(0.46, 9);
+    expect(confirmed.cost.cacheRead).toBeCloseTo(0.02, 9);
+    expect(confirmed.priorityMultiplier).toBe(2);
+  });
+
+  test("an assumed priority outcome stays at the standard price", () => {
+    const assumedOutcome = outcome();
+    const assumed = estimate(assumedOutcome);
+    expect(assumedOutcome).toMatchObject({
+      canonical: "priority",
+      fastOutcome: "applied",
+      confirmation: "assumed",
+    });
+    expect(assumed.cost.total).toBeCloseTo(0.23, 9);
+    expect(assumed.priorityMultiplier).toBeUndefined();
+  });
+
+  test("missing provenance and a requested tier do not prove the xAI premium", () => {
+    for (const serviceTier of [
+      "priority",
+      { requestedServiceTier: "priority" },
+      { configuredServiceTier: "priority" },
+    ] as const) {
+      const unconfirmed = estimateRequestCost({
+        provider: "xai",
+        model: "grok-4.6",
+        usageStatus: "reported",
+        usage,
+        serviceTier,
+      })!;
+      expect(unconfirmed.cost.total).toBeCloseTo(0.23, 9);
+      expect(unconfirmed.priorityMultiplier).toBeUndefined();
+    }
+  });
+
+  test("an echoed default records a downgrade and bills the standard price", () => {
+    const downgradedOutcome = outcome("default");
+    const downgraded = estimate(downgradedOutcome);
+    expect(downgradedOutcome).toMatchObject({
+      fastOutcome: "downgraded",
+      fastDowngradeReason: "response-declined",
+      confirmation: "downgraded",
+      responseServiceTier: "default",
+    });
+    expect(downgradedOutcome).not.toHaveProperty("canonical");
+    expect(downgraded.cost.total).toBeCloseTo(0.23, 9);
+    expect(downgraded.priorityMultiplier).toBeUndefined();
+  });
+
+  test("confirmed priority at 200k uses the long-context price as a marked lower bound", () => {
+    const long = estimate(outcome("priority"), {
+      inputTokens: 200_000,
+      outputTokens: 10_000,
+      cacheReadInputTokens: 50_000,
+    });
+    expect(long.contextTier).toBe("long");
+    expect(long.priorityMultiplier).toBeUndefined();
+    expect(long.priorityLowerBound).toBe(true);
+    expect(long.cost).toMatchObject({
+      input: 0.6,
+      cacheRead: 0.05,
+      output: 0.12,
+    });
+    expect(long.cost.total).toBeCloseTo(0.77, 9);
+  });
+
+  test("a combo is a lower bound only when every priced attempt is a lower bound", () => {
+    const confirmed = outcome("priority");
+    const lowerBoundAttempt = {
+      ordinal: 1,
+      provider: "xai",
+      model: "grok-4.6",
+      usageStatus: "reported" as const,
+      usage: { inputTokens: 200_000, outputTokens: 10_000 },
+      tierOutcome: confirmed,
+    };
+    const ordinaryAttempt = {
+      ordinal: 2,
+      provider: "xai",
+      model: "grok-4.6",
+      usageStatus: "reported" as const,
+      usage,
+    };
+
+    expect(estimateComboCost([lowerBoundAttempt, { ...lowerBoundAttempt, ordinal: 2 }])?.priorityLowerBound).toBe(true);
+    expect(estimateComboCost([lowerBoundAttempt, ordinaryAttempt])?.priorityLowerBound).toBeUndefined();
   });
 });
 
@@ -598,28 +829,36 @@ describe("long-context pricing tiers (#908)", () => {
     // An alias is priced as its current snapshot, so the shipped rows are the real check.
     const red = resolveMatchedPrice("openai-apikey", "daybreak-red-latest");
     const blue = resolveMatchedPrice("openai-apikey", "daybreak-blue-latest");
+    const gptBlueOpenAi = resolveMatchedPrice("openai", "gpt-daybreak-blue-latest");
     expect(red?.cost4).toEqual({ input: 12.5, output: 75, cacheRead: 1.25, cacheWrite: 15.625 });
-    expect(blue?.cost4).toEqual({ input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 });
+    expect(blue?.cost4).toEqual({ input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 });
+    expect(gptBlueOpenAi?.cost4).toEqual({ input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 });
     // verified-derived, never verified: the pricing page has no daybreak-* rows, only the
     // snapshots'. This status is also what keeps `estimated` on downstream, and an alias is
     // more drift-prone than a normal row because OpenAI can repoint it.
     expect(red?.status).toBe("verified-derived");
     expect(blue?.status).toBe("verified-derived");
+    expect(gptBlueOpenAi?.status).toBe("verified-derived");
+    expect(resolveMatchedPrice("openai-apikey", "gpt-daybreak-blue-latest")).toBeNull();
+    expect(resolveMatchedPrice("openai", "daybreak-blue-latest")).toBeNull();
+    expect(resolveMatchedPrice("openai", "daybreak-red-latest")).toBeNull();
 
-    const alias = (model: string, usage: Record<string, number>) =>
-      estimateRequestCost({ provider: "openai-apikey", model, usageStatus: "reported", usage });
+    const alias = (model: string, usage: Record<string, number>, provider = "openai-apikey") =>
+      estimateRequestCost({ provider, model, usageStatus: "reported", usage });
     // Blue aliases gpt-5.6-sol, which publishes a long-context row: same exclusive boundary.
     expect(alias("daybreak-blue-latest", { inputTokens: 272_000, outputTokens: 10_000 })!.contextTier).toBeUndefined();
     expect(alias("daybreak-blue-latest", { inputTokens: 272_001, outputTokens: 10_000 })!.contextTier).toBe("long");
+    expect(alias("gpt-daybreak-blue-latest", { inputTokens: 272_000, outputTokens: 10_000 }, "openai")!.contextTier).toBeUndefined();
+    expect(alias("gpt-daybreak-blue-latest", { inputTokens: 272_001, outputTokens: 10_000 }, "openai")!.contextTier).toBe("long");
     // Red aliases gpt-5.6-cyber, whose four long-context cells are all "-" — no tier at all,
     // so a large prompt must stay on the standard rate rather than inheriting the family rule.
     const redOver = alias("daybreak-red-latest", { inputTokens: 272_001, outputTokens: 10_000 })!;
     expect(redOver.contextTier).toBeUndefined();
     expect(redOver.cost.input / (272_001 / 1e6)).toBeCloseTo(12.5, 9);
 
-    // The Blue tier is scoped to openai-apikey: Daybreak is not routable on Codex login, so
-    // it must not drift back into the shared two-provider expansion.
+    // Each spelling stays in the provider namespace where that selector is routable.
     expect(CONTEXT_TIERS.filter(t => t.modelId === "daybreak-blue-latest").map(t => t.provider)).toEqual(["openai-apikey"]);
+    expect(CONTEXT_TIERS.filter(t => t.modelId === "gpt-daybreak-blue-latest").map(t => t.provider)).toEqual(["openai"]);
     expect(CONTEXT_TIERS.some(t => t.modelId === "daybreak-red-latest")).toBe(false);
   });
 
@@ -1004,5 +1243,49 @@ describe("provider cost overlay (user-configured)", () => {
     expect(activeUserCostOverlays()[0].provider).toBe("sk-provider-789");
     // Leave the registry empty for the rest of the file.
     refreshUserCostOverlays({ providers: {} } as unknown as OcxConfig);
+  });
+});
+
+describe("aggregator vendor-prefixed model ids (#3136)", () => {
+  // CommandCode serves "deepseek/deepseek-v4-flash"; the cost catalog stores the bare id.
+  // The exact lookup missed a price that is present, so every request through such a
+  // provider reported no cost at all.
+  test("a vendor-prefixed id resolves to the same price as its bare id", () => {
+    const bare = resolveMatchedPrice("deepseek", "deepseek-v4-flash");
+    const prefixed = resolveMatchedPrice("commandcode-api", "deepseek/deepseek-v4-flash");
+    expect(bare?.cost4).toBeDefined();
+    expect(prefixed?.cost4).toEqual(bare!.cost4);
+    // Derived, not claimed as an exact catalog row for that provider.
+    expect(prefixed?.status).toBe("verified-derived");
+    expect(prefixed?.jawcodeProvider).toBe("deepseek");
+  });
+
+  test("the vendor prefix is compared after normalization, so x-ai matches xai", () => {
+    // The same vendor is spelled differently across catalogs. Dashes and case are the
+    // only variance this normalizes; anything further stays a miss.
+    expect(resolveMatchedPrice("openrouter", "x-ai/grok-4.6")?.cost4).toBeDefined();
+  });
+
+  test("a prefix that disagrees with the matched vendor stays unpriced", () => {
+    // This is the assertion that keeps the fix from becoming a mispricing.
+    // findVendorCostByModelId returns whichever vendor COST_VENDOR_PRIORITY reaches
+    // first, so an unchecked strip would price a Claude model from Anthropic's row while
+    // the caller named OpenAI - a number that looks authoritative and is wrong.
+    expect(resolveMatchedPrice("openrouter", "openai/claude-opus-4-6")).toBeNull();
+  });
+
+  test("an unknown tail is still unpriced rather than guessed", () => {
+    expect(resolveMatchedPrice("openrouter", "google/gemini-3.6-pro")).toBeNull();
+  });
+
+  test("unprefixed ids are unchanged", () => {
+    expect(resolveMatchedPrice("deepseek", "deepseek-v4-flash")?.cost4).toBeDefined();
+    expect(resolveMatchedPrice("deepseek", "not-a-real-model-xyz")).toBeNull();
+  });
+
+  test("a doubly-slashed id is not treated as a vendor prefix", () => {
+    // Only one prefix segment is understood; deeper paths are left alone rather than
+    // being peeled until something matches.
+    expect(resolveMatchedPrice("openrouter", "a/deepseek/deepseek-v4-flash")).toBeNull();
   });
 });

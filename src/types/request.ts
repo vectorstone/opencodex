@@ -30,6 +30,11 @@ export interface OcxReasoningReplayIdentity {
  * the holder, so late tool-call cache writes see the active physical identity.
  */
 export interface OcxReasoningReplayScopeRef {
+  /**
+   * Conversation namespace for replay state. Historically this was always the Codex parent-thread
+   * id; headerless Responses callers use a raw sanitized thread/Cursor/session fallback, never the
+   * hashed request-log conversation id.
+   */
   readonly clientThreadId: string;
   current?: Readonly<OcxReasoningReplayIdentity>;
 }
@@ -63,8 +68,15 @@ export interface OcxParsedRequest {
   _cursorConversationId?: string;
   /** Stable upstream client thread identity, used only to derive provider-scoped continuation ids. */
   _clientThreadId?: string;
-  /** Provider/account/model-bound namespace for process-local raw-reasoning replay. */
+  /** Cursor-only thread owner; may be an opaque process-local Desktop session/thread identity. */
+  _cursorClientThreadId?: string;
+  /** Conversation/provider/account/model-bound namespace for reasoning replay state. */
   _reasoningReplayScope?: OcxReasoningReplayScopeRef;
+  /**
+   * Set by bindRouteReasoningReplayScope after a proven serving-identity change, or by
+   * prepareOpaqueBlobRecovery after an authoritative rejection; consumers strip replayed blobs.
+   */
+  _stripReasoningEncryptedContent?: boolean;
   /**
    * Optional authenticated tenant/operator namespace for Cursor thread→conversation derivation.
    * When absent (single-operator local proxy), derivation stays local-scoped.
@@ -76,9 +88,13 @@ export interface OcxParsedRequest {
    */
   _cursorIsolateConversation?: boolean;
   /** Account-scoped, non-secret Kiro request metadata selected with the OAuth access token. */
-  _kiroAuthContext?: Pick<KiroOAuthMetadata, "profileArn" | "apiRegion" | "ssoRegion">;
+  _kiroAuthContext?: Pick<KiroOAuthMetadata, "profileArn" | "apiRegion" | "ssoRegion" | "authType">;
   /** Provider-private continuation metadata resolved from the Responses previous_response_id chain. */
   _providerContinuation?: OcxProviderContinuationState;
+  /** Persisted continuation considered only after the final physical route is known. */
+  _providerContinuationCandidate?: OcxProviderContinuationState;
+  /** Exact process-local route owner attached to newly persisted provider state. */
+  _providerContinuationOwner?: OcxProviderContinuationOwner;
   /**
    * The hosted `{type:"web_search", ...}` tool config, stashed when Codex enables web search. Routed
    * (non-OpenAI) providers can't run it server-side, so the proxy re-exposes it as a function tool and
@@ -174,8 +190,14 @@ export interface OcxImageContent {
   detail?: string;
 }
 
-/** A user/developer message content part: text or an image (vision). */
-export type OcxContentPart = OcxTextContent | OcxImageContent;
+export interface OcxVideoContent {
+  type: "video";
+  /** A base64 `data:` URL from an OpenAI-compatible `video_url` part. */
+  videoUrl: string;
+}
+
+/** A user/developer message content part: text or native media. */
+export type OcxContentPart = OcxTextContent | OcxImageContent | OcxVideoContent;
 
 export interface OcxThinkingContent {
   type: "thinking";
@@ -251,16 +273,33 @@ export interface OcxRequestOptions {
 
 export type OcxMessagePhase = "commentary" | "final_answer";
 
+/** Non-secret, process-local owner fence for provider-private continuation state. */
+export interface OcxProviderContinuationOwner {
+  [field: string]: string | number;
+  version: 1;
+  providerName: string;
+  providerDestinationIdentity: string;
+  adapterName: string;
+  modelId: string;
+  credentialIdentity: string;
+}
+
 /**
  * Provider-private state that must follow a locally expanded `previous_response_id` chain.
  * Kept out of public Responses output and persisted only in the bounded local continuation cache.
  */
 export interface OcxProviderContinuationState {
+  /** Proxy-authored owner metadata; stripped before provider adapters receive the state. */
+  __ocxOwner?: OcxProviderContinuationOwner;
   cursor?: {
+    [field: string]: unknown;
     conversationId?: string;
     checkpointUsable?: boolean;
+    /** Opaque process-local Cursor ConversationStateStructure snapshot ref. Never raw protobuf. */
+    checkpointRef?: string;
   };
   kiro?: {
+    [field: string]: unknown;
     conversationId?: string;
   };
   [provider: string]: Record<string, unknown> | undefined;
@@ -294,6 +333,8 @@ export type AdapterEvent =
   | {
       type: "done";
       usage?: OcxUsage;
+      /** Native opaque compaction ciphertext returned by a Responses backend. */
+      compactionEncryptedContent?: string;
       stopReason?: string;
       endTurn?: boolean;
       providerState?: OcxProviderContinuationState;
@@ -355,4 +396,12 @@ export interface OcxUsage {
   cacheCreationInputTokens?: number;
   reasoningOutputTokens?: number;
   estimated?: boolean;
+  /**
+   * The raw upstream usage object for Responses-shaped upstreams (openai/codex#41980 parity):
+   * codex-rs preserves the complete `response.usage` object through its own pipeline, so fields
+   * the proxy does not model (subscription metadata, future counters) must survive the bridged /
+   * rebuilt `response.completed` too. Accounting paths read only the canonical fields above; the
+   * wire rebuild merges this object's unknown keys back under the normalized values.
+   */
+  rawUsage?: Record<string, unknown>;
 }

@@ -54,6 +54,7 @@ ChatGPT bearer auth。由于注入的 `base_url` 指向 opencodex，proxy 会把
   `openai-responses` provider 的 id，该 endpoint 必须实现 OpenAI Images API。显式选择会失败即关闭，
   不会 fallback 到其他付费上游。这里不接受 registry 管理的 provider id；省略 `images.provider`
   即可使用内置的 OpenAI tiers。
+- **xAI Imagine（Grok OAuth）中继：** 当 `images.bridgeEnabled` 为 `true`、未设置 `images.provider`，且配置了 `xai` provider 时，`/v1/images/generations` 和 `/v1/images/edits` 会发到 `https://api.x.ai/v1`。使用哪种凭据由 provider 的 `authMode` 决定：`"oauth"` 时复用 `ocx login xai` 获得的 Grok CLI 授权，其他模式则使用 provider 的 API key。OAuth 登录不会启用 key 方式的 provider，反之亦然。ChatGPT 凭据不会被转发。若凭据缺失，代理返回 400，而不会向 ChatGPT 计费。显式设置 `images.provider` 后，`/v1/images` 由该 provider 接管，其校验错误原样返回，不会再尝试 xAI 中继。该中继会把 Codex 的 `size` / `aspect_ratio` 映射到 xAI Imagine 请求体，并返回同样的 `{created, data:[{b64_json}]}` 形状。整批（inline `b64_json` 与下载的 URL）解码字节与 base64 编码输出合计不超过 100 MiB；超出则返回 502。若 xAI 返回的是图片 URL 而非内联字节，代理会不带凭据自行下载：URL 必须是公开 HTTPS（不允许重定向、`file:`、回环或私有地址），每个文件上限 50 MiB，结果作为本地 artifact 保存，仅通过需认证的管理端点提供。这与仍仅支持 API key 的 Responses Image Bridge 循环相互独立。
 - **Google Antigravity（CCA）fallback：** 当既没有 OpenAI forward 候选，也没有已配置的 keyed
   provider 时，`/v1/images/generations`（不是 `/images/edits`）会 fallback 到 Antigravity
   **Cloud Code Assist** endpoint，并使用 `gemini-3.1-flash-image` 模型。该 fallback 也会在
@@ -159,9 +160,13 @@ opencodex 也会通过 WebSocket 提供 `/v1/responses`。专用 provider 只有
 ## 线程标识与历史记录
 
 默认的 loopback 形式会让新线程继续标记为 Codex 原生的 `openai` provider，因此正常的 resume history 不需要
-重映射。首次 sync 时，它还会把旧版 opencodex 标记过的线程迁回 `openai`。非 loopback 的专用 provider 模式
-在运行期间仍会把历史记录镜像到 `opencodex` provider 名下，并在退出时恢复已备份的 metadata。
-如需保持历史记录完全不变，请设置 `syncResumeHistory: false`。
+重映射。sync 和 restore 只应用与当前状态数据库匹配的备份 manifest，并精确恢复每个线程原来的 provider、
+source 和 event marker。没有 manifest 的 `opencodex` 行会保持不变；只有明确要强制执行旧式重标记时，才使用
+`ocx recover-history --legacy-openai --yes`。此命令的作用范围有意设置得很广：它会把所有包含用户消息且当前标记为
+`opencodex` 的线程改标为 `openai`，将 `exec` 规范化为 `cli`，并设置事件标记；正常的专用提供方历史记录也在
+范围内。请先备份状态，并且仅在确实需要这一完整范围时使用。非 loopback 的专用 provider 模式在运行期间仍会把历史记录镜像到
+`opencodex` provider 名下，并在退出时恢复已备份的 metadata。如需保持历史记录完全不变，请设置
+`syncResumeHistory: false`。
 
 ## 模型目录同步
 
@@ -209,13 +214,13 @@ Browser 或 Computer Use。原生 OpenAI 条目会保持其上游 tool mode 不�
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
-远程 Codex 客户端也可以通过管理 API 拉取同一个生成好的 catalog（与其他 `/api/*` 路由使用相同的 admission token）：
+远程 Codex 客户端可以使用普通的数据面密钥（与 `/v1/responses` 所用凭据相同，而非管理员令牌）拉取同一个生成好的 catalog：
 
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/opencodex-catalog.json"
 tmp="$(mktemp "${dest}.XXXXXX")"
-curl -fsS -H "x-opencodex-api-key: $OPENCODEX_ADMIN_AUTH_TOKEN" \
-  "https://proxy.example.com/api/catalog" > "$tmp" \
+curl -fsS -H "x-opencodex-api-key: $OPENCODEX_API_AUTH_TOKEN" \
+  "https://proxy.example.com/v1/catalog" > "$tmp" \
   && mv "$tmp" "$dest"
 ocx sync-cache
 ```
@@ -226,6 +231,8 @@ ocx sync-cache
 你也可以通过管理 API（`POST /api/custom-models`、带 `displayName` 字符串的 `PUT /api/custom-models/<id>`）
 以及 web dashboard 来设置或编辑它。因为会与路由 slug 分隔符冲突，所以 `/` 会被拒绝。
 
+`GET /v1/catalog` 的存在是为了让读取模型列表不再需要管理员令牌。该路由为只读（`GET` 与 `HEAD`），接受 `x-opencodex-api-key`、bearer 令牌或 `x-api-key`，并返回与管理路由完全相同的字节。响应携带强 `ETag`——通过 `If-None-Match` 回传即可重新验证并获得 `304` 而非完整文档——同时设置 `Cache-Control: private, no-cache`。在此被接纳的数据面密钥在管理面上**不会**获得任何权限：`/api/catalog` 以及所有 `/api/*` 路由仍然要求管理员令牌或仪表板会话。
+
 display name 是 **仅用于显示且在重新生成时保持稳定的**。每一次 `ocx sync` 和 catalog refresh 都会从
 `config.json`（包括 `customModels`）重新派生路由条目，因此配置过的名称会重新应用，而不是漂回路由 slug。
 受管服务重启后也会在 proxy 绑定完成后不久尝试做这次 sync。如果这个尽力而为的启动 sync 失败了，比如在离线登录时，
@@ -235,7 +242,7 @@ display name 是 **仅用于显示且在重新生成时保持稳定的**。每�
 ### 外部 provider 管理器
 
 在默认的 `full` 集成模式下，如果 `config.toml` 已经选择了 `openai` 或 `opencodex` 之外的 provider，
-OpenCodex 会保持文件不变，并跳过 profile 写入、catalog/cache 刷新，以及立即和后台两种 Codex 历史迁移。管理自定义 provider 的工具
+并跳过 profile 写入、catalog/cache 刷新，以及立即和后台两种 Codex 历史元数据恢复。管理自定义 provider 的工具
 通常会把现有会话标记为那个 provider id；如果替换活动 id，Codex 历史视图里那些完整会话可能会消失。
 同样的保护也适用于由旧版 root profile 选择的外部 provider。
 

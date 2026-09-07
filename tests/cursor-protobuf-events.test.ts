@@ -8,6 +8,7 @@ import {
   McpArgsSchema,
   McpToolCallSchema,
   PartialToolCallUpdateSchema,
+  TextDeltaUpdateSchema,
   TokenDeltaUpdateSchema,
   ToolCallCompletedUpdateSchema,
   ToolCallSchema,
@@ -21,6 +22,8 @@ import {
   mapSyntheticMcpExecToToolEvents,
 } from "../src/adapters/cursor/protobuf-events";
 import { createTranslatorBudget } from "../src/lib/translator-budget";
+import { observeEmptyCompletion } from "../src/server/responses/empty-completion-guard";
+import type { AdapterEvent } from "../src/types";
 
 const encoder = new TextEncoder();
 
@@ -118,6 +121,84 @@ describe("Cursor protobuf tool-call events", () => {
       { type: "tool_call_delta", arguments: "{\"cmd\":\"echo hi\"}" },
       { type: "tool_call_end", id: "call_1" },
     ]);
+  });
+
+  test("maps a provider-isolated Cursor client-tool alias back to Claude Desktop's bare tool name", () => {
+    const state = createCursorProtobufEventState({
+      clientToolNames: ["ocx_client_read"],
+      toolSchemas: new Map([[
+        "ocx_client_read",
+        { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      ]]),
+      cursorToolNameMap: new Map([["ocx_client_read", "read"]]),
+    });
+    const toolCall = mcpToolCall("ocx_client_read", { path: "README.md" });
+
+    expect(mapCursorProtobufServerMessage(interaction({
+      case: "toolCallCompleted",
+      value: create(ToolCallCompletedUpdateSchema, { callId: "call_read", modelCallId: "model_read", toolCall }),
+    }), state)).toEqual([
+      { type: "tool_call_start", id: "call_read", name: "read" },
+      { type: "tool_call_delta", arguments: "{\"path\":\"README.md\"}" },
+      { type: "tool_call_end", id: "call_read" },
+    ]);
+  });
+
+  test("rejects malformed freeform arguments after restoring a provider-isolated alias", () => {
+    const state = createCursorProtobufEventState({
+      clientToolNames: ["ocx_client_script"],
+      freeformToolNames: ["script"],
+      cursorToolNameMap: new Map([["ocx_client_script", "script"]]),
+    });
+    const toolCall = mcpToolCall("ocx_client_script", { wrong_key: "not a wrapper" });
+
+    expect(mapCursorProtobufServerMessage(interaction({
+      case: "toolCallCompleted",
+      value: create(ToolCallCompletedUpdateSchema, {
+        callId: "call_bad_freeform", modelCallId: "model_bad_freeform", toolCall,
+      }),
+    }), state)).toEqual([
+      { type: "error", message: "script call had invalid freeform arguments; expected {input:string}" },
+    ]);
+    expect(state.openToolCalls.has("call_bad_freeform")).toBe(false);
+    expect(state.completedToolCalls.has("call_bad_freeform")).toBe(true);
+  });
+
+  test("keeps an aliased partial freeform wrapper open for native arguments", () => {
+    const state = createCursorProtobufEventState({
+      clientToolNames: ["ocx_client_script"],
+      freeformToolNames: ["script"],
+      cursorToolNameMap: new Map([["ocx_client_script", "script"]]),
+    });
+    const toolCall = mcpToolCall("ocx_client_script", {});
+
+    expect(mapCursorProtobufServerMessage(interaction({
+      case: "toolCallStarted",
+      value: create(ToolCallStartedUpdateSchema, {
+        callId: "call_partial_alias", modelCallId: "model_partial_alias", toolCall,
+      }),
+    }), state)).toEqual([]);
+    expect(mapCursorProtobufServerMessage(interaction({
+      case: "partialToolCall",
+      value: create(PartialToolCallUpdateSchema, {
+        callId: "call_partial_alias",
+        modelCallId: "model_partial_alias",
+        toolCall,
+        argsTextDelta: '{"inpu',
+      }),
+    }), state)).toEqual([]);
+    expect(mapCursorProtobufServerMessage(interaction({
+      case: "toolCallCompleted",
+      value: create(ToolCallCompletedUpdateSchema, {
+        callId: "call_partial_alias", modelCallId: "model_partial_alias", toolCall,
+      }),
+    }), state)).toEqual([]);
+    expect(state.openToolCalls.get("call_partial_alias")).toMatchObject({
+      name: "script",
+      args: '{"inpu',
+      awaitingNativeArgs: true,
+    });
+    expect(state.completedToolCalls.has("call_partial_alias")).toBe(false);
   });
 
   test("keeps genuine run_shell tool name when no exec_command alias was advertised", () => {
@@ -1100,5 +1181,104 @@ describe("request-local input estimate (#373)", () => {
     const usage = done?.type === "done" ? done.usage : undefined;
 
     expect(usage?.inputTokens).toBe(0);
+  });
+});
+
+describe("textual pseudo tool-call marker normalization (#2305)", () => {
+  function textDelta(text: string) {
+    return interaction({ case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) });
+  }
+
+  test("display alias inside [TOOL_CALL]...[ARGS] markers folds to the wire name", () => {
+    const state = createCursorProtobufEventState();
+    const events = mapCursorProtobufServerMessage(
+      textDelta('[TOOL_CALL]mcp_opencodex-responses_grep[ARGS]{"pattern":"OpenCodex"}'),
+      state,
+    );
+    expect(events).toEqual([{ type: "text", text: '[TOOL_CALL]grep[ARGS]{"pattern":"OpenCodex"}' }]);
+  });
+
+  test("prose mentioning the display alias without markers stays untouched", () => {
+    const state = createCursorProtobufEventState();
+    const prose = "You could call mcp_opencodex-responses_grep here.";
+    const events = mapCursorProtobufServerMessage(textDelta(prose), state);
+    expect(events).toEqual([{ type: "text", text: prose }]);
+  });
+
+  test("markers with a non-opencodex provider prefix are not rewritten", () => {
+    const state = createCursorProtobufEventState();
+    const other = "[TOOL_CALL]mcp_other-provider_grep[ARGS]{}";
+    const events = mapCursorProtobufServerMessage(textDelta(other), state);
+    expect(events).toEqual([{ type: "text", text: other }]);
+  });
+
+  test("already-short names inside markers pass through unchanged", () => {
+    const state = createCursorProtobufEventState();
+    const short = "[TOOL_CALL]grep[ARGS]{}";
+    const events = mapCursorProtobufServerMessage(textDelta(short), state);
+    expect(events).toEqual([{ type: "text", text: short }]);
+  });
+});
+
+describe("#2472 the Cursor producer path for a silent empty turn", () => {
+  /**
+   * A turnEnded with no text and no committed tool call finalizes to a bare `done`. That is a
+   * successful terminal carrying no content — the exact shape the client records as a
+   * completed turn that said nothing, which is the reported symptom.
+   *
+   * This pins the producer so the shape stays visible. The observer added in #2597 is what
+   * makes it recorded rather than silent; this proves the stream really can reach that state
+   * from a real adapter rather than only in the observer's own fixtures.
+   */
+  test("turnEnded with no output finalizes to a content-free done", () => {
+    const state = createCursorProtobufEventState();
+    const events = mapCursorProtobufServerMessage(turnEndedFrame(), state);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("done");
+    // No text_delta and no tool_call_* were emitted at any point in this turn.
+    expect(events.some(event => event.type === "text_delta")).toBe(false);
+    expect(events.some(event => event.type.startsWith("tool_call"))).toBe(false);
+  });
+
+  test("an incomplete tool call is a stated error, not a silent empty turn", () => {
+    // The distinction matters: this path already tells the client something went wrong, so it
+    // is NOT the failure mode #2472 describes and must not be conflated with it.
+    const state = createCursorProtobufEventState();
+    state.openToolCalls.set("call-1", { name: "shell", args: "" } as never);
+    const events = finalizeTurnEvents(state);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("error");
+  });
+
+  test("a turn that produced text finalizes with content already emitted", () => {
+    const state = createCursorProtobufEventState();
+    state.usage.outputTokens = 3;
+    const events = finalizeTurnEvents(state);
+    expect(events[0]!.type).toBe("done");
+    // Usage alone is not content: the observer keys on emitted events, not token counters,
+    // which is why a turn can report output tokens and still be empty to the client.
+    expect(events.some(event => event.type === "text_delta")).toBe(false);
+  });
+});
+
+
+describe("#2472 end to end: the real producer output reaches the observer", () => {
+  /**
+   * The two halves were verified separately — the Cursor adapter can finalize a turn to a
+   * content-free `done`, and the observer flags a content-free `done`. This joins them so a
+   * future change to either side cannot quietly break the pairing.
+   */
+  test("a Cursor turnEnded with no output is flagged by the observer", async () => {
+    const state = createCursorProtobufEventState();
+    const produced = mapCursorProtobufServerMessage(turnEndedFrame(), state) as unknown as AdapterEvent[];
+
+    let flagged = 0;
+    const seen: AdapterEvent[] = [];
+    const stream = (async function* () { yield* produced; })();
+    for await (const event of observeEmptyCompletion(stream, () => { flagged += 1; })) seen.push(event);
+
+    expect(flagged).toBe(1);
+    // Passthrough: the adapter's own events are delivered unchanged.
+    expect(seen).toEqual(produced);
   });
 });

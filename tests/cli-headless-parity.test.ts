@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { handleAccessCommand } from "../src/cli/access";
 import { handleAgentCommand } from "../src/cli/agent";
 import { handleComboCommand } from "../src/cli/combo";
@@ -9,9 +10,174 @@ import { handleConfigCommand } from "../src/cli/config-command";
 import { handleClientIntegrationCommand, handleGrokCommand } from "../src/cli/integrations";
 import { handleModelsRuntimeCommand } from "../src/cli/models-runtime";
 import { handleProviderRuntimeCommand } from "../src/cli/provider-runtime";
+import { providerQuotaLine } from "../src/cli/account-extended";
+import { formatAccountTable } from "../src/cli/account";
+import { handleConnectCommand } from "../src/cli/connect";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 type Recorded = { path: string; method: string; body: unknown };
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
+
+describe("ocx agent sidecar --list (#2188)", () => {
+  test("web --list prints the server's webSearchModels — the GUI's exact list", async () => {
+    const { requests, deps } = fakeRuntime(req => {
+      const url = new URL(req.url);
+      if (url.pathname === "/api/sidecar-settings" && req.method === "GET") {
+        return {
+          webSearchModels: [
+            { value: "gpt-5.6-luna", label: "gpt-5.6-luna", model: "gpt-5.6-luna", backend: "openai", authSlot: true },
+            { value: "gpt-5.6-terra", label: "gpt-5.6-terra", model: "gpt-5.6-terra", backend: "openai" },
+          ],
+          visionModels: [],
+        };
+      }
+      return undefined;
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const code = await handleAgentCommand(["sidecar", "web", "--list"], deps);
+      expect(code).toBe(0);
+      // Read-only: exactly one GET of the settings route, never a PUT.
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.method).toBe("GET");
+      expect(requests[0]!.path).toBe("/api/sidecar-settings");
+      const out = logSpy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(out).toContain("gpt-5.6-luna [openai] (auth slot)");
+      expect(out).toContain("gpt-5.6-terra [openai]");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("--list combined with a write flag is a usage error, not a silent ignore", async () => {
+    const { requests, deps } = fakeRuntime();
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const code = await handleAgentCommand(["sidecar", "web", "--list", "--model", "x"], deps);
+      expect(code).toBe(2);
+      expect(requests).toHaveLength(0);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("web --model persists the exact backend/model pair offered by the server", async () => {
+    const { requests, deps } = fakeRuntime((req, body) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/api/sidecar-settings" && req.method === "GET") {
+        return {
+          webSearch: { model: "gpt-5.6-luna", backend: "openai" },
+          webSearchModels: [
+            { value: "claude-haiku-4-5", label: "claude-haiku-4-5", model: "claude-haiku-4-5", backend: "anthropic", authSlot: true },
+          ],
+          visionModels: [],
+        };
+      }
+      if (url.pathname === "/api/sidecar-settings" && req.method === "PUT") {
+        return { ok: true, saved: body };
+      }
+      return undefined;
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["sidecar", "web", "--model", "claude-haiku-4-5"], deps)).toBe(0);
+      expect(requests).toEqual([
+        { path: "/api/sidecar-settings", method: "GET", body: null },
+        {
+          path: "/api/sidecar-settings",
+          method: "PUT",
+          body: { webSearch: { model: "claude-haiku-4-5", backend: "anthropic" } },
+        },
+      ]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("web --model preserves an explicit backend clear", async () => {
+    const { requests, deps } = fakeRuntime((req, body) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/api/sidecar-settings" && req.method === "GET") {
+        return {
+          webSearchModels: [
+            { value: "gpt-5.6-luna", label: "gpt-5.6-luna", model: "gpt-5.6-luna", backend: "openai" },
+          ],
+          visionModels: [],
+        };
+      }
+      if (url.pathname === "/api/sidecar-settings" && req.method === "PUT") {
+        return { ok: true, saved: body };
+      }
+      return undefined;
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand([
+        "sidecar", "web", "--model", "gpt-5.6-luna", "--backend", "-",
+      ], deps)).toBe(0);
+      expect(requests).toEqual([
+        { path: "/api/sidecar-settings", method: "GET", body: null },
+        {
+          path: "/api/sidecar-settings",
+          method: "PUT",
+          body: { webSearch: { model: "gpt-5.6-luna", backend: null } },
+        },
+      ]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("web --model surfaces the server's backend/model pair rejection", async () => {
+    const { requests, deps } = fakeRuntime(req => {
+      const url = new URL(req.url);
+      if (req.method === "GET") {
+        return {
+          webSearchModels: [
+            { value: "claude-haiku-4-5", label: "claude-haiku-4-5", model: "claude-haiku-4-5", backend: "anthropic" },
+          ],
+          visionModels: [],
+        };
+      }
+      if (req.method === "PUT") {
+        return Response.json({ error: 'webSearch.model: backend/model pair "anthropic/claude-haiku-4-5" is not a web-search sidecar candidate' }, { status: 400 });
+      }
+      return undefined;
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["sidecar", "web", "--model", "claude-haiku-4-5"], deps)).toBe(1);
+      expect(requests.map(request => request.method)).toEqual(["GET", "PUT"]);
+      expect(errorSpy.mock.calls.map(call => String(call[0])).join("\n")).toContain(
+        'backend/model pair "anthropic/claude-haiku-4-5"',
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("vision --list prints visionModels with backend tags; empty set names the reason", async () => {
+    const { deps } = fakeRuntime(req => {
+      const url = new URL(req.url);
+      if (url.pathname === "/api/sidecar-settings" && req.method === "GET") {
+        return { webSearchModels: [], visionModels: [{ value: "claude-haiku-4-5", label: "claude-haiku-4-5", backend: "anthropic", baseline: true }] };
+      }
+      return undefined;
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(await handleAgentCommand(["sidecar", "vision", "--list"], deps)).toBe(0);
+      const visionOut = logSpy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(visionOut).toContain("claude-haiku-4-5 [anthropic] (baseline)");
+      logSpy.mockClear();
+      expect(await handleAgentCommand(["sidecar", "web", "--list"], deps)).toBe(0);
+      const webOut = logSpy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(webOut).toContain("no runnable web-search sidecar models");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
 
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
@@ -27,6 +193,7 @@ function fakeRuntime(responder?: (req: Request, body: unknown) => unknown) {
       const body = req.method === "GET" ? null : await req.json().catch(() => null);
       requests.push({ path: `${url.pathname}${url.search}`, method: req.method, body });
       const custom = responder?.(req, body);
+      if (custom instanceof Response) return custom;
       if (custom !== undefined) return Response.json(custom);
       return Response.json({ ok: true });
     },
@@ -73,6 +240,11 @@ describe("headless GUI parity CLI", () => {
       ["/api/combos", "ocx combo"],
       ["/api/client-config", "ocx export"],
       ["/api/client-integrations", "ocx integration client"],
+      // #2463: both read and write reach the CLI. `ocx alias list` reads /api/aliases,
+      // `ocx alias defaults` writes /api/default-aliases, and the per-provider writes sit
+      // under /api/providers/:name/alias, already covered by the /api/providers prefix.
+      ["/api/aliases", "ocx alias"],
+      ["/api/default-aliases", "ocx alias defaults"],
       // GUI-only for now: the overview card switches for Claude Code and Grok.
       // Their effect is already reachable from the CLI by other names —
       // `ocx grok apply` regenerates the fence and `ocx stop` strips it, and
@@ -86,9 +258,24 @@ describe("headless GUI parity CLI", () => {
       ["/api/grok", "ocx grok"],
       ["/api/injection", "ocx agent"],
       ["/api/keys", "ocx access"],
+      ["/api/keys/rotate", "ocx access key rotate"],
+      ["/api/keys/rotate/commit", "ocx access key rotate commit"],
+      ["/api/machine", "ocx connect/status/sync/disconnect"],
+      ["/api/session/logout", "(none — GUI current-session logout)"],
       ["/api/logs", "ocx observe"],
       ["/api/lab", "ocx lab"],
       ["/api/config", "ocx config"],
+      // The client machine plane. These are served by the connected client's own loopback
+      // listener rather than the hub, and each one mirrors a connect-family command:
+      // status/clients -> `ocx connect status`, sync -> `ocx sync`, shim -> the client
+      // integration commands, disconnect -> `ocx disconnect`. hub-relay is the fixed-target
+      // relay those same commands use to reach the hub, so it has no separate CLI verb of
+      // its own — it is the transport selected by `--management-transport relay`.
+      ["/api/machine", "ocx connect/disconnect/sync"],
+      // The prompt composer is a GUI-first surface: it reads Codex's own layer
+      // inventory and writes one config key. There is no headless equivalent
+      // today, and claiming one would be worse than saying so here.
+      ["/api/codex-prompt", "(none — GUI prompt-layer surface; keys live in config.toml)"],
       ["/api/settings", "ocx system"],
       // Routing Intelligence (RI-04..RI-10): profiles + dry-run are mirrored by
       // `ocx route policy`. Analytics is GUI-first for now; the same request
@@ -141,6 +328,38 @@ describe("headless GUI parity CLI", () => {
     const clearCode = await handleProviderRuntimeCommand("edit", ["agw", "--headers", "-", "--json"], clearRuntime.deps);
     expect(clearCode).toBe(0);
     expect(clearRuntime.requests[0]?.body).toEqual({ headers: null });
+  });
+
+  test("provider keychain status/store/restore drive /api/providers/keychain", async () => {
+    const status = fakeRuntime();
+    expect(await handleProviderRuntimeCommand("keychain", ["relay", "--json"], status.deps)).toBe(0);
+    expect(status.requests[0]).toMatchObject({ path: "/api/providers/keychain?name=relay" });
+
+    const store = fakeRuntime();
+    expect(await handleProviderRuntimeCommand("keychain", ["relay", "store", "--json"], store.deps)).toBe(0);
+    expect(store.requests[0]).toMatchObject({ path: "/api/providers/keychain", method: "POST", body: { name: "relay", action: "store" } });
+
+    const bad = fakeRuntime();
+    expect(await handleProviderRuntimeCommand("keychain", ["relay", "explode"], bad.deps)).toBe(2);
+    expect(bad.requests).toEqual([]);
+  });
+
+  test("provider edit --retain-models sends the csv list and - clears it", async () => {
+    const runtime = fakeRuntime();
+    const code = await handleProviderRuntimeCommand("edit", [
+      "agw", "--retain-models", " gemini-3.7-flash, other-id ,gemini-3.7-flash", "--json",
+    ], runtime.deps);
+    expect(code).toBe(0);
+    expect(runtime.requests).toEqual([{
+      path: "/api/providers?name=agw",
+      method: "PATCH",
+      body: { retainModels: ["gemini-3.7-flash", "other-id"] },
+    }]);
+
+    const clearRuntime = fakeRuntime();
+    const clearCode = await handleProviderRuntimeCommand("edit", ["agw", "--retain-models", "-", "--json"], clearRuntime.deps);
+    expect(clearCode).toBe(0);
+    expect(clearRuntime.requests[0]?.body).toEqual({ retainModels: null });
   });
 
   test("provider edit rejects malformed --headers JSON without a request", async () => {
@@ -260,6 +479,20 @@ describe("headless GUI parity CLI", () => {
     });
   });
 
+  test("combo set rejects --sticky outside round-robin instead of dropping it", async () => {
+    const runtime = fakeRuntime();
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const code = await handleComboCommand([
+        "set", "demo", "--targets", "a/m1", "--strategy", "random", "--sticky", "5",
+      ], runtime.deps);
+      expect(code).toBe(2);
+      expect(runtime.requests).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   test("combo set forwards the explicit native-alias compatibility contract", async () => {
     const runtime = fakeRuntime();
     const code = await handleComboCommand([
@@ -329,6 +562,25 @@ describe("headless GUI parity CLI", () => {
     expect(runtime.requests[0]).toEqual({ path: "/api/keys", method: "POST", body: { name: "deploy" } });
   });
 
+  test("remote connect status is headless and revoke refuses disconnected state before hub traffic", async () => {
+    let requests = 0;
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await handleConnectCommand(["status", "--json"], {
+        fetchImpl: async () => { requests += 1; return new Response(); },
+      })).toBe(0);
+      expect(await handleConnectCommand(["revoke", "--admin-token-stdin", "--json"], {
+        stdinImpl: Readable.from(["ocx_admin_test\n"]),
+        fetchImpl: async () => { requests += 1; return new Response(); },
+      })).toBe(1);
+      expect(requests).toBe(0);
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
   test("Grok include edits the persisted exclusion set before apply", async () => {
     const runtime = fakeRuntime((req) => {
       const url = new URL(req.url);
@@ -367,6 +619,41 @@ describe("headless GUI parity CLI", () => {
     ]);
   });
 
+  test("enable can waive a conflict, and only when the flag is typed", async () => {
+    /*
+     * The parity this closes: the dashboard could resolve a conflict and the CLI
+     * could not, which strands the user who has no browser -- an SSH session, or
+     * an agent driving the proxy. That dead end is the reason the overwrite path
+     * exists, so leaving it GUI-only reproduces it for half the users.
+     */
+    const runtime = fakeRuntime();
+    expect(await handleClientIntegrationCommand(["enable", "--client", "hermes", "--json"], runtime.deps)).toBe(0);
+    expect(await handleClientIntegrationCommand(
+      ["enable", "--client", "hermes", "--overwrite-conflict", "--json"],
+      runtime.deps,
+    )).toBe(0);
+    expect(runtime.requests.map(row => row.body)).toEqual([
+      // Absent rather than false: an older proxy sees the request it always saw.
+      { enabled: true },
+      { enabled: true, overwriteConflict: true },
+    ]);
+  });
+
+  test("a conflict waiver cannot ride along with disable", async () => {
+    /*
+     * Forcing a DISABLE over a conflict deletes a block we do not own, which is
+     * the one thing the refusal exists to prevent. The route answers 400; failing
+     * locally names the offending flag instead of surfacing a generic request
+     * failure, and sends nothing.
+     */
+    const runtime = fakeRuntime();
+    expect(await handleClientIntegrationCommand(
+      ["disable", "--client", "hermes", "--overwrite-conflict", "--json"],
+      runtime.deps,
+    )).not.toBe(0);
+    expect(runtime.requests).toEqual([]);
+  });
+
   test("a client integration command without its required target fails instead of guessing", async () => {
     const runtime = fakeRuntime();
     // No `--client`: picking one for the user would write a config they never named.
@@ -392,7 +679,7 @@ describe("headless GUI parity CLI", () => {
     } finally {
       if (previous === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previous;
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -422,7 +709,7 @@ describe("headless GUI parity CLI", () => {
     } finally {
       if (previous === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previous;
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -462,7 +749,7 @@ describe("headless GUI parity CLI", () => {
     } finally {
       if (previous === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previous;
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 
@@ -487,7 +774,7 @@ describe("headless GUI parity CLI", () => {
     } finally {
       if (previous === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previous;
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
   test("config set releases the manual pin when it writes the selection order", async () => {
@@ -525,7 +812,94 @@ describe("headless GUI parity CLI", () => {
     } finally {
       if (previous === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previous;
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
+  });
+});
+
+describe("#2565 ocx provider quota renders bars, not a count", () => {
+  /**
+   * `quota()` rendered the response through `summaryLines()`, a depth-1 flattener that emits
+   * "N item(s)" for a non-scalar array. Every fetched report was discarded and the default
+   * invocation printed only `generatedAt` and `reports: 5 item(s)`.
+   */
+  const report = (provider: string, quota: Record<string, unknown>) => ({ provider, quota });
+
+  test("one line per report, using the same formatter as ocx account refresh", () => {
+    const line = providerQuotaLine("anthropic", report("anthropic", {
+      fiveHourPercent: 9,
+      fiveHourResetAt: 1_787_690_999_802,
+      weeklyPercent: 45,
+    }) as never);
+    expect(line).toContain("anthropic");
+    expect(line).toContain("5h 9%");
+    expect(line).toContain("weekly 45%");
+    expect(line).toContain("resets ");
+  });
+
+  test("custom windows keep their upstream labels", () => {
+    const line = providerQuotaLine("cursor", report("cursor", {
+      monthlyPercent: 0.69,
+      customWindows: [
+        { label: "First-party models", percent: 0.77 },
+        { label: "API usage", percent: 0.19 },
+      ],
+    }) as never);
+    expect(line).toContain("monthly 0.69%");
+    expect(line).toContain("First-party models 0.77%");
+    expect(line).toContain("API usage 0.19%");
+  });
+
+  test("a report with no windows still names its provider", () => {
+    expect(providerQuotaLine("plain", report("plain", {}) as never)).toBe("plain");
+  });
+});
+
+describe("#2566 per-account quota in ocx account list", () => {
+  const row = (over: Record<string, unknown> = {}) => ({
+    provider: "anthropic",
+    type: "oauth" as const,
+    id: "acc-1",
+    label: "a@example.test",
+    active: false,
+    ...over,
+  });
+
+  test("the QUOTA column only exists when it is asked for", () => {
+    // The server probes the upstream once per stored credential for quota=1, so the default
+    // listing must stay a cheap local read.
+    expect(formatAccountTable([row()] as never)).not.toContain("QUOTA");
+    expect(formatAccountTable([row()] as never, true)).toContain("QUOTA");
+  });
+
+  test("both DTO spellings of the sub-day window render as 5h", () => {
+    // The per-account provider probe reports fiveHourPercent; the Codex pool reports the same
+    // idea as shortPercent.
+    expect(formatAccountTable([row({ quota: { fiveHourPercent: 7, weeklyPercent: 62 } })] as never, true))
+      .toContain("5h 7% wk 62%");
+    expect(formatAccountTable([row({ quota: { shortPercent: 3, weeklyPercent: 10 } })] as never, true))
+      .toContain("5h 3% wk 10%");
+  });
+
+  test("a provider without per-account quota is blank, not zero", () => {
+    // Blank means "not probed"; 0% would claim the account is fully drained.
+    expect(formatAccountTable([row({ provider: "xai" })] as never, true)).toContain("-");
+  });
+
+  test("a Kiro account's monthly allowance renders instead of a bare dash", () => {
+    // Kiro bills a monthly window and reports no shorter one. Without the monthly arm a
+    // healthy account rendered "-", which is the same output as "never probed".
+    expect(formatAccountTable([row({ provider: "kiro", quota: { monthlyPercent: 15 } })] as never, true))
+      .toContain("mo 15%");
+  });
+
+  test("a fractional monthly percentage is rounded for the column", () => {
+    // The column is a glance surface; the exact figure stays in --json.
+    expect(formatAccountTable([row({ provider: "kiro", quota: { monthlyPercent: 14.782 } })] as never, true))
+      .toContain("mo 15%");
+  });
+
+  test("an account whose probe failed says so instead of reading as empty", () => {
+    expect(formatAccountTable([row({ quotaUnavailable: true })] as never, true)).toContain("unavailable");
   });
 });

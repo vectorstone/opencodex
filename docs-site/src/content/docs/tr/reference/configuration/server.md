@@ -26,14 +26,15 @@ yardımcı özellikleri nasıl çalıştıracağını kontrol eder.
 | `codexAutoStart?` | `boolean` | `true` | Codex dolgusunun Codex'i başlatmadan önce `ocx ensure` çalıştırmasına izin verin. False, ensure'ı bir işlem yapmayan (no-op) hale getirir. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Tamamlanan harici bir Codex güncellemesi değiştirdikten sonra kurulu bir dolguyu geri yükleyin. Ortam vazgeçmesi: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Tersine çevrilebilir Codex App geçmişi uyumluluğu. Orijinal meta veriler yedeklenir ve `ocx stop` / `ocx restore` tarafından geri yüklenir. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını düşük çabayla seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını, istek için yapılandırılan akıl yürütme çabasını koruyarak seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | kullanılabilir olduğunda açık | Web arama sidecar seçenekleri. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | kullanılabilir olduğunda açık | Görsel açıklama sidecar seçenekleri. |
 | `images?` | `OcxImagesConfig` | otomatik OpenAI seçimi | Codex `image_gen` için bağımsız Görseller aktarma seçenekleri. |
 
 Daha eski bir geliştirme derlemesi yedekleme desteği var olmadan önce devam
 geçmişi meta verilerini değiştirdiyse yerel sağlayıcı kurtarmasını zorlamak için
-`ocx recover-history --legacy-openai` çalıştırın.
+`ocx recover-history --legacy-openai --yes` çalıştırın.
+Komut, geçerli dedicated-provider geçmişi de dahil olmak üzere kullanıcı iletisi bulunan tüm `opencodex` satırlarını yeniden etiketler; çalıştırmadan önce lifecycle başvurusundaki tam kapsam uyarısını okuyun.
 
 ## Uzaktan erişim
 
@@ -110,8 +111,9 @@ tarafından atanmaz: geçici bir port yeniden başlatmalar arasında değişirke
 zaten çalışan app-server'lar önceki `base_url`'i tutardı.
 
 Dinleyici yalnızca `POST /v1/responses`, onun WebSocket yükseltmesi, `POST
-/v1/responses/compact` ve `GET /v1/models` sunar. `/api/*` ve kontrol paneli
-dahil diğer her şey `404` döndürür.
+/v1/responses/compact`, `POST /v1/alpha/search` (yerel Codex web arama aktarımı),
+`GET /v1/models` ve bağımsız sesli WebSocket yükseltmelerini sunar. `/api/*` ve
+kontrol paneli dahil diğer her şey `404` döndürür.
 
 :::danger[Bu kimliği doğrulanmamış bir yüzeydir]
 Makinedeki her süreç bu dinleyiciyi kullanabilir. Hesap kotasını ve ücretli
@@ -195,13 +197,13 @@ modu](/tr/guides/claude-code/#auth-mode).
 ## Gölge çağrılar
 
 Codex, başlıklar ve commit mesajları gibi görevler için küçük yardımcı modeller
-kullanır. Tanınan kaynak model öneklerini düşük çabayla yapılandırılmış başka
-bir modele yeniden yönlendirmek için `shadowCallIntercept`'i etkinleştirin.
+kullanır. Tanınan kaynak model öneklerini yapılandırılmış başka bir modele yeniden
+yönlendirmek için `shadowCallIntercept`'i etkinleştirin. Değiştirilen istek, yapılandırılmış
+akıl yürütme çabasını korur.
 `sourceModels`'ı yalnızca bir istemci farklı yardımcı kimlikleri kullandığında
-ayarlayın. Codex 0.145.0+, istek amacını `x-codex-turn-metadata` içinde
-işaretler: normal `request_kind: "turn"` istekleri seçilen modeli tutarken
-tanınan bakım istekleri yeniden yönlendirilebilir. Bu meta verileri içermeyen
-istemciler eski önek davranışını korur.
+ayarlayın. Yakalama model tabanlıdır: çıplak model kimliği `sourceModels` ile
+eşleşen her istek, normal `request_kind: "turn"` istekleri dahil, yeniden
+yönlendirilebilir. `x-codex-turn-metadata` eşleşen bir isteği muaf tutmaz.
 
 ```json
 {
@@ -232,8 +234,10 @@ Images API yollarını ve yanıt şeklini uygulamalıdır.
 | Alan | Tip | Varsayılan | Anlamı |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana anahtar. |
-| `backend?` | `"openai" \| "anthropic"` | auto | Açık olan kazanır; aksi takdirde kullanılabilir saklanan Anthropic OAuth `anthropic`'i, ardından `openai`'yi seçer. |
-| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna` veya Anthropic için `claude-sonnet-5`. Eski açık `gpt-5.4-mini` başlangıçta geçirilir. |
+| `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Açık değer kazanır; ayarlanmadığında her zaman `openai` seçilir. `anthropic` ve `xai` yalnızca açıkça yapılandırıldığında çalışır; `gemini` ve `exa` executor'ları sunulana kadar ayrılmıştır. |
+| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna`, Anthropic için `claude-sonnet-5` veya xAI için `grok-4.6`. Eski açık `gpt-5.4-mini` başlangıçta geçirilir. |
+| `exaApiKey?` | `string` | yok | `exa` arka ucu için operatör anahtarı. Yalnızca yazılır; yönetim okumaları saklanan değeri asla döndürmez. |
+| `xSearch?` | `object` | atlanmış | Yalnızca xAI için hosted `x_search` opt-in: `enabled`, birbirini dışlayan `allowedXHandles` / `excludedXHandles` dizileri (en fazla 20) ve ISO `fromDate` / `toDate` (`YYYY-MM-DD`). |
 | `reasoning?` | `string` | `low` | Sidecar çabası. `minimal` web araması ile reddedilir. |
 | `maxSearchesPerTurn?` | `number` | `3` | Ana model turu başına izin verilen gerçek aramalar. |
 | `routedModelStallTimeoutMs?` | `number` | `200000` | Yalnızca yapılandırma dosyasındaki yönlendirilen model ham gövde hareketsizlik süresi sınırı. Tamsayı 1–2147483647; boş olmayan her parça onu sıfırlar. |
@@ -246,6 +250,11 @@ etkinleştirilmiş bir Anthropic OAuth sağlayıcısından gelen aktif saklanan 
 bilgisini kullanır. Kullanılabilir hesabı olmayan açıkça seçilmiş bir Anthropic
 arka ucu geri dönmek yerine kapalı olarak başarısız olur. Anthropic yürütücüsü
 yerel `web_search_20250305` aracını kullanır.
+xAI arka ucu kullanılabilir, saklanmış bir Grok OAuth hesabı gerektirir, hosted `web_search` kullanır
+ve `xSearch.enabled` true olduğunda hosted `x_search` ekler. Hatalı `xSearch` yönetim girdisi `400`
+döndürür; hatalı kalıcı blok planlama sırasında kapalı olarak başarısız olur. `gemini` ve `exa`
+hatları kimlik bilgisi keşfi veya fallback ile hiçbir zaman etkinleşmez; operatör bunları açıkça
+seçmelidir. `exaApiKey` yazmalarda kabul edilir ancak yönetim yanıtlarından çıkarılır.
 
 Aramayı dört saat yönetir: temel `stallTimeoutSec`, `connectTimeoutMs`,
 yönlendirilen model hareketsizliği ve barındırılan arama zaman aşımı. Geçerli
@@ -257,7 +266,7 @@ hareketsizlik korumasıdır, toplam bir üretim süresi sınırı değildir.
 | Alan | Tip | Varsayılan | Anlamı |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana görsel açıklama anahtarı. |
-| `backend?` | `"openai" \| "anthropic"` | auto | Web araması ile aynı açık öncelikli, Anthropic kimlik bilgisine duyarlı seçim. |
+| `backend?` | `"openai" \| "anthropic"` | auto | Açık değer önceliklidir; ayarlanmadığında kullanılabilir kayıtlı bir Anthropic OAuth kimlik bilgisi tercih edilir, aksi halde `openai` kullanılır. |
 | `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.4-mini` veya Anthropic için `claude-sonnet-5`. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | Ana tur başına kabul edilen yeni açıklama önbellek ıskalamaları. `0` çağrıları devre dışı bırakır; geçersiz değerler varsayılanı kullanır. |
 | `timeoutMs?` | `number` | `45000` | Sidecar getirme zaman aşımı. Tamsayı 1–2147483647. |
@@ -274,3 +283,8 @@ sınırı tüketmez. Uzak `https:` görselleri ve başarısız veya boş açıkl
 Anthropic OAuth sidecar'ları opencodex'in mevcut Claude Code OAuth parmak izini
 yeniden kullanır. Hedeflenen hesap ve iş yükünü kapsamlı bir şekilde test edin.
 
+## Remote Hub anahtarları ve varsayılanlar
+
+`runtimeRole` varsayılan olarak `standalone` değerindedir. Hub; `hub.managementPublicOrigin`, yalnız loopback `hub.managementIngress` (yokken `enabled:false`) ve tam `remoteGui.allowedTailscaleUsers` (yokken boş) kullanır. İstemci anahtarı `config.json` yerine `service-api-token` içinde kalır; döndürme sırasında `service-api-token.prev` geçici olarak bulunabilir. Kullanım kayıtları yansıtılmaz.
+
+`remoteGui.allowInsecureHttp`, yalnızca eski strict-schema yapılandırmalarının yüklenebilmesi için tutulan, kullanımdan kaldırılmış bir no-op'tur. Yapılandırmadan silin: pairing grant'leri yalnız loopback veya kimliği doğrulanmış HTTPS üzerinden kabul edilir ve `true` değeri düz HTTP pairing'i yeniden açmaz.

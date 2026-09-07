@@ -118,6 +118,26 @@ Desktop が許可リストの制御を提供するまでは:
 - Desktop ピッカーの代わりに Codex CLI または TUI を使用します。これらは許可リストを適用せず、ルーティングモデルを通常どおり一覧表示します。
 
 ## モデルの状態を更新しています
+## ネイティブクォータのフォールバック制限
+
+Codex アプリがネイティブの 5 時間クォータを使い切ると、リザーブのフォールバックモデルに切り替わり、ピッカーの他の行がグレーアウトすることがあります。[#2813](https://github.com/lidge-jun/opencodex/issues/2813) で報告されたこの制御は、opencodex がルーティングした行も隠します。これらは無関係なプロバイダー資格情報を使い、ChatGPT のクォータを一切消費しません。
+
+この制御はリクエストがプロキシに届く前にクライアント側で適用されるため、opencodex では解除できません。ルーティング行は `visibility: "list"` で書き込まれ、カタログのフィルタリングは `disabledModels` と各プロバイダーの `selectedModels` だけを参照し、クォータ値はルーティング行の可視性に一切関与しません。
+
+ルーティングモデルを明示的に選ぶ経路はピッカーを通りません。`config.toml` でモデルを指定します。
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+または直接送信します。
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+どちらの経路も **リクエストがプロキシに届いた後は** 正しくルーティングされ、これはテストで確認済みです。ただし Codex デスクトップアプリは、リザーブモード中は設定したモデルを送りません。アプリは自身の `wham/usage` ポーリング（`luna_reserve` アップセルと許可状態の `gpt-reserve` 追加上限）でリザーブを判定し、リクエストが出る前にモデル設定を `gpt-reserve` に強制するため、`config.toml` 経路はアプリ内で上書きされます。ウィンドウがリセットされるまでは `ocx access test`、プロキシ経由の Claude Code（`ocx claude`）、または直接の `/v1` クライアントを使ってください。[Codex リザーブモード中のルーティングモデル](/guides/codex-integration/#routed-models-during-codex-reserve-mode) も参照してください。
+
 
 ピッカーに古いエントリがまだ表示されている場合は、カタログを更新し、ターゲットの Codex サーフェスを再起動します。
 

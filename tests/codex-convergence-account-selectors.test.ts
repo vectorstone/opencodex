@@ -44,6 +44,10 @@ import {
 } from "../src/codex/runtime";
 import { markModelsFetchFailure } from "../src/codex/model-cache";
 import { legacyCustomModelCatalogSlugs } from "../src/codex/custom-model-catalog-migration";
+import { resetCodexModelEntitlementCacheForTests } from "../src/codex/model-entitlements";
+import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../src/codex/catalog/native-models";
+import { removeCodexAccountCredential, saveCodexAccountCredential } from "../src/codex/account-store";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 // The canonical-bytes case spawns real syncs and runs ~2.5s in isolation, on this
 // tree and on a clean baseline alike. That is half of bun's 5s default, but full
@@ -59,6 +63,16 @@ let catalogPath = "";
 let previousCodexHome: string | undefined;
 let previousOpencodexHome: string | undefined;
 let previousCodexCliPath: string | undefined;
+let previousFetch: typeof fetch;
+let modelRostersByChatgptAccount: Map<string, readonly string[]>;
+
+const GPT56_NATIVE_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const;
+
+function grantGpt56NativeModels(...chatgptAccountIds: string[]): void {
+  for (const accountId of chatgptAccountIds) {
+    modelRostersByChatgptAccount.set(accountId, GPT56_NATIVE_MODELS);
+  }
+}
 
 function nativeEntry(visibility = "list"): RawEntry {
   return {
@@ -166,6 +180,34 @@ function config(pickerEnabled: boolean, disabledModels: string[] = []): OcxConfi
   };
 }
 
+function autoReviewConfig(models: string[]): OcxConfig {
+  const nextConfig = config(false);
+  nextConfig.providers.static = {
+    adapter: "openai-chat",
+    baseUrl: "https://static.example.test/v1",
+    liveModels: false,
+    models,
+  };
+  return nextConfig;
+}
+
+function writeAutoReviewModel(value?: string): void {
+  writeFileSync(
+    join(codexHome, "config.toml"),
+    value === undefined ? "" : `auto_review_model = ${JSON.stringify(value)}\n`,
+  );
+}
+
+function autoReviewSeed(routeOverride: string | null = "stale-override"): RawEntry[] {
+  return [
+    { ...nativeEntry(), slug: "gpt-5.4", auto_review_model_override: "native-upstream" },
+    {
+      ...generatedRoutedEntry("static/deepseek-v4-flash"),
+      auto_review_model_override: routeOverride,
+    },
+  ];
+}
+
 function writeCatalog(models: RawEntry[]): void {
   writeFileSync(catalogPath, `${JSON.stringify({ models }, null, 2)}\n`);
 }
@@ -223,6 +265,7 @@ function primeCodexRuntimeFixture(): void {
   process.env.CODEX_CLI_PATH = createCodexRuntimeFixture();
   resetCatalogRuntimeStateForTests();
   resetCodexRuntimeResolveCacheForTests();
+  resetCodexModelEntitlementCacheForTests();
   expect(loadBundledCodexCatalog()?.models?.[0]?.slug).toBe("gpt-5.5");
 }
 
@@ -261,11 +304,38 @@ beforeEach(() => {
   mkdirSync(opencodexHome);
   process.env.CODEX_HOME = codexHome;
   process.env.OPENCODEX_HOME = opencodexHome;
+  previousFetch = globalThis.fetch;
+  modelRostersByChatgptAccount = new Map();
+  writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+  }));
+  saveCodexAccountCredential("side-account-id", {
+    accessToken: "side-token",
+    refreshToken: "side-refresh",
+    expiresAt: Date.now() + 5 * 60_000,
+    chatgptAccountId: "side-chatgpt-account",
+  });
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
+    if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
+      const accountId = new Headers(init?.headers).get("chatgpt-account-id") ?? "";
+      return Response.json({
+        models: (modelRostersByChatgptAccount.get(accountId) ?? []).map(slug => ({
+          slug,
+          supported_in_api: true,
+          visibility: "list",
+        })),
+      });
+    }
+    return previousFetch(input, init);
+  }) as typeof fetch;
   resetCatalogRuntimeStateForTests();
   resetCodexRuntimeResolveCacheForTests();
+  resetCodexModelEntitlementCacheForTests();
 });
 
 afterEach(() => {
+  globalThis.fetch = previousFetch;
   const identity = resolveEffectiveUserIdentity();
   const serializationDb = resolveCodexCatalogSerializationDatabasePath(identity, codexHome);
   for (const suffix of ["", "-journal", "-wal", "-shm"]) {
@@ -278,10 +348,11 @@ afterEach(() => {
   if (previousCodexCliPath === undefined) delete process.env.CODEX_CLI_PATH;
   else process.env.CODEX_CLI_PATH = previousCodexCliPath;
   resetCodexRuntimeResolveCacheForTests();
-  rmSync(root, { recursive: true, force: true });
+  removeTreeWithRetry(root);
 });
 
 test("convergence renders account-qualified rows and preserves only non-generated foreign rows", async () => {
+  grantGpt56NativeModels("main-chatgpt-account", "side-chatgpt-account");
   writeCatalog([
     nativeEntry(),
     accountEntry("stale-selector"),
@@ -320,7 +391,24 @@ test("convergence renders account-qualified rows and preserves only non-generate
   }
 });
 
+test("convergence preserves one configured soft budget on bare and account-native rows", async () => {
+  grantGpt56NativeModels("main-chatgpt-account", "side-chatgpt-account");
+  writeCatalog([nativeEntry()]);
+  const nextConfig = config(true);
+  nextConfig.providers.openai!.modelAutoCompactTokenLimits = { "gpt-5.6-sol": 120_000 };
+
+  const models = (await convergeCatalog(nextConfig)).models ?? [];
+  for (const slug of ["gpt-5.6-sol", "desktop/gpt-5.6-sol", "team/gpt-5.6-sol"]) {
+    expect(models.find(entry => entry.slug === slug)).toMatchObject({
+      context_window: 272_000,
+      max_context_window: 272_000,
+      auto_compact_token_limit: 120_000,
+    });
+  }
+});
+
 test("disabling the picker removes generated rows, restores bare rows, and retains foreign rows", async () => {
+  grantGpt56NativeModels("main-chatgpt-account", "side-chatgpt-account");
   writeCatalog([
     nativeEntry("hide"),
     accountEntry("desktop"),
@@ -357,6 +445,10 @@ test("convergence drops unsupported bare native rows and never qualifies them", 
 
 test("convergence projects the observed Daybreak row onto its selector and one bare row", async () => {
   writeCatalog([nativeEntry()]);
+  removeCodexAccountCredential("side-account-id");
+  writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+  }));
   writeFileSync(join(codexHome, "models_cache.json"), JSON.stringify({
     models: [{
       slug: "gpt-daybreak-blue-latest",
@@ -371,6 +463,7 @@ test("convergence projects the observed Daybreak row onto its selector and one b
     }],
   }, null, 2) + "\n");
 
+  modelRostersByChatgptAccount.set("main-chatgpt-account", ["gpt-daybreak-blue-latest"]);
   const catalog = await convergeCatalog(config(true));
   const models = catalog.models ?? [];
   const daybreak = models.find(entry => entry.slug === "desktop/gpt-daybreak-blue-latest");
@@ -388,12 +481,38 @@ test("convergence projects the observed Daybreak row onto its selector and one b
   });
   expect((daybreak?.supported_reasoning_levels as Array<{ effort: string }>).map(level => level.effort))
     .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
-  // Daybreak is globally allowlisted (owner decision, devlog 260816_.../011). A global
-  // native is seeded onto EVERY visible selector, not only the one that observed it, and the
-  // bare row now exists. Each must appear exactly once despite the observation also present.
-  expect(models.filter(entry => entry.slug === "team/gpt-daybreak-blue-latest")).toHaveLength(1);
+  // Main's authenticated roster confirms Daybreak, so the bare row and main selector exist.
+  // The side account has no confirmed grant and must not receive a selector row.
+  expect(models.filter(entry => entry.slug === "team/gpt-daybreak-blue-latest")).toHaveLength(0);
   expect(models.filter(entry => entry.slug === "desktop/gpt-daybreak-blue-latest")).toHaveLength(1);
   expect(models.filter(entry => entry.slug === "gpt-daybreak-blue-latest")).toHaveLength(1);
+});
+
+test("Direct convergence does not borrow a Pool-only Daybreak grant for the bare row", async () => {
+  writeCatalog([nativeEntry()]);
+  writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+    tokens: { access_token: "main-token", account_id: "main-chatgpt-account" },
+  }));
+  saveCodexAccountCredential("side-account-id", {
+    accessToken: "side-token",
+    refreshToken: "side-refresh",
+    expiresAt: Date.now() + 5 * 60_000,
+    chatgptAccountId: "side-chatgpt-account",
+  });
+
+  modelRostersByChatgptAccount.set("main-chatgpt-account", ["gpt-5.6-sol"]);
+  modelRostersByChatgptAccount.set(
+    "side-chatgpt-account",
+    ["gpt-5.6-sol", "gpt-daybreak-blue-latest"],
+  );
+  const directConfig = config(true);
+  directConfig.providers.openai!.codexAccountMode = "direct";
+  const catalog = await convergeCatalog(directConfig);
+  const models = catalog.models ?? [];
+
+  expect(models.filter(entry => entry.slug === "gpt-daybreak-blue-latest")).toHaveLength(0);
+  expect(models.filter(entry => entry.slug === "desktop/gpt-daybreak-blue-latest")).toHaveLength(0);
+  expect(models.filter(entry => entry.slug === "team/gpt-daybreak-blue-latest")).toHaveLength(1);
 });
 
 test("convergence preserves unrelated foreign rows alongside fresh configured provider rows", async () => {
@@ -518,6 +637,75 @@ test("retained sync removes a deleted pre-marker custom row while discovery is d
   expect(models.some(entry => entry.slug === "offline/discovered-sibling")).toBe(true);
 });
 
+test("retained and convergence writers resolve, clear, reject, and recover auto-review selectors", async () => {
+  primeCodexRuntimeFixture();
+
+  for (const writer of ["retained", "convergence"] as const) {
+    const write = async (nextConfig: OcxConfig): Promise<RawCatalog> => {
+      if (writer === "retained") {
+        const result = await syncCatalogModels(nextConfig);
+        expect(result.catalogWritten).toBe(true);
+      } else {
+        const disposition = await convergeCatalogDisposition(nextConfig);
+        expect(disposition).toMatchObject({ status: "committed" });
+      }
+      return JSON.parse(readFileSync(catalogPath, "utf8")) as RawCatalog;
+    };
+
+    // A configured selector is resolved against the final catalog and trimmed before stamping.
+    writeAutoReviewModel("  static/deepseek-v4-flash  ");
+    writeCatalog(autoReviewSeed());
+    let catalog = await write(autoReviewConfig(["deepseek-v4-flash"]));
+    expect(catalog.models?.find(entry => entry.slug === "static/deepseek-v4-flash"))
+      .toHaveProperty("auto_review_model_override", "static/deepseek-v4-flash");
+
+    // Clearing the root key removes stale routed state while preserving an upstream native value.
+    writeAutoReviewModel();
+    writeCatalog(autoReviewSeed());
+    catalog = await write(autoReviewConfig(["deepseek-v4-flash"]));
+    expect(catalog.models?.find(entry => entry.slug === "gpt-5.4"))
+      .toHaveProperty("auto_review_model_override", "native-upstream");
+    expect(catalog.models?.find(entry => entry.slug === "static/deepseek-v4-flash"))
+      .toHaveProperty("auto_review_model_override", null);
+
+    // A syntactically valid but missing selector is diagnosed and cannot persist a dead override.
+    writeAutoReviewModel("static/missing-model");
+    writeCatalog(autoReviewSeed());
+    const unresolvedWarning = spyOn(console, "warn").mockImplementation(() => {});
+    let unresolvedWarningCalls: unknown[][] = [];
+    try {
+      catalog = await write(autoReviewConfig(["deepseek-v4-flash"]));
+      unresolvedWarningCalls = unresolvedWarning.mock.calls;
+    } finally {
+      unresolvedWarning.mockRestore();
+    }
+    expect(unresolvedWarningCalls.some(call => String(call[0]).includes("not found in the final catalog"))).toBe(true);
+    expect(catalog.models?.find(entry => entry.slug === "static/deepseek-v4-flash"))
+      .toHaveProperty("auto_review_model_override", null);
+
+    // Removing the configured model from the provider makes the target unresolved; recovery
+    // must stamp it again once the model is advertised by the next catalog.
+    writeAutoReviewModel("static/deepseek-v4-flash");
+    writeCatalog(autoReviewSeed());
+    const removedWarning = spyOn(console, "warn").mockImplementation(() => {});
+    let removedWarningCalls: unknown[][] = [];
+    try {
+      catalog = await write(autoReviewConfig([]));
+      removedWarningCalls = removedWarning.mock.calls;
+    } finally {
+      removedWarning.mockRestore();
+    }
+    expect(removedWarningCalls.some(call => String(call[0]).includes("not found in the final catalog"))).toBe(true);
+    expect(catalog.models?.find(entry => entry.slug === "static/deepseek-v4-flash")).toBeUndefined();
+
+    writeAutoReviewModel("static/deepseek-v4-flash");
+    writeCatalog(autoReviewSeed(null));
+    catalog = await write(autoReviewConfig(["deepseek-v4-flash"]));
+    expect(catalog.models?.find(entry => entry.slug === "static/deepseek-v4-flash"))
+      .toHaveProperty("auto_review_model_override", "static/deepseek-v4-flash");
+  }
+});
+
 test("degraded preservation still honors explicit routed visibility policy", async () => {
   writeCatalog([
     nativeEntry(),
@@ -541,7 +729,7 @@ test("degraded preservation still honors explicit routed visibility policy", asy
   expect(models.some(entry => entry.slug === "offline/unselected-old")).toBe(false);
 });
 
-test("custom-catalog convergence reports network degradation without a fallback notice", async () => {
+  test("custom-catalog convergence reports network degradation without a fallback notice", async () => {
   catalogPath = join(codexHome, "custom-catalog.json");
   writeFileSync(
     join(codexHome, "config.toml"),
@@ -550,6 +738,9 @@ test("custom-catalog convergence reports network degradation without a fallback 
   primeCodexRuntimeFixture();
   writeCatalog([nativeEntry(), generatedRoutedEntry("offline/old-live")]);
   const nextConfig = config(false);
+  nextConfig.codexAccounts = [];
+  nextConfig.codexAccountNamespaces = {};
+  rmSync(join(codexHome, "auth.json"), { force: true });
   nextConfig.providers.offline = {
     adapter: "openai-chat",
     baseUrl: "https://offline.example.test/v1",
@@ -640,6 +831,9 @@ test("OAuth admission degradation is auth-only and does not masquerade as a netw
   primeCodexRuntimeFixture();
   writeCatalog([nativeEntry(), generatedRoutedEntry("offline/old-live")]);
   const nextConfig = config(false);
+  nextConfig.codexAccounts = [];
+  nextConfig.codexAccountNamespaces = {};
+  rmSync(join(codexHome, "auth.json"), { force: true });
   nextConfig.providers.offline = {
     adapter: "openai-chat",
     baseUrl: "https://offline.example.test/v1",
@@ -690,6 +884,7 @@ test("disabled-provider selections cannot delete a foreign row in either writer"
 });
 
 test("convergence clamps native, routed, and account rows to observed runtime support", async () => {
+  grantGpt56NativeModels("main-chatgpt-account", "side-chatgpt-account");
   seedObservedRuntimeSupport();
   writeCatalog([nativeEntry()]);
   const nextConfig = config(true);
@@ -728,6 +923,7 @@ test("convergence clamps native, routed, and account rows to observed runtime su
 });
 
 test("generated account rows silently win freshly gathered provider collisions", async () => {
+  grantGpt56NativeModels("main-chatgpt-account", "side-chatgpt-account");
   writeCatalog([nativeEntry()]);
   const nextConfig = config(true);
   nextConfig.providers.team = {
@@ -806,21 +1002,30 @@ test("retained sync and convergence produce identical canonical bytes in either 
     const models = (JSON.parse(bytes) as RawCatalog).models ?? [];
     const slugs = models
       ?.flatMap(entry => typeof entry.slug === "string" ? [entry.slug] : []) ?? [];
-    for (const slug of NATIVE_OPENAI_MODELS) expect(slugs).toContain(slug);
+    for (const slug of NATIVE_OPENAI_MODELS) {
+      if (ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug)) expect(slugs).not.toContain(slug);
+      else expect(slugs).toContain(slug);
+    }
+    for (const entry of models.filter(entry => (
+      entry.opencodex_catalog_kind === CODEX_ACCOUNT_BOUND_CATALOG_KIND
+    ))) {
+      const baseSlug = entry.slug?.slice(entry.slug.indexOf("/") + 1);
+      expect(ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(baseSlug ?? "")).toBe(false);
+    }
     expect(slugs).not.toContain("gpt-legacy-unsupported");
     expect(slugs).toContain("user-native");
-    expect(models.find(entry => entry.slug === "gpt-5.6-sol")?.visibility)
+    expect(models.find(entry => entry.slug === "gpt-5.5")?.visibility)
       .toBe(pickerEnabled ? "hide" : "list");
     expect(models.some(entry => (
       entry.opencodex_catalog_kind === CODEX_ACCOUNT_BOUND_CATALOG_KIND
     ))).toBe(pickerEnabled);
     if (pickerEnabled) {
-      expect(models.find(entry => entry.slug === "desktop/gpt-5.6-sol")).toMatchObject({
-        display_name: "desktop / 5.6 Sol",
+      expect(models.find(entry => entry.slug === "desktop/gpt-5.5")).toMatchObject({
+        display_name: "desktop / 5.5",
         opencodex_catalog_kind: CODEX_ACCOUNT_BOUND_CATALOG_KIND,
       });
-      expect(models.find(entry => entry.slug === "team/gpt-5.6-sol")).toMatchObject({
-        display_name: "team / 5.6 Sol",
+      expect(models.find(entry => entry.slug === "team/gpt-5.5")).toMatchObject({
+        display_name: "team / 5.5",
         opencodex_catalog_kind: CODEX_ACCOUNT_BOUND_CATALOG_KIND,
       });
     }
@@ -957,6 +1162,7 @@ test("convergence refuses a combo shadow when every backup target is present but
 });
 
 test("both writers restore pristine native priorities after featured-model transitions", async () => {
+  grantGpt56NativeModels("main-chatgpt-account", "side-chatgpt-account");
   primeCodexRuntimeFixture();
   catalogPath = join(codexHome, "custom-catalog.json");
   writeFileSync(

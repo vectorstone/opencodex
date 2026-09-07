@@ -15,9 +15,27 @@ const PLACEHOLDER_RE = /\{([a-zA-Z0-9_]+)\}/g;
 
 const INTENTIONAL_ENGLISH = new Set<TKey>([
   // Units, symbols, protocol values, machine labels, and product names.
+  "integrations.cursor.noControl",
   "uptime.hour",
   "uptime.second",
+  // "auto" is the same word in French, and it labels a machine-derived alias source rather
+  // than prose. Translating it would invent a difference the UI does not have.
+  "models.aliasAuto",
   "common.github",
+  // A filename and a product name. "AGENTS.md" is the literal file Codex reads,
+  // and translating "Plugins" would invent a difference French does not have.
+  "codexSet.layer.agents-md",
+  "codexSet.layer.plugins",
+  // "{position} / {total}" is punctuation and two placeholders - no words to
+  // translate. A French-specific variant would have to invent a difference.
+  "codexSet.custom.navPosition",
+  // Same string, same reason, in the base-variant picker. Listing it here rather
+  // than writing a French spelling of "1 / 2" keeps the check meaningful for keys
+  // that really do carry prose.
+  "codexSet.base.position",
+  // "Instructions" is the same word in French. Inventing a synonym to make this
+  // check happy would be worse copy for a French reader.
+  "codexSet.custom.bodyLabel",
   "common.ok",
   "nav.api",
   "nav.grok",
@@ -47,6 +65,9 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "dash.updateVersionTransition",
   "prov.accountId",
   "models.shadowCallOriginal",
+  // One-glyph marker plus a model id in a narrow column; the meaning lives in the translated
+  // tooltip (`logs.badge.interceptedHelperTitle`), not in the glyph.
+  "logs.badge.interceptedHelper",
   "models.v2Mode_v1",
   "models.v2Mode_default",
   "models.v2Mode_v2",
@@ -66,6 +87,11 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "integrations.tab.codex",
   "integrations.tab.claude",
   "integrations.tab.grok",
+  // Cursor product names and the two field labels Cursor's own gateway form renders in English.
+  "integrations.tab.cursor",
+  "integrations.cursor.title",
+  "integrations.cursor.privateInference",
+  "integrations.cursor.baseUrl",
   "integrations.tab.opencode",
   "integrations.tab.pi",
   "integrations.tab.omp",
@@ -88,6 +114,10 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "api.clientConfig.clientDsh",
   "api.clientConfig.clientMcode",
   "api.clientConfig.clientZcode",
+  "integrations.tab.prime",
+  "api.clientConfig.clientPrime",
+  "integrations.tab.aside",
+  "api.clientConfig.clientAside",
   "models.reasoningEffort.minimal",
   "models.reasoningEffort.max",
   "pws.pacingRpmUnit",
@@ -137,6 +167,13 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "lab.observationCount",
   "lab.verdictCount",
   "lab.detailObservations",
+  // "Clients" is the same word in French, and it is the plural noun the
+  // Integrations page uses to head its client catalog.
+  "integrations.catalog.title",
+  // Cost cells are a fixed `$0.1401` / `≥$0.1401` in every locale (the column header is the
+  // untranslated `~$`); the templates are pure placeholders on purpose.
+  "logs.cost.approximate",
+  "logs.cost.lowerBound",
 ]);
 
 function placeholders(value: string): string[] {

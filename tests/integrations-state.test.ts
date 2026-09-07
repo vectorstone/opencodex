@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXPORT_CLIENTS, type ExportModel } from "../src/clients/config-export";
@@ -7,6 +7,7 @@ import { PARSE_FAILED, fileIO, loadTarget, parseConfig } from "../src/integratio
 import { serializeDocument } from "../src/integrations/serialize";
 import {
   canonicalContribution,
+  semanticContribution,
   fingerprint,
   writeRecord,
   type OwnershipRecord,
@@ -15,6 +16,7 @@ import { INTEGRATION_CLIENT_IDS, isLoopbackOnly } from "../src/integrations/regi
 import { classifyIntegration, readIntegrationState } from "../src/integrations/state";
 import { createIntegrationStateStore } from "../src/integrations/store";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * Activation coverage for devlog/_fin/260802_client_toggle_api/021 §6.
@@ -43,7 +45,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(home, { recursive: true, force: true });
+  removeTreeWithRetry(home);
 });
 
 function store() {
@@ -502,6 +504,46 @@ describe("classifier unit behavior", () => {
     const reversed = { ...contribution, fragments: [...contribution.fragments].reverse() };
     expect(canonicalContribution(reversed)).toBe(canonicalContribution(contribution));
   });
+
+  test("nested JSON object key order does not change the contribution fingerprint (#2759)", () => {
+    const original = {
+      clientId: "zcode" as const,
+      fragments: [{
+        path: ["provider", "opencodex"],
+        value: {
+          enabled: true,
+          options: { apiKey: "loopback", baseURL: "http://127.0.0.1:10100/v1" },
+          models: {
+            routed: {
+              modalities: { input: ["text", "image"], output: ["text"] },
+              limit: { context: 350_000 },
+            },
+          },
+        },
+      }],
+    };
+    const reordered = {
+      clientId: "zcode" as const,
+      fragments: [{
+        path: ["provider", "opencodex"],
+        value: {
+          models: {
+            routed: {
+              limit: { context: 350_000 },
+              modalities: { output: ["text"], input: ["text", "image"] },
+            },
+          },
+          options: { baseURL: "http://127.0.0.1:10100/v1", apiKey: "loopback" },
+          enabled: true,
+        },
+      }],
+    };
+
+    expect(semanticContribution(reordered)).toBe(semanticContribution(original));
+    const reorderedArray = structuredClone(reordered);
+    reorderedArray.fragments[0]!.value.models.routed.modalities.input = ["image", "text"];
+    expect(semanticContribution(reorderedArray)).not.toBe(semanticContribution(original));
+  });
 });
 
 describe("ownership is scoped to recorded fragments", () => {
@@ -714,9 +756,9 @@ describe("installation detection is independent of config state", () => {
  * from. Rationale and the per-client table: 020 §1 amendment.
  */
 describe("the loopback-only set is one fact, read through one seam", () => {
-  test("omp, pi, kimi, gajae, dsh, mcode and zcode are loopback-only and nobody else is", () => {
+  test("omp, pi, kimi, gajae, dsh, mcode, zcode, prime and aside are loopback-only and nobody else is", () => {
     const loopbackOnly = INTEGRATION_CLIENT_IDS.filter(id => isLoopbackOnly(id));
-    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode"]);
+    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
   });
 
   test("the registry restates nothing — it reads the export spec", () => {

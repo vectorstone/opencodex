@@ -23,9 +23,17 @@ the bare or API-key model list. The row is matched on the field shape a real cat
 which filters malformed entries — it does not prove the id came from an upstream response, since
 the cache is a user-owned file. See [Exact Codex account selectors](/reference/configuration/routing/#exact-codex-account-selectors).
 
-`gpt-daybreak-blue-latest` follows that observation-only rule for account-qualified rows and is not
-added to the bare native allowlist. A separate, explicit `customModels` entry can expose the same
-wire id as `openai/gpt-daybreak-blue-latest` through the canonical Codex-login forward provider:
+`gpt-daybreak-blue-latest` is account-gated. opencodex checks each authenticated ChatGPT account's
+own Codex model roster before advertising or routing it. In Pool mode, the bare row exists only when
+at least one eligible Pool account reports the slug. In Direct mode, the bare row follows the main
+account used by the local catalog, and each request also checks the forwarded caller credential (or
+the stored main credential when an OpenCodex admission bearer is substituted). A
+`<selector>/gpt-daybreak-blue-latest` row exists only when that selector's mapped account reports it.
+Pool routing excludes unentitled accounts. If no roster can be confirmed, the gated row fails closed
+instead of spending a prompt on an upstream 400.
+
+A separate, explicit `customModels` entry can expose the same wire id as
+`openai/gpt-daybreak-blue-latest` through the canonical Codex-login forward provider:
 
 ```json
 {
@@ -41,8 +49,8 @@ wire id as `openai/gpt-daybreak-blue-latest` through the canonical Codex-login f
 
 Only that exact provider, endpoint, and model id receive the pinned Sol capability snapshot:
 922,000 context, 829,800 automatic compaction, the native reasoning ladder, and native Codex tool
-metadata. The request still sends `gpt-daybreak-blue-latest`; opencodex does not rewrite it to Sol,
-does not create a bare row, and does not grant account entitlement. The separately billed
+metadata. The request still sends `gpt-daybreak-blue-latest`; opencodex does not rewrite it to Sol
+or grant account entitlement. The separately billed
 `openai-apikey/daybreak-blue-latest` API row is a different route and its 1,050,000 / 922,000 limits
 are never copied into the Codex-login row.
 
@@ -68,7 +76,7 @@ gpt-5.6-sol                         # bare Codex-login route via Pool or Direct
 <selector>/gpt-5.6-sol              # stored Codex account mapped by that selector
 openai-apikey/gpt-5.6-sol           # API key
 openai/gpt-daybreak-blue-latest     # explicit Codex-forward custom row (922,000)
-<selector>/gpt-daybreak-blue-latest # observed account-qualified native id, when available
+<selector>/gpt-daybreak-blue-latest # account-qualified native id, only when that account reports it
 openai-apikey/daybreak-blue-latest  # separate API-key route (1,050,000 / 922,000)
 ```
 
@@ -101,6 +109,40 @@ for the command, disable-key semantics, and safety constraints.
 `ocx init`, `ocx start`, and `ocx sync` wire the shared Codex config and catalog into the proxy; see
 [Codex Integration](/guides/codex-integration/) for config injection, catalog sync, shims, WebSocket
 fallback, and restore mechanics.
+
+## Native quota fallback limitation
+
+When the Codex app exhausts its native five-hour quota it can switch to a reserve
+fallback model and grey out the other rows in its picker. Reported in
+[#2813](https://github.com/lidge-jun/opencodex/issues/2813), that gating also hides routed
+opencodex rows, even though those use unrelated provider credentials and consume none of the
+ChatGPT quota.
+
+This gate is applied by the client before a request reaches the proxy, so opencodex cannot lift
+it. Routed rows are written with `visibility: "list"`, catalog filtering consults only
+`disabledModels` and each provider's `selectedModels`, and no quota value takes part in routed
+visibility.
+
+Selecting a routed model explicitly does not go through the picker. Set the model in
+`config.toml`:
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+or send it directly:
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+Both paths route correctly **once the request reaches the proxy** — that part is covered by
+tests. The Codex desktop app, however, does not send the configured model while reserve mode is
+active: it decides reserve from its own `wham/usage` poll (`luna_reserve` upsell plus an allowed
+`gpt-reserve` additional limit) and forces the model setting to `gpt-reserve` before the request
+leaves, so the `config.toml` route is overridden in the app. Use `ocx access test`, Claude Code
+through the proxy (`ocx claude`), or any direct `/v1` client until the window resets. See
+[Routed models during Codex reserve mode](/guides/codex-integration/#routed-models-during-codex-reserve-mode).
 
 ## Why routed models show up
 

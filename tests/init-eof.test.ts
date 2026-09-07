@@ -1,12 +1,31 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
+
+async function waitForOutput(
+  stream: ReadableStream<Uint8Array>,
+  expected: string,
+): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  try {
+    while (!output.includes(expected)) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`init exited before writing ${JSON.stringify(expected)}`);
+      output += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 describe("ocx init piped stdin (#754)", () => {
   const dirs: string[] = [];
   afterEach(() => {
-    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+    while (dirs.length) removeTreeWithRetry(dirs.pop()!);
   });
 
   test("exits cleanly when stdin closes before the first prompt answer", async () => {
@@ -20,14 +39,20 @@ describe("ocx init piped stdin (#754)", () => {
       stdout: "pipe",
       stderr: "pipe",
     });
-    proc.stdin.end();
-    const exit = await Promise.race([
-      proc.exited,
-      new Promise<number>((_, reject) => setTimeout(() => reject(new Error("init did not exit after stdin EOF")), 8_000)),
-    ]);
-    expect(exit).toBe(1);
-    const stderr = await new Response(proc.stderr).text();
-    expect(stderr.toLowerCase()).toMatch(/stdin (closed|reached eof)/);
-    expect(existsSync(join(home, "config.json"))).toBe(false);
-  });
+    const stderrPromise = new Response(proc.stderr).text();
+    try {
+      // Synchronize on the behavior under test, not Windows process startup/import time.
+      // EOF now arrives while readline is waiting for the first answer.
+      await waitForOutput(proc.stdout, "Select default provider (number):");
+      proc.stdin.end();
+
+      expect(await proc.exited).toBe(1);
+      const stderr = await stderrPromise;
+      expect(stderr.toLowerCase()).toMatch(/stdin (closed|reached eof)/);
+      expect(existsSync(join(home, "config.json"))).toBe(false);
+    } finally {
+      if (proc.exitCode === null) proc.kill();
+      await proc.exited.catch(() => {});
+    }
+  }, 30_000);
 });

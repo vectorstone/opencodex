@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   armClaudeCodeBaseline,
   adoptPersistedProviderIntoLiveConfig,
+  deleteConfigTopLevelKey,
   getConfigPath,
   getDefaultConfig,
   loadConfig,
@@ -23,6 +24,7 @@ import {
   resetPreservedDiskOnlyProvidersForTests,
 } from "../src/usage/user-cost-overlays";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * A user or cooperating process can edit config.json while the proxy runs.
@@ -73,7 +75,7 @@ afterEach(() => {
   refreshUserCostOverlays({ providers: {} } as unknown as OcxConfig);
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
-  rmSync(home, { recursive: true, force: true });
+  removeTreeWithRetry(home);
 });
 
 function customModel(modelId: string): NonNullable<OcxConfig["customModels"]>[number] {
@@ -385,6 +387,29 @@ test("config diagnostics sanitize invalid retryOn429 before schema validation", 
   expect(diagnostics.config.providers.test.retryOn429).toBeUndefined();
 });
 
+test("config diagnostics degrade only invalid provider model display names", () => {
+  writeDiskConfig({
+    providers: {
+      test: {
+        adapter: "openai-chat",
+        baseUrl: "http://127.0.0.1:1/v1",
+        apiKey: "k",
+        allowPrivateNetwork: true,
+        modelDisplayNames: {
+          "model-a": "  Model Alpha  ",
+          "model-b": "Bad/Name",
+        },
+      },
+    },
+  });
+
+  const diagnostics = readConfigDiagnostics();
+
+  expect(diagnostics.source).toBe("file");
+  expect(diagnostics.error).toBeNull();
+  expect(diagnostics.config.providers.test.modelDisplayNames).toEqual({ "model-a": "Model Alpha" });
+});
+
 test("invalid retryOn429 values never log the raw value", () => {
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   try {
@@ -668,11 +693,84 @@ test("a live deletion of a key that only ever existed on disk is not undone by t
   // The live writer adopts it and then deletes it, exactly as the management route
   // does for an empty selection.
   live.grokExcludedModels = ["a"];
-  delete live.grokExcludedModels;
+  deleteConfigTopLevelKey(live, "grokExcludedModels");
   saveConfigPreservingClaudeCode(live);
 
   expect(diskConfig().grokExcludedModels).toBeUndefined();
   expect(live.grokExcludedModels).toBeUndefined();
+});
+
+test("provenance distinguishes an unseen disk key from an explicit deletion", () => {
+  const live = loadConfig();
+  armClaudeCodeBaseline(live);
+  deleteConfigTopLevelKey(live, "injectionPrompt");
+
+  const onDisk = loadConfig();
+  onDisk.grokExcludedModels = ["added-elsewhere"];
+  saveConfig(onDisk);
+
+  saveConfigPreservingClaudeCode(live);
+
+  expect(live.grokExcludedModels).toEqual(["added-elsewhere"]);
+  expect(diskConfig().grokExcludedModels).toEqual(["added-elsewhere"]);
+  expect(diskConfig().configRebaseProvenance).toEqual({
+    version: 1,
+    deletedTopLevelKeys: ["injectionPrompt"],
+  });
+});
+
+test("a config without provenance keeps the legacy disk-only-key behavior", () => {
+  const live = loadConfig();
+  armClaudeCodeBaseline(live);
+  const onDisk = loadConfig();
+  onDisk.grokExcludedModels = ["disk-only"];
+  saveConfig(onDisk);
+
+  saveConfigPreservingClaudeCode(live);
+
+  expect(diskConfig().grokExcludedModels).toBeUndefined();
+  expect(diskConfig().configRebaseProvenance).toBeUndefined();
+});
+
+test("version-1 provenance round-trips through load and an older-style whole-config save", () => {
+  const config = loadConfig();
+  deleteConfigTopLevelKey(config, "grokExcludedModels");
+  saveConfig(config);
+  const loaded = loadConfig();
+
+  saveConfig(loaded);
+
+  expect(diskConfig().configRebaseProvenance).toEqual({
+    version: 1,
+    deletedTopLevelKeys: ["grokExcludedModels"],
+  });
+});
+
+test("future provenance is preserved opaquely and grants no deletion authority", () => {
+  const future = { version: 2, opaque: { keep: true } };
+  writeDiskConfig({ configRebaseProvenance: future });
+  const live = loadConfig();
+  armClaudeCodeBaseline(live);
+  const onDisk = loadConfig();
+  onDisk.grokExcludedModels = ["disk-only"];
+  saveConfig(onDisk);
+
+  saveConfigPreservingClaudeCode(live);
+
+  expect(diskConfig().configRebaseProvenance).toEqual(future);
+  expect(diskConfig().grokExcludedModels).toBeUndefined();
+});
+
+test("assigning a deleted key clears its persisted tombstone", () => {
+  const config = loadConfig();
+  deleteConfigTopLevelKey(config, "grokExcludedModels");
+  saveConfig(config);
+  config.grokExcludedModels = ["restored"];
+
+  saveConfig(config);
+
+  expect(diskConfig().grokExcludedModels).toEqual(["restored"]);
+  expect(diskConfig().configRebaseProvenance).toBeUndefined();
 });
 
 test("a provider deletion from a newer disk snapshot survives an unrelated live save", () => {
@@ -711,6 +809,48 @@ test("a provider deletion from a newer disk snapshot wins over a stale edit to t
   saveConfigPreservingClaudeCode(live);
 
   expect(Object.keys(diskConfig().providers as Record<string, unknown>)).toEqual(["test"]);
+});
+
+test("independent provider model display name edits survive a guarded stale save", () => {
+  const live = loadConfig();
+  live.providers.test.modelDisplayNames = { "model-a": "Alpha", "model-b": "Beta" };
+  saveConfig(live);
+  armClaudeCodeBaseline(live);
+
+  live.providers.test.modelDisplayNames["model-a"] = "Live Alpha";
+  writeDiskConfig({
+    providers: {
+      test: {
+        ...live.providers.test,
+        modelDisplayNames: { "model-a": "Alpha", "model-b": "Disk Beta" },
+      },
+    },
+  });
+  saveConfigPreservingClaudeCode(live);
+
+  expect((diskConfig().providers as Record<string, { modelDisplayNames?: Record<string, string> }>).test?.modelDisplayNames)
+    .toEqual({ "model-a": "Live Alpha", "model-b": "Disk Beta" });
+});
+
+test("a display name reset preserves a neighboring label added on disk", () => {
+  const live = loadConfig();
+  live.providers.test.modelDisplayNames = { "model-a": "Alpha", "model-b": "Beta" };
+  saveConfig(live);
+  armClaudeCodeBaseline(live);
+
+  delete live.providers.test.modelDisplayNames["model-a"];
+  writeDiskConfig({
+    providers: {
+      test: {
+        ...live.providers.test,
+        modelDisplayNames: { "model-a": "Alpha", "model-b": "Beta", "model-c": "Disk Gamma" },
+      },
+    },
+  });
+  saveConfigPreservingClaudeCode(live);
+
+  expect((diskConfig().providers as Record<string, { modelDisplayNames?: Record<string, string> }>).test?.modelDisplayNames)
+    .toEqual({ "model-b": "Beta", "model-c": "Disk Gamma" });
 });
 
 test("independent custom-model edits survive a guarded stale save", () => {

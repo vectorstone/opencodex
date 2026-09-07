@@ -50,7 +50,7 @@ import {
   recordScreenExec,
   type CursorNativeToolDeps,
 } from "./native-exec-tools";
-import { clientBytes, execBytes } from "./native-exec-common";
+import { clientBytes, execBytes, execStreamCloseBytes, execThrowBytes } from "./native-exec-common";
 import type { McpToolDefinition } from "./gen/agent_pb";
 import { OCX_RESPONSES_TOOL_PROVIDER } from "./tool-definitions";
 
@@ -117,6 +117,7 @@ interface CursorBlobLimits {
 interface CursorBlobRequestScopeState {
   keys: Set<string>;
   sealed: boolean;
+  kind: "request" | "checkpoint";
 }
 
 const DEFAULT_BLOB_LIMITS: CursorBlobLimits = {
@@ -376,7 +377,7 @@ export function createCursorBlobRequestScope(): CursorBlobRequestScopeToken {
   // IDENTITY, not just pin counts (review C2-2: identical descriptions made
   // scope-swap bugs invisible to deep comparison).
   const scope = Symbol(`cursor-blob-request-${++blobScopeSequence}`);
-  blobRequestScopes.set(scope, { keys: new Set(), sealed: false });
+  blobRequestScopes.set(scope, { keys: new Set(), sealed: false, kind: "request" });
   return scope;
 }
 
@@ -400,6 +401,74 @@ export function storeCursorBlob(data: Uint8Array, requestScope?: CursorBlobReque
   const admission = setBlob(key(blobId), data, "local-regenerated", requestScope);
   if (!admission.admitted) throw new CursorBlobAdmissionError(admission.reason);
   return blobId;
+}
+
+/**
+ * Stored byte length of one blob, or null when it is not in the store.
+ *
+ * Size only, never content: the envelope guard needs to measure the FINAL root set, which mixes
+ * roots minted this turn with roots carried inside a checkpoint. Reading them back through a
+ * hydration path would both defeat the request-scope sealing and log served bytes for a request
+ * that may never be sent.
+ */
+export function cursorBlobByteLength(blobId: Uint8Array): number | null {
+  const entry = blobs.get(key(blobId));
+  return entry ? entry.data.byteLength : null;
+}
+
+/**
+ * Serve-time integrity for content-addressed blobs (devlog 260826_cursor_responses_gap 080):
+ * a raw 32-byte blob id IS the SHA-256 of its bytes, so served data whose digest mismatches
+ * the id means in-store corruption — the splice signature behind garbled replayed tool
+ * results. Ids longer than 32 bytes (digested-key namespace) and server-minted ids are not
+ * content-addressed and always pass.
+ */
+export function cursorBlobServeIntegrityOk(blobId: Uint8Array, served: Uint8Array): boolean {
+  if (blobId.byteLength !== 32) return true;
+  const digest = createHash("sha256").update(served).digest();
+  return digest.equals(Buffer.from(blobId));
+}
+
+/**
+ * Long-lived pin for blobs referenced by an active Cursor conversation checkpoint.
+ * Unlike a request scope, this lease is not sealed and is not released by getBlob hydration.
+ */
+export function createCursorBlobCheckpointLease(label: string): CursorBlobRequestScopeToken {
+  const scope = Symbol("cursor-blob-checkpoint-" + (++blobScopeSequence) + "-" + label.slice(0, 16));
+  blobRequestScopes.set(scope, { keys: new Set(), sealed: false, kind: "checkpoint" });
+  return scope;
+}
+
+export function pinCursorBlobIdsForCheckpoint(
+  blobIds: readonly Uint8Array[],
+  lease: CursorBlobRequestScopeToken,
+): boolean {
+  const state = blobRequestScopes.get(lease);
+  if (!state || state.sealed) return false;
+  const added: Array<{ entry: { requestPins: Set<CursorBlobRequestScopeToken> }; key: string }> = [];
+  for (const blobId of blobIds) {
+    if (blobId.byteLength === 0) continue;
+    const k = key(blobId);
+    const entry = blobs.get(k);
+    if (!entry || (isExpired(entry, Date.now()) && entry.requestPins.size === 0 && entry.provenance !== "remote-setBlobArgs")) {
+      for (const pinned of added) {
+        pinned.entry.requestPins.delete(lease);
+        state.keys.delete(pinned.key);
+      }
+      return false;
+    }
+    if (!entry.requestPins.has(lease)) {
+      entry.requestPins.add(lease);
+      state.keys.add(k);
+      added.push({ entry, key: k });
+    }
+  }
+  reconcileBlobClassAccountingAndEnforce();
+  return true;
+}
+
+export function hasCursorBlob(blobId: Uint8Array): boolean {
+  return getBlob(key(blobId)) !== undefined;
 }
 
 export interface CursorBlobMetrics {
@@ -560,10 +629,15 @@ export async function handleCursorNativeExec(execMsg: ExecServerMessage, deps: C
     }))];
   }
   // Unknown exec case — Cursor added a new native exec type that our protobuf definition does not
-  // include yet. Return an empty reply so the stream stays alive instead of throwing (which kills
-  // the entire gRPC connection via failAndClear). Same class of bug as #116.
+  // include yet. T05 (senpi contract): reply with ExecClientThrow + stream-close so the server
+  // unblocks with a known failure. Previously this returned an empty reply (silence), which is
+  // the stall class senpi explicitly refused (#116 was about throwing into failAndClear and
+  // killing the whole connection; a typed in-band throw does not do that).
   debugProviderDiagnostic("cursor", "unknown-exec-case", { execCase: execCase ?? "unknown", execId: execMsg.execId });
-  return [];
+  return [
+    execThrowBytes(execMsg, "Unknown exec message variant; this client does not implement it."),
+    execStreamCloseBytes(execMsg),
+  ];
 }
 
 
@@ -574,7 +648,16 @@ export function handleCursorNativeKv(
   if (kvMsg.message.case === "getBlobArgs") {
     const blobKey = key(kvMsg.message.value.blobId);
     const blobData = getBlob(blobKey);
-    if (blobData) releaseHydratedBlob(blobKey, requestScope);
+    // Splice-class corruption guard (devlog 260826 080): diagnostic only, never blocks serving.
+    if (blobData && !cursorBlobServeIntegrityOk(kvMsg.message.value.blobId, blobData)) {
+      debugProviderDiagnostic("cursor", "blob-integrity-mismatch", {
+        blobKey: blobKey.slice(0, 18),
+        servedBytes: blobData.byteLength,
+      });
+    }
+    if (blobData && requestScope && blobRequestScopes.get(requestScope)?.kind === "request") {
+      releaseHydratedBlob(blobKey, requestScope);
+    }
     return clientBytes({
       message: {
         case: "kvClientMessage",

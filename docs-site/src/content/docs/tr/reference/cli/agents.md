@@ -103,7 +103,7 @@ verilerini inceleyin. Doğrudan takma adlar şunlardır:
 | Takma ad | Eşdeğer kaynak |
 | --- | --- |
 | `ocx logs [filtreler] [--follow] [--json\|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d\|30d\|all>] [--surface <all\|codex\|claude\|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today\|1d\|7d\|30d\|all>] [--surface <all\|codex\|claude\|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
@@ -177,9 +177,9 @@ eder. Claude Code ayarları için `ocx claude config <status|set> ...` kullanın
 ### `ocx opencode [opencode argumanlari...]`
 
 Proxy'nin çalıştığından emin olun, ardından OpenCode'un satır içi çalışma zamanı
-katmanında (`OPENCODE_CONFIG_CONTENT`) üretilen bir `provider.opencodex`
-bloğuyla opencode'u başlatın. Mevcut satır içi yapılandırma korunur ve bu
-başlatma için yalnızca `provider.opencodex` değiştirilir. Mevcut bir geçersiz
+katmanında (`OPENCODE_CONFIG_CONTENT`) üretilen `provider.opencodex` ve
+`providers.opencodex` bloklarıyla opencode'u başlatın. Mevcut satır içi yapılandırma korunur ve bu
+başlatma için yalnızca bu iki anahtar değiştirilir. Mevcut bir geçersiz
 kılma hakkında uyarmak için genel veya proje `opencode.json` dosyaları
 okunabilir, ancak diskteki dosyalar asla değiştirilmez. Yönlendirilen modeller
 `opencodex/<saglayici>/<model>` olarak görünür. Daha sonra düz `opencode`
@@ -191,7 +191,7 @@ Grok Build model çitini yönetin ve uygulayın.
 
 ## İstemci yapılandırma dışa aktarma
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime>`
 
 Çalışan proxy'ye bağlı bir istemci yapılandırmasını yazdırın. Komut, `opencodex`
 sağlayıcı bloğunu — temel URL, model listesi ve istemcinin kimlik bilgisi
@@ -203,7 +203,7 @@ yalnızca Codex'in şu anda görebildiği modelleri yayınlar.
 
 | Bayrak | Eylem |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | Gerekli. İstemci yapılandırma lehçesini seçer. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime>` | Gerekli. İstemci yapılandırma lehçesini seçer. |
 | `--json` | Betikler için stdout üzerinde oluşturulan belgeyi JSON olarak yazdırın. Bu, seçilen istemcinin yerel formatı YAML, TOML veya JSON5 olsa bile JSON'dur. |
 | `--out <path>` | İstemcinin yerel yapılandırma formatını `<path>` konumuna yazın. Mevcut bir dosyanın üzerine yazmayı reddeder. |
 | `--force` | `--out`'un mevcut bir dosyanın üzerine yazmasına izin verin. |
@@ -223,13 +223,16 @@ için kendi varsayılanlarını uygular) gelir.
 | İstemci | Kurallı hedef | İndirme dosya adı | Ortam değişkeni |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json` (`XDG_CONFIG_HOME` ayarlandığında kazanır) | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | yok — blok değişmez `opencodex-loopback` taşır |
+| `pi` | `~/.pi/agent/models.json` (ayarlandığında `PI_CODING_AGENT_DIR` öncelikli; göreli değer reddedilir) | `pi-models.json` | yok — blok değişmez `opencodex-loopback` taşır |
 | `omp` | `~/.omp/agent/models.yml` (boş olduğunda bile `OMP_PROFILE`, `PI_PROFILE`'a üstün gelir; adlandırılmış profiller eve göre `PI_CONFIG_DIR` dizin adını kullanır ve `PI_CODING_AGENT_DIR`'i yok sayar, varsayılan profil ise `PI_CODING_AGENT_DIR`'in kazanmasına izin verir) | `omp-models.yaml` | yok — geri döngü yer tutucusu |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | yok — geri döngü yer tutucusu |
 | `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
 | `dsh` | `$DSH_HOME/settings.yaml` (varsayılan `~/.dsh/settings.yaml`) | `settings.yaml` | yok — gizli olmayan geri döngü bearer yer tutucusu |
+| `mcode` | `~/.minimax/config.yaml` (ayarlandığında `MINIMAX_DATA_DIR`, ardından eski `MAVIS_DATA_DIR` öncelikli; göreli değer reddedilir) | `mcode-config.yaml` | yok — geri döngü yer tutucusu |
+| `zcode` | `~/.zcode/v2/config.json` (ayarlandığında `ZCODE_DATA_DIR` öncelikli; göreli değer reddedilir) | `config.json` | yok — geri döngü yer tutucusu |
+| `prime` | `~/.prime/agent/models.json` (ayarlandığında `PRIME_AGENT_CODING_AGENT_DIR` öncelikli; göreli değer reddedilir) | `prime-models.json` | yok — geri döngü yer tutucusu |
 
 opencode `{env:OPENCODEX_OPENCODE_API_KEY}` değerini enterpole eder. Üretilen Pi
 ve OMP dışa aktarımları bir ortam değişkeni gerektirmez: her biri değişmez
@@ -264,7 +267,7 @@ sekmesinde işlenir; böylece CLI, API ve GUI aynı baytları kullanır.
 
 ## Çalışma zamanı ve yapılandırma
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 Başsız çalışma zamanı ayarlarını, başlatmayı, senkronizasyonu, tanılamayı ve
 güncellemeleri yönetin.
@@ -272,6 +275,14 @@ güncellemeleri yönetin.
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update` OpenCodex'in kendisini günceller. Codex CLI için ayrı, salt okunur komutu kullanın:
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` paket kayıt defterine istek göndermez ve yapılandırmada belirtilen kurulum adayına ilişkin provenance kanıtını, maskelenmiş yürütülebilir dosya konumu ve sahiplik kanıtı dâhil, sınırlı biçimde inceler. Yayımlanmış başlatıcıdan gelen güvenilir bağlam aday anlık görüntüsünü doğrular; Codex'in başarıyla çalıştırıldığını doğrulamaz. Bu tek seferlik komut Codex'i hiçbir zaman çalıştırmadığından, ortamdan ve kalıcı kayıtlardan gelen adaylar yalnızca raporlanır (`managed: false`, genellikle `selection_unattested`). JSON çıktısında `candidateAvailable`, `candidateVersion` ve `candidateSource` alanları bulunur; `selectionAttested` değeri ise `false` kalır. Yapılandırmada belirtilen kurulum adayını incelemek için yayımlanmış başlatıcıdan gelen güvenilir bağlam gerekir; Bun ile veya kaynak koddan doğrudan başlatıldığında bu kanıt bulunmadığından ortamdaki ve kalıcı kayıtlardaki aday durumu yok sayılır ve `candidate_unavailable` bildirilebilir. Windows'ta bu ilk parça, aday veya yapılandırma yollarında hiçbir dosya sistemi G/Ç işlemi yapmaz. Yalnızca güvenilir başlatıcının yakaladığı mutlak bir ortam adayı sözcüksel olarak uygulama paketi ya da sürüm yöneticisi etiketi alabilir; diğer tüm Windows adayları kapalı başarısızlıkla reddedilir. Komut Codex veya bir paket yöneticisi çalıştırmaz, shim'i onarmaz, yapılandırmaya ya da önbellek durumuna yazmaz, hiçbir süreci durdurmaz ve hiçbir şey kurmaz. Uygulamayla birlikte paketlenmiş adaylar, tanınan sürüm yöneticisi yollarında bulunan adaylar, doğrulanmamış bağımsız adaylar ve belirsiz shim durumları `unmanaged` veya `unknown` olarak raporlanır; hiçbir zaman `managed` olarak sınıflandırılmaz.
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

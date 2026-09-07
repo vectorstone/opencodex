@@ -5,8 +5,8 @@ import {
   mkdtempSync,
   readdirSync,
   renameSync,
-  rmSync,
   statSync,
+  truncateSync,
   utimesSync,
   unlinkSync,
   writeFileSync,
@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { inspectCodexLogs, resetCodexLogGuardInspectionCache } from "../src/codex/log-guard/inspect";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const roots: string[] = [];
 
@@ -81,7 +82,7 @@ function snapshotDir(path: string): Map<string, { size: number; mtimeMs: number 
 }
 
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) removeTreeWithRetry(root);
 });
 
 describe("Codex Log Guard inspection", () => {
@@ -113,6 +114,26 @@ describe("Codex Log Guard inspection", () => {
     expect(report.metrics?.traceShare).toBe(0.5);
     expect(report.metrics?.topTargets[0]).toEqual({ target: "TARGET_1", rows: 2 });
     expect(report.metrics?.reclaimableBytes).toBeGreaterThanOrEqual(0);
+    expect(report.metricsSkipped).toBeNull();
+  });
+
+  test("skips row aggregates for a large database without reporting zero metrics", () => {
+    const root = makeRoot();
+    const databasePath = join(root, "logs_2.sqlite");
+    createCurrentLogsDb(databasePath);
+    truncateSync(databasePath, 64 * 1024 * 1024 + 1);
+
+    const report = inspectCodexLogs({ codexHome: root });
+
+    expect(report.schema).toEqual({ state: "compatible" });
+    expect(report.metrics).toBeNull();
+    expect(report.metricsSkipped).toEqual({
+      reason: "database_too_large",
+      thresholdBytes: 64 * 1024 * 1024,
+    });
+    expect(report).not.toMatchObject({
+      metrics: { totalRows: 0, rowsByLevel: {}, estimatedLogBytes: 0 },
+    });
   });
 
   test("never exposes feedback bodies, arbitrary levels, target names, or paths", () => {

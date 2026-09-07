@@ -65,7 +65,7 @@ ocx route combo set reliable --targets ark/model-a:2,openai/gpt-5.5
 | 별칭 | 대응 리소스 |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
@@ -123,7 +123,7 @@ family는 `opus`, `fable`, `sonnet`, `haiku`이며, 새 route는 `opus`에서 �
 
 ### `ocx opencode [opencode args...]`
 
-프록시가 실행 중인지 확인한 뒤, OpenCode의 인라인 런타임 계층(`OPENCODE_CONFIG_CONTENT`)에 생성된 `provider.opencodex` 블록을 넣어 opencode를 실행합니다. 기존 인라인 config는 유지되고, 이번 실행에서는 `provider.opencodex`만 교체됩니다. 전역 또는 프로젝트 `opencode.json` 파일은 기존 override가 있는지 경고하기 위해 읽을 수 있지만, 디스크상의 파일은 절대 수정하지 않습니다. 라우팅된 model은 `opencodex/<provider>/<model>`로 나타납니다. 이후 plain `opencode`를 실행하면 이전과 정확히 같은 방식으로 동작합니다.
+프록시가 실행 중인지 확인한 뒤, OpenCode의 인라인 런타임 계층(`OPENCODE_CONFIG_CONTENT`)에 생성된 `provider.opencodex` 및 `providers.opencodex` 블록을 넣어 opencode를 실행합니다. 기존 인라인 config는 유지되고, 이번 실행에서는 이 두 키만 교체됩니다. 전역 또는 프로젝트 `opencode.json` 파일은 기존 override가 있는지 경고하기 위해 읽을 수 있지만, 디스크상의 파일은 절대 수정하지 않습니다. 라우팅된 model은 `opencodex/<provider>/<model>`로 나타납니다. 이후 plain `opencode`를 실행하면 이전과 정확히 같은 방식으로 동작합니다.
 
 ### `ocx grok <status|exclude|include|set|clear|apply> ...`
 
@@ -131,7 +131,7 @@ Grok Build model fence를 관리하고 적용합니다.
 
 ## 클라이언트 설정 내보내기
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime>`
 
 실행 중인 프록시에 연결할 client config를 출력합니다. 이 명령은 base URL, model list, 그리고 client에 따라 credential reference 또는 `opencodex-loopback` placeholder를 포함한 `opencodex` provider block을 선택한 client의 네이티브 형식으로 직렬화합니다.
 
@@ -139,7 +139,7 @@ Grok Build model fence를 관리하고 적용합니다.
 
 | 플래그 | 동작 |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | 필수입니다. 클라이언트 설정 형식을 선택합니다. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime>` | 필수입니다. 클라이언트 설정 형식을 선택합니다. |
 | `--json` | config JSON만 stdout에 출력하므로, redirect가 byte-exact 출력을 캡처합니다. `--out` write note를 포함한 모든 진단 메시지는 stderr로 갑니다. |
 | `--out <path>` | config를 `<path>`에 씁니다. 기존 파일이 있으면 덮어쓰지 않습니다. |
 | `--force` | `--out`이 기존 파일을 덮어쓰도록 허용합니다. |
@@ -156,13 +156,16 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 | 클라이언트 | 표준 대상 경로 | 다운로드 파일명 | 환경 변수 |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json` (`XDG_CONFIG_HOME`이 설정되어 있으면 우선합니다) | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | 없음 - 블록에 리터럴 `opencodex-loopback`이 들어갑니다 |
+| `pi` | `~/.pi/agent/models.json` (`PI_CODING_AGENT_DIR`가 설정되면 우선. 상대 경로는 거부됩니다) | `pi-models.json` | 없음 - 블록에 리터럴 `opencodex-loopback`이 들어갑니다 |
 | `omp` | `~/.omp/agent/models.yml` (기본값. 빈 값이어도 `OMP_PROFILE`이 `PI_PROFILE`보다 우선합니다) | `omp-models.yaml` | 없음 - 리터럴 `opencodex-loopback` |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | 없음 - loopback placeholder |
 | `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
 | `dsh` | `$DSH_HOME/settings.yaml`(기본값 `~/.dsh/settings.yaml`) | `settings.yaml` | 없음 — 비밀이 아닌 loopback bearer placeholder |
+| `mcode` | `~/.minimax/config.yaml` (`MINIMAX_DATA_DIR`, 그다음 레거시 `MAVIS_DATA_DIR`가 설정되면 우선. 상대 경로는 거부됩니다) | `mcode-config.yaml` | 없음 — loopback placeholder |
+| `zcode` | `~/.zcode/v2/config.json` (`ZCODE_DATA_DIR`가 설정되면 우선. 상대 경로는 거부됩니다) | `config.json` | 없음 — loopback placeholder |
+| `prime` | `~/.prime/agent/models.json` (`PRIME_AGENT_CODING_AGENT_DIR`가 설정되면 우선. 상대 경로는 거부됩니다) | `prime-models.json` | 없음 — loopback placeholder |
 
 opencode는 `{env:OPENCODEX_OPENCODE_API_KEY}`를 보간합니다. opencodex가 생성한 Pi 블록에는 환경 변수가 필요 없으며, 리터럴 placeholder인 `opencodex-loopback`이 들어갑니다. 이 값은 필수입니다. Pi는 모델 목록을 만들 때 `apiKey`를 해석하고, 기존 config에 설정되지 않은 env 참조가 있으면 provider 전체를 숨기기 때문입니다. 루프백에서 proxy는 생성된 placeholder를 검사하지 않습니다.
 
@@ -170,19 +173,27 @@ opencode는 `{env:OPENCODEX_OPENCODE_API_KEY}`를 보간합니다. opencodex가 
 `ocx export`는 실제 client config를 절대 쓰지 않습니다. 대상 경로는 손으로 병합하라고 출력되며, `--out`은 `--force` 없이 기존 파일을 덮어쓰지 않습니다. config를 바꾸어 덮어쓰면 이미 들어 있던 다른 provider, agent, MCP entry가 사라지기 때문입니다.
 :::
 
-어떤 key도 직렬화되지 않습니다. opencode, Hermes, OpenClaw, Gajae config에는 env reference만 들어가므로 secret은 환경 변수에 남고, Pi, OMP, Kimi, DSH config에는 인증 정보가 아니라 loopback placeholder가 들어갑니다. loopback proxy(`127.0.0.1`, 기본값)는 admission key가 전혀 필요하지 않습니다. proxy가 loopback을 넘어 바인딩할 때는 해당하는 `OPENCODEX_OPENCODE_API_KEY`, `OPENCODEX_HERMES_API_KEY`, `OPENCODEX_OPENCLAW_API_KEY`를 설정하십시오. `OPENCODEX_GAJAE_API_KEY`는 Gajae provider 인증 값을 환경에서 전달하지만 remote admission header를 보낼 수는 없으므로, 생성되는 Gajae 통합은 Pi, OMP, Kimi, DSH와 마찬가지로 loopback 전용입니다. admission key가 어떻게 발급되는지는 [Remote access](/reference/configuration/#remote-access)를 보십시오. upstream provider 자체의 key는 완전히 별개의 것으로, 각 [Providers](/guides/providers/)에 맞게 설정합니다.
+어떤 key도 직렬화되지 않습니다. 생성되는 config에는 문서화된 env reference 또는 비밀이 아닌 loopback placeholder 중 하나가 들어갑니다. loopback proxy(`127.0.0.1`, 기본값)는 admission key가 전혀 필요하지 않습니다. proxy가 loopback을 넘어 바인딩할 때는 해당하는 `OPENCODEX_OPENCODE_API_KEY`, `OPENCODEX_HERMES_API_KEY`, `OPENCODEX_OPENCLAW_API_KEY`를 설정하십시오. `OPENCODEX_GAJAE_API_KEY`는 Gajae provider 인증 값을 환경에서 전달하지만 remote admission header를 보낼 수는 없으므로, 생성되는 Gajae 통합은 loopback 전용으로 남습니다. admission key가 어떻게 발급되는지는 [Remote access](/reference/configuration/#remote-access)를 보십시오. upstream provider 자체의 key는 완전히 별개의 것으로, 각 [Providers](/guides/providers/)에 맞게 설정합니다.
 
 같은 payload는 `GET /api/client-config`로 제공되고 dashboard의 API 탭에도 렌더링되므로, CLI, API, GUI가 모두 같은 바이트를 사용합니다.
 
 ## 런타임과 설정
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 헤드리스 런타임 설정, 시작, 동기화, 진단, 업데이트를 관리합니다.
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update`는 OpenCodex 자체를 업데이트합니다. Codex CLI는 다음의 별도 읽기 전용 명령으로 점검합니다.
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check`는 패키지 레지스트리를 조회하지 않고, 설정된 설치 후보에 대해 전체 경로를 숨긴 실행 파일 위치와 소유권 근거를 포함한 provenance 정보를 제한된 범위에서 검사합니다. 신뢰할 수 있는 배포 런처 컨텍스트가 인증하는 것은 후보 스냅샷뿐이며, Codex가 성공적으로 실행되었다는 사실은 인증하지 않습니다. 이 단발성 명령은 Codex를 전혀 실행하지 않으므로 환경 또는 저장된 상태에서 얻은 후보는 보고 전용입니다(`managed: false`, 일반적으로 `selection_unattested`). `selectionAttested`는 항상 `false`입니다. JSON 출력에는 `candidateAvailable`, `candidateVersion`, `candidateSource`, `selectionAttested: false`가 포함됩니다. Bun이나 소스에서 직접 실행하면 런처 증거가 없으므로 환경 및 저장된 후보를 무시하고 `candidate_unavailable`을 보고할 수 있습니다. Windows에서는 이 첫 조각이 후보 또는 설정 경로의 파일시스템을 전혀 읽지 않습니다. 배포 런처가 증명한 절대 환경 후보에 한해서 앱 번들 또는 버전 관리자라는 어휘적 표지만 보고하며, 그 밖의 Windows 후보는 모두 실패 닫힘 처리합니다. 이 명령은 Codex나 패키지 관리자를 실행하거나 shim을 복구하지 않고, 설정 또는 캐시 상태를 쓰거나 프로세스를 중지하거나 어떤 것도 설치하지 않습니다. 앱에 포함된 후보, 인식된 버전 관리자의 후보, 검증되지 않은 독립 실행형 후보, shim 상태가 모호한 후보는 관리 대상이 아니거나 알 수 없는 것으로 보고되며, 관리 대상으로 분류되지 않습니다.
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

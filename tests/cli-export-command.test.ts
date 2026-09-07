@@ -8,12 +8,15 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { handleExportCommand, exportModelsFromProxyRows } from "../src/cli/export-command";
+import { resetCodexModelEntitlementCacheForTests } from "../src/codex/model-entitlements";
+import { handleManagementAPI } from "../src/server/management-api";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 const cliPath = join(repoRoot, "src", "cli", "index.ts");
@@ -40,10 +43,11 @@ const ROWS = [
     native: true,
     disabled: false,
     contextWindow: 272_000,
+    inputModalities: ["text", "image"],
     reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     defaultReasoningEffort: "high",
   },
-  { provider: "anthropic", id: "claude-opus-5", namespaced: "anthropic/claude-opus-5", disabled: false, contextWindow: 200_000, displayName: "Claude Opus 5" },
+  { provider: "anthropic", id: "claude-opus-5", namespaced: "anthropic/claude-opus-5", disabled: false, contextWindow: 200_000, displayName: "Claude Opus 5", inputModalities: ["text"] },
   { provider: "custom", id: "no-context", namespaced: "custom/no-context", disabled: false },
   { provider: "banned", id: "hidden", namespaced: "banned/hidden", disabled: true, contextWindow: 100_000 },
 ];
@@ -55,6 +59,19 @@ function fakeProxy(rows: unknown = ROWS) {
       const url = new URL(req.url);
       if (url.pathname === "/api/models") return Response.json(rows);
       return new Response("not found", { status: 404 });
+    },
+  });
+  servers.push(server);
+  return { port: server.port, baseUrl: `http://127.0.0.1:${server.port}` };
+}
+
+function managementProxy(managementConfig: OcxConfig) {
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      return await handleManagementAPI(req, url, managementConfig)
+        ?? new Response("not found", { status: 404 });
     },
   });
   servers.push(server);
@@ -85,7 +102,8 @@ afterEach(() => {
   console.log = originalLog;
   console.error = originalError;
   for (const server of servers.splice(0)) server.stop(true);
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const dir of tempDirs.splice(0)) removeTreeWithRetry(dir);
+  resetCodexModelEntitlementCacheForTests();
 });
 
 /** console.log adds exactly one newline per call; this is the byte stream a shell sees. */
@@ -102,6 +120,68 @@ async function run(args: string[], extra: { baseUrl: string; config?: OcxConfig 
 }
 
 describe("ocx export --json (accept criterion 1)", () => {
+  test("the real /api/models handler refreshes expired GPT-5.6 entitlements before export", async () => {
+    const oldOcxHome = process.env.OPENCODEX_HOME;
+    const oldCodexHome = process.env.CODEX_HOME;
+    const originalFetch = globalThis.fetch;
+    const root = tempDir();
+    const codexHome = join(root, "codex");
+    mkdirSync(codexHome, { recursive: true });
+    process.env.OPENCODEX_HOME = join(root, "opencodex");
+    process.env.CODEX_HOME = codexHome;
+    writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+      tokens: { access_token: "export-token", account_id: "export-main" },
+    }));
+    let entitlementFetches = 0;
+    globalThis.fetch = (async input => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/models") {
+        entitlementFetches += 1;
+        return Response.json({ models: [
+          { slug: "gpt-5.6-sol", supported_in_api: true, visibility: "list" },
+          { slug: "gpt-5.6-terra", supported_in_api: true, visibility: "list" },
+          { slug: "gpt-5.6-luna", supported_in_api: true, visibility: "list" },
+        ] });
+      }
+      return originalFetch(input);
+    }) as typeof fetch;
+    try {
+      const managementConfig = config({
+        defaultProvider: "openai",
+        providers: {
+          openai: {
+            adapter: "openai-responses",
+            baseUrl: "https://chatgpt.com/backend-api/codex",
+            authMode: "forward",
+            liveModels: false,
+            models: [],
+          },
+        },
+      });
+      const proxy = managementProxy(managementConfig);
+      const result = await run(["--client", "opencode", "--json"], {
+        baseUrl: proxy.baseUrl,
+        config: managementConfig,
+      });
+      expect(result.code).toBe(0);
+      const parsed = JSON.parse(result.stdout) as {
+        provider: Record<string, { models: Record<string, unknown> }>;
+      };
+      expect(entitlementFetches).toBe(1);
+      expect(Object.keys(parsed.provider.opencodex!.models)).toEqual(expect.arrayContaining([
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+      ]));
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (oldOcxHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = oldOcxHome;
+      if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = oldCodexHome;
+    }
+  });
+
   test("stdout parses as JSON with zero extra bytes, for both clients", async () => {
     const proxy = fakeProxy();
     for (const client of ["opencode", "pi"] as const) {
@@ -142,7 +222,7 @@ describe("ocx export human output (accept criterion 2)", () => {
     expect(result.code).toBe(0);
     expect(result.stdout.startsWith("{\n")).toBe(true);
     expect(result.stdout).toContain(join("opencode", "opencode.json"));
-    expect(result.stdout).toContain("Merge this provider block into that file; do not replace it.");
+    expect(result.stdout).toContain("Merge this generated configuration into that file; do not replace it.");
     expect(result.stdout).toContain("export OPENCODEX_OPENCODE_API_KEY=");
     // Three visible models; only `custom/no-context` lacks an authoritative window.
     expect(result.stdout).toContain("3 models; 1 omit context limits");
@@ -230,7 +310,13 @@ describe("ocx export argument validation (accept criterion 4)", () => {
     expect(yaml.code).toBe(0);
     const yamlText = readFileSync(yamlTarget, "utf8");
     expect(yamlText.startsWith("providers:")).toBe(true);
-    expect(Bun.YAML.parse(yamlText)).toHaveProperty("providers.opencodex");
+    const parsedYaml = Bun.YAML.parse(yamlText) as {
+      providers: { opencodex: { models: Record<string, { supports_vision?: boolean }> } };
+    };
+    expect(parsedYaml).toHaveProperty("providers.opencodex");
+    expect(parsedYaml.providers.opencodex.models["gpt-5.6-luna"]).toEqual({ supports_vision: true });
+    expect(parsedYaml.providers.opencodex.models["anthropic/claude-opus-5"]).toEqual({ supports_vision: false });
+    expect(parsedYaml.providers.opencodex.models["custom/no-context"]).toEqual({});
 
     const tomlTarget = join(tempDir(), "kimi-config.toml");
     const toml = await run(["--client", "kimi", "--out", tomlTarget], { baseUrl: proxy.baseUrl });

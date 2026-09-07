@@ -2,17 +2,22 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { ExportModel } from "../src/clients/config-export";
+import { buildClientContribution, type ExportModel } from "../src/clients/config-export";
 import { fileIO, type IntegrationIO } from "../src/integrations/config-io";
+import { canonicalContribution, fingerprint } from "../src/integrations/ownership";
+import { protectedContributionFingerprint } from "../src/integrations/ownership-policy";
 import { INTEGRATION_CLIENTS } from "../src/integrations/registry";
 import { createIntegrationStateStore, type IntegrationStateStore } from "../src/integrations/store";
+import { exportContextOf, readIntegrationState } from "../src/integrations/state";
 import {
   applyIntegration,
   disableIntegration,
+  overwriteIntegration,
   restoreIntegration,
   type IntegrationWriteInput,
 } from "../src/integrations/writer";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * Activation coverage for devlog/_fin/260802_client_toggle_api/031 §6.
@@ -53,7 +58,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(dirname(home), { recursive: true, force: true });
+  removeTreeWithRetry(dirname(home));
 });
 
 /**
@@ -96,6 +101,22 @@ function installDsh(): string {
   return configPath;
 }
 
+function installZcode(): string {
+  const spec = INTEGRATION_CLIENTS.zcode;
+  mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
+  const configPath = spec.configPath(TEST_ENV, home);
+  mkdirSync(dirname(configPath), { recursive: true });
+  return configPath;
+}
+
+function installOpencode(): string {
+  const spec = INTEGRATION_CLIENTS.opencode;
+  mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
+  const configPath = spec.configPath(TEST_ENV, home);
+  mkdirSync(dirname(configPath), { recursive: true });
+  return configPath;
+}
+
 function input(overrides: Partial<IntegrationWriteInput> = {}): IntegrationWriteInput {
   return {
     clientId: "hermes",
@@ -107,6 +128,16 @@ function input(overrides: Partial<IntegrationWriteInput> = {}): IntegrationWrite
     store,
     ...overrides,
   };
+}
+
+function reverseJsonObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseJsonObjectKeys);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .reverse()
+      .map(([key, nested]) => [key, reverseJsonObjectKeys(nested)]),
+  );
 }
 
 describe("apply", () => {
@@ -130,6 +161,92 @@ describe("apply", () => {
     expect(rows[0]!.kind).toBe("apply");
     // Nothing existed before, so there is nothing to restore TO.
     expect(rows[0]!.snapshot.kind).toBe("none");
+  });
+
+  /**
+   * opencode owns two fragments now, and only the V2 one carries the reasoning-effort
+   * variants. None of the other clients exercise a two-block document, so the writer has to
+   * be shown putting the variants on disk — not just building them.
+   */
+  test("opencode writes the reasoning-effort variants and keeps them on refresh", () => {
+    const configPath = installOpencode();
+    const models: ExportModel[] = [
+      {
+        namespaced: "opencode-go/glm-5.3",
+        provider: "opencode-go",
+        id: "glm-5.3",
+        contextWindow: 1_000_000,
+        reasoningEfforts: ["max", "low", "high"],
+      },
+      { namespaced: "openai/gpt-5.5", provider: "openai", id: "gpt-5.5", contextWindow: 400_000 },
+    ];
+    const request = input({ clientId: "opencode", models });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const doc = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: { opencodex: { models: Record<string, Record<string, unknown>> } };
+      providers: {
+        opencodex: { models: Record<string, { variants?: Array<{ id: string }> }> };
+      };
+    };
+    expect(doc.providers.opencodex.models["opencode-go/glm-5.3"]!.variants!.map(v => v.id))
+      .toEqual(["low", "high", "max"]);
+    // The legacy block stays variant-free, and a model without a ladder gets no key at all.
+    expect(doc.provider.opencodex.models["opencode-go/glm-5.3"]).not.toHaveProperty("variants");
+    expect(doc.providers.opencodex.models["openai/gpt-5.5"]!.variants).toBeUndefined();
+
+    expect(readIntegrationState(request)).toMatchObject({ state: "current" });
+    expect(applyIntegration(request).ok).toBe(true);
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as typeof doc;
+    expect(after.providers.opencodex.models["opencode-go/glm-5.3"]!.variants!.map(v => v.id))
+      .toEqual(["low", "high", "max"]);
+  });
+
+  /**
+   * Every opencode installation that predates the second block has a one-fragment record, so
+   * this is the migration path every existing user takes. Kimi has an equivalent test; opencode
+   * is the client that actually meets it in the field.
+   */
+  test("a legacy opencode record migrates to two fragments and disables cleanly", () => {
+    const configPath = installOpencode();
+    const request = input({ clientId: "opencode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    // Rewind the file and the record to the pre-V2 shape: one fragment, one container, and
+    // fingerprints computed from exactly that state — a record whose fingerprints disagree
+    // with its own fragments is a foreign edit, which is a different (and correct) refusal.
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: { opencodex: unknown };
+    };
+    delete (document as Record<string, unknown>).providers;
+    const legacyText = `${JSON.stringify(document, null, 2)}\n`;
+    writeFileSync(configPath, legacyText);
+
+    const legacy = { ...store.readRecords().opencode! };
+    legacy.fragmentPaths = [["provider", "opencodex"]];
+    legacy.createdContainers = ["provider"];
+    legacy.fileFingerprint = fingerprint(legacyText);
+    legacy.blockFingerprint = fingerprint(canonicalContribution({
+      clientId: "opencode",
+      fragments: [{ path: ["provider", "opencodex"], value: document.provider.opencodex }],
+    }));
+    store.putRecord(legacy);
+
+    expect(readIntegrationState(request)).toMatchObject({ state: "stale" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const migrated = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    expect(migrated.providers).toBeDefined();
+    expect(store.readRecords().opencode!.fragmentPaths).toEqual([
+      ["provider", "opencodex"],
+      ["providers", "opencodex"],
+    ]);
+
+    // Disabling has to take both fragments with it, including the container we created.
+    expect(disableIntegration(request).ok).toBe(true);
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    expect(after.provider).toBeUndefined();
+    expect(after.providers).toBeUndefined();
   });
 
   test("is idempotent: applying twice changes nothing the second time", () => {
@@ -193,6 +310,303 @@ describe("apply", () => {
     const third = applyIntegration(input({ clientId: "pi" }));
     expect(third.ok).toBe(true);
     if (third.ok) expect(third.changed).toBe(false);
+  });
+
+  test("ZCode runtime-derived model metadata is refreshable without weakening the provider envelope (#2389)", () => {
+    const configPath = installZcode();
+    const models: ExportModel[] = [
+      ...MODELS,
+      { namespaced: "mystery/model", provider: "mystery", id: "model" },
+    ];
+    const request = input({ clientId: "zcode", models });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const record = store.readRecords().zcode!;
+    expect(record.protectedBlockFingerprint).toMatch(/^[0-9a-f]{16}$/);
+    expect(record.semanticBlockFingerprint).toMatch(/^[0-9a-f]{16}$/);
+    expect(record.semanticProtectedBlockFingerprint).toMatch(/^[0-9a-f]{16}$/);
+    expect(record.refreshablePaths).toContainEqual([
+      "provider", "opencodex", "models", "mystery/model", "limit", "context",
+    ]);
+    expect(record.refreshablePaths).not.toContainEqual([
+      "provider", "opencodex", "models", "anthropic/claude-opus-4-8", "limit", "context",
+    ]);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, {
+        models: Record<string, Record<string, unknown>>;
+        options: Record<string, unknown>;
+      }>;
+    };
+    const provider = document.provider.opencodex!;
+    const authoritative = provider.models["anthropic/claude-opus-4-8"]!;
+    authoritative.reasoning = { enabled: true, variants: ["off", "high"] };
+    (authoritative.limit as Record<string, unknown>).output = 64_000;
+    provider.models["mystery/model"]!.limit = { context: 128_000, output: 32_000 };
+    provider.models["mystery/model"]!.reasoning = { enabled: false };
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const status = readIntegrationState(request);
+    expect(status.state).toBe("stale");
+    expect(status.reason).toBeUndefined();
+
+    const refreshed = applyIntegration(request);
+    expect(refreshed.ok).toBe(true);
+    if (refreshed.ok) expect(refreshed.changed).toBe(true);
+
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as typeof document;
+    expect(after.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.reasoning).toBeUndefined();
+    expect((after.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.limit as Record<string, unknown>).output).toBeUndefined();
+    expect(after.provider.opencodex!.models["mystery/model"]!.limit).toBeUndefined();
+  });
+
+  test("ZCode on a hub writes and recognizes the unauthenticated loopback listener (#3306)", () => {
+    const configPath = installZcode();
+    const request = input({
+      clientId: "zcode",
+      config: {
+        ...CONFIG,
+        runtimeRole: "hub",
+        hostname: "100.64.0.10",
+        unauthenticatedLoopbackListener: { enabled: true, port: 10102 },
+      },
+    });
+
+    const result = applyIntegration(request);
+    expect(result.ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { options: { apiKey: string; baseURL: string } }>;
+    };
+    expect(document.provider.opencodex!.options).toMatchObject({
+      apiKey: "opencodex-loopback",
+      baseURL: "http://127.0.0.1:10102/v1",
+    });
+    expect(readIntegrationState(request)).toMatchObject({ state: "current" });
+  });
+
+  test("ZCode key-order normalization stays refreshable with derived metadata (#2759)", () => {
+    const configPath = installZcode();
+    const models: ExportModel[] = [
+      ...MODELS,
+      { namespaced: "mystery/model", provider: "mystery", id: "model" },
+    ];
+    const request = input({ clientId: "zcode", models });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { models: Record<string, Record<string, unknown>> }>;
+    };
+    document.provider.opencodex!.models["mystery/model"]!.limit = {
+      context: 128_000,
+      output: 32_000,
+    };
+    document.provider.opencodex!.models["mystery/model"]!.reasoning = { enabled: false };
+    const reordered = reverseJsonObjectKeys(document);
+    writeFileSync(configPath, `${JSON.stringify(reordered, null, 2)}\n`);
+
+    expect(readIntegrationState(request)).toMatchObject({ state: "stale" });
+    const refreshed = applyIntegration(request);
+    expect(refreshed.ok).toBe(true);
+    if (refreshed.ok) expect(refreshed.changed).toBe(true);
+    expect(readIntegrationState(request)).toMatchObject({ state: "current" });
+  });
+
+  test("legacy ZCode records tolerate key reordering when the catalog is unchanged (#2759)", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const legacy = { ...store.readRecords().zcode! };
+    delete legacy.semanticBlockFingerprint;
+    delete legacy.semanticProtectedBlockFingerprint;
+    store.putRecord(legacy);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { models: Record<string, Record<string, unknown>> }>;
+    };
+    document.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.reasoning = {
+      enabled: true,
+    };
+    writeFileSync(
+      configPath,
+      `${JSON.stringify(reverseJsonObjectKeys(document), null, 2)}\n`,
+    );
+
+    expect(readIntegrationState(request)).toMatchObject({ state: "stale" });
+    expect(applyIntegration(request).ok).toBe(true);
+  });
+
+  test("ZCode key-order normalization remains refreshable across catalog drift", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, {
+        name: string;
+        kind: string;
+        enabled: boolean;
+        source: string;
+        options: Record<string, unknown>;
+        models: Record<string, Record<string, unknown>>;
+      }>;
+    };
+    const provider = document.provider.opencodex!;
+    const reorderedModels: Record<string, Record<string, unknown>> = {};
+    for (const [modelId, model] of Object.entries(provider.models)) {
+      const reordered: Record<string, unknown> = {};
+      for (const key of ["name", "reasoning", "limit", "modalities"]) {
+        if (model[key] !== undefined) reordered[key] = model[key];
+      }
+      if (modelId === "anthropic/claude-opus-4-8") {
+        reordered.reasoning = { enabled: true };
+      }
+      reorderedModels[modelId] = reordered;
+    }
+    provider.models = reorderedModels;
+    const reorderedProvider: Record<string, unknown> = {};
+    for (const key of ["name", "kind", "options", "enabled", "source", "models"]) {
+      reorderedProvider[key] = provider[key as keyof typeof provider];
+    }
+    document.provider.opencodex = reorderedProvider as typeof provider;
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const changedCatalog = input({
+      clientId: "zcode",
+      models: [...MODELS, { namespaced: "new/model", provider: "new", id: "model" }],
+    });
+    expect(readIntegrationState(changedCatalog).state).toBe("stale");
+    const refreshed = applyIntegration(changedCatalog);
+    expect(refreshed.ok).toBe(true);
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as typeof document;
+    expect(after.provider.opencodex!.models["new/model"]).toBeDefined();
+  });
+
+  test("a legacy ZCode record accepts derived drift only while its generated catalog is unchanged (#2389)", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const legacy = { ...store.readRecords().zcode! };
+    delete legacy.protectedBlockFingerprint;
+    delete legacy.refreshablePaths;
+    store.putRecord(legacy);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { models: Record<string, Record<string, unknown>> }>;
+    };
+    document.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.reasoning = { enabled: true };
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    expect(readIntegrationState(request).state).toBe("stale");
+    expect(applyIntegration(request).ok).toBe(true);
+  });
+
+  test("a recorded ZCode policy keeps derived drift refreshable across later catalog changes (#2389)", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { models: Record<string, Record<string, unknown>> }>;
+    };
+    document.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.reasoning = { enabled: true };
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const changedCatalog = input({
+      clientId: "zcode",
+      models: [...MODELS, { namespaced: "new/model", provider: "new", id: "model" }],
+    });
+    expect(readIntegrationState(changedCatalog).state).toBe("stale");
+    const result = applyIntegration(changedCatalog);
+    expect(result.ok).toBe(true);
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as typeof document;
+    expect(after.provider.opencodex!.models["new/model"]).toBeDefined();
+  });
+
+  test("a legacy ZCode record fails closed when derived drift overlaps catalog drift (#2389)", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const legacy = { ...store.readRecords().zcode! };
+    delete legacy.protectedBlockFingerprint;
+    delete legacy.refreshablePaths;
+    store.putRecord(legacy);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { models: Record<string, Record<string, unknown>> }>;
+    };
+    document.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.reasoning = { enabled: true };
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const changedCatalog = input({
+      clientId: "zcode",
+      models: [...MODELS, { namespaced: "new/model", provider: "new", id: "model" }],
+    });
+    expect(readIntegrationState(changedCatalog)).toMatchObject({
+      state: "conflict",
+      reason: "foreign-edit",
+    });
+  });
+
+  test("ZCode connection edits remain a hard conflict after derived-drift support (#2389)", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { options: Record<string, unknown> }>;
+    };
+    document.provider.opencodex!.options.baseURL = "http://user-edited.invalid/v1";
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const status = readIntegrationState(request);
+    expect(status).toMatchObject({ state: "conflict", reason: "foreign-edit" });
+    const result = applyIntegration(request);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("conflict");
+  });
+
+  test("a malformed recorded ZCode policy cannot widen refreshable drift (#2389)", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const refreshablePaths = [["provider", "opencodex", "options", "baseURL"]] as const;
+    const contribution = buildClientContribution("zcode", exportContextOf(request));
+    store.putRecord({
+      ...store.readRecords().zcode!,
+      refreshablePaths,
+      protectedBlockFingerprint: protectedContributionFingerprint(contribution, refreshablePaths),
+    });
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { options: Record<string, unknown> }>;
+    };
+    document.provider.opencodex!.options.baseURL = "http://user-edited.invalid/v1";
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    expect(readIntegrationState(request)).toMatchObject({
+      state: "conflict",
+      reason: "foreign-edit",
+    });
+  });
+
+  test("ZCode cannot rewrite an authoritative OpenCodex context limit (#2389)", () => {
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { models: Record<string, Record<string, unknown>> }>;
+    };
+    const model = document.provider.opencodex!.models["anthropic/claude-opus-4-8"]!;
+    (model.limit as Record<string, unknown>).context = 1;
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    expect(readIntegrationState(request)).toMatchObject({ state: "conflict", reason: "foreign-edit" });
   });
 
   test("json disable after a sibling edit keeps the sibling (#1631)", () => {
@@ -814,5 +1228,169 @@ describe("nothing leaks", () => {
 
     const doc = Bun.YAML.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
     expect(doc).toEqual({ providers: {} });
+  });
+});
+
+describe("overwriting a conflict on purpose", () => {
+  /*
+   * Conflict was a dead end. The writer refused unconditionally, the GUI locked
+   * the switch, and the only way forward was editing the file by hand -- the
+   * thing a dashboard exists to avoid. These prove the escape hatch is real AND
+   * that it stays narrow: it waives the conflict refusal and nothing else.
+   */
+
+  test("replaces a block we did not write, and the original is restorable", () => {
+    const configPath = installHermes();
+    // A block occupying our exact paths that we never wrote: unowned-key.
+    writeFileSync(configPath, "providers:\n  opencodex:\n    api: http://someone-else.invalid\n    note: hand written\n");
+    const before = readFileSync(configPath, "utf8");
+
+    // The default still refuses, which is what makes the opt-in meaningful.
+    const refused = applyIntegration(input());
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.reason).toBe("conflict");
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+
+    const forced = overwriteIntegration(input());
+    expect(forced.ok).toBe(true);
+    if (!forced.ok) return;
+    expect(forced.changed).toBe(true);
+    expect(forced.state).toBe("current");
+
+    const after = readFileSync(configPath, "utf8");
+    expect(after).not.toContain("someone-else.invalid");
+    expect(after).not.toContain("hand written");
+    expect(readIntegrationState(input())).toMatchObject({ state: "current" });
+
+    // Journaled as its own kind: "applied" would be a lie about an operation that
+    // replaced somebody else's block, and this list is where a user looks after a
+    // mistake.
+    const operations = store.listOperations("hermes");
+    expect(operations).toHaveLength(1);
+    expect(operations[0]!.kind).toBe("overwrite");
+
+    // And it is undoable, byte for byte.
+    const undone = restoreIntegration({ ...input(), opId: operations[0]!.opId });
+    expect(undone.ok).toBe(true);
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+  });
+
+  test("discards an edit inside our own block without stranding what the old record owned", () => {
+    const configPath = installHermes();
+    expect(applyIntegration(input()).ok).toBe(true);
+    writeFileSync(configPath, readFileSync(configPath, "utf8").replace(
+      "api_mode: chat_completions",
+      "api_mode: user_edited",
+    ));
+    expect(readIntegrationState(input())).toMatchObject({ state: "conflict", reason: "foreign-edit" });
+
+    expect(overwriteIntegration(input()).ok).toBe(true);
+
+    const after = readFileSync(configPath, "utf8");
+    expect(after).not.toContain("api_mode: user_edited");
+    expect(after).toContain("api_mode: chat_completions");
+    /*
+     * A foreign-edit force drops what the PREVIOUS record owned before merging,
+     * the same way a stale refresh does. Without that, a path the old record
+     * covered and the new one does not would be stranded, unremovable by any
+     * later disable -- so disable has to return the file to a clean absence.
+     */
+    expect(disableIntegration(input()).ok).toBe(true);
+    expect(readFileSync(configPath, "utf8")).not.toContain("opencodex");
+  });
+
+  test("leaves the user's own containers standing after a forced apply is disabled", () => {
+    const configPath = installHermes();
+    // The user already owns `providers`, and something they wrote sits in our slot.
+    writeFileSync(configPath, "providers:\n  mine:\n    api: http://user.invalid\n  opencodex:\n    api: http://squatter.invalid\n");
+
+    expect(overwriteIntegration(input()).ok).toBe(true);
+    expect(disableIntegration(input()).ok).toBe(true);
+
+    const doc = Bun.YAML.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    // We did not create `providers`, so pruning it would be a second act of
+    // destruction after the one the user actually authorized.
+    expect(doc.providers).toBeDefined();
+    expect((doc.providers as Record<string, unknown>).mine).toEqual({ api: "http://user.invalid" });
+    expect((doc.providers as Record<string, unknown>).opencodex).toBeUndefined();
+  });
+
+  test("still refuses an unsafe document, where a snapshot is not a licence", () => {
+    const configPath = installHermes();
+    /*
+     * A non-object where we would have to write a section. The merge would
+     * replace a value it cannot reason about, so forcing it is data loss with a
+     * receipt -- the force path must not reach it.
+     */
+    writeFileSync(configPath, "providers: not-a-mapping\n");
+    const before = readFileSync(configPath, "utf8");
+
+    const result = overwriteIntegration(input());
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+  });
+
+  test("behaves exactly like apply when there is no conflict to overwrite", () => {
+    installHermes();
+    /*
+     * Not a way to skip any other check: on a clean file this is an ordinary
+     * apply, journaled as one, and on an already-current file it is the same
+     * no-op apply performs.
+     */
+    const first = overwriteIntegration(input());
+    expect(first.ok).toBe(true);
+    if (first.ok) expect(first.changed).toBe(true);
+    expect(store.listOperations("hermes")[0]!.kind).toBe("apply");
+
+    const second = overwriteIntegration(input());
+    expect(second.ok).toBe(true);
+    if (second.ok) expect(second.changed).toBe(false);
+    expect(store.listOperations("hermes")).toHaveLength(1);
+  });
+
+  test("refuses a client that is not installed", () => {
+    // installHermes() deliberately not called: a missing client is not a conflict.
+    const result = overwriteIntegration(input());
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("not_installed");
+  });
+
+  test("drops a path only the OLD record owned, so nothing is left unremovable", () => {
+    /*
+     * The stranding case the sibling test above cannot see. When every path the
+     * old record owned is also a path the new contribution writes, dropping the
+     * old fragments first changes nothing observable -- the merge overwrites them
+     * anyway. The drop only matters when the layouts DISAGREE, which is what an
+     * upgrade leaves behind: a path we owned under the previous shape and no
+     * longer write. Without the drop, the replacement record never covers it, so
+     * no later disable can ever remove it.
+     */
+    const configPath = installOpencode();
+    const request = input({ clientId: "opencode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      providers: Record<string, Record<string, unknown>>;
+    };
+    document.providers["opencodex-legacy"] = { api: "http://legacy.invalid" };
+    // An edit inside a fragment we DO own is what makes this a foreign-edit
+    // conflict rather than ordinary drift.
+    document.providers.opencodex!.options = { baseURL: "http://user-edited.invalid" };
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const record = { ...store.readRecords().opencode! };
+    record.fragmentPaths = [...record.fragmentPaths, ["providers", "opencodex-legacy"]];
+    store.putRecord(record);
+    expect(readIntegrationState(request)).toMatchObject({ state: "conflict", reason: "foreign-edit" });
+
+    expect(overwriteIntegration(request).ok).toBe(true);
+
+    const after = JSON.parse(readFileSync(configPath, "utf8")) as {
+      providers: Record<string, unknown>;
+    };
+    expect(after.providers["opencodex-legacy"]).toBeUndefined();
+    expect(after.providers.opencodex).toBeDefined();
+    expect(store.readRecords().opencode!.fragmentPaths).not.toContainEqual(["providers", "opencodex-legacy"]);
   });
 });

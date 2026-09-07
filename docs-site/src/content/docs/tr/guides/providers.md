@@ -129,7 +129,7 @@ ocx logout <saglayici>
 
 | Sağlayıcı | Adaptör | Temel URL | Notlar |
 | --- | --- | --- | --- |
-| `xai` | `openai-chat` | `https://api.x.ai/v1` | Canlı öncelikli Grok kataloğu; `grok-4.5` geri dönüş varsayılanıdır. |
+| `xai` | `openai-chat` | `https://cli-chat-proxy.grok.com/v1` | OAuth ayrı Grok CLI abonelik ağ geçidini kullanır. API anahtarı geçersiz kılması `https://api.x.ai/v1` kullanır ve Priority Processing ekleyebilir. Canlı öncelikli Grok kataloğu; `grok-4.5` geri dönüş varsayılanıdır. |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | Claude modelleri; canlı model listesi `/v1/models` üzerinden getirilir. |
 | `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi K2.7/K2.6/K2.5 kodlama modelleri. |
 | `nous` | `openai-chat` | `https://inference-api.nousresearch.com/v1` | Nous Research abonelik ağ geçidi (Hermes Agent'ın kullandığı aynı arka uç). `portal.nousresearch.com`'a karşı cihaz yetkilendirmesi girişi; erişim belirteci istek başına çıkarım JWT'sidir. Oturum açmış hesaptan canlı olarak keşfedilen karışık ücretli + `:free` model kataloğu (`tencent/hy3:free`, `stepfun/step-3.7-flash:free`, ...). Yenileme belirteçleri tek kullanımlıktır ve her yenilemede döndürülür. |
@@ -622,8 +622,11 @@ anahtar girişi listelerinde hala gösterilmez.
 ### Ollama Cloud
 
 Ollama Cloud, [ollama.com/settings/keys](https://ollama.com/settings/keys)
-adresinden alınan bir anahtarla `https://ollama.com/v1` adresinde OpenAI uyumlu
-barındırılan (yerel olmayan) bir Ollama'dır. opencodex, bulut serisini vizyon
+adresinden alınan bir anahtarla `https://ollama.com/v1` adresinde yapılandırılan,
+barındırılan (yerel olmayan) bir Ollama'dır. opencodex ona OpenAI uyumlu yüzey
+yerine Ollama'nın kendi REST API'si (`POST /api/chat`) üzerinden erişir ve model
+listesini sağlayıcıdan keşfeder; böylece yeni Ollama Cloud modelleri yapılandırma
+değişikliği olmadan görünür. opencodex, bulut serisini vizyon
 yeteneğine göre sınıflandırır, böylece [vizyon sidecar'ı](/tr/guides/sidecars/)
 yalnızca salt metin modeller için devreye girer. Salt metin modeller (örneğin
 `glm-5.2`, `deepseek-v4-pro`, `gpt-oss`, `qwen3-coder`, `minimax-m2.x`,
@@ -632,6 +635,11 @@ yalnızca salt metin modeller için devreye girer. Salt metin modeller (örneği
 `gemini-3-flash-preview`) listelenmez. Eşleştirme Ollama'nın `:size`
 etiketlerine toleranslıdır, bu nedenle `gpt-oss`, `gpt-oss:120b` ve
 `gpt-oss:20b`'yi kapsar.
+
+Ollama şu anda yapılandırılmış çıktıyı Ollama Cloud'da desteklemediğini belgeliyor. Kanonik
+`ollama-cloud` için opencodex, yapılandırılmış çıktı isteklerini (`text.format`) serbest metni
+sessizce döndürmek yerine net bir hatayla reddeder; yerel ve özel `ollama-native` uç noktaları
+Ollama'nın yerel `format` davranışını korur.
 
 ## 4. Yerel sağlayıcılar
 

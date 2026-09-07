@@ -12,12 +12,23 @@
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { EXPORT_CLIENTS, type ExportModel, type ManagedContribution } from "../clients/config-export";
-import { isLoopbackHostname } from "../codex/inject";
+import { shouldInjectApiAuthHeader } from "../codex/inject";
 import type { OcxConfig } from "../types";
 import { PARSE_FAILED, defaultIntegrationIO, loadTarget, parseConfig, type IntegrationIO } from "./config-io";
-import { fingerprint, canonicalContribution, fragmentPathsOf, type OwnershipRecord } from "./ownership";
+import {
+  fingerprint,
+  canonicalContribution,
+  fragmentPathsOf,
+  semanticContribution,
+  type OwnershipRecord,
+} from "./ownership";
+import {
+  protectedContributionFingerprint,
+  refreshablePathsOf,
+  semanticProtectedContributionFingerprint,
+} from "./ownership-policy";
 import { createdContainerPaths, mergeContribution, removeFragments } from "./merge";
-import { INTEGRATION_CLIENTS, isLoopbackOnly, type IntegrationClientId } from "./registry";
+import { INTEGRATION_CLIENTS, isLoopbackOnly, resolveIntegrationPaths, type IntegrationClientId } from "./registry";
 import { classifyIntegration, exportContextOf } from "./state";
 import type { IntegrationState } from "./state";
 import { serializeDocument, UnserializableValueError } from "./serialize";
@@ -199,8 +210,20 @@ function preflight(input: IntegrationWriteInput) {
    * whole Integrations page because one client is misconfigured.
    */
   let configPath: string;
+  let detectDir: string;
   try {
-    configPath = input.resolvedPaths?.configPath ?? spec.configPath(input.env, input.home);
+    /*
+     * Resolve the PAIR, never one half.
+     *
+     * The coordinated path hands us a frozen pair, but applyIntegration,
+     * refreshIntegration and disableIntegration are public and may be called
+     * without one. Resolving configPath here and detectDir separately later let
+     * an Aside account switch land between the two, so a direct apply could
+     * verify account 1 was installed and then write account 0's catalog.
+     */
+    const resolved = input.resolvedPaths ?? resolveIntegrationPaths(clientId, input.env, input.home);
+    configPath = resolved.configPath;
+    detectDir = resolved.detectDir;
   } catch (error) {
     if (!(error instanceof ClientPathError)) throw error;
     return { failed: refuse(clientId, "unsafe", "unsafe", error.message) } as const;
@@ -237,26 +260,55 @@ function preflight(input: IntegrationWriteInput) {
   const classified = classifyIntegration({
     fileText: before, fileIsRegular: true, parsed, record, contribution, configPath, clientId,
   });
-  return { failed: undefined, store, io, clientId, spec, exportSpec, configPath, before, parsed, contribution, record, classified } as const;
+  return { failed: undefined, store, io, clientId, spec, exportSpec, configPath, detectDir, before, parsed, contribution, record, classified } as const;
 }
 
-export function applyIntegration(input: IntegrationWriteInput): WriteOutcome {
+/**
+ * How a conflicted document is treated.
+ *
+ * `refuse` is the default and the only behavior that existed: a conflict means
+ * something we did not write occupies our paths, or our own block was edited,
+ * and guessing which one the user meant to keep is how a toggle deletes work.
+ *
+ * `overwrite` is the explicit escape hatch. It is never reached by a plain
+ * apply -- the caller has to ask for it by name -- because the whole value of
+ * the refusal is that it cannot be triggered by accident.
+ */
+type ConflictPolicy = "refuse" | "overwrite";
+
+function applyOrRefreshIntegration(
+  input: IntegrationWriteInput,
+  allowAbsent: boolean,
+  conflictPolicy: ConflictPolicy = "refuse",
+): WriteOutcome {
   const pre = preflight(input);
   if (pre.failed) return pre.failed;
-  const { store, io, clientId, spec, exportSpec, configPath, before, parsed, contribution, record, classified } = pre;
+  const { store, io, clientId, spec, exportSpec, configPath, detectDir, before, parsed, contribution, record, classified } = pre;
 
-  if (io.statKind(input.resolvedPaths?.detectDir ?? spec.detectDir(input.env, input.home)) !== "dir") {
+  // The detect directory preflight already resolved, so it cannot name a
+  // different account than the config path this operation is about to write.
+  if (io.statKind(detectDir) !== "dir") {
     return refuse(clientId, "not_installed", "absent", `${clientId} is not installed`);
   }
-  if (isLoopbackOnly(clientId) && !isLoopbackHostname(input.config.hostname)) {
+  if (isLoopbackOnly(clientId) && shouldInjectApiAuthHeader(input.config)) {
     return refuse(clientId, "non_loopback", classified.state,
       `The generated ${clientId} integration is loopback-only and does not emit the admission header a non-loopback bind requires. Give it loopback access instead, through a tunnel or a local forwarder.`);
   }
   if (classified.state === "conflict") {
-    return refuse(clientId, "conflict", "conflict",
-      classified.reason === "foreign-edit"
-        ? `${configPath} changed after opencodex wrote it`
-        : `${configPath} already contains an opencodex block we did not write`);
+    if (conflictPolicy === "refuse") {
+      return refuse(clientId, "conflict", "conflict",
+        classified.reason === "foreign-edit"
+          ? `${configPath} changed after opencodex wrote it`
+          : `${configPath} already contains an opencodex block we did not write`);
+    }
+    /*
+     * The caller asked for the overwrite explicitly, so the merge below runs
+     * against the document as it stands and our block replaces whatever holds
+     * our paths. Everything that makes it recoverable is shared with apply --
+     * the snapshot, the atomic write, the compare-before-commit recheck and the
+     * journal row all come from the same commit() call -- which is why this is a
+     * policy flag on one code path rather than a second implementation.
+     */
   }
   /*
    * `unsafe` from the classifier means the document is not one we may write
@@ -270,6 +322,21 @@ export function applyIntegration(input: IntegrationWriteInput): WriteOutcome {
       classified.reason === "blocked-container"
         ? `${configPath} holds a value where opencodex would have to write a section, so applying would replace it`
         : `${configPath} cannot be changed safely`);
+  }
+  /*
+   * An implicit catalog sync is refresh-only. Keeping this decision inside the
+   * writer's one preflight closes the read-then-apply race where a user could
+   * remove the managed block after a caller classified it as stale and a
+   * normal apply would silently recreate it.
+   */
+  if (classified.state === "absent" && !allowAbsent) {
+    return {
+      ok: true,
+      changed: false,
+      state: "absent",
+      clientId,
+      message: "managed block is absent; refresh did not reconnect it",
+    };
   }
   if (classified.state === "current") {
     return { ok: true, changed: false, state: "current", clientId, message: "already applied" };
@@ -287,7 +354,22 @@ export function applyIntegration(input: IntegrationWriteInput): WriteOutcome {
    */
   const base = classified.state === "stale" && record
     ? removeFragments(parsed, record.fragmentPaths, new Set(record.createdContainers ?? [])).doc
-    : parsed;
+    : classified.state === "conflict" && record
+      /*
+       * A forced overwrite of a `foreign-edit` conflict drops what the previous
+       * record owned for the same reason a stale refresh does: the replacement
+       * record covers the paths we are about to write, so a path the old record
+       * owned and the new one does not would be stranded forever, unremovable by
+       * any later disable.
+       *
+       * With NO record -- an `unowned-key` conflict -- there is nothing to drop and
+       * the merge runs against the user's document directly. That is correct:
+       * createdContainerPaths then attributes every container they already had to
+       * them, so a later disable removes our leaves and leaves their structure
+       * standing.
+       */
+      ? removeFragments(parsed, record.fragmentPaths, new Set(record.createdContainers ?? [])).doc
+      : parsed;
   // Computed against the document as it stands BEFORE the merge: afterwards
   // every container exists and "did we create this?" is unanswerable.
   const created = createdContainerPaths(base, contribution);
@@ -335,21 +417,66 @@ export function applyIntegration(input: IntegrationWriteInput): WriteOutcome {
   const snapshot = store.captureSnapshot(clientId, opId, before);
   const at = new Date(io.now()).toISOString();
   const entry: JournalEntry = {
-    opId, clientId, kind: classified.state === "stale" ? "refresh" : "apply", at, configPath,
+    /*
+     * `overwrite` is its own kind rather than reusing `apply`. The rollback list
+     * is the one place a user goes after a mistake, and "applied" is a lie about
+     * an operation that replaced a block somebody else wrote.
+     */
+    opId, clientId,
+    kind: classified.state === "conflict"
+      ? "overwrite"
+      : classified.state === "stale" ? "refresh" : "apply",
+    at, configPath,
     snapshot, resultFingerprint: fingerprint(text), resultAbsent: false, priorRecord: record,
   };
+  const refreshablePaths = refreshablePathsOf(contribution);
   return commit({
     io, store, clientId, configPath, before, nextText: text, state: "current",
     priorRecord: record,
     record: {
       clientId, configPath, fileFingerprint: fingerprint(text),
       blockFingerprint: fingerprint(canonicalContribution(contribution)),
+      semanticBlockFingerprint: fingerprint(semanticContribution(contribution)),
+      ...(refreshablePaths.length > 0 ? {
+        protectedBlockFingerprint: protectedContributionFingerprint(contribution, refreshablePaths),
+        semanticProtectedBlockFingerprint: semanticProtectedContributionFingerprint(
+          contribution,
+          refreshablePaths,
+        ),
+        refreshablePaths,
+      } : {}),
       fragmentPaths: fragmentPathsOf(contribution), createdContainers: created,
       appliedAt: at, opId,
     },
     entry,
     snapshotPath: snapshotAbsPath(store, entry),
   });
+}
+
+export function applyIntegration(input: IntegrationWriteInput): WriteOutcome {
+  return applyOrRefreshIntegration(input, true);
+}
+
+/**
+ * Apply over a conflicted config, replacing whatever holds our paths.
+ *
+ * Separate from `applyIntegration` and never a flag on it: a caller has to name
+ * this function to get the behavior, so no existing call site can acquire it by
+ * passing a default through.
+ *
+ * What it does NOT relax. `unsafe` still refuses -- a blocked container means the
+ * merge would replace a value it cannot reason about, and a snapshot is not a
+ * licence for that. `not_installed` and `non_loopback` still refuse; neither is a
+ * conflict. And a non-conflict state behaves exactly as apply does, so calling
+ * this on a clean file is not a way to skip any other check.
+ */
+export function overwriteIntegration(input: IntegrationWriteInput): WriteOutcome {
+  return applyOrRefreshIntegration(input, true, "overwrite");
+}
+
+/** Refresh an owned stale block, but never create or reconnect an absent one. */
+export function refreshIntegration(input: IntegrationWriteInput): WriteOutcome {
+  return applyOrRefreshIntegration(input, false);
 }
 
 export function disableIntegration(input: IntegrationWriteInput): WriteOutcome {
@@ -526,7 +653,10 @@ export function restoreIntegration(input: IntegrationRestoreInput): WriteOutcome
     ? (restoredText === null ? "absent" : "conflict")
     : !recordDescribesBytes
       ? "conflict"
-      : restoredRecord.blockFingerprint === fingerprint(canonicalContribution(fresh))
+      : (
+        restoredRecord.semanticBlockFingerprint === fingerprint(semanticContribution(fresh))
+        || restoredRecord.blockFingerprint === fingerprint(canonicalContribution(fresh))
+      )
         ? "current"
         : "stale";
 
@@ -576,10 +706,12 @@ function freezeIntegrationInput(input: IntegrationWriteInput): FrozenIntegration
   const store = input.store ?? createIntegrationStateStore();
   const io = input.io ?? defaultIntegrationIO(store);
   const spec = INTEGRATION_CLIENTS[input.clientId];
-  const resolvedPaths = {
-    configPath: spec.configPath(env, home),
-    detectDir: spec.detectDir(env, home),
-  };
+  /*
+   * One resolution for both paths. Aside derives them from the account id in
+   * its manifest, so two independent calls could verify one account's install
+   * and then write another account's catalog if a switch landed between them.
+   */
+  const resolvedPaths = resolveIntegrationPaths(input.clientId, env, home);
   return { ...input, env, home, store, io, resolvedPaths };
 }
 
@@ -625,6 +757,20 @@ export function applyIntegrationCoordinated(
   options?: CoordinatedIntegrationOptions,
 ): Promise<WriteOutcome> {
   return coordinatedWrite(input, applyIntegration, options);
+}
+
+export function refreshIntegrationCoordinated(
+  input: IntegrationWriteInput,
+  options?: CoordinatedIntegrationOptions,
+): Promise<WriteOutcome> {
+  return coordinatedWrite(input, refreshIntegration, options);
+}
+
+export function overwriteIntegrationCoordinated(
+  input: IntegrationWriteInput,
+  options?: CoordinatedIntegrationOptions,
+): Promise<WriteOutcome> {
+  return coordinatedWrite(input, overwriteIntegration, options);
 }
 
 export function disableIntegrationCoordinated(

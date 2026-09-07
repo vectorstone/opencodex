@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildCatalogEntries } from "../src/codex/catalog";
+import { CURSOR_NO_VISION_MODELS } from "../src/adapters/cursor/discovery";
 import { getModelMetadata, resolveMetadataProvider } from "../src/generated/model-metadata";
 import { buildInitProviders } from "../src/cli/init";
 import { OAUTH_PROVIDERS } from "../src/oauth";
@@ -30,7 +31,7 @@ function nativeTemplate(): Record<string, unknown> {
 }
 
 const EXPECTED_KEY_PROVIDER_IDS = [
-  "anthropic-apikey", "openai-apikey", "umans", "opencode-go", "neuralwatt", "openrouter", "cline-pass", "cline", "orcarouter", "bizrouter", "groq", "google", "google-vertex", "azure-openai",
+  "anthropic-apikey", "openai-apikey", "meta-model", "umans", "opencode-go", "neuralwatt", "openrouter", "cline-pass", "cline", "orcarouter", "bizrouter", "groq", "google", "google-vertex", "azure-openai",
   "deepseek", "cerebras", "chutes", "deepinfra", "hyperbolic", "nscale", "vultr", "baseten", "commandcode", "sambanova", "nebius", "digitalocean", "scaleway", "featherless", "novita", "together", "fireworks", "firepass", "moonshot",
   "huggingface", "nvidia", "venice", "zai", "zhipu-bigmodel", "zhipu-bigmodel-coding", "nanogpt", "synthetic", "siliconflow", "qwen-cloud", "tencent-coding-plan",
   "volcengine", "volcengine-coding-plan", "volcengine-agent-plan", "qianfan", "alibaba", "alibaba-token-plan", "alibaba-token-plan-intl", "parallel", "zenmux", "litellm", "ollama-cloud", "mistral",
@@ -78,10 +79,15 @@ describe("provider registry parity", () => {
         "kimi-k3": { none: "none", low: "low", medium: "high", high: "high", xhigh: "max", max: "max" },
       },
     });
+    expect(KEY_LOGIN_PROVIDERS["opencode-go"].modelReasoningEfforts?.["gpt-5.6-luna"])
+      .toEqual(KEY_LOGIN_PROVIDERS["openai-apikey"].modelReasoningEfforts?.["gpt-5.6-luna"]);
+    expect(KEY_LOGIN_PROVIDERS["opencode-go"].modelReasoningEfforts?.["qwen3.8-max"])
+      .toEqual(KEY_LOGIN_PROVIDERS["alibaba-token-plan"].modelReasoningEfforts?.["qwen3.8-max"]);
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].noTemperatureModels).toContain("kimi-k3");
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].noTopPModels).toContain("kimi-k3");
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].noPenaltyModels).toContain("kimi-k3");
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].preserveReasoningContentModels).toContain("kimi-k3");
+    expect(KEY_LOGIN_PROVIDERS["opencode-go"].openaiChatEofTolerance).toBe(true);
     expect(KEY_LOGIN_PROVIDERS.umans.modelContextWindows?.["umans-coder"]).toBe(262_144);
     expect(KEY_LOGIN_PROVIDERS.umans.modelContextWindows?.["umans-glm-5.2"]).toBe(405_504);
     expect(KEY_LOGIN_PROVIDERS.umans.modelInputModalities?.["umans-coder"]).toEqual(["text", "image"]);
@@ -276,6 +282,7 @@ describe("provider registry parity", () => {
       expect(entry?.modelReasoningEffortMap?.["MiniMax-M3"]).toMatchObject({ low: "disabled", medium: "adaptive", high: "adaptive" });
       expect(entry?.preserveReasoningContentModels).toEqual(minimaxModels);
       expect(entry?.reasoningSplitModels).toEqual(minimaxModels);
+      expect(entry?.reasoningDetailsModels).toEqual(minimaxModels);
       expect(entry?.thinkingToggleModels).toEqual(["MiniMax-M3"]);
       for (const modelId of minimaxModels.slice(1)) {
         expect(entry?.modelContextWindows?.[modelId]).toBe(204_800);
@@ -301,7 +308,7 @@ describe("provider registry parity", () => {
       liveModels: false,
       models: [
         "qwen3.8-max", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
-        "glm-5.3", "glm-5.2", "deepseek-v4-pro",
+        "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4-pro",
       ],
       modelInputModalities: {
         "qwen3.8-max": ["text", "image"],
@@ -334,6 +341,7 @@ describe("provider registry parity", () => {
     const neuralwatt = PROVIDER_REGISTRY.find(entry => entry.id === "neuralwatt");
     expect(neuralwatt?.models).toEqual([
       "glm-5.3", "glm-5.3-fast", "glm-5.3-short", "glm-5.3-short-fast",
+      "glm-5.3-flash",
       "glm-5.2", "glm-5.2-fast", "glm-5.2-short", "glm-5.2-short-fast",
       "kimi-k2.6", "kimi-k2.6-fast", "kimi-k2.7-code",
       "qwen3.5-397b", "qwen3.5-397b-fast", "qwen3.6-35b", "qwen3.6-35b-fast",
@@ -361,9 +369,43 @@ describe("provider registry parity", () => {
     const optedInProviders = PROVIDER_REGISTRY
       .filter(entry => entry.modelSuffixBracketStrip)
       .map(entry => entry.id);
-    expect(zai?.modelContextWindows).toEqual({ "glm-5.3": 1_000_000, "glm-5.3[1m]": 1_000_000, "glm-5.2": 1_000_000, "glm-5.2[1m]": 1_000_000 });
-    expect(zai?.modelDefaultReasoningEfforts).toEqual({ "glm-5.3": "max", "glm-5.3[1m]": "max" });
-    expect(zai?.modelMaxOutputTokens).toEqual({ "glm-5.3": 131_072, "glm-5.3[1m]": 131_072 });
+    expect(zai?.modelContextWindows).toEqual({ "glm-5.3": 1_000_000, "glm-5.3[1m]": 1_000_000, "glm-5.3-flash": 1_000_000, "glm-5.2": 1_000_000, "glm-5.2[1m]": 1_000_000 });
+    // BUG-R5: glm-5.3-flash is a native VLM (docs.z.ai/guides/vlm/glm-5.3-flash), so it
+    // must never sit in noVisionModels - that list routes a model's images through the
+    // proxy's vision sidecar, which hands the model a text description of a picture it
+    // can read itself. The seeding pass classified it from the family name; the
+    // correction pass fixed the Alibaba entries and missed eight other providers.
+    //
+    // Asserted across the WHOLE registry rather than per provider, because the defect
+    // was not one entry being wrong - it was a set of entries drifting apart, and only
+    // a global assertion catches the next provider to seed it.
+    for (const entry of PROVIDER_REGISTRY) {
+      const flashIds = (entry.models ?? []).filter(id => String(id).includes("glm-5.3-flash"));
+      for (const id of flashIds) {
+        expect(entry.noVisionModels ?? []).not.toContain(id);
+        // An explicit modality declaration must include image. Absent is allowed: an
+        // unclassified model falls through to native passthrough, which is correct here.
+        const declared = entry.modelInputModalities?.[id];
+        if (declared) expect(declared).toContain("image");
+      }
+    }
+    // The sibling it is most often confused with stays text-only, so the assertion above
+    // cannot pass by making every GLM row a VLM.
+    expect(zai?.noVisionModels ?? []).toContain("glm-5.3");
+    // `glm-5.3-flash` belongs in all three maps. It was seeded into the model list
+    // and the context map alone, so it advertised a 1M window with no effort ladder,
+    // no default effort and no output cap - and this assertion pinned that gap in
+    // place rather than catching it, because it was written from the incomplete
+    // state instead of from the family definition.
+    expect(zai?.modelDefaultReasoningEfforts).toEqual({ "glm-5.3": "max", "glm-5.3[1m]": "max", "glm-5.3-flash": "max" });
+    expect(zai?.modelMaxOutputTokens).toEqual({ "glm-5.3": 131_072, "glm-5.3[1m]": 131_072, "glm-5.3-flash": 131_072 });
+    // Every 5.3 row carries the same three-tier ladder. Asserted per member rather
+    // than as one object literal so adding a member cannot quietly skip it.
+    for (const id of ["glm-5.3", "glm-5.3[1m]", "glm-5.3-flash"]) {
+      expect(zai?.modelReasoningEfforts?.[id]).toEqual(["low", "high", "max"]);
+      expect(zai?.modelDefaultReasoningEfforts?.[id]).toBe("max");
+      expect(zai?.modelMaxOutputTokens?.[id]).toBe(131_072);
+    }
     expect(providerConfigSeed(zai!).modelSuffixBracketStrip).toBe(true);
     expect(providerConfigSeed(zai!).modelDefaultReasoningEfforts?.["glm-5.3"]).toBe("max");
     expect(deriveKeyLoginMap().zai.modelMaxOutputTokens?.["glm-5.3[1m]"]).toBe(131_072);
@@ -563,7 +605,10 @@ describe("provider registry parity", () => {
   test("base URL override permission is registry-only and limited to opted-in providers", () => {
     const optedIn = PROVIDER_REGISTRY.filter(entry => entry.allowBaseUrlOverride);
 
-    expect(optedIn.map(entry => entry.id)).toEqual(["ollama", "vllm", "lm-studio", "moonshot", "qwen-cloud", "alibaba", "alibaba-token-plan-intl", "litellm"]);
+    // Registry order. Both OAuth entries (anthropic, google-antigravity) are gated by
+    // providerSecureTransportConfigError; the rest are key/local providers that never send a
+    // subscription bearer to the override.
+    expect(optedIn.map(entry => entry.id)).toEqual(["anthropic", "google-antigravity", "ollama", "vllm", "lm-studio", "moonshot", "qwen-cloud", "alibaba", "alibaba-token-plan-intl", "litellm"]);
     for (const entry of optedIn) {
       expect(providerConfigSeed(entry)).not.toHaveProperty("allowBaseUrlOverride");
     }
@@ -573,7 +618,7 @@ describe("provider registry parity", () => {
     const ollamaCloud = PROVIDER_REGISTRY.find(entry => entry.id === "ollama-cloud");
 
     expect(ollamaCloud?.models).toEqual([
-      "glm-5.3", "glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b", "gpt-oss:120b",
+      "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b", "gpt-oss:120b",
       "kimi-k2.6", "minimax-m3", "qwen3.5:397b", "gemma4:31b",
     ]);
     expect(ollamaCloud?.models).not.toContain("qwen3-coder");
@@ -655,6 +700,13 @@ describe("provider registry parity", () => {
     expect(seed.modelContextWindows?.["gpt-5.6-luna"]).toBe(1_000_000);
     expect(seed.modelReasoningEfforts?.["gpt-5.5"]).toEqual(["low", "medium", "high"]);
     expect(seed.modelReasoningEfforts?.["gpt-5.6-sol"]).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(cursor?.noVisionModels).toEqual([...CURSOR_NO_VISION_MODELS]);
+    expect(seed.noVisionModels).toEqual([...CURSOR_NO_VISION_MODELS]);
+    expect(seed.noVisionModels).toContain("composer-2.5");
+    expect(seed.noVisionModels).toContain("glm-5.3");
+    expect(seed.noVisionModels).not.toContain("grok-4.5");
+    expect(seed.modelInputModalities?.auto).toEqual(["text", "image"]);
+    expect(seed.modelInputModalities?.["composer-2.5"]).toEqual(["text", "image"]);
 
     const savedCursor: OcxProviderConfig = { adapter: "cursor", baseUrl: "https://api2.cursor.sh" };
     enrichProviderFromCatalog("cursor", savedCursor);
@@ -685,6 +737,7 @@ describe("provider registry parity", () => {
     expect(OAUTH_PROVIDERS.anthropic.providerConfig.defaultModel).toBe("claude-sonnet-5");
     expect(OAUTH_PROVIDERS.anthropic.providerConfig.models).toContain("claude-sonnet-5");
     expect(OAUTH_PROVIDERS.anthropic.providerConfig.models).toContain("claude-fable-5");
+    expect(OAUTH_PROVIDERS.anthropic.providerConfig.models).toContain("claude-fable-5-1");
     expect(OAUTH_PROVIDERS.anthropic.providerConfig.modelContextWindows?.["claude-sonnet-5"]).toBe(1_000_000);
     expect(OAUTH_PROVIDERS.anthropic.providerConfig.modelContextWindows?.["claude-opus-4-7"]).toBe(1_000_000);
     expect(OAUTH_PROVIDERS.anthropic.providerConfig.modelContextWindows?.["claude-opus-4-6"]).toBe(1_000_000);
@@ -707,7 +760,7 @@ describe("provider registry parity", () => {
     expect(antigravityRegistry?.liveModels).toBe(true);
     expect(providerConfigSeed(antigravityRegistry!).liveModels).toBe(true);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.liveModels).toBe(true);
-    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.defaultModel).toBe("gemini-3.7-flash");
+    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.defaultModel).toBe("gemini-3.8-flash");
     // Collapsed picker: base models only, no effort-suffix variants.
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toContain("gemini-3.7-flash");
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toContain("gemini-3.1-pro");
@@ -715,13 +768,16 @@ describe("provider registry parity", () => {
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toContain("claude-opus-4-6-thinking");
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toContain("gpt-oss-120b-medium");
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toContain("gemini-3.1-flash-image");
-    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toHaveLength(6);
+    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toContain("gemini-3.8-flash");
+    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toHaveLength(7);
     // Effort ladders on collapsed base models.
+    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelReasoningEfforts?.["gemini-3.8-flash"]).toEqual(["low", "medium", "high"]);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelReasoningEfforts?.["gemini-3.7-flash"]).toEqual(["low", "medium", "high"]);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelReasoningEfforts?.["gemini-3.1-pro"]).toEqual(["low", "high"]);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelReasoningEfforts?.["claude-opus-4-6-thinking"]).toEqual(["low", "medium", "high", "max"]);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelReasoningEfforts?.["claude-sonnet-4-6"]).toEqual(["low", "medium", "high", "max"]);
     // Context windows on collapsed base models.
+    expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelContextWindows?.["gemini-3.8-flash"]).toBe(1_048_576);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelContextWindows?.["gemini-3.7-flash"]).toBe(1_048_576);
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelContextWindows?.["gemini-3.1-pro"]).toBe(1_048_576);
     // Suffix and compat IDs are NOT in the picker list.
@@ -951,6 +1007,34 @@ describe("provider registry parity", () => {
     // The catalog slug flattens the vendor separator, but the routed model id itself is untouched,
     // so the request still reaches Command Code as `deepseek/deepseek-v4-flash`.
     expect(entries.find(e => e.slug === "commandcode/deepseek-deepseek-v4-flash")).toBeTruthy();
+  });
+
+  /*
+   * #2883, at the surface the reporter actually saw. A live-discovered model with no
+   * row in the effort table falls through `configuredReasoningEfforts` to the
+   * provider-level `reasoningEfforts: []`, which `applyProviderConfigHints` then
+   * writes onto the model — so the Codex App picker renders empty and the request
+   * carries `requestedEffort: "none"`. Asserting the catalog entry rather than just
+   * the table is what makes this a regression test for the symptom.
+   */
+  test("the Command Code GLM-5.3-Flash route reaches the catalog with a selectable ladder", () => {
+    const commandcode = PROVIDER_REGISTRY.find(entry => entry.id === "commandcode");
+    const seed = providerConfigSeed(commandcode!);
+    const model = applyProviderConfigHints("commandcode", seed, {
+      id: "z-ai/glm-5.3-flash",
+      provider: "commandcode",
+    });
+    expect(model.id).toBe("z-ai/glm-5.3-flash");
+    expect(model.reasoningEfforts).toEqual(["low", "high", "max"]);
+
+    const entries = buildCatalogEntries(nativeTemplate() as never, [], [model]);
+    const entry = entries.find(e => e.slug === "commandcode/z-ai-glm-5.3-flash");
+    expect(entry).toBeTruthy();
+    // The empty ladder is exactly the reported symptom: an empty picker in the app.
+    expect(entry?.supported_reasoning_levels).not.toEqual([]);
+    // Routed catalogs append the synthetic top rung, as every other routed row above does.
+    expect((entry?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort))
+      .toEqual(["low", "high", "max", "ultra"]);
   });
   /*
    * #1043. Zen publishes no modality metadata, so the classification below is an

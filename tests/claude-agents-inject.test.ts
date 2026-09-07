@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildClaudeAgentDefs, injectClaudeAgentDefs, syncClaudeAgentDefs } from "../src/claude/agents-inject";
@@ -7,6 +7,7 @@ import { buildClaudeContextWindows } from "../src/claude/context-windows";
 import { fetchProviderModels } from "../src/codex/catalog/provider-fetch";
 import { OAUTH_PROVIDERS } from "../src/oauth";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -14,7 +15,7 @@ function tempDir(): string {
   dirs.push(d);
   return d;
 }
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+afterEach(() => { for (const d of dirs.splice(0)) removeTreeWithRetry(d); });
 
 function cfg(extra?: Partial<OcxConfig>): OcxConfig {
   return { port: 10100, defaultProvider: "mock", providers: {}, ...extra } as OcxConfig;
@@ -269,6 +270,12 @@ describe("buildClaudeAgentDefs (devlog 070 + audit 071)", () => {
 });
 
 describe("syncClaudeAgentDefs ownership contract (audit 071 #2/#3)", () => {
+  test("empty sync leaves an absent agents directory absent", () => {
+    const dir = tempDir();
+    expect(syncClaudeAgentDefs([], dir)).toEqual([]);
+    expect(existsSync(join(dir, "agents"))).toBe(false);
+  });
+
   test("writes, overwrites, and prunes ONLY marker-verified ocx files", () => {
     const dir = tempDir();
     writeFileSync(join(dir, "settings.json"), JSON.stringify({ model: "claude-ocx-native--gpt-5.6-sol" }));

@@ -35,8 +35,7 @@ ocx start --port 8080
 
 Остановить работающий прокси (по PID), удалить PID-file и восстановить native Codex. Если
 установлена managed background service, `ocx stop` сначала останавливает и её, чтобы она не
-перезапустила прокси обратно. То же действие доступно из кнопки **Stop** в веб-дашборде
-(`POST /api/stop`).
+перезапустила прокси обратно. Кнопка **Stop** в веб-дашборде выполняет то же действие (`POST /api/stop`) на всех бэкендах, кроме планировщика заданий Windows: там обёртка может перезапустить прокси после завершения задачи, поэтому дашборд отказывает с `respawnable_service`, ничего не меняет и просит выполнить `ocx stop`.
 
 ### `ocx restart`
 
@@ -68,11 +67,16 @@ ocx restore back
 ocx eject back
 ```
 
-### `ocx recover-history --legacy-openai`
+### `ocx recover-history --legacy-openai --yes`
 
 Явное восстановление для старых development-сборок, которые переназначали историю Codex App ещё
 до появления обратимого backup-механизма. Если база истории Codex заблокирована, сначала
 закройте Codex.
+
+Это широкое и разрушительное переименование: все треды с пользовательским сообщением, которые
+сейчас помечены `opencodex`, меняются на `openai`, `exec` нормализуется в `cli`, а event marker
+устанавливается. Корректная история выделенного провайдера тоже входит в охват. Сначала сделайте
+резервную копию и запускайте команду только если нужен весь этот охват.
 
 ### `ocx uninstall` · `ocx remove`
 
@@ -162,7 +166,7 @@ Identity-check живого прокси. Текстовый вывод сооб
 
 Проверяет готовность после синхронизации через не требующий аутентификации `GET /readyz`. При
 готовности возвращается `200`; для `pending` и терминального `failed` возвращается `503` с
-`Retry-After: 1`. Санитизированные поля HTTP-ответа: `{service, version, uptime, pid, port, status}`.
+`Retry-After: 1`. Санитизированные поля HTTP-ответа: `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}`. `protocol` — текущая версия удалённого протокола hub, `minimumClientProtocol` — минимальная совместимая версия клиента, а `managementUrl` — канонический origin управления для браузера.
 Старые прокси без `/readyz` fail-closed как `unreachable`; `/healthz` — отдельная проверка liveness,
 а не готовности. По умолчанию команда выполняет одну пробу. `--wait` опрашивает до готовности или
 тайм-аута, но при терминальном `failed` завершается немедленно. Тайм-аут по умолчанию — 45 секунд;
@@ -209,7 +213,7 @@ opencodex. Предупреждение о stale-`app-server` и optional `--res
 
 ## Фоновая служба
 
-### `ocx service [install|repair|start|stop|status|uninstall|remove]`
+### `ocx service [install|repair|restart|start|stop|status|uninstall|remove]`
 
 Запустить opencodex как login-managed background service (macOS **launchd**, Linux **systemd user
 unit**, Windows **Task Scheduler**), которая автоматически стартует при логине и сама
@@ -218,9 +222,10 @@ unit**, Windows **Task Scheduler**), которая автоматически �
 
 | Подкоманда | Действие |
 | --- | --- |
-| none | Создать/обновить и запустить службу. |
+| none | Установить и запустить службу, если её нет; иначе обновить и перезапустить существующую службу. Исправная конфигурация Windows Task Scheduler используется повторно; устаревшая может быть перерегистрирована и потребовать повышения прав. |
 | `install` | Создать и запустить службу. |
-| `repair` | Обновить установленную службу на месте и перезапустить её без повторной регистрации. |
+| `repair` | Обновить установленную службу на месте и перезапустить её. Исправная конфигурация Windows Task Scheduler используется повторно; устаревшая может быть перерегистрирована и потребовать повышения прав. |
+| `restart` | Псевдоним команды `repair`. |
 | `start` | Запустить уже установленную службу. |
 | `stop` | Остановить службу и восстановить native Codex. |
 | `status` | Показать диагностику службы и прокси, а также пути к логам. |
@@ -231,9 +236,12 @@ unit**, Windows **Task Scheduler**), которая автоматически �
 ocx service
 ocx service install
 ocx service repair
+ocx service restart
 ocx service status
 ocx service uninstall
 ```
+
+На Windows bare `ocx service` выполняет путь установки только после того, как отсутствие подтверждено и для Task Scheduler, и для WinSW. Если любой из запросов статуса не даёт определённого ответа, он отказывается что-либо регистрировать и предлагает выполнить `ocx service status`; явный `ocx service install` используйте только после подтверждения отсутствия.
 
 На Windows `ocx service status` отдельно показывает регистрацию в Task Scheduler и
 identity-проверенную достижимость прокси OpenCodex. Он не печатает локализованную таблицу
@@ -266,6 +274,8 @@ launcher, а не оставляет небезопасный wrapper устан
 
 Если завершённое внешнее обновление Codex перезаписало установленный shim, следующая обычная
 команда `ocx` сохранит новый стабильный launcher и восстановит shim перед выполнением запроса.
+Не имеющая побочных эффектов команда инспекции `ocx system codex-cli-update check` и некорректные
+вызовы зарезервированного пространства `ocx system codex-cli-update` никогда не выполняют этот repair.
 Launcher, который всё ещё меняется, не трогается, а попытка откладывается до следующего раза.
 Сбои repair'а приводят только к warning и не ломают запрошенную команду; ручной запасной путь —
 `ocx codex-shim install`. Чтобы отключить автоматику, задайте `codexShimAutoRestore: false` или
@@ -306,6 +316,8 @@ one-click управление прокси. `start` и `stop` управляю�
 
 ## Обновление
 
+`ocx update` обновляет сам OpenCodex, а не Codex CLI. Используйте `ocx system codex-cli-update check` из [system-команд инспекции](/ru/reference/cli/agents/) для ограниченной read-only проверки provenance настроенного кандидата Codex CLI. Команда не обращается к package registry и не устанавливает обновление.
+
 ### `ocx update [--tag latest|preview]`
 
 Самообновить opencodex из npm. Стабильные установки используют `@latest`; preview-установки
@@ -327,3 +339,7 @@ ocx update --tag preview
 Новые версии становятся доступны, когда
 [Release workflow](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml)
 публикует их в npm.
+
+## Жизненный цикл клиента Remote Hub
+
+Используйте `ocx connect <url> --pairing-code-stdin`, `ocx connect status`, `ocx sync` и `ocx connect rotate --pairing-code-stdin`. `ocx disconnect` офлайн восстанавливает локальное состояние, но не отзывает ключ hub. Пока подключение активно, `ocx connect revoke --admin-token-stdin` отзывает сохранённый `apiKeyId`; после отключения используйте **Integrations → API Keys** на hub. Секреты передаются только через stdin, не argv.

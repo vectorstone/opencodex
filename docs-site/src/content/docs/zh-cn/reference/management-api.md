@@ -120,6 +120,8 @@ Authorization: Bearer <admin-token>
 | `POST /api/storage/cleanup-policy/run` | 启动一次手动清理策略运行 | 409 `already_running`；500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | 仅测试用的策略流钩子 | 不可用时返回 404 `not_found` |
 
+`models`、`providers` 和 `days[].models` 中的记录也带有 `cacheHitRate`：它表示由提供方提示缓存提供的输入 token 比例，并限制在 `[0, 1]` 范围内。当提供方未报告缓存遥测数据或该记录没有输入 token 时，其值为 `null`，绝不会是 `0`，因为“没有缓存数据”与“实际命中率为 0%”是不同的事实，将两者显示为相同结果的图表会产生误导。
+
 :::caution
 存储清理端点可以移动或永久删除已归档的会话数据。务必先预览，并提交返回的摘要。若可能需要恢复，优先选择隔离。
 :::
@@ -193,7 +195,7 @@ Authorization: Bearer <admin-token>
 | --- | --- | --- |
 | `GET /api/system/memory` | 返回标量级的进程、堆、流、响应状态、看门狗和活跃回合指标 | — |
 | `POST /api/system/restart` | 在不移除客户端注入的情况下，开始一次考虑排空的进程重启 | 返回 202；重复调用会报告现有排空 |
-| `POST /api/stop` | 停止服务、恢复原生 Codex、移除受管 Grok 注入并排空代理 | 409 服务所有权冲突 |
+| `POST /api/stop` | 停止服务、恢复原生 Codex、移除受管 Grok 注入并排空代理 | 409 服务所有权冲突；当 Windows 任务计划程序包装器可能重新拉起代理且调用方不是 `ocx stop` 时返回 409 `respawnable_service`（不会做任何更改）；已安装的管理器拒绝停止时返回 409；无法读取任务计划程序状态时返回 409 `service_state_unknown`（不会做任何更改；修复查询后重试） |
 
 ### Codex 身份验证委托
 
@@ -241,3 +243,7 @@ Authorization: Bearer <admin-token>
 ## 如何选择客户端
 
 对于日常管理，[Web 仪表板](/guides/web-dashboard/)提供了最安全的引导式流程。对于无头主机和自动化，请使用相应的 `ocx` 命令：它们调用的是同一个实时 API，并在代理不可达或操作失败时返回非零结果。直接 HTTP 最适合需要上述精确端点契约的集成。
+
+## 远程会话与数据密钥轮换
+
+`POST /api/keys/rotate {id}` 开始十分钟重叠期，并只返回一次新密钥。`POST /api/keys/rotate/commit {id,rotationId}` 提交，`DELETE /api/keys/rotate {id,rotationId}` 中止。它们都需要管理认证，数据密钥不能调用。`POST /api/session/logout` 需要当前 `gui-session`、匹配的 Origin 和 CSRF。Admin token 会收到 403，永远不能创建用户同意会话。

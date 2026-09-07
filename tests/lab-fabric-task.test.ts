@@ -54,10 +54,11 @@ import { ensureLabDirs, ensureRestrictedDir } from "../src/lab/paths";
 import { verifyExactTreeDiffV1 } from "../src/lab/fabric/verifier";
 import { parseSyntheticPatchV1 } from "../src/lab/fabric/patch";
 import { FABRIC_LIMITS } from "../src/lab/fabric/constants";
-import { setFabricProducerIsolationLimitsForTests } from "../src/lab/fabric/producer-isolate";
+import { minimalFabricChildEnv, setFabricProducerIsolationLimitsForTests } from "../src/lab/fabric/producer-isolate";
 import { taskSubjectApplicableToRequirements } from "../src/lab/projection/verification";
 import { createHostIssuedFabricPatchExecutor } from "../src/lib/fabric-task-host";
 import type { TrustedFabricPatchExecutor } from "../src/lab/fabric/types";
+import { isolationBudgetMs, watchdogMs } from "./helpers/ci-watchdog";
 import {
   fabricCorrectPatchExecutor,
   fabricMockRoute,
@@ -65,12 +66,48 @@ import {
   fabricRouteBoundPatchExecutor,
   runTrustedFabricTask,
 } from "./helpers/fabric-task-test";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const CHILD_REAP_GRACE_MS = 2_000;
+
+async function awaitChildExitWithin(child: Bun.Subprocess, timeoutMs: number): Promise<boolean> {
+  return Promise.race([
+    child.exited.then(() => true, () => true),
+    Bun.sleep(timeoutMs).then(() => false),
+  ]);
+}
+
+async function terminateChildWithin(child: Bun.Subprocess): Promise<boolean> {
+  if (child.exitCode !== null) return true;
+  try { child.kill(); } catch { /* already exited */ }
+  if (await awaitChildExitWithin(child, CHILD_REAP_GRACE_MS)) return true;
+  try { child.kill("SIGKILL"); } catch { /* already exited */ }
+  return await awaitChildExitWithin(child, CHILD_REAP_GRACE_MS);
+}
+
 const CREDENTIAL_CANARY = "credential-canary-abcdefghijklmnopqrstuvwxyz1234567890";
+/*
+ * Shortened so a hung producer fails in about a second instead of the product's 30 s / 5 s.
+ *
+ * The budgets are scaled under load. They start counting when the parent spawns a Bun
+ * CHILD, and spawning one while the rest of the suite saturates the CPU can exceed 750 ms
+ * on its own — the child is then killed for inactivity before running a line, and the
+ * assertion sees `inactivity_timeout` or `blocked` instead of the outcome it set up.
+ * Deterministic under contention, not random: eight parallel runs of this file reproduced
+ * five failures each while a lone run passes 49/49.
+ */
+const FAST_FABRIC_INACTIVITY_MS = isolationBudgetMs(750);
 const FAST_FABRIC_ISOLATION = Object.freeze({
-  totalTimeoutMs: 2_000,
-  inactivityTimeoutMs: 750,
+  /*
+   * The total budget must stay a fixed MULTIPLE of the inactivity budget, not a fixed
+   * number. `fabricActivityPatchExecutor` deliberately sleeps 40% of the inactivity
+   * budget three times to prove that activity resets the deadline — so the run needs
+   * ~1.2x inactivity to finish, and pinning the total at 2 s while inactivity scales up
+   * would starve exactly the test that exercises the scaling.
+   */
+  totalTimeoutMs: Math.max(2_000, Math.round(FAST_FABRIC_INACTIVITY_MS * 2.5)),
+  inactivityTimeoutMs: FAST_FABRIC_INACTIVITY_MS,
 });
 
 const HOMES: string[] = [];
@@ -190,6 +227,32 @@ export async function execute(_input: FabricPatchExecutorInput): Promise<Synthet
   return createHostIssuedFabricPatchExecutor(modulePath, async () => correctSyntheticPatch());
 }
 
+function fabricTmpdirProbeExecutor(home: string): TrustedFabricPatchExecutor {
+  const dir = join(home, "fabric-executors");
+  mkdirSync(dir, { recursive: true });
+  const modulePath = join(dir, "tmpdir-probe.ts");
+  writeFileSync(modulePath, `
+import { tmpdir } from "node:os";
+import { isAbsolute, relative, resolve } from "node:path";
+import type { FabricPatchExecutorInput, SyntheticPatchV1 } from "${repoImport("src/lab/fabric/types")}";
+import { SYNTHETIC_AFTER_UTF8, SYNTHETIC_VALUE_PATH } from "${repoImport("src/lab/fabric/constants")}";
+
+export async function execute(input: FabricPatchExecutorInput): Promise<SyntheticPatchV1> {
+  const scratchRoot = resolve(input.scratchRoot);
+  const observedTmpdir = resolve(tmpdir());
+  const fromScratch = relative(scratchRoot, observedTmpdir);
+  if (fromScratch === "" || fromScratch.startsWith("..") || isAbsolute(fromScratch)) {
+    throw new Error(\`tmpdir escaped fabric scratch: \${observedTmpdir}\`);
+  }
+  return {
+    schemaVersion: 1,
+    operations: [{ op: "replace", path: SYNTHETIC_VALUE_PATH, contentUtf8: SYNTHETIC_AFTER_UTF8 }],
+  };
+}
+`);
+  return createHostIssuedFabricPatchExecutor(modulePath, async () => correctSyntheticPatch());
+}
+
 function fabricSymlinkSandboxExecutor(home: string): TrustedFabricPatchExecutor {
   const dir = join(home, "fabric-executors");
   mkdirSync(dir, { recursive: true });
@@ -245,7 +308,7 @@ afterEach(() => {
   setFabricProducerIsolationLimitsForTests();
   for (const dir of HOMES.splice(0)) {
     try {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     } catch {
       /* ignore */
     }
@@ -331,6 +394,90 @@ describe("CL-07 task effectiveness producer", () => {
     expect(result.executionAuthority).toBe("harness");
     expect(result.outcome.outcome).toBe("pass");
   });
+
+  test("producer child awaits an async executor before result and clean exit", async () => {
+    const childWatchdogMs = watchdogMs(5_000);
+    const home = tempHome();
+    const childEntry = join(REPO_ROOT, "src", "lab", "fabric", "producer-child.ts");
+    const executorModulePath = join(home, "async-producer-executor.mjs");
+    const settledMarker = join(home, "async-producer-settled");
+    writeFileSync(executorModulePath, `
+import { writeFileSync } from "node:fs";
+
+export async function execute() {
+  await Bun.sleep(75);
+  writeFileSync(${JSON.stringify(settledMarker)}, "settled", "utf8");
+  return {
+    schemaVersion: 1,
+    operations: [{
+      op: "replace",
+      path: ${JSON.stringify(SYNTHETIC_VALUE_PATH)},
+      contentUtf8: ${JSON.stringify(SYNTHETIC_AFTER_UTF8)},
+    }],
+  };
+}
+`);
+
+    expect(readFileSync(childEntry, "utf8")).toMatch(/\bawait\s+main\(\)\.catch\(/);
+
+    const child = Bun.spawn([process.execPath, "run", childEntry], {
+      cwd: REPO_ROOT,
+      // Production's environment, not a literal copy of it. On Windows the
+      // three variables alone cannot start a Bun child at all, so a hardcoded
+      // copy here asserted against an environment production never uses.
+      env: minimalFabricChildEnv(home),
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdoutPromise = new Response(child.stdout).text();
+    const stderrPromise = new Response(child.stderr).text();
+    try {
+      child.stdin.write(JSON.stringify({
+        executorModulePath,
+        executorInput: {},
+        scratchRoot: home,
+        totalTimeoutMs: 5_000,
+        inactivityTimeoutMs: 2_000,
+      }));
+      child.stdin.end();
+    } catch (error) {
+      await terminateChildWithin(child);
+      void stdoutPromise.catch(() => {});
+      void stderrPromise.catch(() => {});
+      throw error;
+    }
+
+    const completed = await Promise.race([
+      child.exited.then((exitCode) => ({ exitCode })),
+      Bun.sleep(childWatchdogMs).then(() => null),
+    ]);
+    if (!completed) {
+      const reaped = await terminateChildWithin(child);
+      void stdoutPromise.catch(() => {});
+      const stderr = await Promise.race([
+        stderrPromise.catch(() => "<unavailable>"),
+        Bun.sleep(CHILD_REAP_GRACE_MS).then(() => "<unavailable>"),
+      ]);
+      throw new Error(`timed out waiting for producer child (reaped=${reaped}): ${stderr}`);
+    }
+
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    expect(completed.exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(existsSync(settledMarker)).toBe(true);
+    expect(stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line))).toEqual([{
+      type: "result",
+      patch: {
+        schemaVersion: 1,
+        operations: [{
+          op: "replace",
+          path: SYNTHETIC_VALUE_PATH,
+          contentUtf8: SYNTHETIC_AFTER_UTF8,
+        }],
+      },
+    }]);
+  }, { timeout: watchdogMs(5_000) + (3 * CHILD_REAP_GRACE_MS) + 1_000 });
 
   test("harness execution cannot be persisted as production evidence", async () => {
     const home = tempHome();
@@ -443,7 +590,7 @@ describe("CL-07 task effectiveness producer", () => {
     writeFileSync(outside, "secret\n");
     try {
       const srcDir = join(scratch.root, "src");
-      rmSync(srcDir, { recursive: true, force: true });
+      removeTreeWithRetry(srcDir);
       try {
         symlinkSync(home, srcDir);
       } catch {
@@ -691,6 +838,18 @@ describe("CL-07 task effectiveness producer", () => {
       ...result,
       executionAuthority: "harness",
     }, { configDir: home })).toThrow(FabricTaskError);
+  });
+
+  test("isolated executors resolve tmpdir inside their scratch tree", async () => {
+    const home = tempHome();
+    process.env.OPENCODEX_HOME = home;
+    const result = await runFabricSyntheticPatchTaskForRoute({
+      routeContext: fabricMockRoute(),
+      destination: await fabricDestination(home),
+      patchExecutor: fabricTmpdirProbeExecutor(home),
+      configDir: home,
+    });
+    expect(result.outcome.outcome).toBe("pass");
   });
 
   test("user repository cannot host the scratch root", () => {
@@ -1080,5 +1239,53 @@ describe("CL-07 task effectiveness producer", () => {
     const text = readFileSync(join(home, "lab", "compatibility.jsonl"), "utf8");
     expect(text.includes("system prompt")).toBe(false);
     expect(text.includes(CREDENTIAL_CANARY)).toBe(false);
+  });
+
+  // Every producer case above runs a real child process, so all of them turn
+  // "inconclusive" at once when the child cannot start. On Windows that is what
+  // happened: the child env carried three variables, and a CreateProcess child
+  // inherits nothing, so the Bun executable could not resolve its system DLLs
+  // and died before running its entry module. Fourteen cases went red for one
+  // reason, and none of them named it -- they all reported harness_failure.
+  //
+  // This asserts the environment contract directly, so a regression is one
+  // named failure instead of a diffuse cluster. It runs everywhere: the shape
+  // is what matters, and the platform branch is inside the function.
+  test("the isolated producer env carries what a child needs to start on this platform", () => {
+    const home = tempHome();
+    const env = minimalFabricChildEnv(home);
+
+    // The sandbox contract, on every platform: scratch is addressed, and no
+    // ambient credential or config state is forwarded.
+    expect(env.OCX_FABRIC_SCRATCH_ROOT).toBe(home);
+    expect(env.TZ).toBe("UTC");
+    for (const leaked of ["OPENCODEX_HOME", "CODEX_HOME", "PATH", "HOME", "USERPROFILE", "APPDATA"]) {
+      expect(env[leaked]).toBeUndefined();
+    }
+
+    const childTempDir = join(home, ".tmp");
+    expect(env.TEMP).toBe(childTempDir);
+    expect(env.TMP).toBe(childTempDir);
+    expect(env.TMPDIR).toBe(childTempDir);
+    expect(existsSync(childTempDir)).toBe(true);
+
+    if (process.platform !== "win32") {
+      // POSIX needs no ambient loader state; only scratch-owned temp state is added.
+      expect(Object.keys(env).sort()).toEqual([
+        "NO_COLOR",
+        "OCX_FABRIC_SCRATCH_ROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TZ",
+      ]);
+      return;
+    }
+
+    // On Windows the loader itself reads the environment. SystemRoot is the one
+    // that decides whether the child runs at all; assert it against the real
+    // parent value rather than a literal, since a wrong path fails identically.
+    expect(env.SystemRoot).toBe(process.env.SystemRoot);
+    expect(env.SystemRoot).toBeTruthy();
   });
 });

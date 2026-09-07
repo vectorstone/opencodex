@@ -128,9 +128,9 @@ export interface OcxClaudeCodeConfig {
    */
   subagentEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** Claude-originated web-search override. Unset fields inherit the global sidecar settings. */
-  webSearchSidecar?: { backend?: "openai" | "anthropic"; model?: string };
+  webSearchSidecar?: { backend?: "openai" | "anthropic" | "xai" | "gemini" | "exa"; model?: string };
   /** Claude-originated vision override. Unset fields inherit the global sidecar settings. */
-  visionSidecar?: { backend?: "openai" | "anthropic"; model?: string };
+  visionSidecar?: { backend?: "openai" | "anthropic" | "routed"; model?: string };
   /** Persisted Claude Desktop four-family routing profile. */
   desktopProfile?: OcxClaudeDesktopProfile;
   /** Auto-reconcile Desktop 3P config when provider catalog changes. Default: enabled. */
@@ -190,6 +190,8 @@ export interface OcxCustomModel {
   displayName?: string;
   /** 컨텍스트 윈도우 (토큰) */
   contextWindow?: number;
+  /** Authoritative maximum output-token capability for this exact custom route. */
+  maxOutputTokens?: number;
   /** 입력 모달리티 (선택, 기본 ["text"]) */
   inputModalities?: string[];
   /**
@@ -219,6 +221,14 @@ export interface OcxApiKeyEntry {
   name: string;
   key: string;
   createdAt: string;
+  pendingRotation?: OcxPendingApiKeyRotation;
+}
+
+export interface OcxPendingApiKeyRotation {
+  id: string;
+  key: string;
+  createdAt: string;
+  expiresAt: string;
 }
 
 /**
@@ -231,22 +241,144 @@ export interface OcxApiKeyEntry {
  * phase claim ownership over a client it does not implement.
  */
 export interface OcxClientIntegrationsConfig {
-  /** Durable desired state for native Codex. MISSING MEANS ON. */
-  codex?: boolean;
+  /** Durable desired state for native Codex. Missing/true=full, catalog-only=catalog, false=off. */
+  codex?: boolean | "catalog-only";
   /** Durable desired state for Grok Build. MISSING MEANS ON. */
   grok?: boolean;
   /** Durable desired state for Claude Desktop. MISSING MEANS ON. */
   "claude-desktop"?: boolean;
 }
 
+export interface OcxConfigRebaseProvenance {
+  version: 1;
+  deletedTopLevelKeys: string[];
+}
+
+export type OcxRuntimeRole = "standalone" | "hub" | "client";
+
+export interface OcxHubConfig {
+  /** Canonical browser-reachable management origin advertised by a hub. */
+  managementPublicOrigin?: string;
+  /**
+   * Optional management-only listener for a local HTTPS frontend such as Tailscale Serve.
+   * The hostname is deliberately not configurable: when enabled the socket is always bound
+   * to 127.0.0.1, and only GUI, session-bootstrap, and management API routes are admitted.
+   */
+  managementIngress?:
+    | { enabled: false }
+    | { enabled: true; port: number };
+}
+
+export interface OcxRemoteGuiConfig {
+  /** Exact Tailscale login identities permitted to receive an automatic remote GUI session. */
+  allowedTailscaleUsers?: string[];
+  /**
+   * Retired. Once permitted a one-time pairing exchange over non-loopback plaintext HTTP.
+   *
+   * Still parsed so an existing config file keeps loading, but it grants nothing: a pairing
+   * grant now crosses loopback or authenticated HTTPS only. A persisted `true` is reported
+   * once and otherwise ignored. Kept in the type rather than deleted because the schema is
+   * strict — dropping the key outright would make an older config fail to load entirely,
+   * which is a worse outcome than ignoring one retired field.
+   *
+   * @deprecated has no effect; remove it from your config.
+   */
+  allowInsecureHttp?: boolean;
+}
+
+export type OcxConnectedClientId = "codex" | "claude";
+
+export interface OcxClientConnectionConfig {
+  serverUrl: string;
+  managementUrl: string;
+  managementTransport: "direct" | "relay";
+  selectedClients: OcxConnectedClientId[];
+  tokenEnv: "OPENCODEX_API_AUTH_TOKEN";
+  apiKeyId: string;
+  tokenFingerprint: string;
+  protocolVersion: 1;
+  connectedAt: string;
+  /**
+   * sha256/base64url of the catalog bytes this connection wrote, used to tell "still ours"
+   * from "edited or replaced" before removing the file on disconnect.
+   *
+   * Our own hash rather than the hub's ETag: /v1/catalog emits no validator, and this was
+   * always an ownership check on local bytes rather than a cache concern.
+   */
+  catalogFingerprint?: string;
+  /**
+   * The catalog that was on disk before connect overwrote it, base64-encoded, or the
+   * empty string when there was none.
+   *
+   * Durable because disconnect runs in a different process than connect: an in-memory
+   * snapshot only covers a connect that fails and rolls back on the spot. Without this,
+   * disconnect deletes the remote catalog and reports a restored native state while the
+   * user's own catalog is simply gone.
+   */
+  priorCatalog?: string;
+  catalogSyncedAt?: string;
+  pendingOperation?: {
+    kind: "rotate";
+    rotationId: string;
+    newKeyIssuedAt: string;
+    oldKeyBackupPath: string;
+  };
+}
+
 export interface OcxConfig {
   port: number;
+  /** Runtime topology role. Absence preserves the historical standalone behavior. */
+  runtimeRole?: OcxRuntimeRole;
+  /** Hub-only public management metadata. Presence is inert outside the hub role. */
+  hub?: OcxHubConfig;
+  /** Opt-in remote dashboard issuance policy. Presence is inert outside the hub role. */
+  remoteGui?: OcxRemoteGuiConfig;
+  /** Remote-hub client state. The admission secret is stored only in service-api-token. */
+  client?: OcxClientConnectionConfig;
   /** Opt in to one identical-turn retry when a Responses completion has no text or tool call. */
   emptyCompletionRetry?: boolean;
-  /** Maximum usage-log bytes read for one management snapshot. */
+  /**
+   * Whether a login may open a browser on the machine running the proxy.
+   *
+   * Absent and `true` both mean "open", which is what every existing install
+   * already does. Only an explicit `false` declines — for an operator who wants
+   * to paste the authorization URL into a different browser profile, or who is
+   * driving the dashboard from a different machine than the proxy.
+   *
+   * Deliberately a boolean and not an "auto" mode: inferring headlessness from
+   * SSH_CONNECTION or a missing DISPLAY breaks a working login silently when
+   * the guess is wrong.
+   */
+  oauthOpenBrowser?: boolean;
+  /**
+   * @deprecated Compatibility-only limit for bounded legacy usage readers.
+   * `GET /api/usage` always aggregates the complete ledger.
+   */
   managementUsageMaxReadBytes?: number;
   providers: Record<string, OcxProviderConfig>;
   defaultProvider: string;
+  /** Persisted state for newly discovered provider models (#2464). Absent keeps legacy "on" behavior. */
+  modelDiscovery?: {
+    newModelPolicy?: "on" | "off";
+    knownModels?: Record<string, {
+      ids: string[];
+      removed: string[];
+      updatedAt: string;
+      /** Consecutive successful discoveries in which an active id was absent. */
+      missing?: Record<string, number>;
+    }>;
+    recentArrivals?: Record<string, Array<{ id: string; at: string }>>;
+  };
+  /** Enable the shipped model alias patterns for providers without an override. */
+  defaultModelAliases?: boolean;
+  /**
+   * Opt-in Cursor Private Inference compatibility rows. When true, `/v1/models`
+   * adds `<base-id>--<effort>` selectors for reasoning-capable model ids absent
+   * from Cursor's built-in effort table. Omitted/false preserves discovery output.
+   */
+  cursorEffortRows?: boolean;
+  /** Explicit top-level deletion intent used by stale whole-config rebases. */
+  configRebaseProvenance?: OcxConfigRebaseProvenance | Record<string, unknown>;
   /** OpenAI provider-contract migration marker (v2 = single `openai` provider with account mode). */
   openaiProviderTierVersion?: 1 | 2;
   /** One-time migration marker for Antigravity's static-catalog defaults. */
@@ -401,17 +533,26 @@ export interface OcxConfig {
   * Shadow call intercept: redirect Codex's hard-coded helper calls (title generation,
   * commit messages, skill orchestration) to a user-chosen model. Default intercepted
   * source models: gpt-5.4-mini (older clients) and gpt-5.6-luna (Codex 0.145.0+).
-  * Opt-in; disabled by default. Matching maintenance/helper requests are forced to low.
-   * All requests for configured shadow source models are intercepted unconditionally.
+  * Opt-in; disabled by default. Matching requests preserve their configured reasoning effort.
+  * All requests for configured shadow source models are intercepted regardless of request kind,
+  * except when the replacement intersects the same provider+model source set.
+  */
+ shadowCallIntercept?: {
+   /** When true, requests for known shadow/helper source models are rewritten to the configured model. */
+   enabled?: boolean;
+   /** Replacement model id (e.g. "gpt-5.5"). */
+   model?: string;
+   /** Optional override of intercepted source-model prefixes (default: gpt-5.4-mini, gpt-5.6-luna). */
+   sourceModels?: string[];
+ };
+  /**
+   * Optional map of blocked model IDs to their replacement model IDs.
+   * When configured, incoming requests targeting a blocked model (including
+   * account-namespaced and concrete routes) are redirected to the replacement
+   * model at the shared routing layer with routeReason "blocked-model-redirect".
+   * Unset or omitted by default.
    */
-  shadowCallIntercept?: {
-    /** When true, requests for known shadow/helper source models are rewritten to the configured model. */
-    enabled?: boolean;
-    /** Replacement model id (e.g. "gpt-5.5"). */
-    model?: string;
-    /** Optional override of intercepted source-model prefixes (default: gpt-5.4-mini, gpt-5.6-luna). */
-    sourceModels?: string[];
-  };
+  blockedModelRedirects?: Record<string, string>;
   /**
    * 3-state multi-agent surface override:
    * - "v1": force ALL models to v1 surface (override upstream pins)
@@ -468,8 +609,19 @@ export interface OcxConfig {
    * Outbound HTTP(S) proxy URL for provider requests (e.g. "http://user:pass@proxy:8080", or
    * "${HTTPS_PROXY}"-style env reference). Mirrored into HTTP_PROXY/HTTPS_PROXY at startup when
    * those are unset — Bun's fetch honors them for all outbound calls; localhost is excluded.
+   * The literal `"auto"` reads the Windows WinINET static proxy (`ProxyEnable`/`ProxyServer`)
+   * once at process start; on other platforms, or when the system proxy is off, SOCKS-only,
+   * or unreadable, it degrades to direct egress with one log line (#1525). PAC/WPAD and live
+   * changes are not followed.
    */
   proxy?: string;
+  /**
+   * Hosts that bypass `proxy` for OpenCodex's own outbound provider calls, merged into
+   * NO_PROXY at startup. Accepts a comma-separated string (NO_PROXY syntax) or an array.
+   * Loopback is always excluded regardless of this setting, and an inherited NO_PROXY is
+   * preserved — this ADDS entries, it never replaces the environment.
+   */
+  noProxy?: string | string[];
   /**
    * Upstream stall timeout (seconds). After this many seconds of no upstream data, emits
    * response.incomplete. Default 300. Min 1.
@@ -493,6 +645,13 @@ export interface OcxConfig {
   codexAutoStart?: boolean;
   /** Restore an installed shim after a stable external Codex update replaces it. Default true. */
   codexShimAutoRestore?: boolean;
+  /**
+   * Opt-in authless Codex Desktop routing (#1107). On a loopback bind, inject the dedicated
+   * `[model_providers.opencodex]` table with `requires_openai_auth = false` instead of the root
+   * `openai_base_url` override, so Desktop opens without a ChatGPT login. Default off; ignored on
+   * non-loopback binds, whose admission token contract is unchanged.
+   */
+  codexDesktopAuthless?: boolean;
   /**
    * Compatibility mode: temporarily rewrite Codex resume-history metadata while the proxy is active
    * so Codex App can show old OpenAI chats and opencodex-created exec chats under its default
@@ -541,6 +700,23 @@ export interface OcxConfig {
    * selector map remains visible for compatibility with hand-written configurations.
    */
   codexAccountPickerEnabled?: boolean;
+  /**
+   * Show the GPT-5.3-Codex-Spark weekly window on Codex quota surfaces. Default false.
+   *
+   * Spark is a single-model window that reads 0% for most operators, and on a multi-account
+   * pool it doubles the bar count for information almost nobody acts on. Hidden by default and
+   * revealed by an explicit `true`; a malformed value reads as hidden rather than rejecting the
+   * whole config.
+   */
+  showCodexSparkQuota?: boolean;
+  /**
+   * Opt-in auto-redemption of a main-account Codex reset credit shortly before it expires
+   * (#822). Default off. `leadTimeMinutes` (1–60, default 10) is how long before
+   * `expires_at` the redeem is attempted; the credit list is re-read upstream right before
+   * every dispatch and the request id is journaled first, so a manual redeem or a crash never
+   * spends a second credit. A malformed value reads as off.
+   */
+  resetCreditAutoRedeem?: { enabled?: boolean; leadTimeMinutes?: number };
   /** Active pool account id for next session. undefined = main (passthrough as-is). */
   activeCodexAccountId?: string;
   /** Auto-switch threshold (0-100). Default 80. 0 = disabled. */
@@ -557,6 +733,17 @@ export interface OcxConfig {
    */
   upstreamHostCircuitThreshold?: number;
   /**
+   * Opt-in ceiling, in bytes, for a serialized native Responses **passthrough** body. When the
+   * built body exceeds it OpenCodex refuses locally instead of sending, naming the size and any
+   * embedded image payload. Translated adapter paths are not covered.
+   *
+   * Omitted or 0 = disabled, which is the default: no implicit ceiling is inferred for any
+   * destination. The only measured limit in this codebase is the WebSocket create-frame size,
+   * and the same body still succeeds over HTTP SSE, so a default here would refuse requests
+   * that work today — on Azure and custom Responses gateways as well, whose limits are unknown.
+   */
+  maxUpstreamBodyBytes?: number;
+  /**
    * Opt-in Anthropic OAuth account pool (#294). Default OFF.
    * Failover on 429 + sticky affinity; new sessions may pick lowest known 5h usage.
    * Experimental — see docs and GUI warning before enabling.
@@ -569,6 +756,24 @@ export interface OcxConfig {
     strategy?: OcxAccountPoolRotationStrategy;
     /** Successful new-session binds retained on one round-robin selection. Default 1; range 1..100. */
     stickyLimit?: number;
+    /** Usage window for quota-based scoring. Default "five-hour" (today's behaviour). */
+    quotaWindow?: OcxAccountPoolQuotaWindow;
+  };
+  /**
+   * Generic OAuth multi-account 429 failover (#2568). Presence-driven by default.
+   *
+   * Rotates to another logged-in account of the SAME provider when one is rate-limited, for
+   * OAuth providers that have no pool of their own — xAI, Cursor, Kimi, GitHub Copilot,
+   * Antigravity, Nous. The Codex pool and the Anthropic pool own their own rotation and are
+   * excluded; this setting changes neither.
+   *
+   * With the key absent, rotation activates when a provider has 2 or more eligible stored
+   * accounts — the same consent rule API-key pools already apply to a 2+ key pool (#2568d). A
+   * single account is a strict no-op. Set `false` to keep strict single-account behaviour;
+   * `providers.<name>.oauthAccountFailover` overrides this per provider.
+   */
+  oauthAccountFailover?: {
+    enabled?: boolean;
   };
   /** Virtual `combo/<id>` models spanning concrete provider/model targets (issue #133). */
   combos?: Record<string, OcxComboConfig>;
@@ -587,24 +792,43 @@ export interface OcxConfig {
 
 export type OcxAccountPoolRotationStrategy = "quota" | "round-robin" | "fill-first";
 
-export type OcxComboStrategy = "failover" | "round-robin";
+export type OcxAccountPoolQuotaWindow = "five-hour" | "weekly" | "max-utilization";
+
+export type OcxComboStrategy = "failover" | "round-robin" | "random" | "least-used" | "reset-window";
 export type OcxComboDefaultEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
+/**
+ * How a combo derives the reasoning ladder it publishes to the picker.
+ *
+ * `strict` (default) intersects every advertised ladder, so a target that explicitly
+ * advertises no effort control (`reasoningEfforts: []`) empties the combo's picker.
+ * `adaptive` excludes those empty ladders from the published intersection, keeping the
+ * control usable for a mixed-capability group. Unknown (`undefined`) ladders stay
+ * wildcards in both modes. Dispatch is unchanged: each concrete target still resolves
+ * its own effort at request time.
+ */
+export type OcxComboReasoningEffortMode = "strict" | "adaptive";
 
 export interface OcxComboTarget {
   provider: string;
   model: string;
-  /** Relative SWRR batch weight. Default 1; valid range 1..10000. */
+  /** Relative target weight for round-robin batches and random selection. Default 1; valid range 1..10000. */
   weight?: number;
 }
 
 export interface OcxComboConfig {
   targets: OcxComboTarget[];
-  /** Ordered failover (default) or deterministic smooth weighted round-robin. */
+  /** Ordered failover (default), round-robin, weighted random, least-used, or quota reset-window selection. */
   strategy?: OcxComboStrategy;
   /** Successful requests retained on one RR selection batch. Default 1; range 1..100. */
   stickyLimit?: number;
   /** Used when the client omits reasoning.effort. null/omitted leaves the target default unchanged. */
   defaultEffort?: OcxComboDefaultEffort | null;
+  /**
+   * Picker-ladder derivation policy. Omitted / `"strict"` keeps the legacy rule where an
+   * explicitly empty target ladder suppresses the whole combo's effort control.
+   */
+  reasoningEffortMode?: OcxComboReasoningEffortMode;
   /**
    * Disable image input even when every target supports it.
    * Omitted / `"auto"` keeps automatic capability derivation (default: enabled when
@@ -774,8 +998,14 @@ export interface OcxSearchConfig {
 export interface OcxVisionSidecarConfig {
   /** Master switch. Default: enabled when the selected backend has a usable credential. */
   enabled?: boolean;
-  /** Description backend. Unset prefers a usable stored Anthropic OAuth credential, else OpenAI. */
-  backend?: "openai" | "anthropic";
+  /**
+   * Description backend. Unset prefers a usable stored Anthropic OAuth credential, else OpenAI —
+   * the historical default order, deliberately unchanged by the union widening (#2188 roadmap
+   * 170/180 revised): "routed" describes through the proxy's OWN routing (loopback
+   * /v1/chat/completions) with a NAMESPACED "provider/model" describer, is explicit-only, and is
+   * never auto-selected from credential availability.
+   */
+  backend?: "openai" | "anthropic" | "routed";
   /** Vision model that describes images. */
   model?: string;
   /** Max description cache misses admitted in one main-model turn. Zero disables description calls. */
@@ -790,12 +1020,33 @@ export interface OcxWebSearchSidecarConfig {
   /**
    * Which backend actually runs the server-side search. "openai" replays the hosted web_search via
    * the ChatGPT forward provider (gpt-mini sidecar); "anthropic" runs web_search_20250305 on a Claude
-   * model authenticated by the STORED anthropic OAuth credential. Unset resolves to "anthropic" when a
-   * usable anthropic OAuth credential exists, else "openai".
+   * model authenticated by the STORED anthropic OAuth credential. "xai" runs Grok hosted web_search
+   * and optional x_search through stored Grok OAuth. "gemini" (google_search grounding via the
+   * Antigravity CCA transport) and "exa" (non-LLM search JSON via an operator key) are explicit-only
+   * and stay inactive until their executors ship. Unset ALWAYS resolves to "openai"; no backend is ever
+   * auto-selected from credential availability (that once sent incompatible models to the
+   * Anthropic API — see resolveSidecarBackend).
    */
-  backend?: "openai" | "anthropic";
+  backend?: "openai" | "anthropic" | "xai" | "gemini" | "exa";
   /** Sidecar model that runs the real server-side web_search (must be a native ChatGPT model). */
   model?: string;
+  /**
+   * Operator-supplied Exa API key for the "exa" backend. Management GET responses never echo it,
+   * and src/lib/redact.ts strips it from any logged structure or error string.
+   */
+  exaApiKey?: string;
+  /**
+   * Opt-in X (Twitter) search for the xai backend: adds the hosted x_search tool next to
+   * web_search. Limits are doc-validated at the management layer AND in the executor:
+   * handles <=20 per list, allow XOR exclude, ISO-8601 dates.
+   */
+  xSearch?: {
+    enabled?: boolean;
+    allowedXHandles?: string[];
+    excludedXHandles?: string[];
+    fromDate?: string;
+    toDate?: string;
+  };
   /** Reasoning effort for the sidecar — "minimal" (non-thinking) keeps it fast/cheap. */
   reasoning?: string;
   /** Max searches executed per main-model turn (loop guard). */

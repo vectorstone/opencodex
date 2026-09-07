@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,7 +9,6 @@ import {
   OPENCODE_API_KEY_ENV,
   OPENCODE_API_KEY_ENV_REF,
   LOOPBACK_API_KEY_PLACEHOLDER,
-  SCHEMA_REQUIRED_OUTPUT_BUDGET,
   buildClientConfig,
   buildClientConfigText,
   isExportClientId,
@@ -23,17 +22,18 @@ import {
 } from "../src/clients/config-export";
 import { buildOpencodeProviderBlockFromCatalog, opencodeGlobalConfigPath } from "../src/cli/opencode";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * Fixture covering the four rows that exercise every emission branch: native,
- * routed-with-displayName, missing context window, and a context window below the
- * schema output budget (which must clamp).
+ * routed-with-authoritative-output, missing limits, and an output capability above
+ * the context window (which must clamp).
  */
 const FIXTURE: ExportModel[] = [
   { namespaced: "gpt-5.6-luna", native: true, provider: "openai", id: "gpt-5.6-luna", contextWindow: 272_000 },
-  { namespaced: "anthropic/claude-opus-5", provider: "anthropic", id: "claude-opus-5", contextWindow: 200_000, displayName: "Claude Opus 5" },
+  { namespaced: "anthropic/claude-opus-5", provider: "anthropic", id: "claude-opus-5", contextWindow: 200_000, maxOutputTokens: 128_000, displayName: "Claude Opus 5" },
   { namespaced: "custom/no-context", provider: "custom", id: "no-context" },
-  { namespaced: "tiny/small-ctx", provider: "tiny", id: "small-ctx", contextWindow: 8_000 },
+  { namespaced: "tiny/small-ctx", provider: "tiny", id: "small-ctx", contextWindow: 8_000, maxOutputTokens: 12_000 },
 ];
 
 const BASE_URL = "http://127.0.0.1:10100/v1";
@@ -53,15 +53,11 @@ function cfg(extra?: Partial<OcxConfig>): OcxConfig {
 }
 
 /**
- * Captured from `buildOpencodeProviderBlockFromCatalog` BEFORE the serializer moved to
- * src/clients/config-export.ts, for the fixture above at port 10100 / 127.0.0.1. Inlined
- * rather than read from a file so the assertion survives without scratch state.
- *
- * The relocated builder must reproduce this byte-for-byte; the client-config path adds a
- * dedupe+sort precondition, so it is compared entry-by-entry against the same truth.
+ * Expected OpenCode provider block for the authoritative-output contract. Inlined rather
+ * than read from a file so the assertion survives without scratch state.
  */
 const GOLDEN_OPENCODE_BLOCK = JSON.parse(
-  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)","limit":{"context":272000,"output":32000}},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":32000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
+  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)"},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":128000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
 ) as {
   npm: string;
   name: string;
@@ -82,8 +78,8 @@ function dshConfig(context: ExportContext = ctx()): DshGeneratedConfig {
 }
 
 
-describe("relocated OpenCode serializer (accept criterion 1)", () => {
-  test("the moved builder reproduces the pre-refactor golden byte-for-byte", () => {
+describe("OpenCode serializer (accept criterion 1)", () => {
+  test("the launcher helper follows the authoritative-output golden byte-for-byte", () => {
     const block = buildOpencodeProviderBlockFromCatalog(10100, FIXTURE, "127.0.0.1");
     expect(JSON.stringify(block)).toBe(JSON.stringify(GOLDEN_OPENCODE_BLOCK));
   });
@@ -144,14 +140,114 @@ describe("relocated OpenCode serializer (accept criterion 1)", () => {
     expect(block.models["acme/only-namespaced"]!.name).toBe("acme/only-namespaced (acme)");
   });
 
-  test("a non-positive or non-finite context window drops the limit block entirely", () => {
+  test("a missing or invalid context/output value drops the paired limit block entirely", () => {
     const block = buildOpencodeProviderBlockFromCatalog(10100, [
-      { namespaced: "a/zero", provider: "a", id: "zero", contextWindow: 0 },
-      { namespaced: "b/negative", provider: "b", id: "negative", contextWindow: -1 },
-      { namespaced: "c/nan", provider: "c", id: "nan", contextWindow: Number.NaN },
+      { namespaced: "a/no-output", provider: "a", id: "no-output", contextWindow: 100_000 },
+      { namespaced: "b/no-context", provider: "b", id: "no-context", maxOutputTokens: 8_000 },
+      { namespaced: "c/invalid-output", provider: "c", id: "invalid-output", contextWindow: 100_000, maxOutputTokens: Number.NaN },
     ], "127.0.0.1");
     for (const entry of Object.values(block.models)) {
       expect(entry.limit).toBeUndefined();
+    }
+  });
+
+  test("modalities.input is emitted when inputModalities is non-empty, omitted otherwise", () => {
+    const block = buildOpencodeProviderBlockFromCatalog(10100, [
+      { namespaced: "p/vision", provider: "p", id: "vision", inputModalities: ["text", "image"] },
+      { namespaced: "p/audio", provider: "p", id: "audio", inputModalities: ["text", "audio"] },
+      { namespaced: "p/text-only", provider: "p", id: "text-only" },
+      { namespaced: "p/empty-arr", provider: "p", id: "empty-arr", inputModalities: [] },
+    ], "127.0.0.1");
+    expect(block.models["p/vision"]?.modalities).toEqual({ input: ["text", "image"] });
+    expect(block.models["p/audio"]?.modalities).toEqual({ input: ["text", "audio"] });
+    // No inputModalities → modalities block is omitted; opencode keeps its own defaults
+    expect(block.models["p/text-only"]?.modalities).toBeUndefined();
+    // Empty array is treated as absent — no modalities block emitted
+    expect(block.models["p/empty-arr"]?.modalities).toBeUndefined();
+  });
+});
+
+/**
+ * Reasoning efforts reach opencode as model variants, and only through the V2 `providers`
+ * block: a `variants` array under the legacy `provider` block is parsed and then ignored
+ * (verified against opencode 0.0.0-beta-18684), which is why both blocks are emitted.
+ */
+describe("OpenCode V2 block (reasoning-effort variants)", () => {
+  const LADDER_ROWS: ExportModel[] = [
+    // Deliberately out of canonical order, with a duplicate and an unknown value.
+    { namespaced: "opencode-go/glm-5.3", provider: "opencode-go", id: "glm-5.3", reasoningEfforts: ["max", "low", "high", "low", "turbo"], contextWindow: 1_000_000 },
+    // `none` is a declared sentinel, but the chat ingress has no such wire effort, so it is
+    // dropped: offering it would be a selection that silently falls back to the proxy default.
+    // `minimal` is a real wire effort and stays.
+    { namespaced: "opencode-go/deepseek-v4-flash", provider: "opencode-go", id: "deepseek-v4-flash", reasoningEfforts: ["high", "minimal", "none"], contextWindow: 1_000_000 },
+    { namespaced: "opencode-go/no-ladder", provider: "opencode-go", id: "no-ladder", contextWindow: 1_000_000 },
+    { namespaced: "opencode-go/empty-ladder", provider: "opencode-go", id: "empty-ladder", reasoningEfforts: [], contextWindow: 1_000_000 },
+    // A ladder made only of the dropped sentinel leaves nothing selectable.
+    { namespaced: "opencode-go/none-only", provider: "opencode-go", id: "none-only", reasoningEfforts: ["none"], contextWindow: 1_000_000 },
+  ];
+
+  function ladderCtx(config: OcxConfig = cfg()): ExportContext {
+    return { baseUrl: BASE_URL, models: LADDER_ROWS, config };
+  }
+
+  test("one variant per declared effort, in canonical ladder order", () => {
+    const models = (buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig)
+      .providers.opencodex!.models;
+    expect(models["opencode-go/glm-5.3"]!.variants).toEqual([
+      { id: "low", settings: { reasoningEffort: "low" } },
+      { id: "high", settings: { reasoningEffort: "high" } },
+      { id: "max", settings: { reasoningEffort: "max" } },
+    ]);
+    expect(models["opencode-go/deepseek-v4-flash"]!.variants).toEqual([
+      { id: "minimal", settings: { reasoningEffort: "minimal" } },
+      { id: "high", settings: { reasoningEffort: "high" } },
+    ]);
+  });
+
+  test("`none` is never offered: it has no wire effort and would silently no-op", () => {
+    const models = (buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig)
+      .providers.opencodex!.models;
+    const ids = models["opencode-go/deepseek-v4-flash"]!.variants!.map(variant => variant.id);
+    expect(ids).not.toContain("none");
+    // A ladder consisting only of `none` leaves nothing selectable at all.
+    expect(models["opencode-go/none-only"]!.variants).toBeUndefined();
+  });
+
+  test("a model without a usable ladder carries no variants key at all", () => {
+    const models = (buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig)
+      .providers.opencodex!.models;
+    expect(models["opencode-go/no-ladder"]!.variants).toBeUndefined();
+    expect(models["opencode-go/empty-ladder"]!.variants).toBeUndefined();
+  });
+
+  test("the legacy block stays variant-free instead of carrying fields opencode ignores", () => {
+    const config = buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig;
+    for (const entry of Object.values(config.provider.opencodex!.models)) {
+      expect(entry).not.toHaveProperty("variants");
+      expect(entry).not.toHaveProperty("settings");
+    }
+  });
+
+  test("both blocks describe the same model set and the same connection", () => {
+    const config = buildClientConfig("opencode", ladderCtx()) as OpencodeGeneratedConfig;
+    const v1 = config.provider.opencodex!;
+    const v2 = config.providers.opencodex!;
+    expect(Object.keys(v2.models)).toEqual(Object.keys(v1.models));
+    expect(v2.settings).toEqual(v1.options);
+    // opencode V2 merges both blocks by provider and model id, so the same ids must not
+    // produce duplicate picker entries.
+    expect(v2.package).toBe("@opencode-ai/ai/providers/openai-compatible");
+    for (const [key, entry] of Object.entries(v2.models)) {
+      expect(entry.name).toBe(v1.models[key]!.name);
+      expect(entry.limit).toEqual(v1.models[key]!.limit);
+    }
+  });
+
+  test("a non-loopback bind moves admission to the header branch in both blocks", () => {
+    const config = buildClientConfig("opencode", ladderCtx(cfg({ hostname: "0.0.0.0" }))) as OpencodeGeneratedConfig;
+    for (const block of [config.provider.opencodex!.options, config.providers.opencodex!.settings]) {
+      expect(block.headers).toEqual({ "x-opencodex-api-key": OPENCODE_API_KEY_ENV_REF });
+      expect(block.apiKey).toBeUndefined();
     }
   });
 });
@@ -234,18 +330,21 @@ describe("Pi serializer (accept criterion 2)", () => {
     expect(models.find(model => model.id === "c/plain")).not.toHaveProperty("reasoning");
   });
 
-  test("contextWindow and maxTokens are omitted when the context window is unknown", () => {
+  test("contextWindow and maxTokens remain independently optional", () => {
     const entry = piConfig().providers.opencodex!.models.find(model => model.id === "custom/no-context")!;
     expect(entry).not.toHaveProperty("contextWindow");
     expect(entry).not.toHaveProperty("maxTokens");
     expect(entry).toEqual({ id: "custom/no-context", name: "no-context (custom)", input: ["text"] });
+    const contextOnly = piConfig().providers.opencodex!.models.find(model => model.id === "gpt-5.6-luna")!;
+    expect(contextOnly.contextWindow).toBe(272_000);
+    expect(contextOnly.maxTokens).toBeUndefined();
   });
 
-  test("maxTokens uses the schema budget and clamps to a smaller context window", () => {
+  test("maxTokens uses authoritative metadata and clamps to a smaller context window", () => {
     const models = piConfig().providers.opencodex!.models;
-    const large = models.find(model => model.id === "gpt-5.6-luna")!;
-    expect(large.contextWindow).toBe(272_000);
-    expect(large.maxTokens).toBe(SCHEMA_REQUIRED_OUTPUT_BUDGET);
+    const large = models.find(model => model.id === "anthropic/claude-opus-5")!;
+    expect(large.contextWindow).toBe(200_000);
+    expect(large.maxTokens).toBe(128_000);
     const small = models.find(model => model.id === "tiny/small-ctx")!;
     expect(small.contextWindow).toBe(8_000);
     expect(small.maxTokens).toBe(8_000);
@@ -514,8 +613,8 @@ describe("stable ordering (accept criterion 4)", () => {
 });
 
 describe("EXPORT_CLIENTS registry", () => {
-  test("covers exactly the nine file-toggle clients", () => {
-    expect(EXPORT_CLIENT_IDS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode"]);
+  test("covers exactly the twelve file-toggle clients", () => {
+    expect(EXPORT_CLIENT_IDS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
     for (const id of EXPORT_CLIENT_IDS) expect(isExportClientId(id)).toBe(true);
     // The exception clients keep their own surfaces and are not export clients.
     expect(isExportClientId("claude-desktop")).toBe(false);
@@ -527,7 +626,7 @@ describe("EXPORT_CLIENTS registry", () => {
    * a single byte for the two that already shipped — indentation and the one
    * trailing newline included — and only a fixed expected string proves that.
    */
-  test("opencode bytes are unchanged, to the last newline", () => {
+  test("opencode bytes carry both provider generations and authoritative output, to the last newline", () => {
     const built = buildClientConfigText("opencode", ctx({ config: cfg() }));
     expect(built.format).toBe("json");
     expect(built.text).toBe(`{
@@ -545,18 +644,46 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "Claude Opus 5 (anthropic)",
           "limit": {
             "context": 200000,
-            "output": 32000
+            "output": 128000
           }
         },
         "custom/no-context": {
           "name": "no-context (custom)"
         },
         "gpt-5.6-luna": {
-          "name": "gpt-5.6-luna (native)",
+          "name": "gpt-5.6-luna (native)"
+        },
+        "tiny/small-ctx": {
+          "name": "small-ctx (tiny)",
           "limit": {
-            "context": 272000,
-            "output": 32000
+            "context": 8000,
+            "output": 8000
           }
+        }
+      }
+    }
+  },
+  "providers": {
+    "opencodex": {
+      "package": "@opencode-ai/ai/providers/openai-compatible",
+      "name": "OpenCodex",
+      "settings": {
+        "baseURL": "http://127.0.0.1:10100/v1",
+        "apiKey": "{env:OPENCODEX_OPENCODE_API_KEY}"
+      },
+      "models": {
+        "anthropic/claude-opus-5": {
+          "name": "Claude Opus 5 (anthropic)",
+          "limit": {
+            "context": 200000,
+            "output": 128000
+          }
+        },
+        "custom/no-context": {
+          "name": "no-context (custom)"
+        },
+        "gpt-5.6-luna": {
+          "name": "gpt-5.6-luna (native)"
         },
         "tiny/small-ctx": {
           "name": "small-ctx (tiny)",
@@ -572,7 +699,7 @@ describe("EXPORT_CLIENTS registry", () => {
 `);
   });
 
-  test("pi bytes are unchanged, to the last newline", () => {
+  test("pi authoritative-output bytes are stable to the last newline", () => {
     const built = buildClientConfigText("pi", ctx({ config: cfg() }));
     expect(built.format).toBe("json");
     expect(built.text).toBe(`{
@@ -589,7 +716,7 @@ describe("EXPORT_CLIENTS registry", () => {
             "text"
           ],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         },
         {
           "id": "custom/no-context",
@@ -604,8 +731,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "input": [
             "text"
           ],
-          "contextWindow": 272000,
-          "maxTokens": 32000
+          "contextWindow": 272000
         },
         {
           "id": "tiny/small-ctx",
@@ -717,7 +843,7 @@ describe("EXPORT_CLIENTS registry", () => {
       expect(() => ompModelsConfigPath({ OMP_PROFILE: ".." } as NodeJS.ProcessEnv, home)).toThrow(ClientPathError);
       expect(() => ompModelsConfigPath({ OMP_PROFILE: "NUL.txt" } as NodeJS.ProcessEnv, home)).toThrow(ClientPathError);
     } finally {
-      rmSync(home, { recursive: true, force: true });
+      removeTreeWithRetry(home);
     }
   });
 

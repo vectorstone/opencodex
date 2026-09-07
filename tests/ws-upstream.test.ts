@@ -2,11 +2,15 @@ import { afterEach, describe, expect, jest, test } from "bun:test";
 import { providerFetch } from "../src/server/responses/fetch-helpers";
 import { handleResponses } from "../src/server/responses";
 import { isEagerRelaySseResponse } from "../src/server/relay";
+import { isWin32EagerRewrite } from "../src/lib/bun-stream-caps";
 import {
   bunSupportsBoundedCodexWsRelay,
+  CODEX_WS_CREATE_FRAME_LIMIT_BYTES,
+  codexWsCreateFrameExceedsLimit,
   codexWsUpstreamFetch as rawCodexWsUpstreamFetch,
   currentBunRuntimeIdentity,
   isCodexWsUpstreamResponse,
+  MAX_CODEX_WS_CREATE_FRAME_BYTES,
   MAX_CODEX_WS_FRAME_BYTES,
   MAX_CODEX_WS_QUEUE_BYTES,
   shouldUseCodexWsUpstream as rawShouldUseCodexWsUpstream,
@@ -17,8 +21,19 @@ import type { OcxConfig } from "../src/types";
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses";
 const BOUNDED_WS_RUNTIME = "1.4.0";
 
-function shouldUseCodexWsUpstream(url: string, init?: RequestInit): boolean {
-  return rawShouldUseCodexWsUpstream(url, init, BOUNDED_WS_RUNTIME);
+// #864 keeps win32 rewrite traffic out of the tee()+JS-pull chain, so
+// `isWin32EagerRewrite(platform, needsClientRewrite)` sends it through the eager
+// single-reader relay instead. Since the annotations backfill became an
+// unconditional block rewrite (5a75e57f, `createResponsesFieldBackfillBlockRewrite()`),
+// `needsClientRewrite` is true for every Responses stream — so on win32 the eager
+// relay marker is set no matter which upstream transport was chosen. Cases below
+// that are about *not* taking the WebSocket path assert that directly through
+// `FakeWebSocket.instances`; they hold the marker to this rule rather than to a
+// constant that only held before the backfill landed.
+const EAGER_RELAY_FORCED_BY_PLATFORM = isWin32EagerRewrite(process.platform, true);
+
+function shouldUseCodexWsUpstream(url: string, init?: RequestInit, upstreamWebsocket = false): boolean {
+  return rawShouldUseCodexWsUpstream(url, init, BOUNDED_WS_RUNTIME, upstreamWebsocket);
 }
 
 function codexWsUpstreamFetch(
@@ -33,7 +48,7 @@ function streamingInit(body: Record<string, unknown> = {}): RequestInit {
   return {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer test" },
-    body: JSON.stringify({ model: "gpt-5.6-luna", stream: true, ...body }),
+    body: JSON.stringify({ model: "gpt-5.5", stream: true, ...body }),
   };
 }
 
@@ -94,7 +109,7 @@ describe("shouldUseCodexWsUpstream", () => {
     // Non-streaming turns keep HTTP: the WS path only speaks the event protocol.
     expect(shouldUseCodexWsUpstream(CODEX_URL, {
       method: "POST",
-      body: JSON.stringify({ model: "gpt-5.6-luna" }),
+      body: JSON.stringify({ model: "gpt-5.5" }),
     })).toBe(false);
     expect(shouldUseCodexWsUpstream(CODEX_URL, { method: "GET" })).toBe(false);
     expect(shouldUseCodexWsUpstream("https://api.openai.com/v1/responses", streamingInit())).toBe(false);
@@ -106,12 +121,12 @@ describe("shouldUseCodexWsUpstream", () => {
     // Nested stream:true must not flip the transport.
     expect(shouldUseCodexWsUpstream(CODEX_URL, {
       method: "POST",
-      body: JSON.stringify({ model: "gpt-5.6-luna", metadata: { stream: true } }),
+      body: JSON.stringify({ model: "gpt-5.5", metadata: { stream: true } }),
     })).toBe(false);
     // Whitespace-formatted JSON still routes.
     expect(shouldUseCodexWsUpstream(CODEX_URL, {
       method: "POST",
-      body: "{\n  \"model\": \"gpt-5.6-luna\",\n  \"stream\" : true\n}",
+      body: "{\n  \"model\": \"gpt-5.5\",\n  \"stream\" : true\n}",
     })).toBe(true);
     // Non-boolean stream values stay on HTTP.
     expect(shouldUseCodexWsUpstream(CODEX_URL, {
@@ -120,6 +135,27 @@ describe("shouldUseCodexWsUpstream", () => {
     })).toBe(false);
     // Malformed JSON stays on HTTP.
     expect(shouldUseCodexWsUpstream(CODEX_URL, { method: "POST", body: "{\"stream\":true" })).toBe(false);
+  });
+
+  test("opt-in upstream WebSocket only for configured OpenAI-compatible Responses endpoints", () => {
+    // The canonical backend ignores the flag.
+    expect(shouldUseCodexWsUpstream(CODEX_URL, streamingInit(), false)).toBe(true);
+    // Configured providers join the WS lane on their own /v1/responses path.
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/responses", streamingInit(), true)).toBe(true);
+    // Plain HTTP stays on SSE; never send credentials or request data through ws://.
+    expect(shouldUseCodexWsUpstream("http://10.0.0.5:8080/v1/responses", streamingInit(), true)).toBe(false);
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/responses", streamingInit(), false)).toBe(false);
+    // Non-Responses paths on a configured provider stay on HTTP.
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/chat/completions", streamingInit(), true)).toBe(false);
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/images", streamingInit(), true)).toBe(false);
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/alpha/search", streamingInit(), true)).toBe(false);
+    // The usual streaming/body rules still apply to configured providers.
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/responses", { method: "GET" }, true)).toBe(false);
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ model: "m" }),
+    }, true)).toBe(false);
+    expect(shouldUseCodexWsUpstream("not a url", streamingInit(), true)).toBe(false);
   });
 });
 
@@ -226,6 +262,34 @@ describe("providerFetch routing", () => {
     expect(baseCalls).toHaveLength(3);
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
+
+  test("routes an opt-in provider's Responses streams over its upstream WS", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
+    });
+    const baseCalls: string[] = [];
+    const sentinel = new Response("base");
+    const provider = {
+      upstreamWebsocket: true,
+      fetch: (async (input: unknown) => {
+        baseCalls.push(String(input));
+        return sentinel.clone();
+      }) as unknown as typeof fetch,
+    } as unknown as OcxProviderConfig;
+    const wrapped = providerFetch(provider, BOUNDED_WS_RUNTIME);
+
+    const wsResponse = await wrapped("https://sub2api.example.com/v1/responses", streamingInit());
+    expect(wsResponse.headers.get("content-type")).toContain("text/event-stream");
+    expect(baseCalls).toHaveLength(0);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0]!.url).toBe("wss://sub2api.example.com/v1/responses");
+
+    // The same provider's non-Responses paths (images/search/chat) stay on the base fetch.
+    await wrapped("https://sub2api.example.com/v1/images", streamingInit());
+    expect(baseCalls).toHaveLength(1);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
 });
 
 describe("handleResponses Codex WS relay selection", () => {
@@ -249,7 +313,7 @@ describe("handleResponses Codex WS relay selection", () => {
     return new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer test" },
-      body: JSON.stringify({ model: "gpt-5.6-luna", input: "hello", stream: true }),
+      body: JSON.stringify({ model: "gpt-5.5", input: "hello", stream: true }),
     });
   }
 
@@ -288,7 +352,7 @@ describe("handleResponses Codex WS relay selection", () => {
     });
 
     expect(FakeWebSocket.instances).toHaveLength(1);
-    expect(isEagerRelaySseResponse(response)).toBe(false);
+    expect(isEagerRelaySseResponse(response)).toBe(EAGER_RELAY_FORCED_BY_PLATFORM);
     expect(await response.text()).toContain("response.completed");
   });
 
@@ -330,10 +394,70 @@ describe("handleResponses Codex WS relay selection", () => {
       const response = await handleResponses(request(), forwardConfig(), { model: "", provider: "" });
 
       expect(FakeWebSocket.instances).toHaveLength(0);
-      expect(isEagerRelaySseResponse(response)).toBe(false);
+      expect(isEagerRelaySseResponse(response)).toBe(EAGER_RELAY_FORCED_BY_PLATFORM);
       expect(await response.text()).toContain("response.completed");
     },
   );
+
+  // The two cases above assert the marker against `EAGER_RELAY_FORCED_BY_PLATFORM`,
+  // which is only the right expectation while `needsClientRewrite` is genuinely
+  // `true`. Rather than assert that through the rewrite factory — which would stay
+  // green if `handleResponses` stopped registering it — this drives a real Responses
+  // stream through the handler and reads the rewrite's own effect off the client
+  // bytes. `createResponsesFieldBackfillBlockRewrite()` is the unconditional entry in
+  // `blockRewrites`, so observing its transformation is what proves
+  // `clientBlockRewrite !== undefined`, hence `needsClientRewrite === true`.
+  test("the registered rewrite chain transforms the client stream, so needsClientRewrite is true", async () => {
+    const upstreamEvent = {
+      type: "response.completed",
+      response: {
+        id: "r-backfill",
+        status: "completed",
+        // Deliberately spec-non-compliant: `annotations` is required on
+        // `output_text` and this upstream omits it. Only the backfill rewrite
+        // puts it back.
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "hi" }],
+        }],
+      },
+    };
+    globalThis.fetch = (async () => new Response(
+      `event: response.completed\ndata: ${JSON.stringify(upstreamEvent)}\n\n`,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as typeof fetch;
+
+    const response = await handleResponses(request(), forwardConfig(), { model: "", provider: "" });
+    const text = await response.text();
+
+    const payload = text
+      .split("\n")
+      .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map(line => JSON.parse(line.slice("data: ".length)))
+      .find(event => event.type === "response.completed");
+
+    expect(payload).toBeDefined();
+    // Absent on the wire, present to the client: the chain ran.
+    expect(payload.response.output[0].content[0]).toHaveProperty("annotations");
+    expect(payload.response.output[0].content[0].annotations).toEqual([]);
+
+    // And with the chain proven non-empty, the marker is exactly the win32 rule.
+    expect(isEagerRelaySseResponse(response)).toBe(EAGER_RELAY_FORCED_BY_PLATFORM);
+  });
+});
+
+describe("isWin32EagerRewrite", () => {
+  test("marks rewrite traffic on win32 only", () => {
+    // #864 is a win32-only Bun sink defect, so the rule must not widen to other
+    // platforms, and must not fire when there is nothing to rewrite.
+    expect(isWin32EagerRewrite("win32", true)).toBe(true);
+    expect(isWin32EagerRewrite("win32", false)).toBe(false);
+    expect(isWin32EagerRewrite("darwin", true)).toBe(false);
+    expect(isWin32EagerRewrite("linux", true)).toBe(false);
+
+    expect(EAGER_RELAY_FORCED_BY_PLATFORM).toBe(process.platform === "win32");
+  });
 });
 
 describe("codexWsUpstreamFetch", () => {
@@ -395,6 +519,56 @@ describe("codexWsUpstreamFetch", () => {
     expect(text).toContain("event: error");
     expect(text).toContain("upstream refused the turn");
     expect(FakeWebSocket.instances[0].closed).toBe(true);
+  });
+
+  test("normalizes the Responses WebSocket response.done terminal to SSE", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.done",
+          response: { id: "r-done", status: "completed", output: [] },
+        }),
+      });
+      ws.emit("close", { code: 1000, reason: "normal" });
+    });
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+      throw new Error("fallback must not run after open");
+    }) as unknown as typeof fetch);
+
+    const text = await response.text();
+    expect(text).toContain("event: response.completed");
+    expect(text).toContain('"type":"response.completed"');
+    expect(text).not.toContain("response.done");
+    expect(FakeWebSocket.instances[0]!.closed).toBe(true);
+  });
+
+  test("fails closed when response.done has no recognized terminal status", async () => {
+    const cases: Array<{ id: string; status?: string }> = [
+      { id: "r-missing" },
+      { id: "r-queued", status: "queued" },
+      { id: "r-unknown", status: "provider_future_state" },
+    ];
+    for (const response of cases) {
+      installFake(ws => {
+        ws.emit("open", {});
+        ws.emit("message", {
+          data: JSON.stringify({ type: "response.done", response }),
+        });
+      });
+      const upstream = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+        throw new Error("fallback must not run after open");
+      }) as unknown as typeof fetch);
+
+      const text = await upstream.text();
+      expect(text).toContain("event: response.failed");
+      const payload = text
+        .split("\n")
+        .filter(line => line.startsWith("data: ") && line !== "data: [DONE]")
+        .map(line => JSON.parse(line.slice("data: ".length)))
+        .find(event => event.type === "response.failed");
+      expect(payload?.response?.status).toBe("failed");
+    }
   });
 
   test("falls back to the HTTP fetch when the upgrade is rejected before open", async () => {
@@ -598,5 +772,213 @@ describe("codexWsUpstreamFetch", () => {
 
     await expect(response.text()).rejects.toThrow("turn cancelled");
     expect(FakeWebSocket.instances[0].closed).toBe(true);
+  });
+});
+
+describe("codexWsCreateFrameExceedsLimit", () => {
+  test("measures the frame in UTF-8 bytes, not code units", () => {
+    // Two UTF-8 bytes per code unit, so half the limit in "é" is exactly the limit.
+    const halfLimit = CODEX_WS_CREATE_FRAME_LIMIT_BYTES / 2;
+    expect(codexWsCreateFrameExceedsLimit("é".repeat(halfLimit))).toBe(true);
+    expect(codexWsCreateFrameExceedsLimit("é".repeat(halfLimit - 1))).toBe(false);
+  });
+
+  test("holds the boundary at the limit itself", () => {
+    expect(codexWsCreateFrameExceedsLimit("x".repeat(CODEX_WS_CREATE_FRAME_LIMIT_BYTES))).toBe(true);
+    expect(codexWsCreateFrameExceedsLimit("x".repeat(CODEX_WS_CREATE_FRAME_LIMIT_BYTES - 1))).toBe(false);
+  });
+
+  test("keeps a margin under the backend's measured ceiling", () => {
+    // Measured against the live endpoint: 16,777,000 B completed, 16,777,300 B
+    // closed the socket. The gate has to trip below the smaller of those.
+    expect(MAX_CODEX_WS_CREATE_FRAME_BYTES).toBe(16 * 1024 * 1024);
+    expect(CODEX_WS_CREATE_FRAME_LIMIT_BYTES).toBeLessThan(16_777_000);
+  });
+});
+
+describe("oversized Codex create frames", () => {
+  test("takes the HTTP SSE path instead of dialing a socket the backend would close", async () => {
+    installFake(() => { throw new Error("WS must not be dialed for an oversized frame"); });
+    const sentinel = new Response("sse");
+    let fallbackCalls = 0;
+    const fallback = (async () => {
+      fallbackCalls += 1;
+      return sentinel;
+    }) as unknown as typeof fetch;
+
+    const oversized = streamingInit({ padding: "x".repeat(CODEX_WS_CREATE_FRAME_LIMIT_BYTES) });
+    expect(await codexWsUpstreamFetch(CODEX_URL, oversized, fallback)).toBe(sentinel);
+    expect(fallbackCalls).toBe(1);
+    // Nothing was sent, so the SSE resend cannot double-generate a turn.
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  test("keeps the provider's HTTP version pin on the fallback", async () => {
+    installFake(() => { throw new Error("WS must not be dialed for an oversized frame"); });
+    const seen: RequestInit[] = [];
+    const provider = {
+      upstreamHttpVersion: "http1.1",
+      fetch: (async (_input: unknown, init: RequestInit) => {
+        seen.push(init);
+        return new Response("sse");
+      }) as unknown as typeof fetch,
+    } as unknown as OcxProviderConfig;
+    const wrapped = providerFetch(provider, BOUNDED_WS_RUNTIME);
+
+    await wrapped(CODEX_URL, streamingInit({ padding: "x".repeat(CODEX_WS_CREATE_FRAME_LIMIT_BYTES) }));
+
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    // Falling back means serving the turn over HTTP, so the operator's pin has
+    // to survive the transport switch.
+    expect((seen[0] as { protocol?: string }).protocol).toBe("http1.1");
+  });
+
+  test("still uses WS for a frame that fits", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: {} }) });
+    });
+    const fallback = (() => {
+      throw new Error("fallback must not run for a frame that fits");
+    }) as unknown as typeof fetch;
+
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit({ padding: "x".repeat(1024) }), fallback);
+    expect(isCodexWsUpstreamResponse(response)).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  // The unit tests above measure the helper; these two measure the REAL serialized
+  // frame, one byte on each side of the limit. That distinction matters because the
+  // request body is not the frame: `stream` is deleted and `type` is added before
+  // sending, so padding sized against the body would sit at a different offset than
+  // the bytes actually transmitted. An off-by-one lives exactly here and nowhere else.
+  describe("the adjacent-byte transport boundary", () => {
+    // Build padding such that the serialized frame is EXACTLY `target` bytes.
+    function initForFrameBytes(target: number): RequestInit {
+      const probe = frameTextFor(0);
+      const padding = "x".repeat(target - Buffer.byteLength(probe, "utf8"));
+      const init = streamingInit({ padding });
+      const actual = Buffer.byteLength(frameTextFor(padding.length), "utf8");
+      if (actual !== target) throw new Error(`frame sizing is wrong: wanted ${target}, built ${actual}`);
+      return init;
+    }
+
+    function frameTextFor(paddingLength: number): string {
+      const body = JSON.parse(streamingInit({ padding: "x".repeat(paddingLength) }).body as string) as Record<string, unknown>;
+      delete body.stream;
+      return JSON.stringify({ ...body, type: "response.create" });
+    }
+
+    test("a frame one byte under the limit goes over WS", async () => {
+      installFake(ws => {
+        ws.emit("open", {});
+        ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: {} }) });
+      });
+      const fallback = (() => {
+        throw new Error("fallback must not run one byte under the limit");
+      }) as unknown as typeof fetch;
+
+      const response = await codexWsUpstreamFetch(
+        CODEX_URL,
+        initForFrameBytes(CODEX_WS_CREATE_FRAME_LIMIT_BYTES - 1),
+        fallback,
+      );
+      expect(isCodexWsUpstreamResponse(response)).toBe(true);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      expect(FakeWebSocket.instances[0]!.sent).toHaveLength(1);
+      // Byte length, not code units: the limit is a byte budget, and this
+      // assertion should keep meaning the same thing if the fixture ever
+      // carries non-ASCII text.
+      expect(Buffer.byteLength(FakeWebSocket.instances[0]!.sent[0]!, "utf8"))
+        .toBe(CODEX_WS_CREATE_FRAME_LIMIT_BYTES - 1);
+    });
+
+    test("the very next byte takes SSE without dialing", async () => {
+      installFake(() => { throw new Error("WS must not be dialed at the limit"); });
+      const sentinel = new Response("sse");
+      let fallbackCalls = 0;
+      const fallback = (async () => { fallbackCalls += 1; return sentinel; }) as unknown as typeof fetch;
+
+      const response = await codexWsUpstreamFetch(
+        CODEX_URL,
+        initForFrameBytes(CODEX_WS_CREATE_FRAME_LIMIT_BYTES),
+        fallback,
+      );
+      expect(response).toBe(sentinel);
+      expect(fallbackCalls).toBe(1);
+      expect(FakeWebSocket.instances).toHaveLength(0);
+    });
+  });
+
+  test("names the oversized close instead of reporting a bare drop", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("close", { code: 1009, reason: "Message Too Big" });
+    });
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+      throw new Error("fallback must not run after open");
+    }) as unknown as typeof fetch);
+
+    await expect(response.text()).rejects.toThrow(
+      /rejected the request frame as too large \(close 1009 Message Too Big\)/,
+    );
+  });
+
+  test("carries the close code for any other pre-terminal drop", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("close", { code: 1006 });
+    });
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+      throw new Error("fallback must not run after open");
+    }) as unknown as typeof fetch);
+
+    await expect(response.text()).rejects.toThrow("closed before a Responses terminal event (close 1006)");
+  });
+
+  test("dials the configured provider's own wss URL for an opt-in upstream", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r-ws" } }) });
+    });
+    const sentinel = new Response("fallback");
+    const response = await codexWsUpstreamFetch(
+      "https://sub2api.example.com/v1/responses",
+      streamingInit(),
+      (async () => sentinel) as typeof fetch,
+    );
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0]!.url).toBe("wss://sub2api.example.com/v1/responses");
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    expect(await response.text()).toContain("response.completed");
+  });
+
+  test("response.done normalization keeps unknown usage fields (#41980 parity)", async () => {
+    const usage = {
+      input_tokens: 5,
+      output_tokens: 2,
+      total_tokens: 7,
+      subscription: { window: { used_percent: 3 } },
+      future_counter_v2: true,
+    };
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.done",
+          response: { id: "r-done", status: "completed", output: [], usage },
+        }),
+      });
+      ws.emit("close", { code: 1000, reason: "normal" });
+    });
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+      throw new Error("fallback must not run after open");
+    }) as unknown as typeof fetch);
+
+    const text = await response.text();
+    const line = text.split("\n").find(l => l.startsWith("data:") && l.includes("response.completed"));
+    expect(line).toBeDefined();
+    const payload = JSON.parse(line!.slice(5).trim()) as { response: { usage: unknown } };
+    expect(payload.response.usage).toEqual(usage);
   });
 });

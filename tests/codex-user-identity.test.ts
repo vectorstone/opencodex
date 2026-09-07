@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { join, parse } from "node:path";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync} from "node:fs";
+import { isAbsolute, join, parse } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 
@@ -9,9 +9,11 @@ import {
   resolveCodexCatalogSerializationDatabasePath,
   resolveCodexHistorySerializationDatabasePath,
   resolveEffectiveUserIdentity,
+  resolveEffectiveUserRuntimeRoot,
   probeCodexCoordinatorNamespace,
   samePathIdentity,
 } from "../src/codex/user-identity";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let codexHome = "";
 let previousHome: string | undefined;
@@ -91,7 +93,7 @@ test("the coordinator namespace probe is read-only", () => {
 afterEach(() => {
   if (previousHome === undefined) delete process.env.HOME;
   else process.env.HOME = previousHome;
-  rmSync(codexHome, { recursive: true, force: true });
+  removeTreeWithRetry(codexHome);
 });
 
 test("the effective identity is uid/SID and does not follow HOME", () => {
@@ -123,6 +125,31 @@ test("the coordinator resolver returns the final database path", () => {
     resolveEffectiveUserIdentity(),
     canonicalHome,
   ));
+});
+
+test("the effective-user runtime root is an absolute canonical private namespace", () => {
+  const identity = resolveEffectiveUserIdentity();
+  const runtimeRoot = resolveEffectiveUserRuntimeRoot(identity);
+  const entry = lstatSync(runtimeRoot);
+
+  expect(isAbsolute(runtimeRoot)).toBe(true);
+  expect(samePathIdentity(realpathSync.native(runtimeRoot), runtimeRoot)).toBe(true);
+  expect(entry.isDirectory()).toBe(true);
+  expect(entry.isSymbolicLink()).toBe(false);
+  expect(parse(runtimeRoot).ext).not.toBe(".sqlite");
+  if (identity.platform === "posix") {
+    expect(parse(runtimeRoot).base).toBe(`opencodex-runtime-v1-${identity.uid}`);
+    expect(entry.uid).toBe(identity.uid);
+    expect(entry.mode & 0o777).toBe(0o700);
+  } else {
+    expect(parse(runtimeRoot).base).toBe(identity.sid.toUpperCase());
+    expect(parse(parse(runtimeRoot).dir).base).toBe("v1");
+  }
+
+  expect(() => resolveEffectiveUserRuntimeRoot({
+    platform: "win32",
+    sid: "not-a-sid",
+  })).toThrow("invalid SID");
 });
 
 test("real processes resolve one identity and coordinator path across every home/runtime environment", async () => {
@@ -185,7 +212,7 @@ test("real processes resolve one identity and coordinator path across every home
     expect(probes[1]?.identity).toEqual(probes[0]?.identity);
     expect(probes[1]?.databasePath).toBe(probes[0]?.databasePath);
   } finally {
-    for (const { root } of environmentRoots) rmSync(root, { recursive: true, force: true });
+    for (const { root } of environmentRoots) removeTreeWithRetry(root);
   }
 }, { timeout: 20_000 });
 

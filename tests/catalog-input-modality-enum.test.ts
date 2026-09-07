@@ -63,7 +63,7 @@ describe("custom-model API rejects out-of-enum input modalities", () => {
   // object per call would discard the seeded default before the follow-up asserts on it).
   const fixtureConfig = {
     providers: { deepseek: { adapter: "openai-chat", baseUrl: "https://example.invalid/v1" } },
-    customModels: [] as Array<{ id: string; provider: string; modelId: string; inputModalities?: string[] }>,
+    customModels: [] as Array<{ id: string; provider: string; modelId: string; inputModalities?: string[]; maxOutputTokens?: number }>,
   } as unknown as OcxConfig;
 
   beforeEach(() => {
@@ -105,6 +105,24 @@ describe("custom-model API rejects out-of-enum input modalities", () => {
       syncClaudeAgentDefsBestEffort: async () => {},
     });
   }
+
+  test("POST and PUT reject non-object JSON bodies without persisting", async () => {
+    for (const body of [null, [], "model"]) {
+      persistCalls = 0;
+      const before = structuredClone(fixtureConfig.customModels);
+
+      const posted = await callCustomModels("POST", body);
+      expect(posted?.status).toBe(400);
+      expect(await posted!.json()).toEqual({ error: "invalid JSON body" });
+
+      const put = await callCustomModels("PUT", body, "/api/custom-models/existing-uuid");
+      expect(put?.status).toBe(400);
+      expect(await put!.json()).toEqual({ error: "invalid JSON body" });
+
+      expect(persistCalls).toBe(0);
+      expect(fixtureConfig.customModels).toEqual(before);
+    }
+  });
 
   test("POST refuses a rejected modality with 400 instead of storing it", async () => {
     persistCalls = 0;
@@ -170,6 +188,38 @@ describe("custom-model API rejects out-of-enum input modalities", () => {
     const payload = await res!.json() as { inputModalities?: unknown };
     expect(payload.inputModalities).toBeUndefined();
     expect(persistCalls).toBe(1);
+  });
+
+  test("maxOutputTokens accepts positive safe integers and null clears the override", async () => {
+    persistCalls = 0;
+    const posted = await callCustomModels("POST", {
+      provider: "deepseek",
+      modelId: "deepseek-output-known",
+      maxOutputTokens: 64_000,
+    });
+    expect(posted?.status).toBe(201);
+    expect((await posted!.json() as { maxOutputTokens?: number }).maxOutputTokens).toBe(64_000);
+
+    fixtureConfig.customModels![0]!.maxOutputTokens = 32_000;
+    const cleared = await callCustomModels("PUT", { maxOutputTokens: null }, "/api/custom-models/existing-uuid");
+    expect(cleared?.status).toBe(200);
+    expect((await cleared!.json() as { maxOutputTokens?: number }).maxOutputTokens).toBeUndefined();
+  });
+
+  test("maxOutputTokens rejects guesses that are not positive safe integers", async () => {
+    for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "64000"]) {
+      persistCalls = 0;
+      const before = structuredClone(fixtureConfig.customModels);
+      const posted = await callCustomModels("POST", {
+        provider: "deepseek",
+        modelId: `invalid-output-${String(value)}`,
+        maxOutputTokens: value,
+      });
+      expect(posted?.status).toBe(400);
+      expect((await posted!.json() as { error?: string }).error).toContain("maxOutputTokens");
+      expect(fixtureConfig.customModels).toEqual(before);
+      expect(persistCalls).toBe(0);
+    }
   });
 });
 

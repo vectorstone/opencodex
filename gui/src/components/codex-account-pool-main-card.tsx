@@ -85,7 +85,7 @@ export function CodexAccountPoolMainCard({
         <span className={`dot ${showReauth ? "dot-amber" : "dot-green"}`} />
         <strong>{t("codexAuth.mainAccount")}</strong>
         <span className="card-badges">
-          {main && <CodexTicketBadge t={t} account={{ ...main, id: "__main__" } as CodexAccountEntry} onClick={() => onOpenReset({ ...main, id: "__main__" } as CodexAccountEntry)} />}
+          {main?.plan && <span className="badge badge-green">{main.plan}</span>}
           {main?.paused && (
             <span className="badge badge-muted" title={t("codexAuth.pausedHint")}>
               {t("codexAuth.paused")}
@@ -93,6 +93,7 @@ export function CodexAccountPoolMainCard({
           )}
           <AccountPriorityBadge value={mainSwitchEntry.priority} />
           {pinnedId === "__main__" && !main?.paused && <span className="badge badge-muted">{t("codexAuth.pinned")}</span>}
+          {main && <CodexTicketBadge t={t} account={{ ...main, id: "__main__" } as CodexAccountEntry} onClick={() => onOpenReset({ ...main, id: "__main__" } as CodexAccountEntry)} />}
           {healthLabel && (
             <span className={oauthHealthBadgeClass(main?.health?.status)}>{healthLabel}</span>
           )}
@@ -105,7 +106,7 @@ export function CodexAccountPoolMainCard({
             </span>
           )}
         </span>
-        {!main?.paused && !isMainActive && !showReauth && !inCooldown && (
+        {!main?.paused && (!isMainActive || pinnedId !== "__main__") && !showReauth && !inCooldown && (
           <button type="button" className="btn btn-ghost btn-sm codex-account-switch" onClick={() => onSwitch(mainSwitchEntry)}>
             {switchActionLabel}
           </button>
@@ -136,6 +137,8 @@ export function CodexAccountPoolMainCard({
       </div>
       <div className="codex-account-identity">
         <div className="codex-account-identity-copy">{main?.email || t("codexAuth.appLogin")}{main?.plan ? ` · ${main.plan}` : ""}</div>
+        {/* The main card keeps its order select inline: it is one control, not one per pool row,
+            and the main card has no ⋯ disclosure to fold it into. */}
         {main && (
           <AccountPriorityControl
             value={mainSwitchEntry.priority}
@@ -183,6 +186,9 @@ export function CodexAccountPoolPageHead({
   actionFeedbackTone,
   onRefresh,
   onPauseExhausted,
+  sparkVisible,
+  sparkBusy,
+  onToggleSpark,
 }: {
   t: TFn;
   embedded: boolean;
@@ -193,6 +199,10 @@ export function CodexAccountPoolPageHead({
   actionFeedbackTone?: NoticeTone | null;
   onRefresh: () => void;
   onPauseExhausted: () => void;
+  /** undefined until the preference has loaded, so the switch never renders a guessed state. */
+  sparkVisible?: boolean;
+  sparkBusy?: boolean;
+  onToggleSpark?: () => void;
 }) {
   return (
     <div
@@ -208,6 +218,22 @@ export function CodexAccountPoolPageHead({
         >
           {actionFeedback ?? ""}
         </span>
+        {sparkVisible !== undefined && onToggleSpark && (
+          <span className="codex-auth-spark-toggle">
+            <span className="codex-auth-spark-toggle__label">{t("codexAuth.sparkQuota")}</span>
+            <button
+              type="button"
+              className={`toggle ${sparkVisible ? "on" : ""}`}
+              onClick={onToggleSpark}
+              disabled={!!sparkBusy}
+              aria-pressed={sparkVisible}
+              aria-label={t("codexAuth.sparkQuota")}
+              title={t("codexAuth.sparkQuotaHint")}
+            >
+              <span className="toggle-knob" />
+            </button>
+          </span>
+        )}
         <button
           type="button"
           className="btn btn-sm btn-ghost codex-auth-action-btn"

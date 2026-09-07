@@ -1,0 +1,285 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1787758304579,
+  "projectRoot": "/Users/wangxiaoguang/IdeaProjects/opencodex",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": ">=18",
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "tsconfig.json"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "npm",
+    "runtime": "Node.js 18"
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "npm test",
+    "lintCommand": null,
+    "devCommand": "npm run dev",
+    "scripts": {
+      "dev": "bun run src/cli/index.ts start",
+      "dev:proxy": "bun run src/cli/index.ts start",
+      "dev:gui": "cd gui && bun run dev",
+      "start": "bun run src/cli/index.ts start",
+      "test": "bun scripts/test.ts",
+      "typecheck": "bun x tsc --noEmit",
+      "audit:high": "bun audit --audit-level=high && cd gui && bun audit --audit-level=high",
+      "privacy:scan": "bun scripts/privacy-scan.ts",
+      "generate:model-metadata": "bun scripts/generate-model-metadata.ts",
+      "build:gui": "cd gui && bun install --frozen-lockfile && bun run build && cd .. && bun run prepare:package",
+      "prepare:package": "bun scripts/prepare-package.ts",
+      "prepack": "bun run prepare:package",
+      "prepublishOnly": "bun run audit:high && bun run typecheck && bun run build:gui",
+      "release": "bun scripts/release.ts",
+      "release:watch": "bun scripts/release.ts watch",
+      "prepush": "bun run typecheck && bun run lint:gui:if-changed && bun run test && bun run privacy:scan && bun run doctor:gui:if-changed",
+      "lint:gui": "cd gui && bun run lint",
+      "lint:gui:if-changed": "bun scripts/lint-gui-if-changed.ts",
+      "postmerge": "bun scripts/build-gui-if-changed.ts",
+      "doctor:gui": "cd gui && bun run doctor",
+      "doctor:gui:full": "cd gui && bun run doctor:full",
+      "doctor:gui:if-changed": "bun scripts/doctor-gui-if-changed.ts",
+      "setup:hooks": "bun scripts/setup-hooks.ts"
+    }
+  },
+  "conventions": {
+    "namingStyle": "camelCase",
+    "importStyle": null,
+    "testPattern": "*.test.ts",
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "assets",
+      "bin",
+      "docs",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "assets": {
+      "path": "assets",
+      "purpose": "Static assets",
+      "fileCount": 16,
+      "lastAccessed": 1787758304493,
+      "keyFiles": [
+        "architecture.png",
+        "banner-alt.png",
+        "banner.png",
+        "claude-code-models.gif",
+        "claude-desktop-subagent.gif"
+      ]
+    },
+    "bin": {
+      "path": "bin",
+      "purpose": "Executable scripts",
+      "fileCount": 2,
+      "lastAccessed": 1787758304497,
+      "keyFiles": [
+        "ocx.mjs",
+        "package-main.mjs"
+      ]
+    },
+    "devlog": {
+      "path": "devlog",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1787758304533,
+      "keyFiles": [
+        "README.md"
+      ]
+    },
+    "dist": {
+      "path": "dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 0,
+      "lastAccessed": 1787758304535,
+      "keyFiles": []
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 5,
+      "lastAccessed": 1787758304536,
+      "keyFiles": [
+        "README.md",
+        "codex-app-model-catalog.md",
+        "codex-path-investigation.md",
+        "github-copilot-app.md",
+        "shadow-call-intercept.md"
+      ]
+    },
+    "docs-site": {
+      "path": "docs-site",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1787758304540,
+      "keyFiles": [
+        "AGENTS.md",
+        "astro.config.mjs",
+        "bun.lock",
+        "package.json",
+        "tsconfig.json"
+      ]
+    },
+    "gui": {
+      "path": "gui",
+      "purpose": null,
+      "fileCount": 14,
+      "lastAccessed": 1787758304541,
+      "keyFiles": [
+        "AGENTS.md",
+        "README.md",
+        "bun.lock",
+        "doctor.config.json",
+        "index.html"
+      ]
+    },
+    "readme": {
+      "path": "readme",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1787758304543,
+      "keyFiles": [
+        "README.fr.md",
+        "README.ja.md",
+        "README.ko.md",
+        "README.ru.md",
+        "README.tr.md"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 40,
+      "lastAccessed": 1787758304544,
+      "keyFiles": [
+        "AGENTS.md",
+        "OCX-RUN.md",
+        "build-gui-if-changed.ts",
+        "build-release-changelog.ts",
+        "bun-gc-relief-eval.ts"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 11,
+      "lastAccessed": 1787758304545,
+      "keyFiles": [
+        "AGENTS.md",
+        "bridge.ts",
+        "cli.ts",
+        "config.ts",
+        "index.ts"
+      ]
+    },
+    "structure": {
+      "path": "structure",
+      "purpose": null,
+      "fileCount": 13,
+      "lastAccessed": 1787758304546,
+      "keyFiles": [
+        "00_overview.md",
+        "01_runtime.md",
+        "02_config-and-codex-home.md",
+        "03_catalog-and-subagents.md",
+        "04_transports-and-sidecars.md"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 903,
+      "lastAccessed": 1787758304550,
+      "keyFiles": [
+        "abort-idle-deadline.test.ts",
+        "abort-race.test.ts",
+        "account-import.test.ts",
+        "account-pool-management-api.test.ts",
+        "acl-error-classification.test.ts"
+      ]
+    },
+    "dist/bin": {
+      "path": "dist/bin",
+      "purpose": "Executable scripts",
+      "fileCount": 0,
+      "lastAccessed": 1787758304555,
+      "keyFiles": []
+    },
+    "docs-site/dist": {
+      "path": "docs-site/dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 9,
+      "lastAccessed": 1787758304559,
+      "keyFiles": [
+        "404.html",
+        "claude-code-models.gif",
+        "favicon.ico"
+      ]
+    },
+    "docs-site/node_modules": {
+      "path": "docs-site/node_modules",
+      "purpose": "Dependencies",
+      "fileCount": 0,
+      "lastAccessed": 1787758304563,
+      "keyFiles": []
+    },
+    "docs-site/public": {
+      "path": "docs-site/public",
+      "purpose": "Public files",
+      "fileCount": 5,
+      "lastAccessed": 1787758304565,
+      "keyFiles": [
+        "claude-code-models.gif",
+        "favicon.ico",
+        "favicon.png"
+      ]
+    },
+    "docs-site/src": {
+      "path": "docs-site/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1787758304572,
+      "keyFiles": [
+        "content.config.ts"
+      ]
+    },
+    "gui/dist": {
+      "path": "gui/dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 4,
+      "lastAccessed": 1787758304573,
+      "keyFiles": [
+        "favicon.png",
+        "icons.svg",
+        "index.html"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}

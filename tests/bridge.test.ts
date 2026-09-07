@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { bridgeToResponsesSSE, buildResponseJSON, setOwnedBudgetAbandonedMsForTests } from "../src/bridge";
 import {
+  createTranslatorBudget,
   resetTranslatorAggregateForTests,
+  retainTranslatedEventBatch,
   translatorAggregateCurrentBytesForTests,
   translatorLiveBudgetCountForTests,
 } from "../src/lib/translator-budget";
@@ -349,8 +351,8 @@ describe("Responses bridge reasoning and usage parity", () => {
 
   test("non-streaming bridge fails closed when upstream calls an undeclared tool", () => {
     const json = buildResponseJSON([
-      { type: "tool_call_start", id: "call_bad", name: "apply_patch" },
-      { type: "tool_call_delta", arguments: '{"input":"*** Begin Patch"}' },
+      { type: "tool_call_start", id: "call_bad", name: "other_tool" },
+      { type: "tool_call_delta", arguments: "{}" },
       { type: "tool_call_end" },
       { type: "done" },
     ], "deepseek/deepseek-v4-flash", { declaredToolNames: new Set(["exec"]) });
@@ -674,6 +676,103 @@ describe("Responses bridge reasoning and usage parity", () => {
     expect(frames.some(f => f.event === "response.function_call_arguments.done")).toBe(false);
   });
 
+  test("repairs a complete decorated top-level apply_patch payload", () => {
+    const body = `*** Begin Patch ***
+*** Update File: README.md
+@@
+-old
++new
+*** End Patch ***`;
+    const json = buildResponseJSON([
+      { type: "tool_call_start", id: "c1", name: "apply_patch" },
+      { type: "tool_call_delta", arguments: JSON.stringify({ input: body }) },
+      { type: "tool_call_end" },
+      { type: "done" },
+    ], "model", { freeformToolNames: new Set(["apply_patch"]) });
+
+    const output = json.output as Record<string, unknown>[];
+    expect(output[0]).toMatchObject({ type: "custom_tool_call", name: "apply_patch" });
+    expect(output[0].input).toContain("*** Begin Patch\n");
+    expect(output[0].input).toContain("*** End Patch");
+    expect(output[0].input).not.toContain("*** Begin Patch ***");
+  });
+
+  test("preserves namespaced apply_patch payloads across streaming and buffered bridges", async () => {
+    const decorated = `*** Begin Patch ***
+*** Update File: README.md
+@@
+-old
++new
+*** End Patch ***`;
+    const events: AdapterEvent[] = [
+      { type: "tool_call_start", id: "c1", name: "mcp__apply_patch" },
+      { type: "tool_call_delta", arguments: JSON.stringify({ input: decorated }) },
+      { type: "tool_call_end" },
+      { type: "done" },
+    ];
+    const toolNsMap = new Map([
+      ["mcp__apply_patch", { namespace: "mcp", name: "apply_patch", freeform: true as const }],
+    ]);
+
+    const json = buildResponseJSON(events, "model", { toolNsMap });
+    const output = json.output as Record<string, unknown>[];
+    expect(output[0]).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      input: decorated,
+    });
+
+    const frames = await collectSse(bridgeToResponsesSSE(replay(events), "model", toolNsMap));
+    const itemAdded = frames.find(frame => frame.event === "response.output_item.added")?.data.item as Record<string, unknown>;
+    expect(itemAdded).toMatchObject({ type: "custom_tool_call", namespace: "mcp", name: "apply_patch" });
+    const inputDone = frames.find(frame => frame.event === "response.custom_tool_call_input.done")?.data;
+    expect(inputDone).toMatchObject({ namespace: "mcp", input: decorated });
+    const itemDone = frames.find(frame => frame.event === "response.output_item.done")?.data.item as Record<string, unknown>;
+    expect(itemDone).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      input: decorated,
+    });
+    const completed = frames.find(frame => frame.event === "response.completed")?.data.response as Record<string, unknown>;
+    expect((completed.output as Record<string, unknown>[])[0]).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      input: decorated,
+    });
+
+    const incompleteEvents: AdapterEvent[] = [
+      { type: "tool_call_start", id: "c2", name: "mcp__apply_patch" },
+      { type: "tool_call_delta", arguments: JSON.stringify({ input: decorated }) },
+      { type: "incomplete", reason: "upstream_truncated", retryable: true },
+    ];
+    const incompleteJson = buildResponseJSON(incompleteEvents, "model", { toolNsMap });
+    expect((incompleteJson.output as Record<string, unknown>[])[0]).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      status: "incomplete",
+    });
+
+    const incompleteFrames = await collectSse(bridgeToResponsesSSE(replay(incompleteEvents), "model", toolNsMap));
+    const incompleteItem = incompleteFrames.find(frame => frame.event === "response.output_item.done")?.data.item;
+    expect(incompleteItem).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      status: "incomplete",
+    });
+    const incompleteResponse = incompleteFrames.find(frame => frame.event === "response.incomplete")?.data.response as Record<string, unknown>;
+    expect((incompleteResponse.output as Record<string, unknown>[])[0]).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      status: "incomplete",
+    });
+  });
+
   test("non-streaming error produces failed status", () => {
     const json = buildResponseJSON([
       {
@@ -976,7 +1075,7 @@ describe("Responses bridge web_search_call native item", () => {
     });
   });
 
-  test("a batched (plural) search emits action.search.queries without a singular query", () => {
+  test("a batched (plural) search carries both query and queries for Console Go (#3071)", () => {
     const json = buildResponseJSON([
       { type: "web_search_call_begin", id: "ws_3" },
       { type: "web_search_call_end", id: "ws_3", queries: ["rust async", "tokio runtime"] },
@@ -986,9 +1085,9 @@ describe("Responses bridge web_search_call native item", () => {
 
     const output = json.output as Record<string, unknown>[];
     const action = (output[0] as Record<string, unknown>).action as Record<string, unknown>;
-    // Native renders "<first> ..." only when `query` is absent and queries.len() > 1.
-    expect(action).toEqual({ type: "search", queries: ["rust async", "tokio runtime"] });
-    expect(action.query).toBeUndefined();
+    // Console Go's upstream validator requires singular `query` on the search action,
+    // and DeepSeek native Responses requires `queries` — so a batch carries both now.
+    expect(action).toEqual({ type: "search", query: "rust async", queries: ["rust async", "tokio runtime"] });
   });
 
   test("a single-query search also carries queries so strict parsers accept the replay (#930)", () => {
@@ -1030,6 +1129,11 @@ describe("Responses bridge web_search_call native item", () => {
     ]), "routed/model"));
     const done = frames.find(f => f.event === "response.output_item.done"
       && (f.data.item as Record<string, unknown>)?.type === "message");
+    const searchDone = frames.find(f => f.event === "response.output_item.done"
+      && (f.data.item as Record<string, unknown>)?.type === "web_search_call");
+    expect((searchDone!.data.item as Record<string, unknown>).sources).toEqual([
+      { url: "https://nodejs.org", title: "Node.js" },
+    ]);
     const item = done!.data.item as Record<string, unknown>;
     const part = (item.content as Record<string, unknown>[])[0];
     expect(part.annotations).toEqual([{
@@ -1045,11 +1149,160 @@ describe("Responses bridge web_search_call native item", () => {
       { type: "done" },
     ], "routed/model");
     const output = json.output as Record<string, unknown>[];
+    expect(output.find(item => item.type === "web_search_call")?.sources).toEqual([
+      { url: "https://nodejs.org", title: "Node.js" },
+    ]);
     const message = output.find(item => item.type === "message") as Record<string, unknown>;
     const part = (message.content as Record<string, unknown>[])[0];
     expect(part.annotations).toEqual([{
       type: "url_citation", url: "https://nodejs.org", title: "Node.js", start_index: 0, end_index: 0,
     }]);
+  });
+
+  test("unsafe and oversized search sources are absent from cells and annotations", async () => {
+    const sources = [
+      { url: "javascript:alert(1)", title: "unsafe" },
+      { url: "https://user:pass@credential.test/private" },
+      { url: "https://control.test/path\u0000" },
+      { url: "https://safe.test/docs", title: "Safe docs" },
+      { url: "https://title.test", title: "bad\u0001title" },
+      { url: "https://safe.test/docs", title: "duplicate" },
+      ...Array.from({ length: 25 }, (_, index) => ({ url: `https://safe.test/${index}` })),
+    ];
+    const events: AdapterEvent[] = [
+      { type: "web_search_call_begin", id: "ws_safe" },
+      { type: "web_search_call_end", id: "ws_safe", queries: ["docs"], sources },
+      { type: "text_delta", text: "answer" },
+      { type: "done" },
+    ];
+
+    const frames = await collectSse(bridgeToResponsesSSE(replay(events), "routed/model"));
+    const streamingCell = frames.find(f => f.event === "response.output_item.done"
+      && (f.data.item as Record<string, unknown>)?.type === "web_search_call")!.data.item as Record<string, unknown>;
+    const streamingSources = streamingCell.sources as Record<string, unknown>[];
+    expect(streamingSources).toHaveLength(20);
+    expect(streamingSources.slice(0, 2)).toEqual([
+      { url: "https://safe.test/docs", title: "Safe docs" },
+      { url: "https://title.test" },
+    ]);
+    expect(streamingSources.some(source => String(source.url).includes("credential"))).toBe(false);
+
+    const streamingMessage = frames.find(f => f.event === "response.output_item.done"
+      && (f.data.item as Record<string, unknown>)?.type === "message")!.data.item as Record<string, unknown>;
+    const streamingAnnotations = (streamingMessage.content as Record<string, unknown>[])[0].annotations as Record<string, unknown>[];
+    expect(streamingAnnotations.map(({ url, title }) => ({ url, ...(title ? { title } : {}) })))
+      .toEqual(streamingSources);
+
+    const json = buildResponseJSON(events, "routed/model");
+    const output = json.output as Record<string, unknown>[];
+    const batchCell = output.find(item => item.type === "web_search_call")!;
+    expect(batchCell.sources).toEqual(streamingSources);
+    const batchMessage = output.find(item => item.type === "message")!;
+    const batchAnnotations = (batchMessage.content as Record<string, unknown>[])[0].annotations as Record<string, unknown>[];
+    expect(batchAnnotations).toEqual(streamingAnnotations);
+  });
+
+  test("non-streaming citation transfer releases its temporary source ownership", () => {
+    const events: AdapterEvent[] = [
+      { type: "web_search_call_begin", id: "ws_budget" },
+      { type: "web_search_call_end", id: "ws_budget", queries: ["docs"], sources: [
+        { url: "https://safe.test/docs", title: "Safe docs" },
+      ] },
+      { type: "text_delta", text: "answer" },
+      { type: "done" },
+    ];
+    const budget = createTranslatorBudget();
+    try {
+      retainTranslatedEventBatch(events, budget);
+      const json = buildResponseJSON(events, "routed/model", { translatorBudget: budget });
+      const output = json.output as Record<string, unknown>[];
+      const outputBytes = output.reduce((sum, item) => sum + Buffer.byteLength(JSON.stringify(item)), 0);
+      expect(budget.snapshot().currentBytes).toBe(outputBytes);
+    } finally {
+      budget.dispose();
+    }
+  });
+
+  test("streaming source-only completion releases unconsumed citation ownership", async () => {
+    const events: AdapterEvent[] = [
+      { type: "web_search_call_begin", id: "ws_source_only" },
+      { type: "web_search_call_end", id: "ws_source_only", queries: ["docs"], sources: [
+        { url: "https://safe.test/docs", title: "Safe docs" },
+      ] },
+      { type: "done" },
+    ];
+    const budget = createTranslatorBudget();
+    try {
+      const frames = await collectSse(bridgeToResponsesSSE(
+        replay(events),
+        "routed/model",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { translatorBudget: budget },
+      ));
+      const terminal = frames.find(frame => frame.event === "response.completed")!;
+      const output = (terminal.data.response as Record<string, unknown>).output as Record<string, unknown>[];
+      expect(output.map(item => item.type)).toEqual(["web_search_call"]);
+      expect(budget.snapshot().currentBytes).toBe(Buffer.byteLength(JSON.stringify(output[0])));
+    } finally {
+      budget.dispose();
+    }
+  });
+});
+
+describe("citation markers never reach the client (#3150)", () => {
+  const S = "\uE200";
+  const P = "\uE202";
+  const E = "\uE201";
+
+  test("a span split across text deltas is absent from every emitted event", async () => {
+    // End-to-end through the real bridge, not just the filter. closeCurrentMessage re-sends
+    // the accumulated text in output_text.done, content_part.done and output_item.done, so
+    // filtering only the deltas would still leak the markers into the saved transcript.
+    const events = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "text_delta", text: `The setting is supported. ${S}cite${P}` },
+      { type: "text_delta", text: `turn1view0${P}turn1view1${E}` },
+      { type: "text_delta", text: " Next sentence." },
+      { type: "done" },
+    ]), "routed/model"));
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(S);
+    expect(serialized).not.toContain(P);
+    expect(serialized).not.toContain(E);
+    expect(serialized).not.toContain("turn1view0");
+
+    const streamed = events
+      .filter(e => e.event === "response.output_text.delta")
+      .map(e => e.data.delta as string)
+      .join("");
+    expect(streamed).toBe("The setting is supported.  Next sentence.");
+
+    const done = events.find(e => e.event === "response.output_text.done");
+    expect(done?.data.text).toBe("The setting is supported.  Next sentence.");
+  });
+
+  test("a stream ending inside a span still delivers the held text", async () => {
+    // Withhold, not drop: an unterminated marker is malformed input, and swallowing it
+    // would delete words the model actually produced.
+    const events = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "text_delta", text: `partial ${S}cite${P}turn1` },
+      { type: "done" },
+    ]), "routed/model"));
+    const done = events.find(e => e.event === "response.output_text.done");
+    expect(done?.data.text).toContain("partial ");
+  });
+
+  test("ordinary text is untouched", async () => {
+    const events = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "text_delta", text: "plain answer" },
+      { type: "done" },
+    ]), "routed/model"));
+    const done = events.find(e => e.event === "response.output_text.done");
+    expect(done?.data.text).toBe("plain answer");
   });
 });
 

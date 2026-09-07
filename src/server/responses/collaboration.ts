@@ -2,6 +2,7 @@ import type { Server } from "bun";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse, type ResponsesTerminalStatus } from "../../bridge";
 import {
   getConfigPath,
+  loadConfig,
   multiAgentGuidanceEnabled,
   resolveEnvValue,
 } from "../../config";
@@ -10,6 +11,7 @@ import { buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractC
 import { FORWARD_HEADERS, sanitizeReasoningInputContent } from "../../adapters/openai-responses";
 import { expandPreviousResponseInput, previousResponseProviderState, rememberResponseState } from "../../responses/state";
 import { routeModel } from "../../router";
+import type { RawEntry } from "../../codex/catalog/parsing";
 import {
   advanceComboAfterFailure,
   comboDefaultEffort,
@@ -106,12 +108,16 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
   /** Declared parameter schema per request-visible tool name (#1611 integer repair). */
   toolParameterSchemas: Map<string, Record<string, unknown>>;
   freeformToolNames: Set<string>;
+  bareCustomToolNames: Set<string>;
+  bareFunctionToolNames: Set<string>;
   toolSearchToolNames: Set<string>;
 } {
   const toolNsMap = new Map<string, { namespace: string; name: string; freeform?: true }>();
   const declaredToolNames = new Set<string>();
   const toolParameterSchemas = new Map<string, Record<string, unknown>>();
   const freeformToolNames = new Set<string>();
+  const bareCustomToolNames = new Set<string>();
+  const bareFunctionToolNames = new Set<string>();
   const toolSearchToolNames = new Set<string>();
   const requestedTools = parsed.context.tools ?? [];
   const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice, requestedTools);
@@ -131,6 +137,19 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
     if (t.freeform) {
       budget?.chargeRetained(new TextEncoder().encode(t.name).byteLength, { kind: "retained_collectors" });
       freeformToolNames.add(t.name);
+      if (!t.namespace || t.namespace === "functions") {
+        budget?.chargeRetained(new TextEncoder().encode(t.name).byteLength, { kind: "retained_collectors" });
+        bareCustomToolNames.add(t.name);
+      }
+    } else if (
+      !t.toolSearch
+      && !t.webSearch
+      && !t.imageGeneration
+      && !t.videoGeneration
+      && (!t.namespace || t.namespace === "functions")
+    ) {
+      budget?.chargeRetained(new TextEncoder().encode(t.name).byteLength, { kind: "retained_collectors" });
+      bareFunctionToolNames.add(t.name);
     }
     if (t.toolSearch) {
       budget?.chargeRetained(new TextEncoder().encode(t.name).byteLength, { kind: "retained_collectors" });
@@ -160,7 +179,15 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
       toolParameterSchemas.set(t.name, t.parameters);
     }
   }
-  return { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, toolSearchToolNames };
+  return {
+    toolNsMap,
+    declaredToolNames,
+    toolParameterSchemas,
+    freeformToolNames,
+    bareCustomToolNames,
+    bareFunctionToolNames,
+    toolSearchToolNames,
+  };
 }
 
 
@@ -243,15 +270,47 @@ export async function resolveEffectiveSubagentRoster(
   surface: SpawnAgentSurface,
 ): Promise<EffectiveSubagentRoster> {
   const { effectiveSubagentRoster } = await import("../../codex/catalog");
-  return effectiveSubagentRoster(configuredModels, surface);
+  return effectiveSubagentRoster(configuredModels, surface, await freshSubagentCatalogEntries());
+}
+
+/**
+ * The persisted Codex catalog, with native context metadata re-derived from the CURRENT config.
+ *
+ * The subagent roster reads the catalog FILE, which is only as fresh as the last sync. A row
+ * written before the operator widened the native window keeps its old `context_window`, so a
+ * child was planning and compacting against a narrower budget than its parent — measured at
+ * 272,000 x 95% = 258,400 while the request path resolved 922,000 (#2574).
+ *
+ * Re-applying the override is cheap and idempotent: it is the same function the writer uses,
+ * so a fresh catalog is unchanged and a stale one is repaired in memory rather than silently
+ * believed. It does not rewrite the file — the row on disk stays whatever the last sync wrote,
+ * and `ocx sync` remains what refreshes it.
+ */
+async function freshSubagentCatalogEntries(): Promise<RawEntry[]> {
+  const { readCatalog, readCodexCatalogPath, nativeContextLimits } = await import("../../codex/catalog");
+  const { applyNativeOpenAiContextOverride } = await import("../../codex/catalog/parsing");
+  const entries = readCatalog(readCodexCatalogPath())?.models ?? [];
+  if (entries.length === 0) return [];
+  let limits: ReturnType<typeof nativeContextLimits>;
+  try {
+    limits = nativeContextLimits(loadConfig());
+  } catch {
+    // An unreadable config must not cost the caller its roster; serve the file as written.
+    return entries;
+  }
+  return entries.map(entry => {
+    const clone = { ...entry };
+    applyNativeOpenAiContextOverride(clone, limits);
+    return clone;
+  });
 }
 
 /** Reuse one parsed catalog snapshot across every roster projection for this request. */
 async function createRequestScopedSubagentRosterResolver(): Promise<NonNullable<
   MultiAgentGuidanceDeps["resolveEffectiveSubagentRoster"]
 >> {
-  const { effectiveSubagentRoster, readCatalog, readCodexCatalogPath } = await import("../../codex/catalog");
-  const catalogEntries = readCatalog(readCodexCatalogPath())?.models ?? [];
+  const { effectiveSubagentRoster } = await import("../../codex/catalog");
+  const catalogEntries = await freshSubagentCatalogEntries();
   return (configuredModels, surface) =>
     effectiveSubagentRoster(configuredModels, surface, catalogEntries);
 }

@@ -7,8 +7,18 @@ import type {
   OcxUsage,
 } from "./types";
 import { coerceIntegerToolArguments } from "./lib/tool-argument-integers";
-import { adapterFailureFromMessage, classifyError, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode, type OcxErrorPayload } from "./lib/errors";
+import {
+  adapterFailureFromMessage,
+  classifyError,
+  cyberPolicyErrorType,
+  CYBER_POLICY_ERROR_CODE,
+  isCyberPolicyCode,
+  type OcxErrorPayload,
+} from "./lib/errors";
+import { redactSecretString } from "./lib/redact";
+import { repairFreeformToolInput } from "./responses/apply-patch-envelope";
 import { encodeCompactionSummary } from "./responses/compaction";
+import { compileCodeModeHelperInput } from "./responses/code-mode-helper-compat";
 import { isTruncatedStopReason, truncationReasonFor } from "./responses/truncated-stop-reason";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "./responses/reasoning-envelope";
 import { rememberReasoningForCall } from "./responses/reasoning-replay-cache";
@@ -18,7 +28,14 @@ import {
   awaitThoughtSignatureDurability,
 } from "./responses/thought-signature-replay";
 import { resolveStallTimeoutSec } from "./stall-timeout";
+import {
+  createCitationMarkerFilter,
+  stripCitationMarkers,
+  type CitationMarkerFilter,
+} from "./responses/citation-markers";
+import { normalizeDeclaredToolName } from "./types";
 import { usageDisplayTotalTokens } from "./usage/totals";
+import { appendSafeWebSearchSource, safeWebSearchSources } from "./web-search/sources";
 import {
   isTranslatorBudgetExceededError,
   releaseTranslatedEvent,
@@ -42,6 +59,10 @@ function sseEvent(name: string, data: Record<string, unknown>): string {
   return `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function responsesUsage(usage: OcxUsage | undefined): Record<string, unknown> {
   // input_tokens_details / output_tokens_details are ALWAYS emitted (zero defaults):
   // strict Responses clients deserialize them as required fields — grok-build's pinned
@@ -63,7 +84,24 @@ function responsesUsage(usage: OcxUsage | undefined): Record<string, unknown> {
   const inputTokens = usage.contextTotalTokens !== undefined
     ? Math.max(0, usage.contextTotalTokens - usage.outputTokens)
     : usage.inputTokens;
+  // openai/codex#41980 parity: unknown upstream usage fields (subscription metadata, future
+  // counters) pass through the rebuild. Normalized values stay authoritative for the known
+  // keys (they are derived from the same raw values, so this never disagrees with upstream).
+  const raw: Record<string, unknown> = usage.rawUsage ?? {};
+  // cache_write_tokens is a KNOWN key: it is emitted only from the validated normalized
+  // value below, never copied through raw (an unknown-shaped value must not leak into the
+  // normalized contract).
+  const rawInputDetails = isRecord(raw.input_tokens_details)
+    ? Object.fromEntries(Object.entries(raw.input_tokens_details as Record<string, unknown>)
+      .filter(([key]) => key !== "cache_write_tokens"))
+    : {} as Record<string, unknown>;
+  const rawOutputDetails = isRecord(raw.output_tokens_details)
+    ? raw.output_tokens_details as Record<string, unknown>
+    : {} as Record<string, unknown>;
   const out: Record<string, unknown> = {
+    ...Object.fromEntries(Object.entries(raw).filter(([key]) =>
+      key !== "input_tokens" && key !== "output_tokens" && key !== "total_tokens"
+      && key !== "input_tokens_details" && key !== "output_tokens_details")),
     input_tokens: inputTokens,
     output_tokens: usage.outputTokens,
     total_tokens: usage.contextTotalTokens !== undefined
@@ -73,18 +111,19 @@ function responsesUsage(usage: OcxUsage | undefined): Record<string, unknown> {
   // cached_tokens carries cache READS only, matching OpenAI semantics, and is always present
   // (zero default) for strict clients. Clamp to inputTokens so a provider's absolute
   // checkpoint can never report more cache reads than input.
-  const inputDetails: Record<string, number> = {
+  const inputDetails: Record<string, unknown> = {
+    ...rawInputDetails,
     cached_tokens: Math.min(usage.cachedInputTokens ?? 0, inputTokens),
   };
   if (usage.cacheCreationInputTokens !== undefined) {
-    const cacheRead = inputDetails.cached_tokens ?? 0;
+    const cacheRead = typeof inputDetails.cached_tokens === "number" ? inputDetails.cached_tokens : 0;
     inputDetails.cache_write_tokens = Math.min(
       usage.cacheCreationInputTokens,
       Math.max(0, inputTokens - cacheRead),
     );
   }
   out.input_tokens_details = inputDetails;
-  out.output_tokens_details = { reasoning_tokens: usage.reasoningOutputTokens ?? 0 };
+  out.output_tokens_details = { ...rawOutputDetails, reasoning_tokens: usage.reasoningOutputTokens ?? 0 };
   return out;
 }
 
@@ -111,18 +150,19 @@ function toolCallArgumentsUsable(args: string): boolean {
 }
 
 function adapterFailureFromEvent(event: Extract<AdapterEvent, { type: "error" }>): { httpStatus: number; error: OcxErrorPayload } {
+  const message = redactSecretString(event.message);
   if (event.status === undefined && event.errorType === undefined && event.code === undefined) {
-    return adapterFailureFromMessage(event.message);
+    return adapterFailureFromMessage(message);
   }
-  const fallback = adapterFailureFromMessage(event.message);
+  const fallback = adapterFailureFromMessage(message);
   let httpStatus = event.status ?? fallback.httpStatus;
-  const error = classifyError(httpStatus, event.errorType ?? fallback.error.type, event.message);
+  const error = classifyError(httpStatus, event.errorType ?? fallback.error.type, message);
   if (event.errorType !== undefined) error.type = event.errorType;
   if (event.code !== undefined) error.code = event.code;
   // Codex maps cyber_policy on HTTP 400 (body) or mid-stream code; never leave it as 502.
   if (isCyberPolicyCode(error.code) || isCyberPolicyCode(event.code)) {
     error.code = CYBER_POLICY_ERROR_CODE;
-    error.type = "invalid_request_error";
+    error.type = cyberPolicyErrorType(event.errorType);
     httpStatus = 400;
   }
   return { httpStatus, error };
@@ -133,27 +173,27 @@ export { adapterFailureFromMessage } from "./lib/errors";
 /**
  * Build the native `WebSearchAction::Search` payload from the queries that ran.
  *
- * Single query → `{ query, queries: [query] }`. Batch → `{ queries }` with NO singular
- * `query`. Empty → `{ query: "", queries: [""] }`.
+ * Every action carries BOTH keys: `{ query, queries }`, where `query` is the first
+ * member. Empty → `{ query: "", queries: [""] }`.
  *
- * The asymmetry is load-bearing in both directions. codex-rs prefers a non-empty `query`
- * for the cell label and renders "<first> ..." only when `query` is ABSENT and
- * `queries.len() > 1`, so adding `query` to a batch would collapse the plural ellipsis.
- * Meanwhile DeepSeek's native Responses parser makes `queries` a required field, so a
- * replayed one-term `web_search_call` — carried in the history of every subsequent turn
- * — fails deserialization with `missing field 'queries'` and 400s the rest of the
- * conversation (#930). Carrying both keys in the single case satisfies the strict parser
- * without changing what codex-rs displays.
+ * Carrying both is load-bearing in both directions. DeepSeek's native Responses parser
+ * makes `queries` a required field, and Console Go's upstream validator makes `query` a
+ * required field — so a replayed `web_search_call` carried in the history of every
+ * subsequent turn fails deserialization with `missing field 'queries'` (#930) or 400s
+ * with `missing required field 'query'` unless both keys are present. Carrying both keys
+ * in every case satisfies both strict parsers; the trade-off is that a multi-query batch
+ * loses the "<first> ..." ellipsis in codex-rs and shows the first query as the label.
+ *
+ * That trade is deliberate: a cosmetic label against a conversation that 400s on every
+ * subsequent turn. Do not restore the old batch-omits-`query` shape to win the ellipsis
+ * back — it reopens #3071.
  *
  * This fixes items created from here on. History recorded before it is repaired at the
  * replay boundary by `backfillWebSearchQueries()` in the Responses adapter.
  */
 function webSearchAction(queries: string[]): Record<string, unknown> {
-  if (queries.length <= 1) {
-    const query = queries[0] ?? "";
-    return { type: "search", query, queries: [query] };
-  }
-  return { type: "search", queries };
+  const first = queries[0] ?? "";
+  return { type: "search", query: first, queries: queries.length > 0 ? queries : [first] };
 }
 
 interface OutputItem {
@@ -229,12 +269,17 @@ export function bridgeToResponsesSSE(
   const replayCacheScope = options?.replayCacheScope;
   const setBeatInterval = options?.timers?.setInterval ?? ((handler: () => void, ms: number) => setInterval(handler, ms));
   const clearBeatInterval = options?.timers?.clearInterval ?? ((id: unknown) => clearInterval(id as ReturnType<typeof setInterval>));
-  // Freeform/custom tools (apply_patch) carry their body in `input`; the model is given a
-  // function with `{input:string}`, so unwrap it here when relaying back as a custom_tool_call.
-  const freeformInput = (args: string): string => {
-    try { const o = JSON.parse(args); if (o && typeof o.input === "string") return o.input; } catch { /* raw */ }
-    return args;
-  };
+  // Freeform/custom tools (apply_patch, code-mode exec) carry their body in `input`; the
+  // model is given a function with `{input:string}`, so unwrap it here when relaying back
+  // as a custom_tool_call. Decorated apply_patch envelopes are repaired at this boundary.
+  const freeformInput = (
+    args: string,
+    toolName: string,
+    namespace?: string,
+    codeModeHelperName?: string,
+  ): string => codeModeHelperName
+    ? compileCodeModeHelperInput(args, codeModeHelperName)
+    : repairFreeformToolInput(args, toolName, namespace);
   // Best-effort unwrap of a PARTIAL freeform arg buffer for live input streaming
   // (`response.custom_tool_call_input.delta` — codex-rs uses it for UI preview only;
   // the completed custom_tool_call item stays authoritative). Compact `{"input":"...`
@@ -417,7 +462,14 @@ export function bridgeToResponsesSSE(
       const stallSec = resolveStallTimeoutSec(options?.stallTimeoutSec);
       const maxStallTicks = Math.ceil((stallSec * 1000) / heartbeatMs);
 
-      let currentMsg: { itemId: string; outputIndex: number; text: string; textBytes: number; phase?: OcxMessagePhase } | null = null;
+      let currentMsg: {
+        itemId: string;
+        outputIndex: number;
+        text: string;
+        textBytes: number;
+        citationFilter: CitationMarkerFilter;
+        phase?: OcxMessagePhase;
+      } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string; textBytes: number } | null = null;
       let currentRawReasoning: { itemId: string; outputIndex: number; text: string; textBytes: number } | null = null;
       // Anthropic extended-thinking round-trip state: the signature signs the CURRENT thinking
@@ -518,7 +570,7 @@ export function bridgeToResponsesSSE(
       // synthetic compaction item's payload on done.
       let compactionText = "";
       let compactionTextBytes = 0;
-      let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; argsBytes: number; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string; providerMetadata?: OcxProviderOpaqueToolCallMetadata } | null = null;
+      let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; argsBytes: number; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string; codeModeHelperName?: string; providerMetadata?: OcxProviderOpaqueToolCallMetadata } | null = null;
       // Open native web-search cell (between begin and end). Holds the output index allocated on
       // begin so the matching done reuses it; closed as `failed` if the stream terminates early.
       let currentWebSearch: { itemId: string; eventId: string; outputIndex: number } | null = null;
@@ -526,22 +578,38 @@ export function bridgeToResponsesSSE(
       // url_citation annotations on that message (the desktop app's Sources chip), then cleared so
       // they bind to exactly one message. Deduped by URL across multiple searches in the turn.
       let pendingWebSources: { url: string; title?: string }[] = [];
+      let pendingWebSourceBytes = 0;
+      const releasePendingWebSources = () => {
+        if (pendingWebSources.length === 0) return;
+        pendingWebSources = [];
+        budget?.releaseRetained(pendingWebSourceBytes, { kind: "tool_search_sources" });
+        pendingWebSourceBytes = 0;
+      };
       const takeWebAnnotations = (): { type: string; url: string; title?: string; start_index: number; end_index: number }[] => {
         if (pendingWebSources.length === 0) return [];
         const anns = pendingWebSources.map(s => ({
           type: "url_citation", url: s.url, ...(s.title ? { title: s.title } : {}), start_index: 0, end_index: 0,
         }));
-        const sourceBytes = pendingWebSources.reduce((sum, source) => sum + bytesOf(JSON.stringify(source)), 0);
         const annotationBytes = bytesOf(JSON.stringify(anns));
         const reservation = budget?.reserveTransient(annotationBytes, { kind: "retained_collectors" });
-        pendingWebSources = [];
         reservation?.commitRetained();
-        budget?.releaseRetained(sourceBytes, { kind: "tool_search_sources" });
+        releasePendingWebSources();
         return anns;
       };
 
       const closeCurrentMessage = (inferredPhase?: OcxMessagePhase) => {
         if (!currentMsg) return;
+        // Release anything the citation filter was holding for this message, then strip the
+        // accumulated text: closeCurrentMessage re-sends it in output_text.done and
+        // output_item.done, so filtering only the deltas would leave the markers in both.
+        const trailing = currentMsg.citationFilter.flush();
+        if (trailing) {
+          emit("response.output_text.delta", {
+            item_id: currentMsg.itemId, output_index: currentMsg.outputIndex,
+            content_index: 0, delta: trailing,
+          });
+        }
+        const messageText = stripCitationMarkers(currentMsg.text);
         // Chat Completions has no message-phase field. Keep its live item provisional, then
         // classify it only when the next adapter event proves whether this text led into more
         // work or completed the turn. Explicit adapter phases always outrank this inference.
@@ -551,15 +619,15 @@ export function bridgeToResponsesSSE(
         // Finalize the text part (Responses protocol). Without these .done events Codex never
         // commits the content part and renders the message as truncated / cut off.
         emit("response.output_text.done", {
-          item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0, text: currentMsg.text,
+          item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0, text: messageText,
         });
         emit("response.content_part.done", {
           item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0,
-          part: { type: "output_text", text: currentMsg.text, annotations },
+          part: { type: "output_text", text: messageText, annotations },
         });
         const item = {
           type: "message", id: currentMsg.itemId, status: "completed", role: "assistant",
-          content: [{ type: "output_text", text: currentMsg.text, annotations }],
+          content: [{ type: "output_text", text: messageText, annotations }],
           ...(phase ? { phase } : {}),
         };
         emit("response.output_item.done", { output_index: currentMsg.outputIndex, item });
@@ -620,6 +688,7 @@ export function bridgeToResponsesSSE(
         const argsStr = coerceIntegerToolArguments(
           currentToolCall.args || "{}",
           options?.toolParameterSchemas?.get(currentToolCall.name),
+          currentToolCall.namespace === undefined ? currentToolCall.name : undefined,
         );
         // Finalize streamed function-call arguments so Codex commits the call (incl. MCP / computer_use).
         if (!currentToolCall.freeform && !currentToolCall.toolSearch) {
@@ -630,7 +699,8 @@ export function bridgeToResponsesSSE(
         if (currentToolCall.freeform) {
           emit("response.custom_tool_call_input.done", {
             item_id: currentToolCall.itemId, output_index: currentToolCall.outputIndex,
-            input: freeformInput(currentToolCall.args),
+            ...(currentToolCall.namespace ? { namespace: currentToolCall.namespace } : {}),
+            input: freeformInput(currentToolCall.args, currentToolCall.name, currentToolCall.namespace, currentToolCall.codeModeHelperName),
           });
         }
         // Freeform tools serialize as custom_tool_call without extra_content; remember the
@@ -646,7 +716,8 @@ export function bridgeToResponsesSSE(
           ? {
               type: "custom_tool_call", id: currentToolCall.itemId,
               call_id: currentToolCall.callId, name: currentToolCall.name,
-              input: freeformInput(currentToolCall.args), status: "completed",
+              ...(currentToolCall.namespace ? { namespace: currentToolCall.namespace } : {}),
+              input: freeformInput(currentToolCall.args, currentToolCall.name, currentToolCall.namespace, currentToolCall.codeModeHelperName), status: "completed",
             }
           : {
               type: "function_call", id: currentToolCall.itemId,
@@ -685,7 +756,8 @@ export function bridgeToResponsesSSE(
           ? {
               type: "custom_tool_call", id: currentToolCall.itemId,
               call_id: currentToolCall.callId, name: currentToolCall.name,
-              input: freeformInput(currentToolCall.args), status: "incomplete",
+              ...(currentToolCall.namespace ? { namespace: currentToolCall.namespace } : {}),
+              input: freeformInput(currentToolCall.args, currentToolCall.name, currentToolCall.namespace, currentToolCall.codeModeHelperName), status: "incomplete",
             }
           : {
               type: "function_call", id: currentToolCall.itemId,
@@ -792,6 +864,7 @@ export function bridgeToResponsesSSE(
         handlingTranslatorOverflow = true;
         abortCurrentToolCallForTranslatorOverflow();
         currentWebSearch = null;
+        releasePendingWebSources();
         const failure = adapterFailureFromEvent({
           type: "error",
           status: 502,
@@ -908,7 +981,11 @@ export function bridgeToResponsesSSE(
                   item_id: itemId, output_index: outputIndex, content_index: 0,
                   part: { type: "output_text", text: "", annotations: [] },
                 });
-                currentMsg = { itemId, outputIndex, text: "", textBytes: 0, ...(event.phase ? { phase: event.phase } : {}) };
+                currentMsg = {
+                  itemId, outputIndex, text: "", textBytes: 0,
+                  citationFilter: createCitationMarkerFilter(),
+                  ...(event.phase ? { phase: event.phase } : {}),
+                };
               }
               ({ value: currentMsg.text, bytes: currentMsg.textBytes } = appendString(
                 currentMsg.text,
@@ -916,10 +993,16 @@ export function bridgeToResponsesSSE(
                 event.text,
                 "retained_collectors",
               ));
-              emit("response.output_text.delta", {
-                item_id: currentMsg.itemId, output_index: currentMsg.outputIndex,
-                content_index: 0, delta: event.text,
-              });
+              // A citation span can straddle a delta boundary, so the filter withholds an
+              // unterminated tail and releases it at close (#3150). The accumulator above
+              // keeps the raw text; it is stripped once in closeCurrentMessage.
+              const visible = currentMsg.citationFilter.push(event.text);
+              if (visible) {
+                emit("response.output_text.delta", {
+                  item_id: currentMsg.itemId, output_index: currentMsg.outputIndex,
+                  content_index: 0, delta: visible,
+                });
+              }
               break;
             }
             case "thinking_delta": {
@@ -1029,13 +1112,17 @@ export function bridgeToResponsesSSE(
                 rememberReasoningForCall(event.id, rawReasoningForNextToolCall, replayCacheScope);
               }
               if (currentToolCall) closeCurrentToolCall();
-              const mapped = toolNsMap?.get(event.name);
-              const realName = mapped?.name ?? event.name;
-              if (options?.declaredToolNames && !options.declaredToolNames.has(event.name)) {
+              const effectiveName = normalizeDeclaredToolName(event.name, options?.declaredToolNames);
+              const codeModeHelperName = effectiveName === "exec" && event.name !== effectiveName
+                ? event.name
+                : undefined;
+              const mapped = toolNsMap?.get(effectiveName);
+              const realName = mapped?.name ?? effectiveName;
+              if (options?.declaredToolNames && !options.declaredToolNames.has(effectiveName)) {
                 const failure = responseError(
                   502,
                   "upstream_error",
-                  `routed provider emitted undeclared client tool "${event.name}"; only request-declared tools may be called`,
+                  `routed provider emitted undeclared client tool "${effectiveName}"; only request-declared tools may be called`,
                 );
                 emit("response.failed", {
                   response: {
@@ -1057,10 +1144,10 @@ export function bridgeToResponsesSSE(
               const item = toolSearch
                 ? { type: "tool_search_call", id: itemId, call_id: event.id, execution: "client", arguments: {}, status: "in_progress" }
                 : freeform
-                ? { type: "custom_tool_call", id: itemId, call_id: event.id, name: realName, input: "", status: "in_progress" }
+                ? { type: "custom_tool_call", id: itemId, call_id: event.id, name: realName, ...(ns ? { namespace: ns } : {}), input: "", status: "in_progress" }
                 : { type: "function_call", id: itemId, call_id: event.id, name: realName, arguments: "", status: "in_progress", ...(ns ? { namespace: ns } : {}) };
               emit("response.output_item.added", { output_index: outputIndex, item });
-              currentToolCall = { itemId, outputIndex, callId: event.id, name: realName, args: "", argsBytes: 0, namespace: ns, freeform, toolSearch, providerMetadata: event.providerMetadata };
+              currentToolCall = { itemId, outputIndex, callId: event.id, name: realName, args: "", argsBytes: 0, namespace: ns, freeform, toolSearch, codeModeHelperName, providerMetadata: event.providerMetadata };
               budget?.openCall(event.id);
               break;
             }
@@ -1079,7 +1166,7 @@ export function bridgeToResponsesSSE(
                     delta: event.arguments,
                   });
                 }
-                if (currentToolCall.freeform) {
+                if (currentToolCall.freeform && !currentToolCall.codeModeHelperName) {
                   // Hold while the buffer is still an ambiguous prefix of the JSON wrapper,
                   // then stream only the unwrapped input suffix (never rewind on mode flips).
                   if (!FREEFORM_WRAP_PREFIX.startsWith(currentToolCall.args)) {
@@ -1157,15 +1244,13 @@ export function bridgeToResponsesSSE(
                 });
                 currentWebSearch = { itemId: wsItemId2, eventId: event.id, outputIndex };
               }
-              closeCurrentWebSearch(event.status ?? "completed", event.queries, event.sources);
+              const safeSources = safeWebSearchSources(event.sources);
+              closeCurrentWebSearch(event.status ?? "completed", event.queries, safeSources);
               // Queue this search's sources for the next assistant message (dedup by URL).
-              if (event.sources) {
-                const seen = new Set(pendingWebSources.map(s => s.url));
-                for (const s of event.sources) {
-                  if (!seen.has(s.url)) {
-                    seen.add(s.url);
-                    chargeValue(s, "tool_search_sources");
-                    pendingWebSources.push(s);
+              if (safeSources.length > 0) {
+                for (const source of safeSources) {
+                  if (appendSafeWebSearchSource(pendingWebSources, source)) {
+                    pendingWebSourceBytes += chargeValue(source, "tool_search_sources");
                   }
                 }
               }
@@ -1178,6 +1263,7 @@ export function bridgeToResponsesSSE(
               flushHiddenRawReasoning();
               if (currentToolCall) closeCurrentToolCall();
               if (currentWebSearch) closeCurrentWebSearch("completed", []);
+              releasePendingWebSources();
               // Redacted-only turns (or hidden thinking without a trailing signature event) still
               // need their envelope-only reasoning item so the blocks replay next turn.
               flushHiddenReasoningEnvelope();
@@ -1192,10 +1278,12 @@ export function bridgeToResponsesSSE(
                 // Exactly one compaction item per turn; codex-rs takes the first and fatals on 0.
                 const item = {
                   type: "compaction", id: `cmp_${uuid()}`,
-                  encrypted_content: encodeCompactionSummary(compactionText),
+                  encrypted_content: event.compactionEncryptedContent ?? encodeCompactionSummary(compactionText),
                 };
                 emit("response.output_item.done", { output_index: outputIndex, item });
-                retainFinishedItem(item as OutputItem, compactionTextBytes);
+                retainFinishedItem(item as OutputItem, event.compactionEncryptedContent
+                  ? bytesOf(event.compactionEncryptedContent)
+                  : compactionTextBytes);
                 outputIndex++;
               }
               // Recognize every adapter's truncation vocabulary, not just the canonical pair.
@@ -1241,6 +1329,7 @@ export function bridgeToResponsesSSE(
               flushHiddenRawReasoning();
               if (currentToolCall) failCurrentToolCall();
               if (currentWebSearch) closeCurrentWebSearch("failed", []);
+              releasePendingWebSources();
               flushHiddenReasoningEnvelope();
               options?.onUsage?.(event.usage);
               await awaitThoughtSignatureDurability();
@@ -1270,6 +1359,7 @@ export function bridgeToResponsesSSE(
               flushHiddenRawReasoning();
               if (currentToolCall) failCurrentToolCall();
               if (currentWebSearch) closeCurrentWebSearch("failed", []);
+              releasePendingWebSources();
               const failure = adapterFailureFromEvent(event);
               if (event.usage) options?.onUsage?.(event.usage);
               await awaitThoughtSignatureDurability();
@@ -1281,7 +1371,9 @@ export function bridgeToResponsesSSE(
                   ...(event.usage ? { usage: responsesUsage(event.usage) } : {}),
                   error: failure.error,
                   last_error: failure.error,
-                  ...(event.retryable !== undefined ? { retryable: event.retryable } : {}),
+                  ...(isCyberPolicyCode(failure.error.code)
+                    ? { retryable: false }
+                    : event.retryable !== undefined ? { retryable: event.retryable } : {}),
                 },
               });
               reportTerminal("failed");
@@ -1304,11 +1396,18 @@ export function bridgeToResponsesSSE(
           flushHiddenRawReasoning();
           if (currentToolCall) failCurrentToolCall();
           if (currentWebSearch) closeCurrentWebSearch("failed", []);
+          releasePendingWebSources();
+          const failure = responseError(
+            500,
+            "proxy_error",
+            redactSecretString(err instanceof Error ? err.message : String(err)),
+          );
           emit("response.failed", {
             response: {
               ...responseSnapshot("failed", finishedItems),
-              error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
-              last_error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
+              error: failure,
+              last_error: failure,
+              ...(isCyberPolicyCode(failure.code) ? { retryable: false } : {}),
             },
           });
           reportTerminal("failed");
@@ -1333,6 +1432,7 @@ export function bridgeToResponsesSSE(
         flushHiddenRawReasoning();
         if (currentToolCall) failCurrentToolCall();
         if (currentWebSearch) closeCurrentWebSearch("failed", []);
+        releasePendingWebSources();
         options?.onUsage?.(undefined);
         await awaitThoughtSignatureDurability();
         emit("response.incomplete", {
@@ -1360,6 +1460,8 @@ export function bridgeToResponsesSSE(
 
       const startStream = () => {
         emit("response.created", { response: responseSnapshot("in_progress", []) });
+        // Responses spec parity: clients expect an explicit in_progress frame after created.
+        emit("response.in_progress", { response: responseSnapshot("in_progress", []) });
         // The default ReadableStream strategy has HWM=1. Once one event's frames fill that
         // queue, pull stepping pauses; no custom FIFO or queuing strategy is layered on top.
         gated = true;
@@ -1375,6 +1477,7 @@ export function bridgeToResponsesSSE(
             flushHiddenRawReasoning();
             if (currentToolCall) failCurrentToolCall();
             if (currentWebSearch) closeCurrentWebSearch("failed", []);
+            releasePendingWebSources();
             // #1926 gap 2 residual: this beat callback is synchronous, so the durability
             // barrier is not awaited on the stall-timeout kill path. The in-memory store is
             // already updated; only a crash between here and the queued write loses it,
@@ -1427,6 +1530,7 @@ export function bridgeToResponsesSSE(
         clearOwnedWatchdog();
         if (beat !== undefined) clearBeatInterval(beat);
         cancelUpstreamOnce();
+        releasePendingWebSources();
         disposeOwnedBudget();
       },
     });
@@ -1527,6 +1631,7 @@ function buildResponseJSONWithBudget(
   let sawTerminal = false;
   let compactionText = "";
   let compactionTextBytes = 0;
+  let compactionEncryptedContent: string | undefined;
 
   let currentText = "";
   let currentTextBytes = 0;
@@ -1549,16 +1654,21 @@ function buildResponseJSONWithBudget(
   let batchKiroRedactedBytes = 0;
   let currentToolCallId = "";
   let currentToolCallName = "";
+  let currentToolCallCodeModeHelperName: string | undefined;
   let currentToolCallArgs = "";
   let currentToolCallProviderMetadata: OcxProviderOpaqueToolCallMetadata | undefined;
   let currentToolCallArgsBytes = 0;
   // Web-search citations awaiting the next assistant message (attached as url_citation annotations).
   let pendingWebSources: { url: string; title?: string }[] = [];
 
-  const freeformInput = (args: string): string => {
-    try { const o = JSON.parse(args); if (o && typeof o.input === "string") return o.input; } catch { /* raw */ }
-    return args;
-  };
+  const freeformInput = (
+    args: string,
+    toolName: string,
+    namespace?: string,
+    codeModeHelperName?: string,
+  ): string => codeModeHelperName
+    ? compileCodeModeHelperInput(args, codeModeHelperName)
+    : repairFreeformToolInput(args, toolName, namespace);
   const parseArgsObj = (args: string): Record<string, unknown> => {
     try { const o = JSON.parse(args); return o && typeof o === "object" ? o : {}; } catch { return {}; }
   };
@@ -1566,16 +1676,22 @@ function buildResponseJSONWithBudget(
   const flushText = (inferredPhase?: OcxMessagePhase) => {
     if (!currentText) return;
     const phase = currentTextPhase ?? inferredPhase;
+    // ChatGPT-backend citation markers arrive as literal private-use characters that the
+    // Codex TUI prints verbatim (#3150). Strip them here rather than at the accumulator so
+    // the retained byte accounting above still describes what the upstream actually sent.
+    const text = stripCitationMarkers(currentText);
+    const sourceBytes = pendingWebSources.reduce((sum, source) => sum + bytesOf(JSON.stringify(source)), 0);
     const annotations = pendingWebSources.map(s => ({
       type: "url_citation", url: s.url, ...(s.title ? { title: s.title } : {}), start_index: 0, end_index: 0,
     }));
     pendingWebSources = [];
     const item = {
       type: "message", id: `msg_${uuid()}`, role: "assistant", status: "completed",
-      content: [{ type: "output_text", text: currentText, annotations }],
+      content: [{ type: "output_text", text, annotations }],
       ...(phase ? { phase } : {}),
     } as OutputItem;
     pushOutput(item, currentTextBytes);
+    budget?.releaseRetained(sourceBytes, { kind: "tool_search_sources" });
     currentText = "";
     currentTextBytes = 0;
     currentTextPhase = undefined;
@@ -1642,6 +1758,7 @@ function buildResponseJSONWithBudget(
     const coercedArgs = coerceIntegerToolArguments(
       currentToolCallArgs,
       options?.toolParameterSchemas?.get(currentToolCallName),
+      ns === undefined ? realName : undefined,
     );
     // Freeform tools serialize as custom_tool_call without extra_content; remember the
     // signature server-side regardless so the replayed call can be re-signed (#1735).
@@ -1656,7 +1773,8 @@ function buildResponseJSONWithBudget(
       pushOutput({
         type: "custom_tool_call", id: `ctc_${uuid()}`,
         call_id: currentToolCallId, name: realName,
-        input: freeformInput(currentToolCallArgs), status,
+        ...(ns ? { namespace: ns } : {}),
+        input: freeformInput(currentToolCallArgs, realName, ns, currentToolCallCodeModeHelperName), status,
       });
     } else {
       pushOutput({
@@ -1670,6 +1788,7 @@ function buildResponseJSONWithBudget(
     budget?.closeCall(currentToolCallId);
     currentToolCallId = "";
     currentToolCallName = "";
+    currentToolCallCodeModeHelperName = undefined;
     currentToolCallProviderMetadata = undefined;
     currentToolCallArgs = "";
     currentToolCallArgsBytes = 0;
@@ -1763,7 +1882,7 @@ function buildResponseJSONWithBudget(
           ));
         }
         break;
-      case "tool_call_start":
+      case "tool_call_start": {
         if (currentText) flushText("commentary");
         if (currentSummaryReasoning) flushSummaryReasoning();
         if (currentRawReasoning) flushRawReasoning();
@@ -1771,10 +1890,11 @@ function buildResponseJSONWithBudget(
           rememberReasoningForCall(e.id, rawReasoningForNextToolCall, replayCacheScope);
         }
         flushToolCall();
-        if (options?.declaredToolNames && !options.declaredToolNames.has(e.name)) {
+        const effectiveName = normalizeDeclaredToolName(e.name, options?.declaredToolNames);
+        if (options?.declaredToolNames && !options.declaredToolNames.has(effectiveName)) {
           errorEvent = {
             type: "error",
-            message: `routed provider emitted undeclared client tool "${e.name}"; only request-declared tools may be called`,
+            message: `routed provider emitted undeclared client tool "${effectiveName}"; only request-declared tools may be called`,
             status: 502,
             errorType: "upstream_error",
           };
@@ -1782,11 +1902,15 @@ function buildResponseJSONWithBudget(
         }
         currentToolCallId = e.id;
         budget?.openCall(e.id);
-        currentToolCallName = e.name;
+        currentToolCallName = effectiveName;
+        currentToolCallCodeModeHelperName = effectiveName === "exec" && e.name !== effectiveName
+          ? e.name
+          : undefined;
         currentToolCallArgs = "";
         currentToolCallArgsBytes = 0;
         currentToolCallProviderMetadata = e.providerMetadata;
         break;
+      }
       case "tool_call_delta":
         {
           ({ value: currentToolCallArgs, bytes: currentToolCallArgsBytes } = appendBatchString(
@@ -1820,27 +1944,26 @@ function buildResponseJSONWithBudget(
         // Batch/non-streaming output has no in_progress phase to animate — the search cell is a
         // single finalized item, emitted on `end`. Begin is a no-op here.
         break;
-      case "web_search_call_end":
+      case "web_search_call_end": {
         if (currentText) flushText("commentary");
         if (currentSummaryReasoning) flushSummaryReasoning();
         if (currentRawReasoning) flushRawReasoning();
         flushToolCall();
+        const safeSources = safeWebSearchSources(e.sources);
         pushOutput({
           type: "web_search_call", id: `ws_${uuid()}`, status: e.status ?? "completed",
           action: webSearchAction(e.queries),
-          ...(e.sources && e.sources.length > 0 ? { sources: e.sources } : {}),
+          ...(safeSources.length > 0 ? { sources: safeSources } : {}),
         });
-        if (e.sources) {
-          const seen = new Set(pendingWebSources.map(s => s.url));
-          for (const s of e.sources) {
-            if (!seen.has(s.url)) {
-              seen.add(s.url);
-              budget?.chargeRetained(bytesOf(JSON.stringify(s)), { kind: "tool_search_sources" });
-              pendingWebSources.push(s);
+        if (safeSources.length > 0) {
+          for (const source of safeSources) {
+            if (appendSafeWebSearchSource(pendingWebSources, source)) {
+              budget?.chargeRetained(bytesOf(JSON.stringify(source)), { kind: "tool_search_sources" });
             }
           }
         }
         break;
+      }
       case "error":
         errorEvent = e;
         sawTerminal = true;
@@ -1854,6 +1977,7 @@ function buildResponseJSONWithBudget(
         break;
       case "done":
         usage = e.usage;
+        compactionEncryptedContent = e.compactionEncryptedContent;
         sawTerminal = true;
         endTurn = e.endTurn;
         cleanDone = e.stopReason === undefined;
@@ -1872,6 +1996,11 @@ function buildResponseJSONWithBudget(
     if (budget) releaseTranslatedEvent(e, budget);
   }
   flushText(cleanDone && !errorEvent && !incompleteEvent ? "final_answer" : undefined);
+  if (pendingWebSources.length > 0) {
+    const sourceBytes = pendingWebSources.reduce((sum, source) => sum + bytesOf(JSON.stringify(source)), 0);
+    pendingWebSources = [];
+    budget?.releaseRetained(sourceBytes, { kind: "tool_search_sources" });
+  }
   flushSummaryReasoning();
   flushRawReasoning();
   // Open tool call on a failed/incomplete turn must not land as status:"completed" — and neither
@@ -1901,7 +2030,11 @@ function buildResponseJSONWithBudget(
     && sawTerminal
     && !isTruncatedStopReason(rawStopReason)
   ) {
-    pushOutput({ type: "compaction", id: `cmp_${uuid()}`, encrypted_content: encodeCompactionSummary(compactionText) }, compactionTextBytes);
+   const item = {
+      type: "compaction", id: `cmp_${uuid()}`,
+      encrypted_content: compactionEncryptedContent ?? encodeCompactionSummary(compactionText),
+    };
+    pushOutput(item, compactionEncryptedContent ? bytesOf(compactionEncryptedContent) : compactionTextBytes);
   }
 
   const failure = errorEvent ? adapterFailureFromEvent(errorEvent) : undefined;
@@ -1924,7 +2057,9 @@ function buildResponseJSONWithBudget(
     model: modelId, output,
     ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
     ...(failure ? { error: failure.error, last_error: failure.error } : {}),
-    ...(errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),
+    ...(failure && isCyberPolicyCode(failure.error.code)
+      ? { retryable: false }
+      : errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),
     ...(incompleteEvent ? {
       incomplete_details: {
         reason: incompleteEvent.reason,
@@ -1953,12 +2088,15 @@ export function formatErrorResponse(
   const error = classifyError(status, type, message);
   if (isCyberPolicyCode(options?.code)) {
     error.code = CYBER_POLICY_ERROR_CODE;
-    error.type = "invalid_request_error";
+    error.type = cyberPolicyErrorType(type);
   }
   const finalStatus = error.code === CYBER_POLICY_ERROR_CODE ? 400 : status;
   const headers = new Headers({ "Content-Type": "application/json" });
   const retryAfter = options?.retryAfter?.trim();
-  if (retryAfter && retryAfter.length > 0 && retryAfter.length <= 128) {
+  if (error.code !== CYBER_POLICY_ERROR_CODE
+    && retryAfter
+    && retryAfter.length > 0
+    && retryAfter.length <= 128) {
     headers.set("Retry-After", retryAfter);
   }
   return new Response(JSON.stringify({ error }), {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { claudeNotFoundHint } from "../src/cli/claude";
+import { buildClaudeEnv, claudeNotFoundHint, ensureProxyForClaude, rootSkipPermissionsNotice, shouldAllowRootSkipPermissions } from "../src/cli/claude";
 import { commandInvocation } from "../src/lib/win-exec";
-import { buildClaudeEnv } from "../src/cli/claude";
+import type { LivenessIo, LiveProxy } from "../src/server/proxy-liveness";
 import type { OcxConfig } from "../src/types";
 
 function cfg(extra?: Partial<OcxConfig>): OcxConfig {
@@ -20,13 +20,100 @@ function cfg(extra?: Partial<OcxConfig>): OcxConfig {
  */
 const AUTH_PRESENT = {
   authDetect: {
-    readClaudeJson: () => ({ oauthAccount: { emailAddress: "dev@example.com" } }),
+    readClaudeJson: () => ({ oauthAccount: { emailAddress: "dev-fixture" } }),
     credentialsFileExists: () => true,
     keychainProbe: () => "present" as const,
   },
 };
 
+describe("ocx claude proxy liveness", () => {
+  test("retries the initial liveness probe before spawning a proxy", async () => {
+    const seen: (number | undefined)[] = [];
+    const findLiveProxy = async (io?: LivenessIo): Promise<LiveProxy> => {
+      seen.push(io?.attempts);
+      // retry semantics are covered by tests/proxy-liveness.test.ts:102-119; this pins that the launcher hands the stop-path budget down.
+      return { pid: 4242, port: 10100, source: "runtime" };
+    };
+
+    expect(await ensureProxyForClaude({ findLiveProxy })).toBe(10100);
+    expect(seen).toEqual([3]);
+  });
+});
+
 describe("ocx claude env assembly", () => {
+  test("connected target injects only the hub base and client admission token", () => {
+    const env = buildClaudeEnv(cfg(), {
+      baseUrl: "https://hub.example.test",
+      admissionToken: "ocx_data_connected",
+    }, {}, {}, AUTH_PRESENT);
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://hub.example.test");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("ocx_data_connected");
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe("1");
+  });
+
+  test("a connected target keeps its admission token even when the local env reads as subscription", () => {
+    // #3148 resolves the auth mode before adding proxy-owned credentials, which is right for
+    // an ordinary launch. A connected launch is different: the caller already named a hub and
+    // supplied the client admission token for it, so a machine whose own environment looks
+    // like a Claude subscription must not strip the credential the launch was built with.
+    const env = buildClaudeEnv(cfg(), {
+      baseUrl: "https://hub.example.test",
+      admissionToken: "ocx_data_connected",
+    }, {}, {}, { mode: "subscription", origin: "explicit" });
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://hub.example.test");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("ocx_data_connected");
+  });
+
+  test("user-owned connected destination wins and cannot receive the hub token", () => {
+    const env = buildClaudeEnv(cfg(), {
+      baseUrl: "https://hub.example.test",
+      admissionToken: "ocx_data_connected",
+    }, {
+      ANTHROPIC_BASE_URL: "https://user-gateway.example.test",
+      ANTHROPIC_AUTH_TOKEN: "ocx_data_connected",
+    }, {}, {
+      ...AUTH_PRESENT,
+      preBunAnthropicSlots: ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
+    });
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://user-gateway.example.test");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  });
+
+  test("root skip-permissions bypass requires both the explicit flag and uid 0", () => {
+    expect(shouldAllowRootSkipPermissions(["--dangerously-skip-permissions"], () => 0)).toBe(true);
+    expect(shouldAllowRootSkipPermissions([], () => 0)).toBe(false);
+    expect(shouldAllowRootSkipPermissions(["--dangerously-skip-permissions"], () => 1000)).toBe(false);
+    expect(shouldAllowRootSkipPermissions(["--dangerously-skip-permissions"], null)).toBe(false);
+  });
+
+  test("root skip-permissions opt-in marks only that launch as sandboxed", () => {
+    const bypass = buildClaudeEnv(cfg(), 10100, {}, {}, {
+      ...AUTH_PRESENT,
+      allowRootSkipPermissions: true,
+    });
+    expect(bypass.IS_SANDBOX).toBe("1");
+
+    const ordinary = buildClaudeEnv(cfg(), 10100, {}, {}, AUTH_PRESENT);
+    expect(ordinary.IS_SANDBOX).toBeUndefined();
+  });
+
+  test("an explicit user sandbox value wins over the root skip-permissions opt-in", () => {
+    const env = buildClaudeEnv(cfg(), 10100, { IS_SANDBOX: "0" }, {}, {
+      ...AUTH_PRESENT,
+      allowRootSkipPermissions: true,
+    });
+    expect(env.IS_SANDBOX).toBe("0");
+    expect(rootSkipPermissionsNotice(env)).toContain("preserving user IS_SANDBOX=0");
+    expect(rootSkipPermissionsNotice(env)).toContain("root guard remains in control");
+  });
+
+  test("the unsafe root bypass notice discloses that no OS sandbox was created", () => {
+    const notice = rootSkipPermissionsNotice({ IS_SANDBOX: "1" });
+    expect(notice).toContain("set IS_SANDBOX=1");
+    expect(notice).toContain("did not create an OS sandbox");
+  });
+
   test("injects base URL, discovery flag and model slots — NO auth token by default (subscription mode)", () => {
     const env = buildClaudeEnv(cfg({
       claudeCode: { model: "claude-ocx-gemini--gemini-3-pro", smallFastModel: "gemini/gemini-3-flash" },
@@ -48,8 +135,32 @@ describe("ocx claude env assembly", () => {
   test("configured API key becomes the auth token (admission required)", () => {
     const env = buildClaudeEnv(cfg({
       apiKeys: [{ id: "1", name: "main", key: "sk-ocx-123", createdAt: "2026-01-01" }],
+      claudeCode: { authMode: "proxy" },
     }), 10100, {});
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe("sk-ocx-123");
+  });
+
+  test("subscription mode keeps configured proxy keys out of Claude auth", () => {
+    const env = buildClaudeEnv(cfg({
+      apiKeys: [{ id: "1", name: "main", key: "sk-ocx-123", createdAt: "2026-01-01" }],
+      claudeCode: { authMode: "subscription" },
+    }), 10100, {}, {}, AUTH_PRESENT);
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBeUndefined();
+  });
+
+  test("subscription mode removes an inherited proxy admission token", () => {
+    const env = buildClaudeEnv(cfg({
+      apiKeys: [{ id: "1", name: "main", key: "ocx_data_this_proxy_key", createdAt: "2026-01-01" }],
+      claudeCode: { authMode: "subscription" },
+    }), 10100, {
+      ANTHROPIC_AUTH_TOKEN: "ocx_data_this_proxy_key",
+    }, {}, {
+      ...AUTH_PRESENT,
+      preBunAnthropicSlots: ["ANTHROPIC_AUTH_TOKEN"],
+    });
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBeUndefined();
   });
 
   // Host-managed routing guard (devlog 260720_claude_authmode_persist/020):
@@ -66,6 +177,7 @@ describe("ocx claude env assembly", () => {
 
     const admission = buildClaudeEnv(cfg({
       apiKeys: [{ id: "1", name: "main", key: "sk-ocx-123", createdAt: "2026-01-01" }],
+      claudeCode: { authMode: "proxy" },
     }), 10100, {});
     expect(admission.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe("1");
   });
@@ -235,6 +347,51 @@ describe("ocx claude env assembly", () => {
     expect(env.PATH).toBe("/usr/bin");
     expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
     expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBeUndefined();
+  });
+
+  // A stale loopback ANTHROPIC_BASE_URL is rewritten to this launch's port. The credentials
+  // in that environment were minted by the proxy we just stopped pointing at, so keeping
+  // them makes Claude Code launch as a host-managed provider instead of using its own
+  // subscription OAuth.
+  test("replacing a stale loopback base URL drops the admission credential paired with it", () => {
+    // This proxy requires no admission key, so the launch must stay in subscription mode.
+    // The inherited token was minted by the proxy on :19999 that we just stopped targeting.
+    const env = buildClaudeEnv(cfg(), 10100, {
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:19999",
+      ANTHROPIC_AUTH_TOKEN: "ocx_data_other_proxy_key",
+    }, {}, { ...AUTH_PRESENT, preBunAnthropicSlots: ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"] });
+    expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:10100");
+    // A surviving token makes Claude Code authenticate as a host-managed provider and
+    // overrides the caller's own claude.ai OAuth.
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  test("a stale admission token is replaced by THIS proxy's key, never carried over", () => {
+    const env = buildClaudeEnv(
+      cfg({
+        claudeCode: { authMode: "proxy" },
+        apiKeys: [{ id: "k1", name: "local", key: "ocx_data_this_proxy_key", createdAt: "2026-01-01T00:00:00Z" }],
+      }),
+      10100,
+      {
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:19999",
+        ANTHROPIC_AUTH_TOKEN: "ocx_data_other_proxy_key",
+      },
+      {},
+      { ...AUTH_PRESENT, preBunAnthropicSlots: ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"] },
+    );
+    expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:10100");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("ocx_data_this_proxy_key");
+  });
+
+  test("a user sk-ant- credential survives the stale base-URL rewrite (native passthrough auth)", () => {
+    const env = buildClaudeEnv(cfg(), 10100, {
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:19999",
+      ANTHROPIC_API_KEY: "sk-ant-user-owned-key",
+    }, {}, { ...AUTH_PRESENT, preBunAnthropicSlots: ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"] });
+    expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:10100");
+    expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-user-owned-key");
   });
 
 });

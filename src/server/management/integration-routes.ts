@@ -21,12 +21,19 @@ import { createIntegrationStateStore, type IntegrationStateStore } from "../../i
 import {
   applyIntegrationCoordinated,
   disableIntegrationCoordinated,
+  overwriteIntegrationCoordinated,
   restoreIntegrationCoordinated,
   type IntegrationRestoreInput,
   type IntegrationWriteInput,
   type WriteRefused,
 } from "../../integrations/writer";
 import { IntegrationWriterLockBusyError, type IntegrationWriterLockSeams } from "../../integrations/writer-lock";
+import {
+  INTEGRATION_MUTATION_TERMINAL_MS,
+  IntegrationMutationBusyError,
+  runIntegrationMutationFlight,
+  setIntegrationMutationFlightTestHook,
+} from "../../integrations/mutation-flight";
 import { jsonResponse } from "../auth-cors";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 import type { ManagementContext } from "./context";
@@ -34,8 +41,7 @@ import { loadExportModels } from "./model-rows";
 
 
 const INTEGRATION_ROUTE_PREFIX = "/api/client-integrations/";
-const INTEGRATION_MUTATION_JOIN_MS = 120_000;
-export const INTEGRATION_MUTATION_TERMINAL_MS = 10 * 60_000;
+export { INTEGRATION_MUTATION_TERMINAL_MS };
 
 type IntegrationStateRecord = Awaited<ReturnType<typeof readIntegrationState>>;
 type ApplyResult = Awaited<ReturnType<typeof applyIntegrationCoordinated>>;
@@ -65,7 +71,7 @@ export interface IntegrationJournalEnvelope {
 export interface IntegrationJournalRow {
   opId: string;
   clientId: IntegrationClientId;
-  kind: "apply" | "disable" | "refresh" | "restore";
+  kind: "apply" | "disable" | "refresh" | "restore" | "overwrite";
   at: string;
   configPath: string;
   snapshot: "none" | "stored" | "expired";
@@ -74,6 +80,14 @@ export interface IntegrationJournalRow {
 
 export interface IntegrationToggleBody {
   enabled: boolean;
+  /**
+   * Opt in to replacing a conflicted block with the one opencodex would write.
+   *
+   * Absent and `false` behave identically and are the only states a caller
+   * reaches by accident, which is the point: the conflict refusal protects work
+   * we did not author, so it can only be waived by asking for it by name.
+   */
+  overwriteConflict?: boolean;
 }
 
 export interface IntegrationRestoreBody {
@@ -81,19 +95,6 @@ export interface IntegrationRestoreBody {
   confirmDrift?: boolean;
 }
 
-interface IntegrationMutationFlight {
-  key: string;
-  startedAt: number;
-  promise: Promise<unknown>;
-}
-
-class IntegrationMutationBusyError extends Error {
-  constructor(readonly clientId: IntegrationClientId) {
-    super("integration_mutation_busy");
-  }
-}
-
-const integrationMutationFlights = new Map<IntegrationClientId, IntegrationMutationFlight>();
 let integrationMutationTestHooks: {
   io?: IntegrationIO;
   lockSeams?: IntegrationWriterLockSeams;
@@ -145,45 +146,6 @@ function decodeClientPath(pathname: string): string | null {
   }
 }
 
-function runIntegrationMutationFlight<T>(
-  clientId: IntegrationClientId,
-  key: string,
-  now: () => number,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const startedAt = now();
-  const current = integrationMutationFlights.get(clientId);
-  if (current) {
-    const age = startedAt - current.startedAt;
-    if (current.key === key && age < INTEGRATION_MUTATION_JOIN_MS) {
-      return current.promise as Promise<T>;
-    }
-    if (age <= INTEGRATION_MUTATION_TERMINAL_MS) {
-      return Promise.reject(new IntegrationMutationBusyError(clientId));
-    }
-    if (integrationMutationFlights.get(clientId) === current) {
-      integrationMutationFlights.delete(clientId);
-    }
-  }
-
-  const flight: IntegrationMutationFlight = {
-    key,
-    startedAt,
-    promise: Promise.resolve(),
-  };
-  const run = async (): Promise<unknown> => operation();
-  flight.promise = (integrationMutationTestHooks?.run
-    ? integrationMutationTestHooks.run(run)
-    : run()
-  ).finally(() => {
-    if (integrationMutationFlights.get(clientId) === flight) {
-      integrationMutationFlights.delete(clientId);
-    }
-  });
-  integrationMutationFlights.set(clientId, flight);
-  return flight.promise as Promise<T>;
-}
-
 export function setIntegrationMutationFlightTestHooks(
   hooks: {
     io?: IntegrationIO;
@@ -194,7 +156,7 @@ export function setIntegrationMutationFlightTestHooks(
   } | null,
 ): void {
   integrationMutationTestHooks = hooks;
-  integrationMutationFlights.clear();
+  setIntegrationMutationFlightTestHook(hooks?.run ?? null);
   // Path overrides are part of the same isolation contract: clearing flights
   // while leaving a temp home bound would let the next suite write real files.
   if (hooks === null) integrationPathTestHooks = null;
@@ -519,16 +481,38 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
       code: "invalid_enabled",
     }, 400, req, ctx.config);
   }
+  if (parsed.overwriteConflict !== undefined && typeof parsed.overwriteConflict !== "boolean") {
+    return jsonResponse({
+      error: "overwriteConflict must be a boolean",
+      code: "invalid_overwrite_conflict",
+    }, 400, req, ctx.config);
+  }
+  /*
+   * Rejected rather than ignored. Disabling a block we do not own is precisely
+   * the deletion this subsystem exists to prevent, so a caller sending this
+   * combination has misunderstood the field, and silently dropping it would
+   * answer 200 for a request whose intent we refused.
+   */
+  if (parsed.overwriteConflict === true && parsed.enabled === false) {
+    return jsonResponse({
+      error: "overwriteConflict applies only to enabling an integration",
+      code: "invalid_overwrite_conflict",
+    }, 400, req, ctx.config);
+  }
 
   try {
     const input = await buildIntegrationWriteInput(requestedClient, ctx, integrationStore());
     const result = await runIntegrationMutationFlight(
       requestedClient,
-      parsed.enabled ? "apply" : "disable",
+      parsed.enabled ? (parsed.overwriteConflict === true ? "overwrite" : "apply") : "disable",
       input.io?.now ?? Date.now,
-      () => parsed.enabled
-        ? applyIntegrationCoordinated(input, { lockSeams: integrationMutationTestHooks?.lockSeams })
-        : disableIntegrationCoordinated(input, { lockSeams: integrationMutationTestHooks?.lockSeams }),
+      () => {
+        const options = { lockSeams: integrationMutationTestHooks?.lockSeams };
+        if (!parsed.enabled) return disableIntegrationCoordinated(input, options);
+        return parsed.overwriteConflict === true
+          ? overwriteIntegrationCoordinated(input, options)
+          : applyIntegrationCoordinated(input, options);
+      },
     );
     if (!result.ok) return writerFailureResponse(requestedClient, result, ctx);
     return jsonResponse(result satisfies IntegrationToggleEnvelope, 200, req, ctx.config);

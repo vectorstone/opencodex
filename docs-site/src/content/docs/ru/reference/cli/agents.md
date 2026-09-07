@@ -71,7 +71,7 @@ ocx route combo set reliable --targets ark/model-a:2,openai/gpt-5.5
 | Алиас | Эквивалентный ресурс |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
@@ -139,9 +139,9 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 ### `ocx opencode [opencode args...]`
 
-Убедиться, что прокси запущен, и затем запустить opencode со сгенерированным блоком
-`provider.opencodex` в inline runtime layer OpenCode (`OPENCODE_CONFIG_CONTENT`). Существующая
-inline-конфигурация сохраняется, а только `provider.opencodex` заменяется для этого запуска.
+Убедиться, что прокси запущен, и затем запустить opencode со сгенерированными блоками
+`provider.opencodex` и `providers.opencodex` в inline runtime layer OpenCode (`OPENCODE_CONFIG_CONTENT`). Существующая
+inline-конфигурация сохраняется, а для этого запуска заменяются только эти два ключа.
 Глобальные или проектные `opencode.json` могут читаться, чтобы выдать warning о существующем
 override, но файлы на диске никогда не меняются. Маршрутизируемые модели появляются как
 `opencodex/<provider>/<model>`. Последующий запуск обычного `opencode` работает ровно как раньше.
@@ -152,7 +152,7 @@ override, но файлы на диске никогда не меняются. 
 
 ## Экспорт client config
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime>`
 
 Печатает client config, направленный на работающий прокси. Команда сериализует блок
 провайдера `opencodex` в нативном формате выбранного клиента: base URL, список моделей и,
@@ -163,7 +163,7 @@ override, но файлы на диске никогда не меняются. 
 
 | Флаг | Действие |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | Обязателен. Выбирает формат конфигурации клиента. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime>` | Обязателен. Выбирает формат конфигурации клиента. |
 | `--json` | Печатать только JSON-конфиг в stdout, чтобы redirect сохранял побайтно точный вывод. Вся диагностика, включая заметку о записи через `--out`, идёт в stderr. |
 | `--out <path>` | Записать конфиг в `<path>`. Перезаписывать существующий файл не позволит. |
 | `--force` | Разрешить `--out` заменить существующий файл. |
@@ -183,13 +183,16 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 | Клиент | Канонический путь | Имя скачиваемого файла | Переменная окружения |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json` (`XDG_CONFIG_HOME` имеет приоритет, если задан) | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | нет — блок несёт литерал `opencodex-loopback` |
+| `pi` | `~/.pi/agent/models.json` (`PI_CODING_AGENT_DIR` имеет приоритет, если задана; относительное значение отклоняется) | `pi-models.json` | нет — блок несёт литерал `opencodex-loopback` |
 | `omp` | `~/.omp/agent/models.yml` (по умолчанию; `OMP_PROFILE` имеет приоритет над `PI_PROFILE`, даже если пуст) | `omp-models.yaml` | нет — литерал `opencodex-loopback` |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | нет — loopback placeholder |
 | `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
 | `dsh` | `$DSH_HOME/settings.yaml` (по умолчанию `~/.dsh/settings.yaml`) | `settings.yaml` | нет — несекретная loopback bearer-заглушка |
+| `mcode` | `~/.minimax/config.yaml` (`MINIMAX_DATA_DIR`, затем устаревшая `MAVIS_DATA_DIR`, имеют приоритет, если заданы; относительное значение отклоняется) | `mcode-config.yaml` | нет — loopback placeholder |
+| `zcode` | `~/.zcode/v2/config.json` (`ZCODE_DATA_DIR` имеет приоритет, если задана; относительное значение отклоняется) | `config.json` | нет — loopback placeholder |
+| `prime` | `~/.prime/agent/models.json` (`PRIME_AGENT_CODING_AGENT_DIR` имеет приоритет, если задана; относительное значение отклоняется) | `prime-models.json` | нет — loopback placeholder |
 
 opencode интерполирует `{env:OPENCODEX_OPENCODE_API_KEY}`. Сгенерированный opencodex экспорт для
 Pi не требует переменной окружения и несёт литеральную заглушку `opencodex-loopback`. Это значение
@@ -204,14 +207,13 @@ Pi не требует переменной окружения и несёт л�
 MCP-записи.
 :::
 
-Никакой ключ никогда не сериализуется. Конфиги opencode, Hermes, OpenClaw и Gajae несут только
-env-reference, так что секрет остаётся в вашем окружении, а конфиги Pi, OMP, Kimi и DSH несут
-loopback-заглушку вместо учётных данных. Loopback-прокси (`127.0.0.1`, по умолчанию) вообще не
+Никакой ключ никогда не сериализуется. Сгенерированные конфиги несут либо документированную
+env-reference, либо несекретную loopback-заглушку. Loopback-прокси (`127.0.0.1`, по умолчанию) вообще не
 требует admission key. Если прокси слушает не на loopback, задайте соответствующую переменную
 `OPENCODEX_OPENCODE_API_KEY`, `OPENCODEX_HERMES_API_KEY` или `OPENCODEX_OPENCLAW_API_KEY`.
 `OPENCODEX_GAJAE_API_KEY` передаёт provider credential Gajae через окружение, но не позволяет
-отправить remote admission header, поэтому сгенерированная интеграция Gajae, как и Pi, OMP, Kimi и
-DSH, работает только через loopback. Как выдаются admission key, описано в
+отправить remote admission header, поэтому сгенерированная интеграция Gajae
+работает только через loopback. Как выдаются admission key, описано в
 [Удалённом доступе](/reference/configuration/#remote-access). Ключи upstream-провайдеров — это совсем
 отдельная история и настраиваются в [Провайдерах](/guides/providers/).
 
@@ -220,13 +222,21 @@ DSH, работает только через loopback. Как выдаются 
 
 ## Runtime и configuration
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 Управляйте headless runtime-setting'ами, startup, sync, diagnostics и update.
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update` обновляет сам OpenCodex. Для Codex CLI используйте отдельную read-only команду:
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` не обращается к реестру пакетов и в строго ограниченном объёме проверяет данные о происхождении настроенного кандидата, включая замаскированный путь к исполняемому файлу и подтверждения его принадлежности. Доверенный контекст опубликованного средства запуска подтверждает только подлинность снимка данных о кандидате, но не факт успешного запуска Codex. Поскольку команда выполняет только такую проверку и никогда не запускает Codex, кандидаты из окружения и сохранённых данных отображаются только в отчёте (`managed: false`, обычно `selection_unattested`). В выводе JSON присутствуют `candidateAvailable`, `candidateVersion`, `candidateSource` и `selectionAttested`, причём значение `selectionAttested` всегда равно `false`. Для проверки настроенного кандидата нужен доверенный контекст опубликованного средства запуска. При прямом запуске через Bun или из исходного кода такого подтверждения нет; в этом случае команда игнорирует кандидатов из окружения и сохранённых данных и может вернуть `candidate_unavailable`. В Windows этот первый этап вообще не выполняет файловый ввод-вывод по путям кандидата или конфигурации. Только абсолютный кандидат из окружения, зафиксированный доверенным средством запуска, может получить лексическую метку комплекта приложения или менеджера версий; все остальные кандидаты Windows отклоняются по принципу fail-closed. Команда не запускает Codex или менеджер пакетов, не восстанавливает shim, ничего не записывает в конфигурацию или кеш, не останавливает процессы и ничего не устанавливает. Кандидаты, входящие в комплект приложения, найденные в распознанных путях менеджеров версий, являющиеся непроверенными автономными установками или имеющие неоднозначное состояние shim, отображаются как `unmanaged` или `unknown` и никогда не классифицируются как `managed`.
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

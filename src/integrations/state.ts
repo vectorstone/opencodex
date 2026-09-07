@@ -12,8 +12,19 @@ import { ClientPathError, EXPORT_CLIENTS, opencodeProxyBaseUrl, type ExportModel
 import type { OcxConfig } from "../types";
 import { PARSE_FAILED, loadTarget, parseConfig, type IntegrationIO } from "./config-io";
 import { SNAPSHOT_RETENTION } from "./journal";
-import { canonicalContribution, fingerprint, type OwnershipRecord } from "./ownership";
-import { INTEGRATION_CLIENTS, type IntegrationClientId } from "./registry";
+import { canonicalContribution, fingerprint, semanticContribution, type OwnershipRecord } from "./ownership";
+import {
+  protectedContributionFingerprint,
+  refreshablePathsOf,
+  semanticProtectedContributionFingerprint,
+  validRefreshablePaths,
+} from "./ownership-policy";
+import {
+  INTEGRATION_CLIENTS,
+  resolveIntegrationPaths,
+  unresolvedPathHintFor,
+  type IntegrationClientId,
+} from "./registry";
 import { createIntegrationStateStore, type IntegrationStateStore } from "./store";
 
 export type IntegrationState = "absent" | "current" | "stale" | "conflict" | "unsafe";
@@ -106,10 +117,10 @@ export function blockedContainerPath(
  * values lets another integration or a user add a sibling without blocking a
  * later refresh, while a change inside our block still fails closed.
  */
-function recordedFragmentFingerprint(
+function recordedContribution(
   doc: unknown,
   record: OwnershipRecord,
-): string | null {
+): ManagedContribution | null {
   if (
     !Array.isArray(record.fragmentPaths)
     || record.fragmentPaths.length === 0
@@ -125,10 +136,72 @@ function recordedFragmentFingerprint(
     if (value === undefined) return null;
     fragments.push({ path, value });
   }
-  return fingerprint(canonicalContribution({
+  return {
     clientId: record.clientId,
     fragments,
-  }));
+  };
+}
+
+/**
+ * Prove that every protected field still matches what OpenCodex wrote.
+ *
+ * New records carry an operation-scoped protected fingerprint and the exact
+ * paths excluded from it. Legacy records can recover only when the desired
+ * contribution has not moved since apply; otherwise catalog drift and a
+ * foreign edit are indistinguishable, so the classifier keeps failing closed.
+ */
+function recordedBlockIsOwned(
+  doc: unknown,
+  record: OwnershipRecord,
+  desired: ManagedContribution,
+): boolean {
+  const observed = recordedContribution(doc, record);
+  if (!observed) return false;
+  if (fingerprint(canonicalContribution(observed)) === record.blockFingerprint) return true;
+
+  const observedSemanticFingerprint = fingerprint(semanticContribution(observed));
+  if (
+    typeof record.semanticBlockFingerprint === "string"
+    && observedSemanticFingerprint === record.semanticBlockFingerprint
+  ) return true;
+
+  const desiredFingerprint = fingerprint(canonicalContribution(desired));
+  if (
+    desiredFingerprint === record.blockFingerprint
+    && observedSemanticFingerprint === fingerprint(semanticContribution(desired))
+  ) return true;
+
+  if (
+    typeof record.protectedBlockFingerprint === "string"
+    && validRefreshablePaths(observed, record.refreshablePaths)
+    && record.refreshablePaths.length > 0
+  ) {
+    const observedProtectedFingerprint = protectedContributionFingerprint(
+      observed,
+      record.refreshablePaths,
+    );
+    if (observedProtectedFingerprint === record.protectedBlockFingerprint) return true;
+
+    const observedSemanticProtectedFingerprint = semanticProtectedContributionFingerprint(
+      observed,
+      record.refreshablePaths,
+    );
+    if (
+      typeof record.semanticProtectedBlockFingerprint === "string"
+      && observedSemanticProtectedFingerprint === record.semanticProtectedBlockFingerprint
+    ) return true;
+
+    return protectedContributionFingerprint(desired, record.refreshablePaths)
+        === record.protectedBlockFingerprint
+      && observedSemanticProtectedFingerprint
+        === semanticProtectedContributionFingerprint(desired, record.refreshablePaths);
+  }
+
+  if (desiredFingerprint !== record.blockFingerprint) return false;
+  const legacyPaths = refreshablePathsOf(desired);
+  return legacyPaths.length > 0
+    && semanticProtectedContributionFingerprint(observed, legacyPaths)
+      === semanticProtectedContributionFingerprint(desired, legacyPaths);
 }
 
 /**
@@ -170,6 +243,42 @@ export function classifyIntegration(input: {
     return { state: "unsafe", reason: "blocked-container" };
   }
   if (!hasOurFragments(input.parsed, input.contribution)) return { state: "absent" };
+
+  /*
+   * Fragments the desired contribution carries beyond the paths this record names. Both
+   * states appear whenever a client gains a second owned block:
+   *
+   *   - occupied by a value we did not write -> refuse. A refresh merges the WHOLE
+   *     contribution, so without this check applying would replace a block the user wrote
+   *     themselves and report success.
+   *   - empty -> our own block is missing, because the record predates it. Report drift so
+   *     a refresh adds it. Without this the file reads `current` forever and the second
+   *     block never arrives, which is exactly what an older installation hits on upgrade.
+   *
+   * A byte-identical value is ours in substance: adopt it instead of dead-ending a
+   * hand-merged config on a conflict the user can only resolve by deleting our own block.
+   */
+  const recordedPaths = new Set((input.record?.fragmentPaths ?? []).map(path => path.join("\u0000")));
+  let addedPathMissing = false;
+  for (const fragment of input.contribution.fragments) {
+    if (recordedPaths.has(fragment.path.join("\u0000"))) continue;
+    const observed = readPath(input.parsed, fragment.path);
+    if (observed === undefined) {
+      addedPathMissing = true;
+      continue;
+    }
+    const one = (value: unknown): string => fingerprint(canonicalContribution({
+      clientId: (input.clientId ?? input.record?.clientId) as IntegrationClientId,
+      fragments: [{ path: fragment.path, value }],
+    }));
+    if (one(observed) !== one(fragment.value)) return { state: "conflict", reason: "unowned-key" };
+  }
+  /*
+   * No record: whatever occupies our paths is not ours to touch. A byte-identical value
+   * would be ours in substance, but `stale` without a record is not actionable — the writer
+   * reads `createdContainers` off the record to decide what it may prune, so adopting a
+   * hand-merged block needs an apply path that creates one first. Refuse, exactly as before.
+   */
   if (!input.record) return { state: "conflict", reason: "unowned-key" };
   /*
    * A record proves ownership of ONE file. Change HOME, XDG_CONFIG_HOME,
@@ -191,7 +300,7 @@ export function classifyIntegration(input: {
    * conflict no matter what the rest of the file looks like, so the sibling-
    * edit exemption below can never mask it.
    */
-  if (recordedFragmentFingerprint(input.parsed, input.record) !== input.record.blockFingerprint) {
+  if (!recordedBlockIsOwned(input.parsed, input.record, input.contribution)) {
     return { state: "conflict", reason: "foreign-edit" };
   }
   if (!INTEGRATION_CLIENTS[clientId].sourcePreservingYaml
@@ -218,7 +327,17 @@ export function classifyIntegration(input: {
     }
     return { state: "stale" };
   }
-  return input.record.blockFingerprint === fingerprint(canonicalContribution(input.contribution))
+  /*
+   * Checked after everything else that could refuse: an owned fragment that no longer
+   * matches, or a sibling edit in a format that cannot be rewritten safely, still wins.
+   * What is left is a block we own on paper and are merely missing on disk.
+   */
+  if (addedPathMissing) return { state: "stale" };
+  const desiredFingerprint = typeof input.record.semanticBlockFingerprint === "string"
+    ? fingerprint(semanticContribution(input.contribution))
+    : fingerprint(canonicalContribution(input.contribution));
+  const recordedFingerprint = input.record.semanticBlockFingerprint ?? input.record.blockFingerprint;
+  return recordedFingerprint === desiredFingerprint
     ? { state: "current" }
     : { state: "stale" };
 }
@@ -250,7 +369,7 @@ export function exportContextOf(input: {
      * loopback, and every client we write into deserves the same answer the
      * export command already gives.
      */
-    baseUrl: opencodeProxyBaseUrl(input.port, input.config.hostname),
+    baseUrl: opencodeProxyBaseUrl(input.port, input.config.hostname, input.config),
     models: input.models,
     config: input.config,
   };
@@ -310,15 +429,30 @@ export function readIntegrationState(input: IntegrationStateInput): IntegrationS
   let configPath: string;
   let installed: boolean;
   try {
-    configPath = spec.configPath(input.env, input.home);
-    installed = io.statKind(spec.detectDir(input.env, input.home)) === "dir";
+    // One resolution for both, so a client whose paths come from mutable state
+    // cannot report one account's install beside another account's config path.
+    const paths = resolveIntegrationPaths(input.clientId, input.env, input.home);
+    configPath = paths.configPath;
+    installed = io.statKind(paths.detectDir) === "dir";
   } catch (error) {
     if (!(error instanceof ClientPathError)) throw error;
+    /*
+     * Two different situations reach here and they are not the same answer.
+     *
+     * A relative `OPENCLAW_CONFIG_PATH` is a misconfiguration: there is nothing
+     * to name, and "cannot verify" is correct. Aside's absent account manifest
+     * is the ORDINARY state of an Aside that has been installed and never
+     * signed into, and answering that with a red danger badge and an empty path
+     * told the user their config was suspect when in fact there is no account
+     * yet. A client that can name where its config would go gets `installed:
+     * false` and that location, which reads as "not installed" in the UI.
+     */
+    const hint = unresolvedPathHintFor(input.clientId, input.env, input.home);
     return {
       clientId: input.clientId,
-      state: "unsafe",
+      state: hint ? "absent" : "unsafe",
       installed: false,
-      configPath: "",
+      configPath: hint,
       reason: "unresolvable-path",
       ...retention,
     };

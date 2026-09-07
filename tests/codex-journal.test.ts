@@ -1,4 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach, setDefaultTimeout } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -9,6 +10,7 @@ import {
   MANAGED_SUBAGENT_DEFAULT_MARKER,
 } from "../src/codex/subagent-defaults";
 import { SPAWN_BUDGET_MS } from "./helpers/test-budget";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 
@@ -33,7 +35,7 @@ describe("codex-journal", () => {
   });
 
   afterEach(() => {
-    rmSync(testDir, { recursive: true, force: true });
+    removeTreeWithRetry(testDir);
   });
 
   test("writeJournal creates journal file", () => {
@@ -123,6 +125,39 @@ describe("codex-journal", () => {
     expect(JSON.parse(r.stdout).restored).toBe(false);
     expect(readFileSync(join(testDir, "config.toml"), "utf8")).toBe(modified);
     expect(existsSync(journalPath)).toBe(true);
+  });
+
+  test("client-owned journal survives only the matching committed api key id", () => {
+    const journalPath = join(testDir, "opencodex-journal.json");
+    const original = "# original client baseline\n";
+    const injected = "# connected routing\n";
+    writeFileSync(join(testDir, "config.toml"), injected, "utf8");
+    writeFileSync(journalPath, JSON.stringify({
+      version: 1,
+      originalConfig: Buffer.from(original).toString("base64"),
+      originalProfile: null,
+      owner: { kind: "client", apiKeyId: "client-key-1" },
+      pid: 999999,
+      timestamp: new Date().toISOString(),
+    }), "utf8");
+
+    const preserved = runScript(testDir, `
+      const { reconcileJournal } = require("./src/codex/journal");
+      console.log(JSON.stringify({ restored: reconcileJournal({ activeClientApiKeyId: "client-key-1" }) }));
+    `);
+    expect(preserved.status).toBe(0);
+    expect(JSON.parse(preserved.stdout).restored).toBe(false);
+    expect(readFileSync(join(testDir, "config.toml"), "utf8")).toBe(injected);
+    expect(existsSync(journalPath)).toBe(true);
+
+    const restored = runScript(testDir, `
+      const { reconcileJournal } = require("./src/codex/journal");
+      console.log(JSON.stringify({ restored: reconcileJournal({ activeClientApiKeyId: "different-key" }) }));
+    `);
+    expect(restored.status).toBe(0);
+    expect(JSON.parse(restored.stdout).restored).toBe(true);
+    expect(readFileSync(join(testDir, "config.toml"), "utf8")).toBe(original);
+    expect(existsSync(journalPath)).toBe(false);
   });
 
   test("removeJournal cleans up", () => {
@@ -553,7 +588,10 @@ describe("codex-journal", () => {
 
     const r = runScript(testDir, `
       const { markJournalInjectedState } = require("./src/codex/journal");
-      markJournalInjectedState("# injected\\n", null);
+      markJournalInjectedState("# injected\\n", null, {
+        injectedOpenaiBaseUrl: null,
+        injectedCatalogPath: null,
+      });
       console.log(String(process.pid));
     `);
     expect(r.status).toBe(0);
@@ -562,6 +600,38 @@ describe("codex-journal", () => {
     const second = JSON.parse(readFileSync(journalPath, "utf8"));
     expect(second.pid).toBe(first.pid);              // still the first process's record
     expect(typeof second.injectedConfigHash).toBe("string"); // marked by the second
+  });
+
+  test("reinjection keeps the first config hash while refreshing owned route and catalog", () => {
+    const r = runScript(testDir, `
+      const fs = require("fs");
+      const path = require("path");
+      const { writeJournal, markJournalInjectedState } = require("./src/codex/journal");
+      const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+      writeJournal();
+      markJournalInjectedState("# first injection\\n", null, {
+        injectedOpenaiBaseUrl: "http://127.0.0.1:10100/v1",
+        injectedCatalogPath: "first-catalog.json",
+      });
+      const first = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+      markJournalInjectedState("# second injection\\n", "# second profile\\n", {
+        injectedOpenaiBaseUrl: "http://127.0.0.1:10200/v1",
+        injectedCatalogPath: "second-catalog.json",
+      });
+      const second = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+      console.log(JSON.stringify({ firstHash: first.injectedConfigHash, secondHash: second.injectedConfigHash }));
+    `);
+    expect(r.status).toBe(0);
+    const hashes = JSON.parse(r.stdout) as { firstHash: string; secondHash: string };
+    expect(typeof hashes.firstHash).toBe("string");
+    expect(hashes.firstHash).toBe(createHash("sha256").update("# first injection\n").digest("hex"));
+    expect(hashes.secondHash).toBe(hashes.firstHash);
+
+    const journal = JSON.parse(readFileSync(join(testDir, "opencodex-journal.json"), "utf8"));
+    expect(Buffer.from(journal.originalConfig, "base64").toString("utf8")).toContain("# original config");
+    expect(journal.injectedOpenaiBaseUrl).toBe("http://127.0.0.1:10200/v1");
+    expect(journal.injectedCatalogPath).toBe("second-catalog.json");
+    expect(typeof journal.injectedProfileHash).toBe("string");
   });
 
   test("writeJournal() with no options still snapshots a native config", () => {
@@ -582,5 +652,29 @@ describe("codex-journal", () => {
     ].join("\n"), "utf8");
     runScript(testDir, `require("./src/codex/journal").writeJournal(); console.log("done");`);
     expect(existsSync(join(testDir, "opencodex-journal.json"))).toBe(false);
+  });
+
+  test("a restore that leaves the profile behind never reports complete (source-level)", () => {
+    // "There was no profile before, so delete the one we generated." When that unlink
+    // fails, reporting success also deletes the journal — the only record that the leftover
+    // profile is ours — and disconnect then tells the user native state was restored.
+    //
+    // Source-level because the failure is not reachable from a test process: making unlink
+    // fail requires denying writes on the Codex home, and that denies the atomic config
+    // write earlier in the same function, so the call throws before the branch runs.
+    // Asserting the shape is honest about what is being checked; asserting a fabricated
+    // runtime failure would not be.
+    const source = readFileSync(join(repoRoot, "src/codex/journal.ts"), "utf8");
+    const restore = source.slice(source.indexOf("export function restoreJournalState"));
+    const body = restore.slice(0, restore.indexOf("\nexport "));
+
+    // The unlink result must decide profileRestored. The pre-fix shape set it
+    // unconditionally after a swallowed try/catch.
+    expect(body).not.toMatch(/catch \{ \/\* ignore \*\/ \}\s*\n\s*\}\s*\n\s*profileRestored = true;/);
+    // ENOENT is the one benign unlink failure: the file is already gone, which is the
+    // outcome the removal wanted.
+    expect(body).toContain('=== "ENOENT"');
+    // And completeness still gates journal deletion.
+    expect(body).toContain("if (complete) removeJournal();");
   });
 });

@@ -1,13 +1,14 @@
 import { waitForNativeMainStartupGate } from "../src/codex/native-profile-startup";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { saveConfig } from "../src/config";
+import { loadConfig, saveConfig } from "../src/config";
 import { startServer } from "../src/server";
 import { ownedServiceHomeInspection } from "./helpers/owned-service-home-inspection";
 import type { OcxConfig, OcxProviderConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 import { chatCompletionsToResponsesBody, ChatCompletionsRequestError } from "../src/chat/inbound";
 import { chatCompletionsUsage } from "../src/chat/outbound";
 import { parseRequest } from "../src/responses/parser";
@@ -75,7 +76,7 @@ afterEach(() => {
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
   globalThis.fetch = originalFetch;
-  if (testDir) rmSync(testDir, { recursive: true, force: true });
+  if (testDir) removeTreeWithRetry(testDir);
 });
 
 function mockChatUpstream() {
@@ -1328,6 +1329,200 @@ test("chat-native redacts structured provider errors before returning them", asy
   } finally {
     await server.stop(true);
     upstream.stop(true);
+  }
+});
+
+test("chat-native preserves a structured cyber_policy type on JSON and SSE failures", async () => {
+  const secret = `blocked by upstream policy Authorization: ${["Bear", "er"].join("")} chatnativesecret123456`;
+  const safeMessage = "blocked by upstream policy Authorization: Bearer [REDACTED]";
+  const upstream = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const body = await req.json() as { stream?: boolean };
+      const error = {
+        message: secret,
+        type: "server_error",
+        code: "cyber_policy",
+        status: 502,
+      };
+      if (body.stream) {
+        return new Response(`data: ${JSON.stringify({ error })}\n\n`, {
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+      return Response.json(error, { status: 502, headers: { "retry-after": "120" } });
+    },
+  });
+  saveConfig(mockConfig(`${upstream.url.toString().replace(/\/$/, "")}/v1`));
+  const server = startServer(0);
+  try {
+    const request = (stream: boolean) => fetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/test-model", stream, messages: [{ role: "user", content: "hi" }] }),
+    });
+
+    const jsonResponse = await request(false);
+    expect(jsonResponse.status).toBe(400);
+    expect(jsonResponse.headers.get("retry-after")).toBeNull();
+    await expect(jsonResponse.json()).resolves.toMatchObject({
+      error: { type: "server_error", code: "cyber_policy", message: safeMessage },
+    });
+
+    const sseResponse = await request(true);
+    expect(sseResponse.status).toBe(200);
+    const sseText = await sseResponse.text();
+    expect(sseText).toContain('"type":"server_error"');
+    expect(sseText).toContain('"code":"cyber_policy"');
+    expect(sseText).toContain("Authorization: Bearer [REDACTED]");
+    expect(sseText).not.toContain("chatnativesecret123456");
+    expect(sseText).not.toContain("data: [DONE]");
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+  }
+});
+
+test("chat-native shares the transient send budget across same-target 429 recovery", async () => {
+  let upstreamSends = 0;
+  const upstream = Bun.serve({
+    port: 0,
+    fetch() {
+      upstreamSends += 1;
+      if (upstreamSends === 1) {
+        return Response.json({ error: { message: "rate limited", type: "rate_limit_error" } }, {
+          status: 429,
+          headers: { "retry-after": "0" },
+        });
+      }
+      return Response.json({ error: { message: "temporarily unavailable", type: "server_error" } }, {
+        status: 503,
+        headers: { "retry-after": "0" },
+      });
+    },
+  });
+  saveConfig(mockConfig(`${upstream.url.toString().replace(/\/$/, "")}/v1`, {
+    authMode: "key",
+    transientRetryOn5xx: { attempts: 3 },
+    retryOn429: { attempts: 1, intervalMs: 100, maxIntervalMs: 100, respectRetryAfter: false },
+  }));
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(response.status).toBe(503);
+    await response.text();
+    expect(upstreamSends).toBe(3);
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+  }
+});
+
+test("chat-native shares the transient send budget across key rotation", async () => {
+  const { clearKeyCooldowns } = await import("../src/providers/key-failover");
+  clearKeyCooldowns("mock");
+  const authorizations: Array<string | null> = [];
+  const upstream = Bun.serve({
+    port: 0,
+    fetch(req) {
+      authorizations.push(req.headers.get("authorization"));
+      if (authorizations.length === 1) {
+        return Response.json({ error: { message: "temporarily unavailable", type: "server_error" } }, {
+          status: 503,
+          headers: { "retry-after": "0" },
+        });
+      }
+      if (authorizations.length <= 3) {
+        return Response.json({ error: { message: "rate limited", type: "rate_limit_error" } }, {
+          status: 429,
+          headers: { "retry-after": "60" },
+        });
+      }
+      return Response.json({
+        id: "chatcmpl_budget_escape",
+        object: "chat.completion",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: "escaped budget" },
+          finish_reason: "stop",
+        }],
+      });
+    },
+  });
+  saveConfig(mockConfig(`${upstream.url.toString().replace(/\/$/, "")}/v1`, {
+    authMode: "key",
+    apiKey: "key-one",
+    apiKeyPool: [
+      { id: "one", key: "key-one" },
+      { id: "two", key: "key-two" },
+      { id: "three", key: "key-three" },
+    ],
+    transientRetryOn5xx: { attempts: 3 },
+  }));
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(response.status).toBe(429);
+    await response.text();
+    expect(authorizations).toEqual([
+      "Bearer key-one",
+      "Bearer key-one",
+      "Bearer key-two",
+    ]);
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+    clearKeyCooldowns("mock");
+  }
+});
+
+test("chat-native records terminal key cooldown after the send budget is exhausted", async () => {
+  const { clearKeyCooldowns, getKeyCooldownUntil } = await import("../src/providers/key-failover");
+  clearKeyCooldowns("mock");
+  let upstreamSends = 0;
+  const upstream = Bun.serve({
+    port: 0,
+    fetch() {
+      upstreamSends += 1;
+      return Response.json({ error: { message: "rate limited", type: "rate_limit_error" } }, {
+        status: 429,
+        headers: { "retry-after": "60" },
+      });
+    },
+  });
+  saveConfig(mockConfig(`${upstream.url.toString().replace(/\/$/, "")}/v1`, {
+    authMode: "key",
+    apiKey: "key-one",
+    apiKeyPool: [
+      { id: "one", key: "key-one" },
+      { id: "two", key: "key-two" },
+    ],
+    transientRetryOn5xx: { attempts: 1 },
+  }));
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(response.status).toBe(429);
+    await response.text();
+    expect(upstreamSends).toBe(1);
+    expect(getKeyCooldownUntil("mock", "one")).not.toBeNull();
+    expect(loadConfig().providers.mock?.apiKey).toBe("key-two");
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+    clearKeyCooldowns("mock");
   }
 });
 
@@ -2663,6 +2858,66 @@ test("inbound chat-completions honors the override when stripping sampling (#404
   }
 });
 
+test("/v1/chat/completions non-OK upstream preserves top-level structured cyber_policy type", async () => {
+  const secret = `blocked by upstream policy Authorization: ${["Bear", "er"].join("")} chathttpsecret123456`;
+  const safeMessage = "blocked by upstream policy Authorization: Bearer [REDACTED]";
+  const upstream = Bun.serve({
+    port: 0,
+    fetch() {
+      return Response.json({
+        message: secret,
+        type: "server_error",
+        code: "cyber_policy",
+      }, { status: 400, headers: { "retry-after": "120" } });
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const url = new URL(requestUrl);
+    if (url.hostname === "chatgpt.com" && url.pathname.startsWith("/backend-api/codex")) {
+      return originalFetch(new URL(`${url.pathname.slice("/backend-api/codex".length)}${url.search}`, upstream.url), init);
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  saveConfig({
+    port: 0,
+    defaultProvider: "openai",
+    providers: {
+      openai: {
+        adapter: "openai-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authMode: "forward",
+        codexAccountMode: "direct",
+      },
+    },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: ["Bear" + "er", "caller-direct-token"].join(" "),
+      },
+      body: JSON.stringify({
+        model: "gpt-test",
+        stream: false,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(response.headers.get("retry-after")).toBeNull();
+    await expect(response.json()).resolves.toMatchObject({
+      error: { type: "server_error", code: "cyber_policy", message: safeMessage },
+    });
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("/v1/chat/completions non-OK upstream preserves structured model_not_found", async () => {
   const upstream = Bun.serve({
     port: 0,
@@ -2781,6 +3036,70 @@ test("/v1/chat/completions status:failed replay normalizes translation_buffer_li
     expect(response.status).toBe(502);
     const json = await response.json() as { error?: { code?: string; type?: string } };
     expect(json.error).toMatchObject({ code: "translation_buffer_limit", type: "upstream_error" });
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("/v1/chat/completions status:failed replay preserves structured cyber_policy type", async () => {
+  const secret = `blocked by upstream policy Authorization: ${["Bear", "er"].join("")} chatreplaysecret123456`;
+  const safeMessage = "blocked by upstream policy Authorization: Bearer [REDACTED]";
+  const upstream = Bun.serve({
+    port: 0,
+    fetch() {
+      return Response.json({
+        id: "resp_policy",
+        object: "response",
+        status: "failed",
+        error: {
+          message: secret,
+          type: "server_error",
+          code: "cyber_policy",
+        },
+      });
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const url = new URL(requestUrl);
+    if (url.hostname === "chatgpt.com" && url.pathname.startsWith("/backend-api/codex")) {
+      return originalFetch(new URL(`${url.pathname.slice("/backend-api/codex".length)}${url.search}`, upstream.url), init);
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  saveConfig({
+    port: 0,
+    defaultProvider: "openai",
+    providers: {
+      openai: {
+        adapter: "openai-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authMode: "forward",
+        codexAccountMode: "direct",
+      },
+    },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: ["Bear" + "er", "caller-direct-token"].join(" "),
+      },
+      body: JSON.stringify({
+        model: "gpt-test",
+        stream: false,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { type: "server_error", code: "cyber_policy", message: safeMessage },
+    });
   } finally {
     await server.stop(true);
     upstream.stop(true);

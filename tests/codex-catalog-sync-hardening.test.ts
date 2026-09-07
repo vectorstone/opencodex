@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../src/codex/catalog/native-models";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 
@@ -103,11 +105,11 @@ describe("Codex catalog sync hardening", () => {
   });
 
   afterEach(() => {
-    if (existsSync(codexHome)) rmSync(codexHome, { recursive: true, force: true });
-    if (existsSync(opencodexHome)) rmSync(opencodexHome, { recursive: true, force: true });
+    if (existsSync(codexHome)) removeTreeWithRetry(codexHome);
+    if (existsSync(opencodexHome)) removeTreeWithRetry(opencodexHome);
   });
 
-  test("Gap B: drops legacy OpenAI-family natives but keeps supported + user natives", () => {
+  test("Gap B: drops legacy and unentitled account-gated natives but keeps supported + user natives", () => {
     const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(catalogPath, JSON.stringify({
@@ -137,9 +139,11 @@ describe("Codex catalog sync hardening", () => {
     expect(slugs).toContain("gpt-5.4");
     expect(slugs).toContain("gpt-5.4-mini");
     expect(slugs).toContain("gpt-5.3-codex-spark");
-    expect(slugs).toContain("gpt-5.6-sol");
-    expect(slugs).toContain("gpt-5.6-terra");
-    expect(slugs).toContain("gpt-5.6-luna");
+    // This isolated fixture has no authenticated ChatGPT roster, so account-gated
+    // native models must fail closed rather than remain selectable.
+    expect(slugs).not.toContain("gpt-5.6-sol");
+    expect(slugs).not.toContain("gpt-5.6-terra");
+    expect(slugs).not.toContain("gpt-5.6-luna");
     expect(slugs).toContain("user-native");           // genuine user native preserved
     expect(slugs).not.toContain("gpt-5.3-codex");      // legacy dropped
     expect(slugs).not.toContain("gpt-5.2");            // legacy dropped
@@ -152,8 +156,8 @@ describe("Codex catalog sync hardening", () => {
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         {
-          ...nativeEntry("gpt-5.6-sol", 0),
-          display_name: "Original Sol",
+          ...nativeEntry("gpt-5.5", 0),
+          display_name: "Original GPT-5.5",
           comp_hash: "native-sol-hash",
           base_instructions: "Native Sol instructions",
           model_messages: { instructions_template: "Native Sol instructions" },
@@ -177,17 +181,17 @@ describe("Codex catalog sync hardening", () => {
             adapter: "openai-chat",
             baseUrl: "https://api.example.test/v1",
             liveModels: false,
-            models: ["codex/gpt-5.6-sol"]
+            models: ["codex/gpt-5.5"]
           }
         },
         codexAccounts: [{ id: "stored-team-account", isMain: false }],
         codexAccountNamespaces: { team: "stored-team-account" },
         combos: {
           "nova-sol": {
-            alias: "gpt-5.6-sol",
+            alias: "gpt-5.5",
             nativeAlias: true,
-            displayName: "Nova Sol",
-            targets: [{ provider: "Nova1", model: "codex/gpt-5.6-sol" }]
+            displayName: "Nova GPT-5.5",
+            targets: [{ provider: "Nova1", model: "codex/gpt-5.5" }]
           }
         }
       };
@@ -204,13 +208,13 @@ describe("Codex catalog sync hardening", () => {
       tool_mode?: string | null;
       opencodex_catalog_kind?: string;
     }>;
-    expect(rows.filter(row => row.slug === "gpt-5.6-sol")).toEqual([
+    expect(rows.filter(row => row.slug === "gpt-5.5")).toEqual([
       expect.objectContaining({
-        display_name: "Nova Sol",
+        display_name: "Nova GPT-5.5",
         opencodex_catalog_kind: "combo-native-alias-v1",
       }),
     ]);
-    expect(rows.find(row => row.slug === "team/gpt-5.6-sol")).toMatchObject({
+    expect(rows.find(row => row.slug === "team/gpt-5.5")).toMatchObject({
       comp_hash: "native-sol-hash",
       base_instructions: "Native Sol instructions",
       model_messages: { instructions_template: "Native Sol instructions" },
@@ -379,7 +383,7 @@ describe("Codex catalog sync hardening", () => {
     expect(JSON.stringify(rows)).not.toContain("Private Display Name");
   });
 
-  test("account sync preserves an observed account-only native id without creating a bare row", () => {
+  test("account sync preserves an observed gated native only after the mapped account confirms it", () => {
     const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(catalogPath, JSON.stringify({
@@ -393,8 +397,22 @@ describe("Codex catalog sync hardening", () => {
         opencodex_account_observed_native: true,
       }],
     }, null, 2) + "\n");
+    writeFileSync(join(codexHome, "auth.json"), JSON.stringify({
+      tokens: { access_token: "main-token", account_id: "main-account" },
+    }), "utf8");
 
     const r = runScript(codexHome, opencodexHome, `
+      globalThis.fetch = async input => {
+        const url = new URL(typeof input === "string" ? input : input.url);
+        if (url.hostname === "chatgpt.com" && url.pathname.endsWith("/models")) {
+          return Response.json({ models: [{
+            slug: "gpt-daybreak-blue-latest",
+            supported_in_api: true,
+            visibility: "list"
+          }] });
+        }
+        throw new Error("unexpected fetch");
+      };
       const { syncCatalogModels } = require("./src/codex/catalog");
       syncCatalogModels({
         providers: {
@@ -419,8 +437,8 @@ describe("Codex catalog sync hardening", () => {
       use_responses_lite: true,
       supports_parallel_tool_calls: true,
     });
-    // Daybreak is globally allowlisted now (owner decision, devlog 260816_.../011),
-    // so the bare row IS expected — exactly once — alongside the account-qualified row.
+    // Main's authenticated roster grants Daybreak, so Pool publishes one bare row alongside
+    // the exact selector row. The observed cache row alone is not entitlement evidence.
     expect(rows.filter(row => row.slug === "gpt-daybreak-blue-latest")).toHaveLength(1);
   });
 
@@ -471,9 +489,9 @@ describe("Codex catalog sync hardening", () => {
       opencodex_catalog_kind: "custom-model-v1",
     });
     expect(daybreak?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
-    // The global native row exists (owner decision); the explicit Codex-forward custom row
-    // above is a separate identity and must not collapse into it.
-    expect(rows.filter(row => row.slug === "gpt-daybreak-blue-latest")).toHaveLength(1);
+    // The explicit custom row is independent of native account entitlement. With no confirmed
+    // account roster, the account-gated bare row stays absent instead of collapsing into it.
+    expect(rows.filter(row => row.slug === "gpt-daybreak-blue-latest")).toHaveLength(0);
     expect(rows.some(row => row.slug === "main/gpt-daybreak-blue-latest")).toBe(false);
     // The separately billed API-key alias must still never reach the Codex surface.
     expect(rows.some(row => row.slug === "openai-apikey/daybreak-blue-latest")).toBe(false);
@@ -640,7 +658,9 @@ describe("Codex catalog sync hardening", () => {
     expect(r.status).toBe(0);
     const result = JSON.parse(r.stdout) as { picker: string[]; native: string[]; fallback: string[] };
     expect(result.picker).toContain("gpt-5.3-codex-spark");
-    expect(result.native).toEqual(result.fallback);
+    expect(result.native).toEqual(
+      result.fallback.filter(slug => !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug)),
+    );
   });
 
   test("account sync recovers supported natives that were hidden before selectors existed", () => {

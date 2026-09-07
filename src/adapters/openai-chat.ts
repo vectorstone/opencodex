@@ -8,21 +8,32 @@ import { isDebugEnabled } from "../lib/debug-settings";
 import { isCyberPolicyCode } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
 import { contentPartsToText } from "./image";
+import { EMPTY_TOOL_OUTPUT_ANNOTATION, isWhitespaceOnlyTextPartArray } from "./empty-tool-output-annotation";
 import { identifyRoutedModel } from "./identity";
 import { peekReasoningForCall } from "../responses/reasoning-replay-cache";
 import { buildNonOpenAIToolCatalogNudgeForTools, shouldInjectNonOpenAIToolCatalogNudge } from "./tool-catalog-nudge";
 import { openRouterProviderPayload, resolveOpenRouterRouting } from "../providers/openrouter-routing";
+import { resolveVercelGatewayRouting, vercelGatewayProviderPayload } from "../providers/vercel-gateway-routing";
 import {
   canForwardForeignServiceTierForChatModel,
+  fastPolicyForModel,
   supportsServiceTierForModel,
 } from "../providers/service-tier";
 import {
   canonicalFastTierMarker,
   createAdapterTierMetadata,
+  decideTier,
   type AdapterTierMetadata,
+  type ResolvedFastPolicy,
 } from "../providers/fastwire";
 import { openaiChatCompletionsUrl } from "./openai-chat-url";
 import { stripResponsesOnlyEncryptedMarker } from "./responses-tool-schema";
+import { agentRouterDefaultHeaders, frameAgentRouterMessages } from "./agentrouter";
+import {
+  isXaiSchemaTarget,
+  lookupLocalJsonPointer,
+  normalizeXaiToolParameters,
+} from "./xai-tool-schema";
 import {
   isTranslatorBudgetExceededError,
   retainTranslatedEventBatch,
@@ -79,7 +90,10 @@ function openAIChatTransport(provider: OcxProviderConfig): {
   if ((provider.authMode === "key" || provider.authMode === "oauth") && !provider.keyOptional && !hasCredential) {
     throw new Error(`${provider.adapter} requires a non-empty credential (authMode: ${provider.authMode})`);
   }
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...agentRouterDefaultHeaders(provider.baseUrl, provider.headers),
+  };
   if (hasCredential) headers.Authorization = `Bearer ${provider.apiKey}`;
   if (provider.headers) Object.assign(headers, provider.headers);
   return { url: openaiChatCompletionsUrl(provider.baseUrl), headers, hasCredential };
@@ -96,12 +110,14 @@ export function buildOpenAIChatPassthroughRequest(
   rawBody: Record<string, unknown>,
   modelId: string,
   stream: boolean,
+  fastPolicy: ResolvedFastPolicy = fastPolicyForModel(provider, modelId, undefined, "chat"),
+  fastMode?: boolean,
 ): AdapterRequest {
   const { url, headers, hasCredential } = openAIChatTransport(provider);
 
   const body: Record<string, unknown> = {
     model: provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(modelId) : modelId,
-    messages: rawBody.messages,
+    messages: frameAgentRouterMessages(provider.baseUrl, rawBody.messages),
     stream,
   };
   for (const field of CHAT_PASSTHROUGH_FIELDS) {
@@ -110,6 +126,8 @@ export function buildOpenAIChatPassthroughRequest(
 
   const openRouterRouting = resolveOpenRouterRouting(provider, modelId);
   if (openRouterRouting) body.provider = openRouterProviderPayload(openRouterRouting);
+  const vercelRouting = resolveVercelGatewayRouting(provider, modelId);
+  if (vercelRouting) body.provider = vercelGatewayProviderPayload(vercelRouting);
 
   if (modelInList(provider.noTemperatureModels, modelId)) delete body.temperature;
   if (modelInList(provider.noTopPModels, modelId)) delete body.top_p;
@@ -123,7 +141,16 @@ export function buildOpenAIChatPassthroughRequest(
   // `<listed>:<tag>` siblings the operator never opted out, silently returning prose.
   if (provider.noStructuredOutputModels?.includes(modelId)) delete body.response_format;
 
-  if (provider.chatServiceTier && rawBody.service_tier !== undefined) {
+  // Run the same complete Fast policy as the translated Chat path, including explicit
+  // fastMode and foreign-tier handling. On inherited canonical Fast, the passthrough still
+  // retains the caller's exact spelling; forced Fast uses the policy-owned wire value.
+  const callerTier = typeof rawBody.service_tier === "string" ? rawBody.service_tier : undefined;
+  const tierDecision = decideTier(fastPolicy, fastMode, callerTier);
+  if (tierDecision.kind === "set") {
+    body.service_tier = fastMode === undefined && canonicalFastTierMarker(callerTier) !== undefined
+      ? callerTier
+      : tierDecision.value;
+  } else if (tierDecision.kind === "forward-caller" && rawBody.service_tier !== undefined) {
     body.service_tier = rawBody.service_tier;
   }
   if (provider.promptCacheKey && rawBody.prompt_cache_key !== undefined) {
@@ -296,6 +323,39 @@ function reasoningTextFrom(record: Record<string, unknown>): string | undefined 
       : undefined;
 }
 
+interface ReasoningDetailSegment {
+  key: string;
+  text: string;
+}
+
+/**
+ * Structured `reasoning_details` array (MiniMax M-series with `reasoning_split`).
+ * Each segment's key scopes cumulative-snapshot tracking: upstream repeats the
+ * full text-so-far under a stable `id`/`index` instead of sending increments.
+ */
+function reasoningDetailSegmentsFrom(record: Record<string, unknown>): ReasoningDetailSegment[] {
+  const raw = record.reasoning_details;
+  if (!Array.isArray(raw)) return [];
+  const segments: ReasoningDetailSegment[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const item: unknown = raw[i];
+    if (!isRecord(item)) continue;
+    if (typeof item.text !== "string" || item.text.length === 0) continue;
+    const key = typeof item.id === "string" && item.id.length > 0
+      ? `id:${item.id}`
+      : typeof item.index === "number"
+        ? `i:${item.index}`
+        : `n:${i}`;
+    segments.push({ key, text: item.text });
+  }
+  return segments;
+}
+
+/** Single-segment `reasoning_details` entry for replaying preserved reasoning (MiniMax wire shape). */
+function reasoningDetailSegmentForWire(text: string): Record<string, unknown> {
+  return { type: "reasoning.text", id: "reasoning-text-1", format: "MiniMax-response-v1", index: 0, text };
+}
+
 function invalidChoicesEvent(usage?: OcxUsage): Extract<AdapterEvent, { type: "error" }> {
   return {
     type: "error",
@@ -308,8 +368,13 @@ function invalidToolCallsEvent(
   rawToolCalls: unknown,
   mode: "stream" | "response",
   usage?: OcxUsage,
+  diagnosticOverride?: InvalidToolCallDiagnostic,
 ): Extract<AdapterEvent, { type: "error" }> {
-  const diagnostic = diagnoseInvalidToolCalls(rawToolCalls, mode);
+  // The streamed accumulator knows things a rescan cannot: which field on which pending call
+  // was actually rejected. Without the override, a stream carrying accepted padding on call 0
+  // and a real defect on call 1 blames call 0, because the stateless scan stops at the first
+  // structurally odd value it sees.
+  const diagnostic = diagnosticOverride ?? diagnoseInvalidToolCalls(rawToolCalls, mode);
   const detail = diagnostic
     ? ` (${diagnostic.reason}${diagnostic.callIndex !== undefined ? `; callIndex=${diagnostic.callIndex}` : ""}; valueType=${diagnostic.valueType})`
     : "";
@@ -527,9 +592,13 @@ function diagnoseInvalidToolCalls(
   return undefined;
 }
 
-function logInvalidToolCalls(mode: "stream" | "response", rawToolCalls: unknown): void {
+function logInvalidToolCalls(
+  mode: "stream" | "response",
+  rawToolCalls: unknown,
+  diagnosticOverride?: InvalidToolCallDiagnostic,
+): void {
   if (!isDebugEnabled()) return;
-  const diagnostic = diagnoseInvalidToolCalls(rawToolCalls, mode);
+  const diagnostic = diagnosticOverride ?? diagnoseInvalidToolCalls(rawToolCalls, mode);
   if (!diagnostic) return;
   const fieldShape = fingerprintInvalidField(invalidToolCallField(rawToolCalls, diagnostic));
   debugProviderDiagnostic("openai-chat", "invalid-tool-calls", {
@@ -560,9 +629,22 @@ function isNativeOpenAIChatTarget(provider: OcxProviderConfig): boolean {
  * being flattened to the "[image]" marker the model can't actually see. Data URLs and remote https
  * URLs are both valid in image_url.url, unlike Gemini inline_data which needs base64.
  */
-function toolResultTextForWire(content: string | OcxContentPart[]): string {
-  if (typeof content === "string") return content;
+function toolResultTextForWire(content: string | OcxContentPart[], annotateEmpty = false): string {
+  // An empty content array is a present-but-empty result; `contentPartsToText` would
+  // otherwise fall back to the "[image]" marker and hide the emptiness from the model.
+  if (annotateEmpty && Array.isArray(content) && content.length === 0) return EMPTY_TOOL_OUTPUT_ANNOTATION;
+  if (typeof content === "string") {
+    if (annotateEmpty && content.trim() === "") return EMPTY_TOOL_OUTPUT_ANNOTATION;
+    return content;
+  }
   const text = content.filter((p) => p.type === "text").map((p) => (p as OcxTextContent).text).join("");
+  // A whitespace-only text-part array is the array twin of a blank string; the
+  // shared emptiness contract (same module as the Responses adapter) annotates it
+  // instead of forwarding whitespace the model silently accepts. Image parts and
+  // any other non-text part keep the array non-empty.
+  if (annotateEmpty && isWhitespaceOnlyTextPartArray(content)) {
+    return EMPTY_TOOL_OUTPUT_ANNOTATION;
+  }
   if (text) {
     const untransportableImages = content.filter((p) => p.type === "image" && !p.imageUrl).length;
     return `${text}${"[image]".repeat(untransportableImages)}`;
@@ -717,9 +799,17 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           }
         }
         if (reasoningContent.length > 0 && modelInList(provider.preserveReasoningContentModels, parsed.modelId)) {
-          chatMsg.reasoning_content = reasoningContent;
+          // MiniMax's interleaved-thinking contract requires the structured
+          // reasoning_details array back on the next turn; a reasoning_content
+          // string is the native-format pass-back the docs mark unsupported.
+          if (modelInList(provider.reasoningDetailsModels, parsed.modelId)) {
+            chatMsg.reasoning_details = [reasoningDetailSegmentForWire(reasoningContent)];
+          } else {
+            chatMsg.reasoning_content = reasoningContent;
+          }
         }
-        if (chatMsg.content === undefined && toolCalls.length === 0 && chatMsg.reasoning_content === undefined) break;
+        const hasReplayedReasoning = chatMsg.reasoning_content !== undefined || chatMsg.reasoning_details !== undefined;
+        if (chatMsg.content === undefined && toolCalls.length === 0 && !hasReplayedReasoning) break;
         flushPendingToolCalls();
         const wireToolCalls = toolCalls.map(tc => {
           let id = tc.id;
@@ -735,7 +825,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           }));
           if (!chatMsg.content) chatMsg.content = emptyAssistantContent(provider);
         }
-        if (chatMsg.reasoning_content !== undefined && chatMsg.content === undefined && chatMsg.tool_calls === undefined) {
+        if (hasReplayedReasoning && chatMsg.content === undefined && chatMsg.tool_calls === undefined) {
           chatMsg.content = emptyAssistantContent(provider);
         }
         out.push(chatMsg);
@@ -749,7 +839,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           out.push({
             role: "tool",
             tool_call_id: toolCallId,
-            content: toolResultTextForWire(msg.content),
+            content: toolResultTextForWire(msg.content, provider.annotateEmptyToolOutputs === true),
           });
           pendingToolResultImageParts.push(...toolResultImageChatParts(msg.content));
           pendingToolCalls.splice(matchIdx, 1);
@@ -780,10 +870,15 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
               && modelInList(provider.requiresReasoningPlaceholderModels ?? provider.preserveReasoningContentModels, parsed.modelId)
               ? " "
               : undefined);
+          const orphanReasoningFields: Record<string, unknown> = !orphanReasoning
+            ? {}
+            : modelInList(provider.reasoningDetailsModels, parsed.modelId)
+              ? { reasoning_details: [reasoningDetailSegmentForWire(orphanReasoning)] }
+              : { reasoning_content: orphanReasoning };
           out.push({
             role: "assistant",
             content: emptyAssistantContent(provider),
-            ...(orphanReasoning ? { reasoning_content: orphanReasoning } : {}),
+            ...orphanReasoningFields,
             tool_calls: [{
               id: toolCallId,
               type: "function",
@@ -794,7 +889,7 @@ function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderCon
           out.push({
             role: "tool",
             tool_call_id: toolCallId,
-            content: toolResultTextForWire(msg.content),
+            content: toolResultTextForWire(msg.content, provider.annotateEmptyToolOutputs === true),
           });
           pendingToolResultImageParts.push(...toolResultImageChatParts(msg.content));
           flushToolResultImages();
@@ -899,11 +994,50 @@ function shouldSanitizeZenToolParameters(provider: OcxProviderConfig): boolean {
     || baseUrl === "https://opencode.ai/zen/go/v1";
 }
 
-function isXaiSchemaTarget(provider: OcxProviderConfig): boolean {
+/** Azure Model Router (and Gemini-in-the-pool) 400s Codex MCP schemas whose root is a union. */
+const AZURE_CHAT_FORBIDDEN_ROOT_KEYS = ["oneOf", "anyOf", "allOf", "enum", "const", "not"] as const;
+
+function isAzureOpenAiChatTarget(provider: OcxProviderConfig): boolean {
   try {
-    // Public api.x.ai accepts native root object unions. Only the Grok CLI proxy
-    // 400s on a root oneOf/anyOf, so flattening/omitting is scoped to that host.
-    return new URL(provider.baseUrl).hostname === "cli-chat-proxy.grok.com";
+    const host = new URL(provider.baseUrl).hostname.toLowerCase();
+    return host.endsWith(".openai.azure.com")
+      || host.endsWith(".cognitiveservices.azure.com")
+      || host.endsWith(".services.ai.azure.com")
+      || host.endsWith(".ai.azure.com");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Azure Foundry Model Router validates every function schema against the strictest model in
+ * the pool (Gemini-shaped): root must be {type:"object"} with no oneOf/anyOf/allOf/enum/
+ * const/not. Codex App MCP tools such as mcp__codex_app__automation_update ship a root
+ * union, which 400s the whole turn. Flatten like Zen, then strip leftover forbidden keys.
+ */
+function sanitizeAzureChatToolParameters(parameters: unknown): Record<string, unknown> {
+  const root = ensureZenRootObjectSchema(parameters);
+  for (const key of AZURE_CHAT_FORBIDDEN_ROOT_KEYS) delete root[key];
+  root.type = "object";
+  if (!root.properties || typeof root.properties !== "object" || Array.isArray(root.properties)) {
+    root.properties = {};
+  }
+  return root;
+}
+
+// Moonshot validates function schemas against a draft-07 reading of `$ref`, where the
+// keyword stands alone and siblings are ignored. It rejects the whole request rather
+// than ignoring them: "not a valid moonshot flavored json schema ... when using $ref,
+// type should be defined in the referenced schema instead of the parent schema".
+const MOONSHOT_SCHEMA_HOSTNAMES = new Set([
+  "api.kimi.com",
+  "api.moonshot.ai",
+  "api.moonshot.cn",
+]);
+
+function isMoonshotSchemaTarget(provider: OcxProviderConfig): boolean {
+  try {
+    return MOONSHOT_SCHEMA_HOSTNAMES.has(new URL(provider.baseUrl).hostname);
   } catch {
     return false;
   }
@@ -941,263 +1075,248 @@ function isXaiObjectSchema(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function stringRequiredFields(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
-}
-
-/** Variant keys the merger can keep. Anything else is refused, not silently dropped. */
-const XAI_VARIANT_MERGE_KEYS = new Set([
-  "type",
-  "properties",
-  "required",
-  "additionalProperties",
-  "description",
-  "title",
-  "$comment",
-  "$defs",
-  "definitions",
-]);
-
-function decodeJsonPointerToken(token: string): string {
-  return token.replace(/~1/g, "/").replace(/~0/g, "~");
-}
-
-function lookupLocalJsonPointer(root: unknown, ref: string): unknown {
-  if (ref === "#" || ref === "#/") return root;
-  if (!ref.startsWith("#/")) return undefined;
-  let current: unknown = root;
-  for (const token of ref.slice(2).split("/").map(decodeJsonPointerToken)) {
-    if (!isXaiObjectSchema(current) || !Object.hasOwn(current, token)) return undefined;
-    current = current[token];
-  }
-  return current;
-}
-
-/** Resolve local `#/` `$ref`s. Unresolvable or cyclic refs return undefined. */
-function resolveXaiSchemaRefs(
-  schema: unknown,
-  root: Record<string, unknown>,
-  stack: Set<string> = new Set(),
-): unknown | undefined {
-  if (!isXaiObjectSchema(schema)) return schema;
-  if (typeof schema.$ref === "string") {
-    const ref = schema.$ref;
-    if (stack.has(ref)) return undefined;
-    const target = lookupLocalJsonPointer(root, ref);
-    if (target === undefined) return undefined;
-    stack.add(ref);
-    const resolvedTarget = resolveXaiSchemaRefs(target, root, stack);
-    stack.delete(ref);
-    if (resolvedTarget === undefined) return undefined;
-    const rest: Record<string, unknown> = { ...schema };
-    delete rest.$ref;
-    if (Object.keys(rest).length === 0) return resolvedTarget;
-    const resolvedRest = resolveXaiSchemaRefs(rest, root, stack);
-    if (resolvedRest === undefined || !isXaiObjectSchema(resolvedTarget) || !isXaiObjectSchema(resolvedRest)) {
-      return undefined;
-    }
-    return composeXaiObjectSchemas(resolvedTarget, resolvedRest);
-  }
-
-  const resolved: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(schema)) {
-    if ((key === "oneOf" || key === "anyOf") && Array.isArray(value)) {
-      const items: unknown[] = [];
-      for (const item of value) {
-        const next = resolveXaiSchemaRefs(item, root, stack);
-        if (next === undefined) return undefined;
-        items.push(next);
-      }
-      resolved[key] = items;
-      continue;
-    }
-    if (key === "properties" && isXaiObjectSchema(value)) {
-      const properties: Record<string, unknown> = {};
-      for (const [name, property] of Object.entries(value)) {
-        const next = resolveXaiSchemaRefs(property, root, stack);
-        if (next === undefined) return undefined;
-        properties[name] = next;
-      }
-      resolved[key] = properties;
-      continue;
-    }
-    resolved[key] = value;
-  }
-  return resolved;
-}
-
-function xaiVariantIsConcreteObject(variant: Record<string, unknown>): boolean {
-  if (variant.type !== undefined && variant.type !== "object") return false;
-  return Object.keys(variant).every(key => XAI_VARIANT_MERGE_KEYS.has(key));
-}
-
-function variantProperties(variant: Record<string, unknown>): Record<string, unknown> {
-  return isXaiObjectSchema(variant.properties) ? variant.properties : {};
+/**
+ * JSON Schema 2020-12 makes `$ref` an in-place applicator: siblings stay in force and are
+ * combined with the referenced schema. Moonshot enforces the older draft-07 reading where
+ * `$ref` must stand alone, and 400s the entire request when a node carries both. Codex's own
+ * deferred tool catalog emits exactly that shape (zod-to-json-schema deduplicates into
+ * `$defs.__schema*` nodes that keep `type`/`minLength`/`format` beside the `$ref`), so the
+ * schema is not something a user can fix from configuration — see issue #2673.
+ *
+ * Inline the referenced schema underneath the node's own keywords, which is what 2020-12 says
+ * the node means, then drop `$ref`. Constraints reach the model instead of being stripped.
+ * The `$defs` bag is preserved: a bare `$ref` (no siblings) is already legal for Moonshot and
+ * is left pointing at its definition rather than expanded, which keeps recursive schemas finite.
+ */
+function moonshotRefTargetKeys(node: Record<string, unknown>): string[] {
+  return Object.keys(node).filter(key => key !== "$ref");
 }
 
 /**
- * Independent per-property anyOf is lossless only when every property name exists
- * on every variant (absence is meaningful under xAI's default additionalProperties:
- * false, and promoting a branch-local key also tightens explicit-true variants)
- * and at most one of those shared properties has a conflicting schema.
+ * Inlining duplicates the target, so a schema referencing one large definition from many
+ * sibling-carrying nodes can multiply. Bound the total expansions and fall back to a bare
+ * `$ref` once the budget is spent: still valid for Moonshot, just without the node's own
+ * narrowing keywords. Mirrors the node budget in google-tool-schema.ts.
  */
-function xaiPropertyMergeIsLossless(variants: Record<string, unknown>[]): boolean {
-  const names = new Set<string>();
-  const props = variants.map(variant => {
-    const properties = variantProperties(variant);
-    for (const name of Object.keys(properties)) names.add(name);
-    return properties;
-  });
-  let schemaConflicts = 0;
-  for (const name of names) {
-    const values = props.map(property => property[name]);
-    if (values.some(value => value === undefined)) return false;
-    if (values.some(value => JSON.stringify(value) !== JSON.stringify(values[0]))) schemaConflicts += 1;
+const MOONSHOT_MAX_REF_EXPANSIONS = 512;
+
+/**
+ * Expansion count alone does not bound the walk: a deeply nested ref-free schema, or one
+ * large definition repeated across many nodes, still recurses to exhaustion or amplifies the
+ * emitted output. Depth and node budgets close both, and mirror google-tool-schema.ts.
+ */
+const MOONSHOT_MAX_SCHEMA_DEPTH = 64;
+const MOONSHOT_MAX_SCHEMA_NODES = 4_096;
+
+/**
+ * Assertion keywords whose meaning under a `$ref` is CONJUNCTION, not replacement. A node
+ * carrying `required: ["b"]` beside a target requiring `["a"]` means both are required;
+ * letting the sibling win emitted a schema that no longer described the tool.
+ */
+function unionRequired(target: unknown, sibling: unknown): unknown {
+  if (!Array.isArray(target) || !Array.isArray(sibling)) return sibling;
+  const seen = new Set<unknown>();
+  const out: unknown[] = [];
+  for (const name of [...target, ...sibling]) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
   }
-  return schemaConflicts <= 1;
+  return out;
 }
 
-function xaiRequiredSetsMatch(variants: Record<string, unknown>[]): boolean {
-  const serialized = variants.map(variant => [...stringRequiredFields(variant.required)].sort().join("\0"));
-  return serialized.every(value => value === serialized[0]);
+/**
+ * Keywords whose values are DATA, not schemas.
+ *
+ * Recursing into them rewrote user data: an `enum` listing a literal object that happens
+ * to carry a `"$ref"` string had that key stripped as if it were a schema reference, so a
+ * value the tool declared as legal silently changed shape. These are copied through.
+ */
+const MOONSHOT_DATA_VALUED_KEYWORDS = new Set(["enum", "const", "default", "examples"]);
+
+/**
+ * Numeric assertions whose intersection is a bound, and which direction tightens.
+ *
+ * `$ref` under 2020-12 is an in-place applicator: the node and its target BOTH apply, so
+ * the emitted schema must be their INTERSECTION. The previous code overwrote the target
+ * with the node and called that "the narrower reading", which holds only when the node
+ * happens to be narrower. A node declaring `minLength: 1` beside a target declaring
+ * `minLength: 5` shipped `minLength: 1` - a contract weaker than either side asked for,
+ * emitted silently, which is the same failure mode the `required` composition fixed for
+ * set-valued keywords.
+ *
+ * "max" means the surviving value is the larger of the two (lower bounds), "min" the
+ * smaller (upper bounds). A keyword absent from this table keeps the overwrite: for
+ * `type`, `format`, `description` and friends there is no ordering to intersect along,
+ * and the node is the more specific statement.
+ */
+const MOONSHOT_BOUND_KEYWORDS: Record<string, "max" | "min"> = {
+  minLength: "max",
+  minItems: "max",
+  minProperties: "max",
+  minimum: "max",
+  exclusiveMinimum: "max",
+  maxLength: "min",
+  maxItems: "min",
+  maxProperties: "min",
+  maximum: "min",
+  exclusiveMaximum: "min",
+};
+
+/**
+ * Intersect one numeric bound. Either side being absent or non-finite yields the other,
+ * because an unstated bound constrains nothing - returning `undefined` there would drop
+ * a constraint the remaining side genuinely made.
+ */
+function intersectBound(target: unknown, sibling: unknown, direction: "max" | "min"): unknown {
+  const a = typeof target === "number" && Number.isFinite(target) ? target : null;
+  const b = typeof sibling === "number" && Number.isFinite(sibling) ? sibling : null;
+  if (a === null) return b === null ? sibling : sibling;
+  if (b === null) return target;
+  return direction === "max" ? Math.max(a, b) : Math.min(a, b);
 }
 
-function mergeXaiAdditionalProperties(
-  variants: Record<string, unknown>[],
-): { ok: true; value?: unknown } | { ok: false } {
-  const values = variants.map(variant => variant.additionalProperties);
-  const explicit = values.filter(value => value !== undefined);
-  if (explicit.length === 0) return { ok: true };
-  if (explicit.length !== values.length) return { ok: false };
-  const hasFalse = explicit.some(value => value === false);
-  const permissive = explicit.filter(value => value !== false);
-  if (hasFalse && permissive.length > 0) return { ok: false };
-  if (hasFalse) return { ok: true, value: false };
-  const unique: unknown[] = [];
-  const seen = new Set<string>();
-  for (const value of permissive) {
-    const key = JSON.stringify(value);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(value);
-  }
-  if (unique.length !== 1) return { ok: false };
-  return { ok: true, value: unique[0] };
-}
-
-/** Compose root siblings into a branch so properties/required are not overwritten. */
-function composeXaiObjectSchemas(
-  inherited: Record<string, unknown>,
-  branch: Record<string, unknown>,
+/**
+ * Compose two `properties` maps. A property named in BOTH the referenced target and the
+ * node is the same conjunction problem `required` had: letting the sibling win discards
+ * the target's constraints for that member. Merge the two member schemas so neither side
+ * loses its keywords. Shared member bounds are the same conjunction one level down,
+ * and nested object members recurse through this helper instead of replacing the target.
+ */
+function composeProperties(
+  target: Record<string, unknown>,
+  sibling: Record<string, unknown>,
 ): Record<string, unknown> {
-  const composed: Record<string, unknown> = { ...inherited, ...branch };
-  const inheritedProps = isXaiObjectSchema(inherited.properties) ? inherited.properties : undefined;
-  const branchProps = isXaiObjectSchema(branch.properties) ? branch.properties : undefined;
-  if (inheritedProps || branchProps) {
-    const properties: Record<string, unknown> = { ...(inheritedProps ?? {}) };
-    for (const [name, value] of Object.entries(branchProps ?? {})) {
-      const inheritedValue = inheritedProps?.[name];
-      properties[name] = inheritedValue !== undefined && JSON.stringify(inheritedValue) !== JSON.stringify(value)
-        ? { allOf: [inheritedValue, value] }
-        : value;
+  const combined: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const [name, sub] of Object.entries(target)) combined[name] = sub;
+  for (const [name, sub] of Object.entries(sibling)) {
+    const existing = combined[name];
+    if (isXaiObjectSchema(existing) && isXaiObjectSchema(sub)) {
+      const member: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+      for (const [k, v] of Object.entries(existing)) member[k] = v;
+      for (const [k, v] of Object.entries(sub)) {
+        if (k === "required") {
+          member[k] = unionRequired(member[k], v);
+          continue;
+        }
+        if (k === "properties" && isXaiObjectSchema(member[k]) && isXaiObjectSchema(v)) {
+          member[k] = composeProperties(member[k] as Record<string, unknown>, v);
+          continue;
+        }
+        const boundDirection = MOONSHOT_BOUND_KEYWORDS[k];
+        if (boundDirection && k in member) {
+          member[k] = intersectBound(member[k], v, boundDirection);
+          continue;
+        }
+        member[k] = v;
+      }
+      combined[name] = member;
+      continue;
     }
-    composed.properties = properties;
+    combined[name] = sub;
   }
-  const required = [...new Set([
-    ...stringRequiredFields(inherited.required),
-    ...stringRequiredFields(branch.required),
-  ])];
-  if (required.length > 0) composed.required = required;
-  else delete composed.required;
-  return composed;
+  return combined;
 }
 
-function expandXaiRootObjectSchemas(schema: unknown): Record<string, unknown>[] | undefined {
-  if (!isXaiObjectSchema(schema)) return undefined;
-  const compositionKey = ["oneOf", "anyOf"].find(key => Array.isArray(schema[key]));
-  if (!compositionKey) {
-    if (schema.type !== undefined && schema.type !== "object") return undefined;
-    return [{ ...schema, type: "object" }];
-  }
-
-  const siblings = Object.fromEntries(Object.entries(schema).filter(([key]) => key !== compositionKey));
-  const branches = schema[compositionKey];
-  if (!Array.isArray(branches)) return undefined;
-  const expanded: Record<string, unknown>[] = [];
-  for (const branch of branches) {
-    const variants = expandXaiRootObjectSchemas(branch);
-    if (!variants) return undefined;
-    for (const variant of variants) expanded.push(composeXaiObjectSchemas(siblings, variant));
-  }
-  return expanded.length > 0 ? expanded : undefined;
+interface MoonshotNormalizeState {
+  activeRefs: Set<string>;
+  remainingExpansions: number;
+  remainingNodes: number;
 }
 
-function mergeXaiPropertySchemas(values: unknown[]): unknown {
-  const unique: unknown[] = [];
-  const serialized = new Set<string>();
-  for (const value of values) {
-    const key = JSON.stringify(value);
-    if (serialized.has(key)) continue;
-    serialized.add(key);
-    unique.push(value);
+function normalizeMoonshotSchemaNode(
+  node: unknown,
+  root: Record<string, unknown>,
+  state: MoonshotNormalizeState,
+  depth = 0,
+): unknown {
+  if (Array.isArray(node)) {
+    if (depth >= MOONSHOT_MAX_SCHEMA_DEPTH) return [];
+    return node.map(item => normalizeMoonshotSchemaNode(item, root, state, depth + 1));
   }
-  return unique.length === 1 ? unique[0] : { anyOf: unique };
-}
+  if (!isXaiObjectSchema(node)) return node;
 
-/**
- * The Grok CLI proxy rejects a function parameter schema whose root remains oneOf/anyOf.
- * Flatten only when the merge is lossless: local $refs resolve, every variant is a concrete
- * object whose keys we can preserve, required sets match, additionalProperties does not change
- * meaning, every property name exists on every variant, and at most one property schema
- * differs. Otherwise omit the tool rather than emit a weaker schema.
- */
-function normalizeXaiToolParameters(parameters: unknown): Record<string, unknown> | undefined {
-  if (!isXaiObjectSchema(parameters)) return undefined;
-  const resolved = resolveXaiSchemaRefs(parameters, parameters);
-  if (!isXaiObjectSchema(resolved)) return undefined;
+  // Fail closed for this node rather than emitting a partially weakened schema: an empty
+  // object is the one shape that asserts nothing it cannot back up.
+  if (depth >= MOONSHOT_MAX_SCHEMA_DEPTH || state.remainingNodes <= 0) return {};
+  state.remainingNodes -= 1;
 
-  const normalizedRoot = { ...resolved };
-  delete normalizedRoot.$schema;
+  const ref = node.$ref;
+  const hasSiblings = moonshotRefTargetKeys(node).length > 0;
 
-  const variants = expandXaiRootObjectSchemas(normalizedRoot);
-  if (!variants) return undefined;
-  if (variants.length === 1) {
-    return xaiVariantIsConcreteObject(variants[0]) ? variants[0] : undefined;
-  }
-  if (!variants.every(xaiVariantIsConcreteObject) || !xaiRequiredSetsMatch(variants)) return undefined;
-  const additionalProperties = mergeXaiAdditionalProperties(variants);
-  if (!additionalProperties.ok) return undefined;
-  if (!xaiPropertyMergeIsLossless(variants)) return undefined;
+  if (typeof ref === "string" && hasSiblings) {
+    // A cycle cannot be inlined. Keeping the bare `$ref` is the lossy-but-valid fallback:
+    // Moonshot accepts it, and the alternative (dropping the ref) would erase the recursion.
+    if (state.activeRefs.has(ref) || state.remainingExpansions <= 0) return { $ref: ref };
 
-  const metadata = Object.fromEntries(Object.entries(normalizedRoot).filter(([key]) => key !== "oneOf" && key !== "anyOf" && key !== "type"));
-  delete metadata.properties;
-  delete metadata.required;
-  delete metadata.additionalProperties;
-
-  const propertyValues = new Map<string, unknown[]>();
-  for (const variant of variants) {
-    if (!variant.properties || typeof variant.properties !== "object" || Array.isArray(variant.properties)) continue;
-    for (const [name, value] of Object.entries(variant.properties as Record<string, unknown>)) {
-      const values = propertyValues.get(name) ?? [];
-      values.push(value);
-      propertyValues.set(name, values);
+    const target = lookupLocalJsonPointer(root, ref);
+    if (isXaiObjectSchema(target)) {
+      state.remainingExpansions -= 1;
+      state.activeRefs.add(ref);
+      const resolvedTarget = normalizeMoonshotSchemaNode(target, root, state, depth + 1);
+      state.activeRefs.delete(ref);
+      const merged: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+      if (isXaiObjectSchema(resolvedTarget)) {
+        for (const [key, value] of Object.entries(resolvedTarget)) merged[key] = value;
+      }
+      // "Alongside the target" is conjunction, not replacement. For most keywords the node
+      // narrows the target and overwriting is the narrower reading, but `required` and
+      // `properties` are set-valued: letting the sibling win DROPPED the target's own
+      // members, so a tool requiring `a` beside a node requiring `b` shipped requiring only
+      // `b`. Those two compose; everything else keeps the narrowing overwrite.
+      for (const [key, value] of Object.entries(node)) {
+        if (key === "$ref") continue;
+        if (MOONSHOT_DATA_VALUED_KEYWORDS.has(key)) {
+          merged[key] = value;
+          continue;
+        }
+        const normalized = normalizeMoonshotSchemaNode(value, root, state, depth + 1);
+        if (key === "required") {
+          merged[key] = unionRequired(merged[key], normalized);
+          continue;
+        }
+        if (key === "properties" && isXaiObjectSchema(merged[key]) && isXaiObjectSchema(normalized)) {
+          merged[key] = composeProperties(merged[key] as Record<string, unknown>, normalized);
+          continue;
+        }
+        // Numeric bounds intersect rather than overwrite: both the node and its target
+        // apply, so the surviving bound is the stricter of the two in whichever direction
+        // that keyword tightens.
+        const boundDirection = MOONSHOT_BOUND_KEYWORDS[key];
+        if (boundDirection && key in merged) {
+          merged[key] = intersectBound(merged[key], normalized, boundDirection);
+          continue;
+        }
+        merged[key] = normalized;
+      }
+      return merged;
     }
+
+    // Unresolvable pointer: a remote ref, a malformed path, or a non-object target. Dropping
+    // the ref and keeping the siblings silently discards whatever the reference constrained,
+    // which is the one outcome we cannot detect downstream. A bare `$ref` is lossy in the
+    // other direction - it loses the node's own keywords - but it preserves the identity of
+    // what was asked for, and Moonshot accepts it.
+    return { $ref: ref };
   }
 
-  const properties = Object.fromEntries(
-    [...propertyValues].map(([name, values]) => [name, mergeXaiPropertySchemas(values)]),
-  );
-  const required = stringRequiredFields(variants[0]?.required);
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(node)) {
+    out[key] = key === "$ref" || MOONSHOT_DATA_VALUED_KEYWORDS.has(key)
+      ? value
+      : normalizeMoonshotSchemaNode(value, root, state, depth + 1);
+  }
+  return out;
+}
 
-  return {
-    ...metadata,
-    type: "object",
-    properties,
-    ...(required.length > 0 ? { required } : {}),
-    ...("value" in additionalProperties ? { additionalProperties: additionalProperties.value } : {}),
-  };
+function normalizeMoonshotToolParameters(parameters: unknown): Record<string, unknown> {
+  const rooted = ensureRootObjectType(parameters);
+  const normalized = normalizeMoonshotSchemaNode(rooted, rooted, {
+    activeRefs: new Set<string>(),
+    remainingExpansions: MOONSHOT_MAX_REF_EXPANSIONS,
+    remainingNodes: MOONSHOT_MAX_SCHEMA_NODES,
+  });
+  return isXaiObjectSchema(normalized) ? normalized : rooted;
 }
 
 function toolsToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderConfig): unknown[] | undefined {
@@ -1205,10 +1324,14 @@ function toolsToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderConfig
   const tools = parsed.context.tools.filter(toolChoiceToolPredicate(parsed.options.toolChoice, parsed.context.tools));
   if (tools.length === 0) return undefined;
   const xaiTarget = isXaiSchemaTarget(provider);
+  const moonshotTarget = !xaiTarget && isMoonshotSchemaTarget(provider);
   const formatted = tools.flatMap(t => {
-    const parameters = stripResponsesOnlyEncryptedMarker(xaiTarget
+    const normalized = xaiTarget
       ? normalizeXaiToolParameters(t.parameters)
-      : ensureRootObjectType(t.parameters));
+      : moonshotTarget
+        ? normalizeMoonshotToolParameters(t.parameters)
+        : ensureRootObjectType(t.parameters);
+    const parameters = stripResponsesOnlyEncryptedMarker(normalized);
 
     if (parameters === undefined) return [];
     return [{
@@ -1226,17 +1349,22 @@ function toolsToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderConfig
 
 function toolsToChatFormatForProvider(parsed: OcxParsedRequest, provider: OcxProviderConfig): unknown[] | undefined {
   const base = toolsToChatFormat(parsed, provider);
-  if (!base || !shouldSanitizeZenToolParameters(provider)) return base;
+  const azureChat = isAzureOpenAiChatTarget(provider);
+  const zenChat = shouldSanitizeZenToolParameters(provider);
+  if (!base || (!zenChat && !azureChat)) return base;
   return base.map(tool => {
     if (!tool || typeof tool !== "object") return tool;
     const functionDef = (tool as { function?: Record<string, unknown> }).function;
     if (!functionDef || typeof functionDef !== "object") return tool;
+    const parameters = azureChat
+      ? sanitizeAzureChatToolParameters(functionDef.parameters ?? {})
+      : ensureZenRootObjectSchema(functionDef.parameters ?? {});
+    const nextFunction: Record<string, unknown> = { ...functionDef, parameters };
+    // strict: true plus a flattened schema is rejected by Gemini-in-the-pool routers.
+    if (azureChat) delete nextFunction.strict;
     return {
       ...tool,
-      function: {
-        ...functionDef,
-        parameters: ensureZenRootObjectSchema(functionDef.parameters ?? {}),
-      },
+      function: nextFunction,
     };
   });
 }
@@ -1290,15 +1418,37 @@ function thinkingBudgetForEffort(parsed: OcxParsedRequest, reasoningEffort: stri
   return fraction === undefined ? undefined : Math.max(1, Math.floor(maxBudget * fraction));
 }
 
+function canSerializeOpenAIChatServiceTier(
+  provider: OcxProviderConfig,
+  modelId: string,
+  serviceTier: unknown,
+  tierDecision?: OcxParsedRequest["options"]["tierDecision"],
+): boolean {
+  if (serviceTier === undefined) return false;
+  if (tierDecision !== undefined) {
+    return tierDecision.kind === "set" || tierDecision.kind === "forward-caller";
+  }
+  // No decision from the router means this call did not go through the tier state machine, so
+  // ask that machine rather than re-deriving a looser answer beside it. The previous fallback
+  // returned true whenever foreign forwarding was allowed at all, which let a caller tier
+  // reach the wire in cases `decideTier` would have dropped — the two paths disagreeing is
+  // precisely the bug, so there is now only one authority.
+  const callerTier = typeof serviceTier === "string" ? serviceTier : undefined;
+  const decision = decideTier(fastPolicyForModel(provider, modelId, undefined, "chat"), undefined, callerTier);
+  return decision.kind === "set" || decision.kind === "forward-caller";
+}
+
 export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAdapter {
+  let lastRequestedModelId: string | undefined;
   return {
     name: "openai-chat",
 
     formatErrorBody: formatOpenAIChatErrorBody,
 
     buildRequest(parsed: OcxParsedRequest) {
+      lastRequestedModelId = parsed.modelId;
       const { url, headers, hasCredential } = openAIChatTransport(provider);
-      const messages = messagesToChatFormat(parsed, provider);
+      const messages = frameAgentRouterMessages(provider.baseUrl, messagesToChatFormat(parsed, provider));
       const tools = toolsToChatFormatForProvider(parsed, provider);
       const toolChoice = toolChoiceToChatFormat(parsed.options.toolChoice, parsed.context.tools, provider);
 
@@ -1312,13 +1462,12 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       // unclassified Chat routes remain behind the caller-forwarding opt-in.
       const serviceTier = parsed.options.serviceTier;
       const tierDecision = parsed.options.tierDecision;
-      const callerCanonicalFast = canonicalFastTierMarker(serviceTier) !== undefined;
-      const callerTierForwardAllowed = canForwardForeignServiceTierForChatModel(provider, parsed.modelId);
-      const canonicalFastCapability = callerCanonicalFast
-        && supportsServiceTierForModel(provider, parsed.modelId) === true;
-      const canSerializeServiceTier = tierDecision?.kind === "set"
-        || tierDecision?.kind === "forward-caller"
-        || (tierDecision === undefined && (callerTierForwardAllowed || canonicalFastCapability));
+      const canSerializeServiceTier = canSerializeOpenAIChatServiceTier(
+        provider,
+        parsed.modelId,
+        serviceTier,
+        tierDecision,
+      );
       if (canSerializeServiceTier && serviceTier !== undefined) {
         body.service_tier = serviceTier;
       }
@@ -1326,6 +1475,8 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const maxTokens = resolveMaxTokens(provider, parsed);
       const openRouterRouting = resolveOpenRouterRouting(provider, parsed.modelId);
       if (openRouterRouting) body.provider = openRouterProviderPayload(openRouterRouting);
+      const vercelRouting = resolveVercelGatewayRouting(provider, parsed.modelId);
+      if (vercelRouting) body.provider = vercelGatewayProviderPayload(vercelRouting);
       if (tools) body.tools = tools;
       if (tools && toolChoice !== undefined) {
         body.tool_choice = modelInList(provider.autoToolChoiceOnlyModels, parsed.modelId)
@@ -1341,10 +1492,18 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       }
       if (parsed.options.stopSequences !== undefined) body.stop = parsed.options.stopSequences;
       const reasoningDisabled = modelInList(provider.noReasoningModels, parsed.modelId);
-      const reasoningEffort = mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning);
+      // Some gateways accept a reasoning-effort field on a plain turn but reject the
+      // effort + tools combination. `noReasoningModels` would fix that only by
+      // stripping reasoning everywhere, costing the model its whole picker. This keeps
+      // the ladder advertised and drops the wire field for tool-bearing requests only.
+      const omitReasoningEffortWithTools = !!tools
+        && modelInList(provider.omitReasoningEffortWithToolsModels, parsed.modelId);
+      const reasoningEffort = omitReasoningEffortWithTools
+        ? undefined
+        : mapReasoningEffort(provider, parsed.modelId, parsed.options.reasoning);
       const nativeOpenAI = isNativeOpenAIChatTarget(provider);
       let reasoningLog: AdapterRequest["reasoningLog"];
-      if (!reasoningDisabled && provider.reasoningWireFormat === "gateway-object" && parsed.options.reasoning === "none") {
+      if (!reasoningDisabled && !omitReasoningEffortWithTools && provider.reasoningWireFormat === "gateway-object" && parsed.options.reasoning === "none") {
         if (nativeOpenAI) {
           body.reasoning_effort = "none";
           reasoningLog = {
@@ -1499,7 +1658,20 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const budgetEncoder = new TextEncoder();
       let buffer = "";
       let bufferBytes = 0;
-      interface PendingToolCall { key: string; id: string; name: string; args: string; argsBytes: number }
+      interface PendingToolCall {
+        key: string;
+        id: string;
+        name: string;
+        args: string;
+        argsBytes: number;
+        /**
+         * Whether this call has ever received `arguments` as an actual string, empty included.
+         * An empty string still counts: it proves the upstream sent the field with the right
+         * wire type, which is what a later malformed repeat of that field would be padding for.
+         * A canonical NAME is not evidence about the ARGUMENTS field and must not stand in.
+         */
+        sawArgumentsString: boolean;
+      }
       const pendingToolCalls: PendingToolCall[] = [];
       let toolCallSeq = 0;
       const closeToolCalls = (): PendingToolCall[] => {
@@ -1508,6 +1680,16 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         pendingToolCalls.length = 0;
         return calls;
       };
+      const pendingToolCallsAreCompleteJsonObjects = (): boolean =>
+        pendingToolCalls.length > 0 && pendingToolCalls.every(call => {
+          if (call.name.trim().length === 0 || !call.sawArgumentsString || call.args.length === 0) return false;
+          try {
+            const parsed = JSON.parse(call.args) as unknown;
+            return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+          } catch {
+            return false;
+          }
+        });
       // Returns "terminate" when a pending call cannot be dispatched, so every flush site
       // stops the turn instead of emitting an unusable call. `closeToolCalls()` runs first,
       // so budget reservations are released for every pending call even on the early return.
@@ -1540,6 +1722,14 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       let pendingUsage: OcxUsage | undefined;
       let finishReason: string | undefined;
       let sawUserFacingOutput = false;
+      // MiniMax-style structured reasoning: each stream chunk repeats a detail's
+      // full text-so-far, so deltas are derived by prefix-diffing per segment key.
+      // A piece that does not extend the previous snapshot is appended whole, which
+      // keeps incremental senders parseable on the same path.
+      const reasoningDetailSnapshots = new Map<string, string>();
+      // Gate on the routed model, not list length: a mixed openai-chat provider
+      // can list MiniMax ids without putting every sibling on MiniMax semantics.
+      const reasoningDetailsOptIn = modelInList(provider.reasoningDetailsModels, lastRequestedModelId ?? "");
 
       const handleDataLine = function* (line: string): Generator<AdapterEvent, "continue" | "terminate"> {
         const rawPayload = sseFieldValue(line, "data");
@@ -1596,8 +1786,23 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         if (typeof choice.finish_reason === "string" && choice.finish_reason) finishReason = choice.finish_reason;
         const delta = choice.delta;
         if (delta) {
-          const reasoningText = reasoningTextFrom(delta);
-          if (reasoningText !== undefined) yield { type: "reasoning_raw_delta", text: reasoningText };
+          const detailSegments = reasoningDetailsOptIn ? reasoningDetailSegmentsFrom(delta) : [];
+          if (detailSegments.length > 0) {
+            for (const segment of detailSegments) {
+              const prev = reasoningDetailSnapshots.get(segment.key) ?? "";
+              if (segment.text === prev) continue;
+              if (segment.text.startsWith(prev)) {
+                reasoningDetailSnapshots.set(segment.key, segment.text);
+                yield { type: "reasoning_raw_delta", text: segment.text.slice(prev.length) };
+              } else {
+                reasoningDetailSnapshots.set(segment.key, prev + segment.text);
+                yield { type: "reasoning_raw_delta", text: segment.text };
+              }
+            }
+          } else {
+            const reasoningText = reasoningTextFrom(delta);
+            if (reasoningText !== undefined) yield { type: "reasoning_raw_delta", text: reasoningText };
+          }
           if (typeof delta.content === "string" && delta.content.length > 0) {
             sawUserFacingOutput = true;
             yield { type: "text_delta", text: delta.content };
@@ -1613,61 +1818,103 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
               logInvalidToolCalls("stream", rawToolCalls);
               return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage));
             }
-            for (const rawToolCall of rawToolCalls) {
+            for (let callIndex = 0; callIndex < rawToolCalls.length; callIndex++) {
+              const rawToolCall: unknown = rawToolCalls[callIndex];
               if (!isRecord(rawToolCall)) {
-                logInvalidToolCalls("stream", rawToolCalls);
-                return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage));
+                const diagnostic: InvalidToolCallDiagnostic = {
+                  reason: "tool_call_not_object",
+                  callIndex,
+                  valueType: rawToolCall === null ? "null" : Array.isArray(rawToolCall) ? "array" : typeof rawToolCall,
+                };
+                logInvalidToolCalls("stream", rawToolCalls, diagnostic);
+                return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage, diagnostic));
               }
-              const tc = rawToolCall as {
-                index?: number;
-                id?: string;
-                function?: { name?: string; arguments?: string };
-              };
-              // That cast is a TypeScript convenience, not a runtime guarantee: this is
-              // upstream JSON. Validate the fields before they are stored, so a non-string
-              // name or arguments value fails closed through the #1325 channel here rather
-              // than escaping later as a TypeError from string handling at flush time.
-              const rawFunction = (rawToolCall as { function?: unknown }).function;
-              if (rawFunction !== undefined && rawFunction !== null) {
-                if (!isRecord(rawFunction)) {
-                  logInvalidToolCalls("stream", rawToolCalls);
-                  return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage));
-                }
-                const rawName = rawFunction.name;
-                const rawArguments = rawFunction.arguments;
-                // Some OpenAI-compatible streamers repeat already-sent fields as null on
-                // continuation deltas. Treat only null/undefined as absent; every other
-                // non-string value still fails closed before entering the accumulator.
-                if (isInvalidStreamStringField(rawName) || isInvalidStreamStringField(rawArguments)) {
-                  logInvalidToolCalls("stream", rawToolCalls);
-                  return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage));
-                }
+              // This is upstream JSON, so every field is validated before it is stored: a
+              // malformed value must fail closed through the #1325 channel here rather than
+              // escaping later as a TypeError from string handling at flush time.
+              const rawFunction = rawToolCall.function;
+              if (rawFunction !== undefined && rawFunction !== null && !isRecord(rawFunction)) {
+                const diagnostic: InvalidToolCallDiagnostic = {
+                  reason: "tool_call_function_not_object",
+                  callIndex,
+                  valueType: Array.isArray(rawFunction) ? "array" : typeof rawFunction,
+                };
+                logInvalidToolCalls("stream", rawToolCalls, diagnostic);
+                return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage, diagnostic));
               }
-              if (isInvalidStreamStringField(tc.id)) {
-                logInvalidToolCalls("stream", rawToolCalls);
-                return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage));
-              }
-              const key = typeof tc.index === "number"
-                ? `i:${tc.index}`
-                : tc.id
-                  ? `id:${tc.id}`
+              const fnRecord = isRecord(rawFunction) ? rawFunction : undefined;
+              const rawName = fnRecord?.name;
+              const rawArguments = fnRecord?.arguments;
+              const rawId = rawToolCall.id;
+              const idDelta = typeof rawId === "string" ? rawId : "";
+              const rawIndex = rawToolCall.index;
+
+              // Resolve the pending call BEFORE judging the fields. Some OpenAI-compatible
+              // streamers repeat an already-sent field as a non-string placeholder on a
+              // continuation delta; judging first meant the whole stream died with a 502 even
+              // though the value being repeated was already held in canonical form.
+              const key = typeof rawIndex === "number"
+                ? `i:${rawIndex}`
+                : idDelta
+                  ? `id:${idDelta}`
                   : pendingToolCalls[pendingToolCalls.length - 1]?.key;
               let call = key !== undefined ? pendingToolCalls.find(c => c.key === key) : undefined;
-              if (!call && tc.id) call = pendingToolCalls.find(c => c.id === tc.id);
+              if (!call && idDelta) call = pendingToolCalls.find(c => c.id === idDelta);
               if (!call) {
-                call = { key: key ?? `seq:${pendingToolCalls.length}`, id: "", name: "", args: "", argsBytes: 0 };
+                call = {
+                  key: key ?? `seq:${pendingToolCalls.length}`,
+                  id: "",
+                  name: "",
+                  args: "",
+                  argsBytes: 0,
+                  sawArgumentsString: false,
+                };
                 pendingToolCalls.push(call);
                 budget.openCall(call.key);
               }
-              if (tc.id && !call.id) call.id = tc.id;
-              if (tc.function?.name && !call.name) call.name = tc.function.name;
-              if (tc.function?.arguments) {
+
+              // Tolerance is per FIELD, keyed on that field's own provenance. A canonical name
+              // says nothing about whether `arguments` was ever sent as a string, so it cannot
+              // authorize a malformed arguments value — that would silently drop a real
+              // argument payload the model intended to send.
+              const rejection: InvalidToolCallDiagnostic | undefined =
+                isInvalidStreamStringField(rawName) && call.name.trim() === ""
+                  ? { reason: "tool_call_function_name_invalid", callIndex, valueType: typeof rawName }
+                  : isInvalidStreamStringField(rawArguments) && !call.sawArgumentsString
+                    ? { reason: "tool_call_function_arguments_invalid", callIndex, valueType: typeof rawArguments }
+                    : isInvalidStreamStringField(rawId) && call.id === ""
+                      ? { reason: "tool_call_id_invalid", callIndex, valueType: typeof rawId }
+                      : undefined;
+              if (rejection) {
+                logInvalidToolCalls("stream", rawToolCalls, rejection);
+                return yield* terminateWithError(invalidToolCallsEvent(rawToolCalls, "stream", pendingUsage, rejection));
+              }
+
+              if (idDelta && !call.id) call.id = idDelta;
+              if (typeof rawName === "string" && rawName && !call.name) call.name = rawName;
+              if (typeof rawArguments === "string") call.sawArgumentsString = true;
+              // Tool-call deltas are BUFFERED until a terminal signal, so this adapter can
+              // consume upstream frames for a long time while yielding nothing. The Responses
+              // bridge reads adapter activity, not socket activity, so a model that streams a
+              // large argument payload looks identical to a hung upstream and the stall
+              // watchdog can abort a turn that was progressing normally.
+              //
+              // Found while investigating #2156, but it is NOT that bug: a stall abort emits
+              // `response.incomplete` with `upstream_stall_timeout` from the bridge, whereas
+              // that report shows the adapter's own end-of-stream error after `reader.read()`
+              // returned EOF with tool calls still pending. Different path, different frame.
+              //
+              // A heartbeat is invisible downstream — the bridge consumes it to re-arm the
+              // watchdog and emits nothing — which is the same remedy the Cursor, Anthropic,
+              // Google, and Kiro adapters already use for their own silent phases.
+              yield { type: "heartbeat" };
+              if (typeof rawArguments === "string" && rawArguments) {
                 const previousBytes = call.argsBytes;
-                const nextBytes = previousBytes + budgetEncoder.encode(tc.function.arguments).byteLength;
+                const nextBytes = previousBytes + budgetEncoder.encode(rawArguments).byteLength;
                 const scope = { kind: "tool_args" as const, callId: call.key };
                 const reservation = budget.reserveTransient(nextBytes, scope);
                 try {
-                  call.args += tc.function.arguments;
+                  call.args += rawArguments;
                   reservation.commitRetained();
                   budget.releaseRetained(previousBytes, scope);
                   call.argsBytes = nextBytes;
@@ -1726,6 +1973,15 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         }
         const sawFinish = finishReason !== undefined;
         if (!sawFinish && pendingToolCalls.length > 0) {
+          // Some OpenAI-compatible gateways close immediately after a complete function-call
+          // delta and omit both terminal conventions. Keep the default fail-closed policy, and
+          // let an opted-in provider recover only calls whose assembled argument payload is a
+          // complete JSON object. A partial JSON prefix still takes the truncation path below.
+          if (provider.openaiChatEofTolerance === true && pendingToolCallsAreCompleteJsonObjects()) {
+            if ((yield* flushToolCalls()) === "terminate") return;
+            yield { type: "done", usage: pendingUsage };
+            return;
+          }
           debugProviderDiagnostic("openai-chat", "stream-truncated", {
             finishReason: null,
             hadUsage: pendingUsage !== undefined,
@@ -1816,9 +2072,36 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         const choice = rawChoice;
         if (choice.finish_reason === "error") return [upstreamErrorEvent(choice.error, usage)];
         if (!choice.message) return [{ type: "error", message: "upstream response contained no choices", ...(usage ? { usage } : {}) }];
+        // `!choice.message` splits this input class on TRUTHINESS, not on shape: `null` and `0` fail
+        // closed here, while `"text"`, `true` and `[{...}]` pass and every property read below yields
+        // `undefined` — so a choice claiming an assistant message completed as a SUCCESSFUL EMPTY
+        // turn, stranding any tool call it claimed. The one line above already validates the choice
+        // container this way; its message was left on a truthiness test.
+        //
+        // Every non-record is rejected, arrays included. The google adapter does carve out `[]` for
+        // `content`, but that carve-out is specific to a protobuf-derived wire where a repeated
+        // field can spell an empty message — and `content` is genuinely an ARRAY of blocks there.
+        // `message` is a record on a plain-JSON wire that already has `{}`, so importing the
+        // exception would be an analogy rather than evidence. `[{"content":"…"}]` is the case that
+        // matters: it discards a complete answer, #2232's `content: [{ parts: [...] }]` one adapter over.
+        //
+        // Read through `unknown` rather than the declared type: `choices` is a cast over wire data,
+        // so its `message?: Record<string, unknown>` is an assertion the upstream never made, and
+        // narrowing against it is what let the missing check look type-safe.
+        const rawMessage: unknown = choice.message;
+        if (!isRecord(rawMessage)) {
+          return [invalidChoicesEvent(usage)];
+        }
 
-        const msg = choice.message;
-        const reasoningText = reasoningTextFrom(msg);
+        const msg = rawMessage as Record<string, unknown>;
+        let reasoningText = reasoningTextFrom(msg);
+        if (reasoningText === undefined && modelInList(provider.reasoningDetailsModels, lastRequestedModelId ?? "")) {
+          // MiniMax split-reasoning responses carry the same thinking in both
+          // reasoning_content and reasoning_details; the array is the fallback
+          // when only the structured form arrives.
+          const segments = reasoningDetailSegmentsFrom(msg);
+          if (segments.length > 0) reasoningText = segments.map(s => s.text).join("");
+        }
         if (reasoningText !== undefined) events.push({ type: "reasoning_raw_delta", text: reasoningText });
         if (typeof msg.content === "string") events.push({ type: "text_delta", text: msg.content });
         const rawToolCalls = msg.tool_calls;

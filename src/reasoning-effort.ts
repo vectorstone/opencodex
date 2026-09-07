@@ -14,6 +14,16 @@ export const CODEX_REASONING_LEVELS: { effort: string; description: string }[] =
 const CODEX_REASONING_ORDER = CODEX_REASONING_LEVELS.map(l => l.effort);
 const CODEX_REASONING_SET = new Set(CODEX_REASONING_ORDER);
 
+/**
+ * Sentinel wire value in reasoningEffortMap / modelReasoningEffortMap to explicitly
+ * omit the reasoning_effort field from the upstream wire request (issue #2356).
+ */
+export const REASONING_EFFORT_OMIT_SENTINEL = "__omit__";
+
+export function isReasoningEffortOmitted(wireEffort: string | undefined): boolean {
+  return wireEffort === REASONING_EFFORT_OMIT_SENTINEL;
+}
+
 /** True when `effort` is a member of the Codex reasoning ladder (low..ultra). */
 export function isCodexReasoningEffort(effort: string): boolean {
   return CODEX_REASONING_SET.has(effort);
@@ -68,6 +78,38 @@ export function sanitizeVisionReasoning(effort: unknown): VisionReasoningEffort 
 /** Position of `effort` in the Codex ladder (low=0 .. ultra=5), or -1 when not a ladder member. */
 export function codexEffortRank(effort: string): number {
   return CODEX_REASONING_ORDER.indexOf(effort);
+}
+
+/**
+ * Resolve a requested effort against the rungs a target actually supports, never
+ * raising above the request.
+ *
+ * Returns the request itself when supported, otherwise the highest supported rung
+ * at or below it, otherwise the lowest supported rung, and `undefined` when the
+ * supported set contains no rankable rung at all (including the empty ladder, which
+ * is how a no-reasoning model is expressed).
+ *
+ * This lives here rather than beside its first caller because two very different
+ * planes need the same answer: the catalog advertises a combo's default effort, and
+ * the request path injects one. When they disagreed, the catalog promised `max` and
+ * the runtime silently sent nothing, so the provider default applied instead (#3108).
+ * `reasoning-effort.ts` is a leaf — its only import is `./types` — so the request
+ * path can share this without pulling the catalog plane along.
+ */
+export function resolveEffortAtOrBelow(
+  requested: string | null | undefined,
+  supported: readonly string[],
+): string | undefined {
+  if (!requested) return undefined;
+  if (supported.includes(requested)) return requested;
+  const requestedRank = codexEffortRank(requested);
+  const ranked = supported
+    .map(effort => ({ effort, rank: codexEffortRank(effort) }))
+    .filter(item => item.rank >= 0)
+    .sort((a, b) => a.rank - b.rank);
+  if (ranked.length === 0) return undefined;
+  const atOrBelow = ranked.filter(item => item.rank <= requestedRank);
+  return atOrBelow.at(-1)?.effort ?? ranked[0]!.effort;
 }
 
 export function modelRecordValue<T>(record: Record<string, T> | undefined, modelId: string): T | undefined {
@@ -170,7 +212,10 @@ export function mapReasoningEffort(provider: OcxProviderConfig, modelId: string,
   const boundary = requested === "ultra" ? "max" : requested;
 
   const wireMap = reasoningEffortMapFor(provider, modelId);
-  if (wireMap && Object.prototype.hasOwnProperty.call(wireMap, boundary)) return wireMap[boundary];
+  if (wireMap && Object.prototype.hasOwnProperty.call(wireMap, boundary)) {
+    const mapped = wireMap[boundary];
+    return mapped === REASONING_EFFORT_OMIT_SENTINEL ? undefined : mapped;
+  }
 
   const supported = configuredReasoningEfforts(provider, modelId);
   const codexEffort = supported !== undefined ? clampToSupportedCodexEffort(boundary, supported) : requestToCodexEffort(boundary);
@@ -178,6 +223,10 @@ export function mapReasoningEffort(provider: OcxProviderConfig, modelId: string,
 
   // Belt for the odd config where the supported ladder is ultra-only and the clamp lands on it.
   const wire = codexEffort === "ultra" ? "max" : codexEffort;
-  if (wireMap && Object.prototype.hasOwnProperty.call(wireMap, wire)) return wireMap[wire];
+  if (wireMap && Object.prototype.hasOwnProperty.call(wireMap, wire)) {
+    const mapped = wireMap[wire];
+    return mapped === REASONING_EFFORT_OMIT_SENTINEL ? undefined : mapped;
+  }
+  if (wire === REASONING_EFFORT_OMIT_SENTINEL) return undefined;
   return wire;
 }

@@ -18,7 +18,7 @@ import {
   responsesJsonToChatCompletion,
   responsesSseToChatCompletionsSse,
 } from "../chat/outbound";
-import { classifyError, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode } from "../lib/errors";
+import { classifyError, cyberPolicyErrorType, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
 import { resolveClientRetryAfter } from "../lib/retry-after";
 import { estimateTokens } from "../lib/token-estimate";
@@ -46,6 +46,7 @@ import {
   type TranslatorBudget,
 } from "../lib/translator-budget";
 import { handleNativeChatCompletions, isNativeChatRouteEligible } from "./chat-native";
+import { parseRequestEffortRowId } from "./effort-row";
 
 type Rec = Record<string, unknown>;
 
@@ -104,6 +105,8 @@ async function handleChatCompletionsWithBudget(
   }
 
   const requestedModel = chatBody.model as string;
+  const effortRow = parseRequestEffortRowId(requestedModel, config);
+  if (effortRow) chatBody.model = effortRow.baseId;
   const stream = chatBody.stream === true;
   // Best-effort Grok attribution: the managed fence stamps this header on every model
   // it registers (extra_headers, sent verbatim by upstream Grok). Dashboard usage
@@ -113,13 +116,14 @@ async function handleChatCompletionsWithBudget(
   let settledRoute: ReturnType<typeof routeModel> | null = null;
   let chatNativeRoute: ReturnType<typeof routeModel> | null = null;
   try {
-    const route = routeModel(config, requestedModel, evidenceFromBody(chatBody));
+    const route = routeModel(config, chatBody.model as string, evidenceFromBody(chatBody));
     // Settle the wire once so every branch below reads the adapter this model will
     // actually use, not the provider-wide default (#404).
     route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, "chat");
     logCtx.model = route.modelId;
     logCtx.providerAdapter = route.provider.adapter;
     logCtx.requestedModel = requestedModel;
+    if (route.routeReason === "model-alias" || route.modelId !== requestedModel && requestedModel.includes("/")) logCtx.requestedAlias = requestedModel;
     logCtx.provider = route.providerName;
     logCtx.routeDecision = route.routeDecision;
     settledRoute = route;
@@ -132,7 +136,7 @@ async function handleChatCompletionsWithBudget(
       if (chatBody.tools !== undefined) parts.push(JSON.stringify(chatBody.tools));
       logCtx.usageLogInputTokens = Math.max(1, estimateTokens(parts.join("\n"), requestedModel));
     }
-    if (isNativeChatRouteEligible(route, chatBody)) chatNativeRoute = route;
+    if (!effortRow && isNativeChatRouteEligible(route, chatBody)) chatNativeRoute = route;
   } catch (err) {
     if (err instanceof NoEligiblePolicyCandidateError) {
       logCtx.routeDecision = err.trace;
@@ -161,6 +165,12 @@ async function handleChatCompletionsWithBudget(
     // Validate the full Chat boundary after routing. Native Chat keeps `chatBody` as
     // its wire source; this Responses projection is used only by the fallback path.
     internalBody = chatCompletionsToResponsesBody(chatBody);
+    if (effortRow) {
+      internalBody.reasoning = {
+        ...(isRec(internalBody.reasoning) ? internalBody.reasoning : {}),
+        effort: effortRow.effort,
+      };
+    }
   } catch (err) {
     const overflow = isTranslatorBudgetExceededError(err);
     const status = overflow ? 413 : err instanceof ChatCompletionsRequestError ? 400 : 500;
@@ -258,6 +268,10 @@ async function handleChatCompletionsWithBudget(
     abortSignal: req.signal,
     // Body is Responses-shaped by now, but the client spoke Chat Completions.
     inboundWire: "chat",
+    // Terminal vision-describe marker (roadmap 180): the bridge rebuilds
+    // headers from the FORWARD_HEADERS allowlist, which would drop the raw
+    // header — so the fact is detected here and carried as an option flag.
+    ...(req.headers.get("x-opencodex-vision-describe") === "1" ? { visionDescribeTerminal: true } : {}),
     translatorBudget,
     ...(logIds ? { onFirstOutput: () => recordFirstOutput(logCtx, logIds.start) } : {}),
     onNativePassthroughTerminal: status => finalizeNativeLog(httpStatusForRequestLogTerminal(status, logCtx), { terminalStatus: status, closeReason: "terminal" }),
@@ -276,26 +290,26 @@ async function handleChatCompletionsWithBudget(
         const parsed = JSON.parse(text) as {
           error?: { message?: string; type?: string; code?: string | null } | string;
           message?: string;
+          type?: string;
+          code?: string | null;
         };
         const nested = typeof parsed?.error === "object" && parsed.error ? parsed.error : undefined;
         const flat = typeof parsed?.error === "string" ? parsed.error : parsed?.message;
         const rawFallback = text
           ? `upstream error (${upstream.status}): ${redactSecretString(text).slice(0, 400)}`
           : message;
-        message = nested?.message || flat || rawFallback;
-        if (nested) {
-          if (typeof nested.type === "string") upstreamType = nested.type;
-          if (nested.code === null || typeof nested.code === "string") upstreamCode = nested.code;
-        }
+        const upstreamMessage = nested?.message || flat;
+        message = upstreamMessage
+          ? redactSecretString(upstreamMessage).slice(0, 500)
+          : rawFallback;
+        const structuredType = nested?.type ?? parsed.type;
+        const structuredCode = nested?.code ?? parsed.code;
+        if (typeof structuredType === "string") upstreamType = structuredType;
+        if (structuredCode === null || typeof structuredCode === "string") upstreamCode = structuredCode;
       } catch {
         if (text) message = `upstream error (${upstream.status}): ${redactSecretString(text).slice(0, 400)}`;
       }
     } catch { /* keep fallback */ }
-    const retryAfter = resolveClientRetryAfter({
-      status: upstream.status,
-      message,
-      upstreamRetryAfter: upstream.headers.get("retry-after"),
-    });
     const classified = classifyError(
       upstream.status,
       upstreamType
@@ -305,9 +319,9 @@ async function handleChatCompletionsWithBudget(
           : "invalid_request_error"),
       message,
     );
-    if (isCyberPolicyCode(upstreamCode)) {
+    if (isCyberPolicyCode(upstreamCode) || classified.code === CYBER_POLICY_ERROR_CODE) {
       classified.code = CYBER_POLICY_ERROR_CODE;
-      classified.type = "invalid_request_error";
+      classified.type = cyberPolicyErrorType(upstreamType);
     } else if (upstreamCode === "model_not_found") {
       // Structured model_not_found must win over classifyError's generic remaps.
       classified.code = "model_not_found";
@@ -316,6 +330,13 @@ async function handleChatCompletionsWithBudget(
       classified.code = upstreamCode;
     }
     const status = isCyberPolicyCode(classified.code) ? 400 : upstream.status;
+    const retryAfter = isCyberPolicyCode(classified.code)
+      ? undefined
+      : resolveClientRetryAfter({
+        status: upstream.status,
+        message,
+        upstreamRetryAfter: upstream.headers.get("retry-after"),
+      });
     const rewritten = new Response(JSON.stringify({
       error: {
         message: classified.message,
@@ -382,14 +403,14 @@ async function handleChatCompletionsWithBudget(
   const status = (json as Rec)?.status;
   if (status === "failed") {
     const error = (json as { error?: { message?: string; type?: string; code?: string | null } }).error;
-    const message = error?.message ?? "upstream request failed";
+    const message = redactSecretString(error?.message ?? "upstream request failed");
     const classified = classifyError(502, error?.type ?? "server_error", message);
     if (error?.code === "translation_buffer_limit") {
       classified.code = "translation_buffer_limit";
       classified.type = "upstream_error";
-    } else if (isCyberPolicyCode(error?.code)) {
+    } else if (isCyberPolicyCode(error?.code) || classified.code === CYBER_POLICY_ERROR_CODE) {
       classified.code = CYBER_POLICY_ERROR_CODE;
-      classified.type = "invalid_request_error";
+      classified.type = cyberPolicyErrorType(error?.type);
     } else if (error?.code === "model_not_found") {
       // Same deliberate preserve as the non-OK path: structured code beats generic classify.
       classified.code = "model_not_found";

@@ -8,12 +8,13 @@
  * codexAutoStart-only PUTs keep working).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getConfigPath, loadConfig, saveConfig } from "../src/config";
 import { handleManagementAPI, type ManagementApiDeps } from "../src/server/management-api";
 import { invalidateStartupHealthCache } from "../src/server/startup-health-cache";
+import { USAGE_RANGES, USAGE_SURFACES } from "../src/usage/summary";
 import type { OcxConfig } from "../src/types";
 import {
   appOwnedBytesSnapshot,
@@ -28,8 +29,10 @@ import {
   setUsageSummaryCacheEntry,
   usageSummaryRetainedStoreSnapshot,
 } from "../src/server/management/usage-summary-cache";
+import { resetUsageAggregateCacheForTests } from "../src/server/management/usage-aggregate-cache";
 import { catalogConvergenceFactory } from "./helpers/catalog-convergence";
 import { startupHealthFixture } from "./helpers/startup-health";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let TEST_DIR = "";
 const previousHome = process.env.OPENCODEX_HOME;
@@ -78,6 +81,7 @@ function getSettings(config: OcxConfig): Promise<Response | null> {
 beforeEach(() => {
   resetAppOwnedMemoryForTests();
   resetUsageSummaryCacheForTests();
+  resetUsageAggregateCacheForTests();
   invalidateStartupHealthCache();
   TEST_DIR = mkdtempSync(join(tmpdir(), "ocx-settings-stream-"));
   process.env.OPENCODEX_HOME = TEST_DIR;
@@ -86,12 +90,13 @@ beforeEach(() => {
 afterEach(() => {
   resetAppOwnedMemoryForTests();
   resetUsageSummaryCacheForTests();
+  resetUsageAggregateCacheForTests();
   invalidateStartupHealthCache();
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   if (TEST_DIR && existsSync(TEST_DIR)) {
     try {
-      rmSync(TEST_DIR, { recursive: true, force: true });
+      removeTreeWithRetry(TEST_DIR);
     } catch {
       /* Windows may briefly retain file handles during test cleanup */
     }
@@ -210,13 +215,17 @@ describe("usage summary retained-store accounting", () => {
       const req = new Request(`http://127.0.0.1:10100/api/usage?range=${range}`);
       expect((await handleManagementAPI(req, new URL(req.url), baseConfig()))!.status).toBe(200);
     }
+    // Derived, not hardcoded: one usage request warms the whole
+    // range x surface cross-product, so a literal here turns any future range
+    // into a failure in a file about stream mode.
+    const warmedEntries = USAGE_RANGES.length * USAGE_SURFACES.length;
     const before = usageSummaryRetainedStoreSnapshot();
-    expect(before.count).toBe(12);
+    expect(before.count).toBe(warmedEntries);
     expect(before.bytes).toBeGreaterThan(0);
     const released = evictOldestUsageSummaryForBudget();
     const after = usageSummaryRetainedStoreSnapshot();
     expect(released).toBeGreaterThan(0);
-    expect(after.count).toBe(11);
+    expect(after.count).toBe(warmedEntries - 1);
     expect(after.bytes).toBe(before.bytes - released);
   });
 
@@ -234,20 +243,22 @@ describe("usage summary retained-store accounting", () => {
       identityKey: "slow-read",
       maxReadBytes: 64 * 1024 * 1024,
       overlayVersion: 0,
+      timeZone: seed!.timeZone,
       expiresAt: Date.now() + 60_000,
       freshUntil: Date.now() + 60_000,
       lastSeenSize: 0,
       revisionReadAt: Date.now() + 10_000,
       summary: { ...seed!.summary, generatedAt: 1 },
     });
+    const warmedEntries = USAGE_RANGES.length * USAGE_SURFACES.length;
     const before = usageSummaryRetainedStoreSnapshot();
-    expect(before.count).toBe(13);
+    expect(before.count).toBe(warmedEntries + 1);
     // The slow-read entry has the minimum generatedAt; a generatedAt-keyed
     // implementation would evict it first. Completion order must win instead.
     const released = evictOldestUsageSummaryForBudget();
     expect(released).toBeGreaterThan(0);
     expect(getUsageSummaryCacheEntry("slow:stale-generated")).toBeDefined();
-    expect(usageSummaryRetainedStoreSnapshot().count).toBe(12);
+    expect(usageSummaryRetainedStoreSnapshot().count).toBe(warmedEntries);
   });
 });
 
@@ -330,6 +341,42 @@ describe("PUT /api/settings", () => {
     });
     expect(convergences).toBe(1);
     expect(config.codexAccountNamespaces).toEqual({ main: "@main" });
+  });
+
+  test("codexDesktopAuthless (#1107): absent reports false, enable persists and converges once, disable deletes the key", async () => {
+    const config = baseConfig();
+    const absent = await (await getSettings(config))!.json() as { codexDesktopAuthless?: boolean };
+    expect(absent.codexDesktopAuthless).toBe(false);
+
+    let convergences = 0;
+    let saved: OcxConfig | undefined;
+    const on = await putSettings(config, { codexDesktopAuthless: true }, {
+      saveConfigPreservingClaudeCode: next => { saved = next; },
+      createManagementConvergeCodex: catalogConvergenceFactory(() => { convergences += 1; }),
+    });
+    expect(on!.status).toBe(200);
+    expect(await on!.json()).toMatchObject({ codexDesktopAuthless: true });
+    expect(saved?.codexDesktopAuthless).toBe(true);
+    expect(convergences).toBe(1);
+
+    const same = await putSettings(config, { codexDesktopAuthless: true }, {
+      saveConfigPreservingClaudeCode: () => {},
+      createManagementConvergeCodex: catalogConvergenceFactory(() => { convergences += 1; }),
+    });
+    expect(same!.status).toBe(200);
+    expect(convergences).toBe(1);
+
+    const off = await putSettings(config, { codexDesktopAuthless: false }, {
+      saveConfigPreservingClaudeCode: next => { saved = next; },
+      createManagementConvergeCodex: catalogConvergenceFactory(() => { convergences += 1; }),
+    });
+    expect(off!.status).toBe(200);
+    expect(await off!.json()).toMatchObject({ codexDesktopAuthless: false });
+    expect(Object.hasOwn(saved!, "codexDesktopAuthless")).toBe(false);
+    expect(convergences).toBe(2);
+
+    const bad = await putSettings(config, { codexDesktopAuthless: "yes" });
+    expect(bad!.status).toBe(400);
   });
 
   test("account-picker disable does not initialize an empty namespace map", async () => {

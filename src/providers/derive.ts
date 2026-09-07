@@ -44,9 +44,11 @@ export interface DerivedKeyLoginProvider {
   preserveReasoningContentModels?: string[];
   requiresReasoningPlaceholderModels?: string[];
   reasoningSplitModels?: string[];
+  reasoningDetailsModels?: string[];
   thinkingToggleModels?: string[];
   thinkingBudgetModels?: string[];
   escapeBuiltinToolNames?: boolean;
+  openaiChatEofTolerance?: boolean;
   googleMode?: "ai-studio" | "vertex" | "cloud-code-assist";
   project?: string;
   location?: string;
@@ -229,6 +231,7 @@ export function providerConfigSeed(entry: ProviderRegistryEntry): OcxProviderCon
     ...(liveModels !== undefined ? { liveModels } : {}),
     ...(entry.contextWindow !== undefined ? { contextWindow: entry.contextWindow } : {}),
     ...(entry.modelContextWindows ? { modelContextWindows: { ...entry.modelContextWindows } } : {}),
+    ...(entry.modelDisplayNames ? { modelDisplayNames: { ...entry.modelDisplayNames } } : {}),
     ...(entry.modelInputModalities ? { modelInputModalities: cloneRecordOfArrays(entry.modelInputModalities) } : {}),
     ...(entry.modelMaxInputTokens ? { modelMaxInputTokens: { ...entry.modelMaxInputTokens } } : {}),
     ...(entry.defaultMaxOutputTokens !== undefined ? { defaultMaxOutputTokens: entry.defaultMaxOutputTokens } : {}),
@@ -247,15 +250,20 @@ export function providerConfigSeed(entry: ProviderRegistryEntry): OcxProviderCon
     ...(entry.parallelToolCalls !== undefined ? { parallelToolCalls: entry.parallelToolCalls } : {}),
     ...(entry.promptCacheKey !== undefined ? { promptCacheKey: entry.promptCacheKey } : {}),
     ...(entry.chatServiceTier !== undefined ? { chatServiceTier: entry.chatServiceTier } : {}),
+    ...(entry.openaiChatEofTolerance !== undefined ? { openaiChatEofTolerance: entry.openaiChatEofTolerance } : {}),
     ...(entry.responsesPath !== undefined ? { responsesPath: entry.responsesPath } : {}),
     ...(entry.statelessResponses !== undefined ? { statelessResponses: entry.statelessResponses } : {}),
     ...(entry.requiresAdjacentResponsesToolResults !== undefined
       ? { requiresAdjacentResponsesToolResults: entry.requiresAdjacentResponsesToolResults }
       : {}),
+    ...(entry.annotateEmptyToolOutputs !== undefined
+      ? { annotateEmptyToolOutputs: entry.annotateEmptyToolOutputs }
+      : {}),
     ...(entry.autoToolChoiceOnlyModels ? { autoToolChoiceOnlyModels: [...entry.autoToolChoiceOnlyModels] } : {}),
     ...(entry.preserveReasoningContentModels ? { preserveReasoningContentModels: [...entry.preserveReasoningContentModels] } : {}),
     ...(entry.requiresReasoningPlaceholderModels ? { requiresReasoningPlaceholderModels: [...entry.requiresReasoningPlaceholderModels] } : {}),
     ...(entry.reasoningSplitModels ? { reasoningSplitModels: [...entry.reasoningSplitModels] } : {}),
+    ...(entry.reasoningDetailsModels ? { reasoningDetailsModels: [...entry.reasoningDetailsModels] } : {}),
     ...(entry.thinkingToggleModels ? { thinkingToggleModels: [...entry.thinkingToggleModels] } : {}),
     ...(entry.thinkingBudgetModels ? { thinkingBudgetModels: [...entry.thinkingBudgetModels] } : {}),
     ...(entry.escapeBuiltinToolNames !== undefined ? { escapeBuiltinToolNames: entry.escapeBuiltinToolNames } : {}),
@@ -303,9 +311,11 @@ export function deriveKeyLoginMap(): Record<string, DerivedKeyLoginProvider> {
       ...(entry.preserveReasoningContentModels ? { preserveReasoningContentModels: [...entry.preserveReasoningContentModels] } : {}),
       ...(entry.requiresReasoningPlaceholderModels ? { requiresReasoningPlaceholderModels: [...entry.requiresReasoningPlaceholderModels] } : {}),
       ...(entry.reasoningSplitModels ? { reasoningSplitModels: [...entry.reasoningSplitModels] } : {}),
+      ...(entry.reasoningDetailsModels ? { reasoningDetailsModels: [...entry.reasoningDetailsModels] } : {}),
       ...(entry.thinkingToggleModels ? { thinkingToggleModels: [...entry.thinkingToggleModels] } : {}),
       ...(entry.thinkingBudgetModels ? { thinkingBudgetModels: [...entry.thinkingBudgetModels] } : {}),
       ...(entry.escapeBuiltinToolNames !== undefined ? { escapeBuiltinToolNames: entry.escapeBuiltinToolNames } : {}),
+      ...(entry.openaiChatEofTolerance !== undefined ? { openaiChatEofTolerance: entry.openaiChatEofTolerance } : {}),
       ...(entry.googleMode ? { googleMode: entry.googleMode } : {}),
       ...(entry.project ? { project: entry.project } : {}),
       ...(entry.location ? { location: entry.location } : {}),
@@ -388,6 +398,32 @@ function serviceTierModelDefaultsFor(
 }
 
 /**
+ * Materialize the registry's verbosity opt-out into the provider config at seed/enrich time.
+ *
+ * The catalog hint pass must not read PROVIDER_REGISTRY: a gather flight captures its registry
+ * authority up front and forbids any later read, so consulting the registry per model turned
+ * every hint pass into a post-lookup read and dropped a custom-destination flight's own
+ * discovery result (tests/codex-gather-authority.test.ts).
+ *
+ * Registry values go in first so an explicit user entry still wins, matching
+ * `applyReasoningSummaryDefaults`. `supportsVerbosity` is the provider-wide default, expanded
+ * across the seeded model list so an id discovered later still inherits it through the same
+ * Record the hint pass already reads.
+ */
+function applyVerbosityDefaults(prov: OcxProviderConfig, entry: ProviderRegistryEntry | undefined): void {
+  if (!entry) return;
+  const perModel = entry.modelSupportsVerbosity;
+  if (!perModel && entry.supportsVerbosity === undefined) return;
+  prov.modelSupportsVerbosity = {
+    ...(perModel ?? {}),
+    ...(prov.modelSupportsVerbosity ?? {}),
+  };
+  if (entry.supportsVerbosity !== undefined) {
+    prov.supportsVerbosity ??= entry.supportsVerbosity;
+  }
+}
+
+/**
  * Last-resort enrichment for a provider whose NAME matches no registry id.
  *
  * #1100 was reported against a hand-added provider called "GLM" pointing at a vendor endpoint
@@ -423,6 +459,7 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
     // destinations, so a templated or overridable base URL cannot be claimed by it.
     enrichReasoningSummariesByDestination(prov);
     applyServiceTierModelDefaults(prov, serviceTierModelDefaultsFor(registryEntryForProviderDestination(prov), prov));
+    applyVerbosityDefaults(prov, registryEntryForProviderDestination(prov));
     return;
   }
   const explicitDirectReasoning: DirectReasoningEffortOverrides = {
@@ -442,6 +479,11 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (prov.liveModels === undefined && seed.liveModels !== undefined) prov.liveModels = seed.liveModels;
   if (prov.contextWindow === undefined && seed.contextWindow !== undefined) prov.contextWindow = seed.contextWindow;
   if (!prov.modelContextWindows && seed.modelContextWindows) prov.modelContextWindows = { ...seed.modelContextWindows };
+  // Per-model fill, not all-or-nothing: an operator who renamed ONE model must still receive
+  // labels for the rest, and an existing install must pick up newly seeded rows on enrich.
+  if (seed.modelDisplayNames) {
+    prov.modelDisplayNames = { ...seed.modelDisplayNames, ...(prov.modelDisplayNames ?? {}) };
+  }
   if (seed.modelInputModalities) prov.modelInputModalities = fillRecordOfArrays(seed.modelInputModalities, prov.modelInputModalities);
   if (prov.defaultMaxOutputTokens === undefined && seed.defaultMaxOutputTokens !== undefined) prov.defaultMaxOutputTokens = seed.defaultMaxOutputTokens;
   if (!prov.modelMaxOutputTokens && seed.modelMaxOutputTokens) prov.modelMaxOutputTokens = { ...seed.modelMaxOutputTokens };
@@ -461,6 +503,9 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (prov.parallelToolCalls === undefined && seed.parallelToolCalls !== undefined) prov.parallelToolCalls = seed.parallelToolCalls;
   if (prov.promptCacheKey === undefined && seed.promptCacheKey !== undefined) prov.promptCacheKey = seed.promptCacheKey;
   if (prov.chatServiceTier === undefined && seed.chatServiceTier !== undefined) prov.chatServiceTier = seed.chatServiceTier;
+  if (prov.openaiChatEofTolerance === undefined && seed.openaiChatEofTolerance !== undefined) {
+    prov.openaiChatEofTolerance = seed.openaiChatEofTolerance;
+  }
   // Fill-only: a hand-edited path must survive, and a config saved before the registry
   // learned this route still gets backfilled.
   if (prov.responsesPath === undefined && seed.responsesPath !== undefined) prov.responsesPath = seed.responsesPath;
@@ -468,15 +513,25 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (prov.requiresAdjacentResponsesToolResults === undefined && seed.requiresAdjacentResponsesToolResults !== undefined) {
     prov.requiresAdjacentResponsesToolResults = seed.requiresAdjacentResponsesToolResults;
   }
+  if (prov.annotateEmptyToolOutputs === undefined && seed.annotateEmptyToolOutputs !== undefined) {
+    prov.annotateEmptyToolOutputs = seed.annotateEmptyToolOutputs;
+  }
   // Registry-only metadata (never seeded into saved config): backfill straight from
   // the entry so an explicit user value stays distinguishable from the default.
   if (prov.fastWire === undefined && entry.fastWire !== undefined) {
     prov.fastWire = cloneFastWire(entry.fastWire);
   }
   if (prov.supportsServiceTier === undefined && entry.supportsServiceTier !== undefined) prov.supportsServiceTier = entry.supportsServiceTier;
+  if (prov.supportsOpenAiWebSearchToolFields === undefined && entry.supportsOpenAiWebSearchToolFields !== undefined) {
+    prov.supportsOpenAiWebSearchToolFields = entry.supportsOpenAiWebSearchToolFields;
+  }
+  if (prov.supportsResponsesCustomTools === undefined && entry.supportsResponsesCustomTools !== undefined) {
+    prov.supportsResponsesCustomTools = entry.supportsResponsesCustomTools;
+  }
   if (prov.preserveResponsesReasoningContent === undefined && entry.preserveResponsesReasoningContent !== undefined) prov.preserveResponsesReasoningContent = entry.preserveResponsesReasoningContent;
   applyReasoningSummaryDefaults(prov, entry.modelSupportsReasoningSummaries);
   applyServiceTierModelDefaults(prov, serviceTierModelDefaultsFor(entry, prov));
+  applyVerbosityDefaults(prov, entry);
   // Registry-only repair policy (#938): fill only when the runtime provider has
   // no explicit policy, and deep-clone so saved/user values never alias the
   // registry constant.
@@ -496,6 +551,7 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (!prov.preserveReasoningContentModels && seed.preserveReasoningContentModels) prov.preserveReasoningContentModels = [...seed.preserveReasoningContentModels];
   if (!prov.requiresReasoningPlaceholderModels && seed.requiresReasoningPlaceholderModels) prov.requiresReasoningPlaceholderModels = [...seed.requiresReasoningPlaceholderModels];
   if (!prov.reasoningSplitModels && seed.reasoningSplitModels) prov.reasoningSplitModels = [...seed.reasoningSplitModels];
+  if (!prov.reasoningDetailsModels && seed.reasoningDetailsModels) prov.reasoningDetailsModels = [...seed.reasoningDetailsModels];
   if (!prov.thinkingToggleModels && seed.thinkingToggleModels) prov.thinkingToggleModels = [...seed.thinkingToggleModels];
   if (!prov.thinkingBudgetModels && seed.thinkingBudgetModels) prov.thinkingBudgetModels = [...seed.thinkingBudgetModels];
   if (prov.escapeBuiltinToolNames === undefined && seed.escapeBuiltinToolNames !== undefined) prov.escapeBuiltinToolNames = seed.escapeBuiltinToolNames;

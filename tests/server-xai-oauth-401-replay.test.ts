@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../src/config";
@@ -9,9 +9,10 @@ import { XAI_GROK_CLI_BASE_URL } from "../src/providers/xai-transport";
 import { startServer } from "../src/server";
 import type { OcxConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const TOKEN_ENDPOINT = "https://auth.x.ai/oauth/token";
-const CHAT_ENDPOINT = `${XAI_GROK_CLI_BASE_URL}/chat/completions`;
+const OAUTH_RESPONSES_ENDPOINT = `${XAI_GROK_CLI_BASE_URL}/responses`;
 const PUBLIC_OAUTH_AUTHENTICATION_ERROR = "OAuth authentication failed. Check the OpenCodex account status and retry.";
 const WINDOWS_PATH_CANARY = "C:\\Users\\Alice\\.opencodex\\auth.json.ocx-tmp";
 const UNC_PATH_CANARY = "\\\\server\\share\\opencodex\\auth.json.ocx-tmp";
@@ -36,7 +37,7 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousHome;
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
-  if (testDir) rmSync(testDir, { recursive: true, force: true });
+  if (testDir) removeTreeWithRetry(testDir);
 });
 
 async function seedOAuth(expires = Date.now() + 3_600_000): Promise<void> {
@@ -60,6 +61,7 @@ function xaiConfig(authMode: "oauth" | "key" = "oauth"): OcxConfig {
         baseUrl: "https://api.x.ai/v1",
         authMode,
         ...(authMode === "key" ? { apiKey: "xai-api-key" } : {}),
+        ...(authMode === "oauth" ? { modelAdapters: { "grok-4.5": "openai-responses" } } : {}),
         models: ["grok-4.5"],
       },
     },
@@ -68,10 +70,18 @@ function xaiConfig(authMode: "oauth" | "key" = "oauth"): OcxConfig {
 
 function successBody(text: string): string {
   return JSON.stringify({
-    id: "chatcmpl-xai-401",
-    object: "chat.completion",
-    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    id: "resp-xai-401",
+    object: "response",
+    status: "completed",
+    model: "grok-4.5",
+    output: [{
+      id: "msg-xai-401",
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    }],
+    usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
   });
 }
 
@@ -114,7 +124,11 @@ function installOAuthFetch(
         expires_in: 3600,
       }), { headers: { "content-type": "application/json" } });
     }
-    if (url === CHAT_ENDPOINT) {
+    if (url === OAUTH_RESPONSES_ENDPOINT) {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      expect(body.model).toBe("grok-4.5");
+      expect(body.input).toBe("hello");
+      expect(body.messages).toBeUndefined();
       chatAuth.push(new Headers(init?.headers).get("authorization") ?? "");
       const status = chatStatuses.shift() ?? 200;
       if (status === 401) {
@@ -130,7 +144,7 @@ function installOAuthFetch(
   return { chatAuth, counts };
 }
 
-describe("xAI OAuth upstream 401 replay", () => {
+describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
   test("initial OAuth refresh projects raw provider failures before responding", async () => {
     await seedOAuth(0);
     saveConfig(xaiConfig());
@@ -209,7 +223,7 @@ describe("xAI OAuth upstream 401 replay", () => {
       const response = await post(server);
       const json = await response.json() as { error?: { message?: string } };
       expect(response.status).toBe(401);
-      expect(json.error?.message).toContain("Provider error 401");
+      expect(json.error?.message).toBe("rejected");
       expect(observed.counts.refresh).toBe(1);
       expect(observed.chatAuth).toEqual(["Bearer rejected-access", "Bearer fresh-access"]);
     } finally {
@@ -277,7 +291,7 @@ describe("xAI OAuth upstream 401 replay", () => {
           expires_in: 3600,
         }), { headers: { "content-type": "application/json" } });
       }
-      if (url === CHAT_ENDPOINT) {
+      if (url === OAUTH_RESPONSES_ENDPOINT) {
         const bearer = new Headers(init?.headers).get("authorization") ?? "";
         attemptsByBearer.set(bearer, (attemptsByBearer.get(bearer) ?? 0) + 1);
         if (bearer === "Bearer rejected-access") {

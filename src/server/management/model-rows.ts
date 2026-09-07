@@ -25,6 +25,7 @@ import { providerContextCap } from "../../providers/context-cap";
 import { isVisionReasoningEffort } from "../../reasoning-effort";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import type { OcxConfig } from "../../types";
+import { ensureCodexEntitlementFreshness } from "../../codex/model-entitlements";
 import { fetchAllModels } from "./shared";
 
 /**
@@ -40,15 +41,43 @@ export type ManagementModelRow = Partial<CatalogModel> & {
   native?: boolean;
   custom?: boolean;
   customId?: string;
+  displayNameOverride?: string;
+  displayNameSource?: "operator" | "provider" | "fallback";
 };
+
+/** Resolve the exact text and source shown for one routed discovered model. */
+export function effectiveManagementDisplayName(
+  config: Pick<OcxConfig, "providers">,
+  model: CatalogModel,
+): Pick<ManagementModelRow, "displayName" | "displayNameOverride" | "displayNameSource"> {
+  const provider = config.providers[model.provider];
+  const configured = provider?.modelDisplayNames;
+  if (configured && Object.hasOwn(configured, model.id)) {
+    const displayName = configured[model.id]?.trim();
+    if (displayName) {
+      return { displayName, displayNameOverride: displayName, displayNameSource: "operator" };
+    }
+  }
+  const providerDisplayName = model.displayName?.trim();
+  if (providerDisplayName) return { displayName: providerDisplayName, displayNameSource: "provider" };
+  return { displayName: catalogModelSlug(model), displayNameSource: "fallback" };
+}
 
 /**
  * The exact row list `/api/models` returns. Extracted so `/api/client-config` exports the
  * models the GUI's Models tab shows — including this function's `disabled` computation,
  * which the export core (src/clients/config-export.ts) deliberately does not perform.
  */
-export async function listManagementModelRows(config: OcxConfig): Promise<ManagementModelRow[]> {
-  const models = await fetchAllModels(config);
+export async function listManagementModelRows(
+  config: OcxConfig,
+  options: { entitlementWaitMs?: number } = {},
+): Promise<ManagementModelRow[]> {
+  const [models] = await Promise.all([
+    fetchAllModels(config),
+    ensureCodexEntitlementFreshness(config, {
+      waitMs: options.entitlementWaitMs ?? 3_000,
+    }),
+  ]);
   const disabled = new Set(config.disabledModels ?? []);
   // Native GPT passthrough rows lead (provider "openai", bare-slug namespaced ids): sourced
   // from the static supported set so a disabled model stays listed and re-enableable.
@@ -63,6 +92,7 @@ export async function listManagementModelRows(config: OcxConfig): Promise<Manage
           disabled: disabled.has(`${selector}/${slug}`) || disabled.has(slug),
           contextWindow: undefined,
           maxInputTokens: undefined,
+          autoCompactTokenLimit: undefined,
         })))
     : [];
   const native: ManagementModelRow[] = [...nativeRows, ...accountNativeRows].map(row => {
@@ -82,6 +112,9 @@ export async function listManagementModelRows(config: OcxConfig): Promise<Manage
       // 1.05M). Dropping it here made /api/models describe a native row as if the whole
       // window were usable as input, which is the claim the measurement disproved.
       ...(row.maxInputTokens !== undefined ? { maxInputTokens: row.maxInputTokens } : {}),
+      ...(row.autoCompactTokenLimit !== undefined
+        ? { autoCompactTokenLimit: row.autoCompactTokenLimit }
+        : {}),
     };
   });
   const customModels: ManagementModelRow[] = (config.customModels ?? []).map(cm => {
@@ -95,6 +128,7 @@ export async function listManagementModelRows(config: OcxConfig): Promise<Manage
       customId: cm.id,
       displayName: cm.displayName,
       ...(cm.contextWindow ? { contextWindow: cm.contextWindow } : {}),
+      ...(cm.maxOutputTokens ? { maxOutputTokens: cm.maxOutputTokens } : {}),
       ...(cm.inputModalities ? { inputModalities: cm.inputModalities } : {}),
       // Stored override, not the inherited ladder: the edit dialog must show what the user
       // set (including an explicit empty "no reasoning" ladder), not what the provider row
@@ -110,7 +144,21 @@ export async function listManagementModelRows(config: OcxConfig): Promise<Manage
   const comboNamespaced = new Set(
     publicModels.filter(model => model.provider === "combo").map(catalogModelSlug),
   );
-  const visibleCustomModels = customModels.filter(model => !comboNamespaced.has(model.namespaced));
+  const effectiveMaxOutputBySlug = new Map(
+    publicModels.flatMap(model => (
+      model.maxOutputTokens !== undefined
+        ? [[catalogModelSlug(model), model.maxOutputTokens] as const]
+        : []
+    )),
+  );
+  const visibleCustomModels = customModels
+    .filter(model => !comboNamespaced.has(model.namespaced))
+    .map(model => {
+      const inherited = effectiveMaxOutputBySlug.get(model.namespaced);
+      return model.maxOutputTokens === undefined && inherited !== undefined
+        ? { ...model, maxOutputTokens: inherited }
+        : model;
+    });
   // Custom metadata wins when a physical live/static row resolves to the same Codex-facing
   // slug, while a combo keeps the same precedence it has in routing and /v1/models.
   const customNamespaced = new Set(visibleCustomModels.map(c => c.namespaced));
@@ -120,8 +168,10 @@ export async function listManagementModelRows(config: OcxConfig): Promise<Manage
     if (m.provider !== "combo" && customNamespaced.has(namespaced)) return null;
     const contextCap = providerContextCap(config, m.provider);
     const nativeAlias = m.provider === "combo" && m.nativeAlias === true;
+    const displayName = effectiveManagementDisplayName(config, m);
     return {
       ...m,
+      ...displayName,
       namespaced,
       disabled: [...disabled].some(stored => (
         (!nativeAlias && stored === namespaced) || slugEquals(stored, m.provider, m.id)
@@ -139,8 +189,9 @@ export function toExportModel(row: ManagementModelRow): ExportModel {
     provider: row.provider,
     id: row.id,
     ...(row.native ? { native: true } : {}),
-    ...(row.displayName ? { displayName: row.displayName } : {}),
+    ...(row.displayName && row.displayNameSource !== "fallback" ? { displayName: row.displayName } : {}),
     ...(row.contextWindow !== undefined ? { contextWindow: row.contextWindow } : {}),
+    ...(row.maxOutputTokens !== undefined ? { maxOutputTokens: row.maxOutputTokens } : {}),
     ...(row.inputModalities ? { inputModalities: row.inputModalities } : {}),
     ...(row.reasoningEfforts ? { reasoningEfforts: row.reasoningEfforts } : {}),
     ...(row.defaultReasoningEffort ? { defaultReasoningEffort: row.defaultReasoningEffort } : {}),

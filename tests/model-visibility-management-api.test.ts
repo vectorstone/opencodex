@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync} from "node:fs";
 import { join } from "node:path";
 import { nativeModelRows } from "../src/codex/catalog";
 import { loadConfig, saveConfig } from "../src/config";
 import { handleManagementAPI } from "../src/server/management-api";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 import { catalogConvergenceFactory } from "./helpers/catalog-convergence";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const TEST_DIR = join(import.meta.dir, `.tmp-model-visibility-management-${process.pid}`);
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
@@ -13,7 +14,7 @@ let isolatedCodexHome: IsolatedCodexHome | null = null;
 let refreshes = 0;
 
 beforeEach(() => {
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
   mkdirSync(TEST_DIR, { recursive: true });
   process.env.OPENCODEX_HOME = TEST_DIR;
   isolatedCodexHome = installIsolatedCodexHome("ocx-model-visibility-codex-");
@@ -44,7 +45,7 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
 });
 
 async function putWithConfig(body: unknown, config = loadConfig()): Promise<Response> {
@@ -321,6 +322,44 @@ describe("atomic model visibility management", () => {
     expect((await put({ scope: "models", provider: "combo", targets: [{ id: "toString" }], enabled: true })).status).toBe(400);
     expect(loadConfig()).toEqual(before);
     expect(refreshes).toBe(2);
+  });
+
+  test("a native model suppressed by an unconfirmed roster is still a valid visibility target (#2886)", async () => {
+    // The endpoint validated bare native targets against nativeModelRows, which has already
+    // dropped rows an unconfirmed entitlement roster suppressed. So `ocx models enable
+    // gpt-5.6-sol` answered "invalid model visibility target" for a model this build knows
+    // perfectly well, leaving the operator with no way to clear its disable key.
+    //
+    // Scope: accepting the target says "this build knows this model", not "this account may
+    // use it". Visibility only writes disabledModels; entitlement still filters the rendered
+    // rows and routing stays gated, so this removes a misleading error rather than granting
+    // access.
+    saveConfig({ ...loadConfig(), disabledModels: ["gpt-5.6-sol", "other/keep"] });
+    // Precondition: the model is genuinely absent from the rendered rows here.
+    expect(nativeModelRows(loadConfig()).some(row => row.slug === "gpt-5.6-sol")).toBe(false);
+
+    const response = await put({
+      scope: "models",
+      provider: "openai",
+      targets: [{ id: "gpt-5.6-sol", native: true }],
+      enabled: true,
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).not.toContain("invalid model visibility target");
+    expect(loadConfig().disabledModels).toEqual(["other/keep"]);
+  });
+
+  test("an unknown native id is still rejected (#2886)", async () => {
+    // The validation set widens to what this build knows, not to anything a caller names.
+    const before = loadConfig();
+    expect((await put({
+      scope: "models",
+      provider: "openai",
+      targets: [{ id: "gpt-9.9-imaginary", native: true }],
+      enabled: true,
+    })).status).toBe(400);
+    expect(loadConfig()).toEqual(before);
   });
 });
 import { ManagementRequest as Request } from "./helpers/management-auth";

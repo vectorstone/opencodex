@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { invalidateCodexModelsCache, syncCatalogModels } from "../src/codex/catalog";
 import { refreshCodexModelCatalog } from "../src/codex/refresh";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const config = {
   port: 10100,
@@ -31,8 +32,8 @@ function installTempHomes(): { codexHome: string; opencodexHome: string; restore
       else process.env.CODEX_HOME = previousCodexHome;
       if (previousOpenCodexHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousOpenCodexHome;
-      rmSync(codexHome, { recursive: true, force: true });
-      rmSync(opencodexHome, { recursive: true, force: true });
+      removeTreeWithRetry(codexHome);
+      removeTreeWithRetry(opencodexHome);
     },
   };
 }
@@ -53,7 +54,7 @@ function nativeCatalogFixture(slug = "gpt-5.5"): string {
 
 afterEach(() => {
   for (const path of tempHomes.splice(0)) {
-    rmSync(path, { recursive: true, force: true });
+    removeTreeWithRetry(path);
   }
 });
 
@@ -159,8 +160,10 @@ describe("Codex catalog refresh", () => {
       expect(result.path).toBe(join(realpathSync.native(home.codexHome), "nested", "catalog.json"));
       expect(result.catalogWritten).toBe(true);
       expect(after).not.toBe(before);
-      expect(rewritten.models[0].slug).toBe("gpt-5.6-sol");
-      expect(rewritten.models[0].display_name).toBe("GPT-5.6-Sol");
+      // The fixture seeds gated Sol rows, but this isolated home has no authenticated
+      // roster, so sync drops them and the first surviving row is gpt-5.5.
+      expect(rewritten.models[0].slug).toBe("gpt-5.5");
+      expect(rewritten.models[0].display_name).toBe("gpt-5.5");
       expect(rewritten.models[0].context_window).toBeGreaterThan(0);
     } finally {
       home.restore();

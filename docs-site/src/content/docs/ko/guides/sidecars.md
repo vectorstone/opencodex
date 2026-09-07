@@ -5,13 +5,14 @@ description: 네이티브 ChatGPT 사이드카를 통해 라우팅 모델에 실
 
 라우팅 모델마다 호스팅 **웹 검색**이나 네이티브 **이미지 입력** 지원 범위가 다릅니다. opencodex는
 ChatGPT 로그인(`forward`) 프로바이더나 저장된 Anthropic OAuth 프로바이더를 사용하는 두
-사이드카로 부족한 기능을 보완합니다. 사이드카 오류는 턴 전체를 실패시키지 않고 길이가 제한된 도구
+사이드카로 부족한 기능을 보완하며, 웹 검색은 명시적인 `xai` 백엔드로 저장된 Grok OAuth도 사용할 수
+있습니다. 사이드카 오류는 턴 전체를 실패시키지 않고 길이가 제한된 도구
 결과나 이미지 안내문으로 바뀝니다.
 
 :::note[백엔드 자동 선택]
-`backend`를 명시하면 그 값이 우선합니다. 생략하면 활성 계정이 `needsReauth` 상태가 아닌 Anthropic
-OAuth 프로바이더가 있을 때 `anthropic`, 없을 때 `openai`를 사용합니다. 쓸 수 있는 자격 증명 없이
-`anthropic`을 명시하면 실패 후 중단합니다. `openai`는 ChatGPT 로그인과 활성화된 `forward`
+`backend`를 명시하면 그 값이 우선합니다. 웹 검색은 생략 시 항상 `openai`를 사용하고, 비전은 사용
+가능한 Anthropic OAuth 계정이 있으면 `anthropic`, 없으면 `openai`를 사용합니다. 쓸 수 있는 자격
+증명 없이 `anthropic` 또는 `xai`를 명시하면 폴백 없이 실패합니다. `openai`는 ChatGPT 로그인과 활성화된 `forward`
 프로바이더가 모두 필요합니다.
 :::
 
@@ -24,8 +25,9 @@ Codex가 패스스루가 아닌 라우팅 모델에 호스팅 `web_search`를 �
    노출합니다. 원래 호스팅 도구의 옵션은 사이드카 호출에 그대로 사용합니다.
 2. 라우팅 모델을 작은 **에이전트 루프**에서 실행합니다. 모델이 `web_search`를 호출하면 선택한
    백엔드를 사용합니다. OpenAI는 기본 `gpt-5.6-luna`로 호스팅 `web_search`를 실행하고,
-   Anthropic은 기본 `claude-sonnet-5`로 `web_search_20250305`를 실행합니다. 스트리밍 답변과
-   인용을 파싱한 결과는 도구 결과로 돌려줍니다.
+   Anthropic은 기본 `claude-sonnet-5`로 `web_search_20250305`를 실행합니다. xAI는 기본
+   `grok-4.6`으로 호스팅 `web_search`를 실행하고, `xSearch.enabled`가 true이면 같은 요청에
+   `x_search`를 추가합니다. 스트리밍 답변과 인용을 파싱한 결과는 도구 결과로 돌려줍니다.
 3. 모델이 답하거나 실제 검색 쿼리의 총합이 `maxSearchesPerTurn`(기본값 3)에 도달할 때까지
    **반복**합니다. 한도에 닿으면 검색 도구를 제거하고 최종 답변을 강제합니다. `apply_patch`나 shell
    같은 실제 클라이언트 도구가 나오면 턴을 끝내 해당 호출이 Codex에 전달되게 합니다.
@@ -69,8 +71,13 @@ stall은 전체 생성 timeout이 아닙니다. SSE가 시작되기 전 실패�
 
 ## 비전 사이드카
 
-라우팅 모델이 해당 프로바이더의 `noVisionModels`에 있고 요청에 이미지가 들어오면, opencodex는
-메인 호출 **전에** 각 이미지를 설명한 텍스트로 바꿉니다. `visionSidecar.model`이 없거나 빈 값이면
+라우팅 모델이 해당 프로바이더의 `noVisionModels`에 있거나 해당 모델이 `modelInputModalities`에서
+텍스트 전용으로 선언되어 있고 요청에 이미지가 들어오면, opencodex는 사용 가능한 비전 사이드카 계획이 있을 때에만
+메인 호출 **전에** 각 이미지를 설명한 텍스트로 바꿉니다. 사용 가능한 계획이 없으면 원본 이미지는 텍스트 전용
+백엔드로 전달되지 않고 제거됩니다. 모델 카탈로그는 사이드카로 처리되는 모든 모델에 image input을 알립니다.
+콤보는 모든 멤버가 네이티브로 또는 사이드카를 통해 이미지를 수용하고 콤보의 `imageInput` 설정이 비활성화되지 않은
+경우에만 image input을 알립니다. 따라서 Codex 앱 같은 클라이언트는 사이드카가 실행되기 전에 첨부를 차단하지 않고 허용합니다.
+`visionSidecar.model`이 없거나 빈 값이면
 OpenAI 실행 경로, Dashboard, 관리 API는 `gpt-5.4-mini`를 폴백으로 사용합니다. 시작 시 명시적으로
 저장된 기존 `gpt-5.4-mini` 값은 계속 `gpt-5.6-luna`로 마이그레이션되지만, 이 마이그레이션은 저장된
 값에만 적용되고 모델 필드가 없는 경우에는 적용되지 않습니다.
@@ -92,8 +99,8 @@ OpenAI 실행 경로, Dashboard, 관리 API는 `gpt-5.4-mini`를 폴백으로 �
   원격 `https` 이미지는 프록시가 아니라 OpenAI 백엔드가 가져옵니다.
 - `noVisionModels` 비교는 Ollama식 `:size` 접미사를 무시하므로 `gpt-oss` 항목 하나로
   `gpt-oss:120b`도 처리할 수 있습니다.
-- 이미지 설명이 실패하면 짧은 처리 오류 안내문을 모델에 전달합니다. 사이드카 계획 자체를 만들 수
-  없으면 텍스트 전용 백엔드에 원본 이미지를 보내지 않고 제거합니다.
+- 이미지 설명이 실패하면 짧은 처리 오류 안내문을 모델에 전달합니다. (사용 가능한 사이드카 계획이 없으면
+  설명을 시도하지 않고 위에서 설명한 대로 원본 이미지를 제거합니다.)
 - `maxDescriptionsPerTurn`(기본값 8)은 메인 모델 한 턴에서 새로 실행할 설명 수를 제한합니다. 캐시
   적중과 같은 턴의 중복 요청은 한도를 쓰지 않습니다. 성공한 `data:` 이미지 설명은 백엔드, 모델,
   detail, 이미지 바이트, 메시지 문맥을 기준으로 캐시하며, OpenAI 키에는 추론 강도도 포함됩니다
@@ -119,7 +126,6 @@ OpenAI 실행 경로, Dashboard, 관리 API는 `gpt-5.4-mini`를 폴백으로 �
 {
   "providers": {
     "ollama-cloud": {
-      "adapter": "openai-chat",
       "baseUrl": "https://ollama.com/v1",
       "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
     }

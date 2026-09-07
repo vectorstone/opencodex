@@ -9,6 +9,9 @@
  * src/cli/index.ts — only the published npm `bin` routes through here.)
  */
 import { spawn, spawnSync } from "node:child_process";
+import { STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "../src/update/stop-contract.mjs";
+import { probeProxyLiveness } from "../src/update/proxy-liveness-probe.mjs";
+import { decidePostStopUpdate } from "../src/update/stop-decision.mjs";
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -17,12 +20,17 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isRealBunBinary } from "../src/lib/bun-binary-validator.mjs";
 import { npmInvocation } from "../src/update/npm-invocation.mjs";
+import { hasPendingTeardownIn } from "../src/config/pending-teardown-names.mjs";
 import {
   npmCachePreflightFailureMessage,
   runNpmCachePreflight,
 } from "../src/update/npm-cache-preflight.mjs";
 import { handoffWindowsTrayForUpdate, planWindowsTrayUpdate } from "../src/update/tray-update-plan.mjs";
 import { bootRestoreProbe, transactionalNpmUpdate } from "../src/update/transactional-install.mjs";
+import {
+  CODEX_CLI_VERSION_MANAGER_ROOT_ENV_SLOTS,
+  isCodexCliUpdateInspectionArgv,
+} from "../src/update/codex-cli-update-launch-policy.mjs";
 
 const PKG = "@bitkyc08/opencodex";
 const require = createRequire(import.meta.url);
@@ -155,10 +163,9 @@ function runNpmSelfUpdate() {
     process.platform === "win32" ? trayInstallState() : { installed: false, running: false },
   );
   /**
-   * Refresh the existing service without re-registering it. `service repair` discovers
-   * the installed backend itself and, on Windows scheduler installs, rewrites the wrapper
-   * assets and restarts the existing task without `schtasks /create` — the elevation a
-   * non-admin `ocx update` does not have.
+   * Refresh the existing service in place. `service repair` discovers the installed backend;
+   * healthy Windows scheduler registrations avoid `schtasks /create`, while stale definitions
+   * may be re-registered and require elevation.
    */
   function serviceRefreshArgs() {
     return [launcher, "service", "repair"];
@@ -199,7 +206,12 @@ function runNpmSelfUpdate() {
   // Capture listen target before stop clears runtime-port.json (mirrors GUI/CLI update worker).
   // Do not treat a live runtime port of 10100 as "missing" — track whether the read succeeded.
   let bakePort = 10100;
+  // The hostname travels with the port: a proxy bound to ::1 or a specific interface is
+  // invisible to a probe that assumes 127.0.0.1, and "no answer" would then read as
+  // "stopped" for exactly the proxy the probe exists to find.
+  let bakeHostname = "127.0.0.1";
   let sawRuntimePort = false;
+  let sawRuntimeHostname = false;
   try {
     const rt = JSON.parse(readFileSync(join(configDir(), "runtime-port.json"), "utf8"));
     if (Number.isFinite(rt?.port) && rt.port > 0 && rt.port <= 65535) {
@@ -216,22 +228,115 @@ function runNpmSelfUpdate() {
       }
       if (runtimeLive) {
         bakePort = Math.trunc(rt.port);
+        if (typeof rt?.hostname === "string" && rt.hostname.trim() !== "") {
+          bakeHostname = rt.hostname.trim();
+          sawRuntimeHostname = true;
+        }
         sawRuntimePort = true;
       }
     }
   } catch { /* fall through to config */ }
-  if (!sawRuntimePort) {
+  // Port and hostname resolve INDEPENDENTLY: a legacy runtime record carries a port and no
+  // hostname, and skipping config in that case probed 127.0.0.1 for a proxy bound to ::1.
+  if (!sawRuntimePort || bakeHostname === "127.0.0.1") {
     try {
       const cfg = JSON.parse(readFileSync(join(configDir(), "config.json"), "utf8"));
-      if (Number.isFinite(cfg?.port) && cfg.port > 0 && cfg.port <= 65535) bakePort = Math.trunc(cfg.port);
+      if (!sawRuntimePort && Number.isFinite(cfg?.port) && cfg.port > 0 && cfg.port <= 65535) {
+        bakePort = Math.trunc(cfg.port);
+      }
+      if (!sawRuntimeHostname && typeof cfg?.hostname === "string" && cfg.hostname.trim() !== "") {
+        bakeHostname = cfg.hostname.trim();
+      }
     } catch { /* keep default */ }
+  }
+  // Wildcard and bracketed-IPv6 normalization lives in probeProxyLiveness, so both lanes
+  // get it from one place.
+
+  const launcher = fileURLToPath(import.meta.url);
+
+  function startProxyDirectly() {
+    if (!existsSync(launcher)) {
+      console.error("opencodex: cannot restart the proxy because the launcher is missing; reinstall opencodex manually.");
+      return;
+    }
+    const env = { ...process.env };
+    delete env.OCX_SERVICE;
+    console.log(`Attempting to restart the proxy on port ${bakePort}.`);
+    const child = spawn(process.execPath, [launcher, "start", "--port", String(bakePort)], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env,
+    });
+    child.on("error", error => {
+      console.error(`opencodex: direct proxy restart failed: ${error.message}`);
+    });
+    child.unref();
+  }
+
+  function refreshBackgroundServiceOrStartDirect() {
+    const prevBake = process.env.OCX_BAKE_PORT;
+    process.env.OCX_BAKE_PORT = String(bakePort);
+    try {
+      let svc = spawnSync(process.execPath, serviceRefreshArgs(), { stdio: "inherit", windowsHide: true });
+      // `serviceWasInstalled` is inferred from service-state.json alone, which can be
+      // STALE — present while the registration is gone. Repair refuses that case by
+      // design, and its thrown Error is indistinguishable from any other failure at
+      // this layer (plain Error, inherited stdio, generic exit status). So ask for
+      // structured state instead of parsing the failure: install only when the
+      // diagnostic says the service is genuinely absent. Installing after ANY repair
+      // failure would resurrect the elevation prompt this change exists to avoid, and
+      // could re-register a service the user just uninstalled.
+      if (svc.status !== 0 && readServiceInstalledFromStatus(launcher) === false) {
+        console.log("No registered service found — installing it instead.");
+        svc = spawnSync(process.execPath, serviceInstallArgs(), { stdio: "inherit", windowsHide: true });
+      }
+      let needDirectStart = svc.status !== 0;
+      if (!needDirectStart) {
+        // Exit 0 can still leave stale/missing assets that never bring the proxy
+        // back — match the GUI/CLI fallthrough so /healthz is not left dead.
+        try {
+          const st = spawnSync(process.execPath, [launcher, "status", "--json"], {
+            encoding: "utf8",
+            timeout: 20_000,
+            windowsHide: true,
+          });
+          if (st.status === 0 && typeof st.stdout === "string" && st.stdout.trim()) {
+            const parsed = JSON.parse(st.stdout);
+            const proxyUp = parsed?.proxy?.running === true || parsed?.proxy?.health?.ok === true;
+            const viable = parsed?.startup?.serviceViable === true;
+            if (!proxyUp && !viable) needDirectStart = true;
+          } else {
+            // status failed or empty — fail closed to direct start (match CLI).
+            needDirectStart = true;
+          }
+        } catch {
+          needDirectStart = true;
+        }
+      }
+      if (needDirectStart) {
+        // Repair normally avoids elevation for a healthy registration, but a stale Windows
+        // scheduler definition can require it. It can also fail — or exit 0 while leaving
+        // a non-viable manager. Fall back to a direct detached proxy start so the
+        // update never leaves the user without a running proxy.
+        console.warn(
+          svc.status === 0
+            ? "opencodex: service refresh left a non-viable manager — starting the proxy directly instead."
+            : "opencodex: service refresh failed — starting the proxy directly instead.",
+        );
+        console.warn("  Run 'ocx service repair' to see why the background service could not restart.");
+        startProxyDirectly();
+      }
+    } finally {
+      if (prevBake === undefined) delete process.env.OCX_BAKE_PORT;
+      else process.env.OCX_BAKE_PORT = prevBake;
+    }
   }
 
   // Never replace package files under a live proxy — stop it first (full `ocx stop`
   // semantics: graceful drain, service stop, native Codex restore). Gate on the service
   // and the runtime-port record too: a service-managed or orphaned proxy can be live
   // while ocx.pid is stale/missing.
-  const launcher = fileURLToPath(import.meta.url);
   if (trayBeforeUpdate.stopBeforeReplacement) {
     console.log("⏹  Handing off the Windows tray before updating...");
     try {
@@ -249,21 +354,62 @@ function runNpmSelfUpdate() {
   }
   const hasRuntimeState =
     existsSync(join(configDir(), "ocx.pid")) || existsSync(join(configDir(), "runtime-port.json"));
-  if (serviceWasInstalled || hasRuntimeState) {
+
+  function recoverStoppedRuntimeAfterFailure() {
+    if (serviceWasInstalled) {
+      console.warn("opencodex: update failed after stopping the proxy — restoring the previous background service.");
+      refreshBackgroundServiceOrStartDirect();
+    } else if (hasRuntimeState) {
+      console.warn("opencodex: update failed after stopping the proxy — restarting the previous version directly.");
+      startProxyDirectly();
+    }
+  }
+
+  // An outstanding pending-teardown receipt is a fourth reason to run the stop. After a
+  // parent crashed mid-deferral the service, pid and runtime records can all be absent
+  // while the shared client config still points at a proxy that is gone; installing over
+  // that silently skips the recovery the receipt was written to trigger (#3008). Presence
+  // is the whole test here — the launcher cannot parse it, and `ocx stop` is what decides
+  // whether the obligation is safe to finish.
+  const hasPendingTeardown = hasPendingTeardownIn(readdirSync, configDir());
+  if (serviceWasInstalled || hasRuntimeState || hasPendingTeardown) {
     console.log("⏹  Stopping the running proxy before updating...");
     const stopRes = spawnSync(process.execPath, [launcher, "stop"], { stdio: "inherit", windowsHide: true });
     const stillHasRuntimeState =
       existsSync(join(configDir(), "ocx.pid")) || existsSync(join(configDir(), "runtime-port.json"));
-    if (stopRes.status !== 0 || stillHasRuntimeState) {
+    // A history-only failure means teardown succeeded and a backup manifest is waiting for
+    // review: the proxy is down and replacing package files is safe. Every other nonzero
+    // status is a stop that did not finish, and a signal kill (status null) says nothing
+    // about whether it did - both abort, because replacing files under a live server
+    // leaves it running mixed old and new modules (#3008).
+    // The same decision the Bun updater makes, from the same module (#3008). Absent PID and
+    // runtime files are weak evidence, so the captured endpoint is asked; "unknown" aborts
+    // because a silent listener is exactly the state where replacing files is dangerous.
+    const decision = decidePostStopUpdate({
+      status: stopRes.status,
+      hasRuntimeState: stillHasRuntimeState,
+      // Re-checked AFTER the stop: a quarantined receipt lets the stop itself succeed
+      // (there is nothing left to stop), so a pre-stop check alone let the retry install
+      // over a teardown that never ran.
+      teardownOutstanding: hasPendingTeardownIn(readdirSync, configDir()),
+      liveness: probeProxyLiveness(bakePort, bakeHostname),
+    });
+    const historyOnlyStop = decision.reason === "history-only";
+    if (!decision.proceed) {
       if (trayBeforeUpdate.restoreOnFailure) runTrayLifecycle(launcher, "start");
-      console.error("opencodex: could not stop the running proxy; aborting the update. Run 'ocx stop' and retry.");
+      if (decision.reason === "teardown-outstanding") {
+        console.error("opencodex: a shared teardown from an earlier stop is still outstanding and needs manual review; aborting the update.");
+        console.error("opencodex: confirm no proxy is running, run 'ocx restore', then remove the pending-teardown file in the opencodex home.");
+      } else console.error(decision.reason === "proxy-unknown"
+        ? `opencodex: could not confirm the proxy on ${bakeHostname}:${bakePort} is stopped; aborting the update. Run 'ocx stop' and retry.`
+        : "opencodex: could not stop the running proxy; aborting the update. Run 'ocx stop' and retry.");
       process.exit(1);
     }
-    if (historyRestoreIncomplete()) {
+    if (historyOnlyStop || historyRestoreIncomplete()) {
       console.warn(
-        "opencodex: WARNING — Codex resume history was NOT restored (history DB locked; Codex app/IDE open?).\n" +
-        "  Routed threads stay hidden in the native Codex app until restored.\n" +
-        "  After the update: close the Codex app, then run 'ocx stop' once to restore.",
+        "opencodex: WARNING — Codex resume-history metadata restore is incomplete (a backup manifest remains).\n" +
+        "  The DB may be busy or the manifest/target may need review; untracked routed history is intentionally unchanged.\n" +
+        "  After the update: close the Codex app, run 'ocx doctor', then run 'ocx stop' once to retry.",
       );
     }
   }
@@ -309,7 +455,8 @@ function runNpmSelfUpdate() {
     // it recreates the #1849 destruction path. Report and stop; the boot probe and the
     // recovery marker cover the swap-window states.
     console.error(`opencodex: transactional update failed unexpectedly (${error?.message ?? error}). ` +
-      "The live install was not knowingly modified; run 'ocx update' again or reinstall with npm install -g.");
+      `The live install was not knowingly modified; run 'ocx update' again or reinstall with ` +
+      `npm install -g --allow-scripts=bun ${PKG}@${tag}.`);
     res = { status: 1 };
   }
   if (res.status === 0) {
@@ -329,77 +476,15 @@ function runNpmSelfUpdate() {
     // launcher so the new files write the baked paths and the service restarts.
     if (serviceWasInstalled) {
       console.log("Refreshing the background service with the updated files...");
-      const prevBake = process.env.OCX_BAKE_PORT;
-      process.env.OCX_BAKE_PORT = String(bakePort);
-      try {
-        let svc = spawnSync(process.execPath, serviceRefreshArgs(), { stdio: "inherit", windowsHide: true });
-        // `serviceWasInstalled` is inferred from service-state.json alone, which can be
-        // STALE — present while the registration is gone. Repair refuses that case by
-        // design, and its thrown Error is indistinguishable from any other failure at
-        // this layer (plain Error, inherited stdio, generic exit status). So ask for
-        // structured state instead of parsing the failure: install only when the
-        // diagnostic says the service is genuinely absent. Installing after ANY repair
-        // failure would resurrect the elevation prompt this change exists to avoid, and
-        // could re-register a service the user just uninstalled.
-        if (svc.status !== 0 && readServiceInstalledFromStatus(launcher) === false) {
-          console.log("No registered service found — installing it instead.");
-          svc = spawnSync(process.execPath, serviceInstallArgs(), { stdio: "inherit", windowsHide: true });
-        }
-        let needDirectStart = svc.status !== 0;
-        if (!needDirectStart) {
-          // Exit 0 can still leave stale/missing assets that never bring the proxy
-          // back — match the GUI/CLI fallthrough so /healthz is not left dead.
-          try {
-            const st = spawnSync(process.execPath, [launcher, "status", "--json"], {
-              encoding: "utf8",
-              timeout: 20_000,
-              windowsHide: true,
-            });
-            if (st.status === 0 && typeof st.stdout === "string" && st.stdout.trim()) {
-              const parsed = JSON.parse(st.stdout);
-              const proxyUp = parsed?.proxy?.running === true || parsed?.proxy?.health?.ok === true;
-              const viable = parsed?.startup?.serviceViable === true;
-              if (!proxyUp && !viable) needDirectStart = true;
-            } else {
-              // status failed or empty — fail closed to direct start (match CLI).
-              needDirectStart = true;
-            }
-          } catch {
-            needDirectStart = true;
-          }
-        }
-        if (needDirectStart) {
-          // A repair needs no elevation, but it can still fail — or exit 0 while leaving
-          // a non-viable manager. Fall back to a direct detached proxy start so the
-          // update never leaves the user without a running proxy.
-          console.warn(
-            svc.status === 0
-              ? "opencodex: service refresh left a non-viable manager — starting the proxy directly instead."
-              : "opencodex: service refresh failed — starting the proxy directly instead.",
-          );
-          console.warn("  Run 'ocx service repair' to see why the background service could not restart.");
-          const env = { ...process.env };
-          delete env.OCX_SERVICE;
-          const child = spawn(process.execPath, [launcher, "start", "--port", String(bakePort)], {
-            detached: true,
-            stdio: "ignore",
-            windowsHide: true,
-            env,
-          });
-          child.unref();
-          console.log(`Proxy starting on port ${bakePort}.`);
-        }
-      } finally {
-        if (prevBake === undefined) delete process.env.OCX_BAKE_PORT;
-        else process.env.OCX_BAKE_PORT = prevBake;
-      }
+      refreshBackgroundServiceOrStartDirect();
     } else {
       console.log("Restart the proxy:  ocx start");
     }
     process.exit(0);
   }
   if (trayBeforeUpdate.restoreOnFailure) runTrayLifecycle(launcher, "start");
-  console.error(`\nUpdate failed (npm exit ${res.status ?? "?"}). Try manually:  npm install -g ${PKG}@${tag}`);
+  recoverStoppedRuntimeAfterFailure();
+  console.error(`\nUpdate failed (npm exit ${res.status ?? "?"}). Try manually:  npm install -g --allow-scripts=bun ${PKG}@${tag}`);
   process.exit(1);
 }
 
@@ -439,7 +524,7 @@ function fail(msg) {
   process.exit(1);
 }
 
-function resolveBun() {
+function resolveBun({ allowInstall = true } = {}) {
   // Keep direct npm-launcher starts aligned with durable service/shim installs:
   // a valid explicit runtime must win even when the bundled dependency exists.
   const override = process.env[BUN_OVERRIDE_ENV]?.trim();
@@ -464,7 +549,7 @@ function resolveBun() {
   // Lazy fallback: --ignore-scripts (or a failed postinstall) leaves the
   // ~450-byte placeholder stub. Run the bun package's own installer once.
   const installJs = join(bunDir, "install.js");
-  if (existsSync(installJs)) {
+  if (allowInstall && existsSync(installJs)) {
     const r = spawnSync(process.execPath, [installJs], { stdio: "inherit" });
     if (r.status === 0) bin = findBunBinary(bunDir);
   }
@@ -483,6 +568,12 @@ if (updateHelpRequested) {
   process.exit(0);
 }
 
+const codexCliUpdateInspection = isCodexCliUpdateInspectionArgv(process.argv);
+if (codexCliUpdateInspection && typeof process.versions.bun === "string") {
+  console.error("opencodex: codex-cli-update inspection must use the published Node launcher.");
+  process.exit(1);
+}
+
 if (process.argv[2] === "update" && isNodeModulesInstall() && !isBunGlobalInstall()) {
   runNpmSelfUpdate();
 }
@@ -490,7 +581,7 @@ if (process.argv[2] === "update" && isNodeModulesInstall() && !isBunGlobalInstal
 // #1849 boot probe: a prior update that lost power (or double-faulted) mid-swap leaves a
 // backup sibling and a broken live tree. Restore before anything tries to run from the
 // broken tree; reap stale backups once the live tree verifies healthy.
-if (isNodeModulesInstall() && !isBunGlobalInstall()) {
+if (!codexCliUpdateInspection && isNodeModulesInstall() && !isBunGlobalInstall()) {
   try {
     const probe = bootRestoreProbe(resolve(here, ".."));
     if (probe.action === "restored") {
@@ -501,7 +592,7 @@ if (isNodeModulesInstall() && !isBunGlobalInstall()) {
   } catch { /* the probe must never block launch */ }
 }
 
-const bunRuntime = resolveBun();
+const bunRuntime = resolveBun({ allowInstall: !codexCliUpdateInspection });
 const bun = bunRuntime.path;
 
 // Run the Bun child asynchronously and FORWARD termination signals to it, then wait
@@ -525,12 +616,61 @@ const bun = bunRuntime.path;
 // interpolation and provider settings legitimately read the project environment.
 const preBunAnthropicSlots = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
   .filter(name => typeof process.env[name] === "string" && process.env[name] !== "");
+// A configured CODEX_CLI_PATH may legitimately be cwd-relative (`./tools/codex`), which the
+// ordinary runtime resolver accepts. Inspection only trusts absolute local paths, so capture
+// the absolute form here, in the launcher, while the original cwd is still authoritative;
+// resolving it later would silently reinterpret it against a different working directory.
+//
+// A bare command with no separator (`codex`) is NOT a relative path: the runtime resolver
+// deliberately hands those to executable lookup along PATH. Rewriting it to `<cwd>/codex`
+// would make the inspector treat it as an explicit path and stop searching PATH entirely.
+const configuredCodexCliPath = typeof process.env.CODEX_CLI_PATH === "string" && process.env.CODEX_CLI_PATH !== ""
+  ? process.env.CODEX_CLI_PATH
+  : null;
+const preBunCodexCliPath = configuredCodexCliPath !== null
+    && (configuredCodexCliPath.includes("/") || configuredCodexCliPath.includes("\\") || /^[A-Za-z]:/.test(configuredCodexCliPath))
+  ? resolve(configuredCodexCliPath)
+  : configuredCodexCliPath;
+const preBunPath = typeof process.env.PATH === "string" ? process.env.PATH : null;
+const preBunPathExt = typeof process.env.PATHEXT === "string" ? process.env.PATHEXT : null;
+const preBunCodexCliManagerRoots = Object.fromEntries(
+  CODEX_CLI_VERSION_MANAGER_ROOT_ENV_SLOTS.flatMap(name => {
+    const value = process.env[name];
+    return typeof value === "string" && value !== "" ? [[name, value]] : [];
+  }),
+);
 const launchProof = randomBytes(32).toString("base64url");
 const launchContext = JSON.stringify({
   version: 1,
   proof: launchProof,
   anthropicEnvSlots: preBunAnthropicSlots,
+  codexCliInspectionEnv: codexCliUpdateInspection ? {
+    codexCliPath: preBunCodexCliPath,
+    path: preBunPath,
+    pathExt: preBunPathExt,
+    managerRoots: preBunCodexCliManagerRoots,
+    configDir: configDir(),
+  } : null,
 });
+// The inspection snapshot above already carries PATH, PATHEXT, and the manager-root slots as
+// proof-bound values, and `inspectCodexCliInstall` reads them from that snapshot rather than
+// from the live environment. Inheriting them again would spend the 32,767-character Windows
+// environment block twice, so a large-but-valid shell environment could stop the Bun child
+// from spawning and fail the command before it reports anything. Drop the duplicates for the
+// one-shot inspection launch only; every other launch inherits the environment unchanged.
+// Windows environment names are case-insensitive, but this spread produces an ordinary
+// case-sensitive object, and a real Windows environment commonly spells the variable `Path`.
+// Deleting only the canonical upper-case spelling would silently leave that copy behind and
+// reintroduce the duplication this block exists to prevent, so match on the lowercase form.
+const inheritedEnv = { ...process.env };
+if (codexCliUpdateInspection) {
+  const snapshotted = new Set(
+    ["PATH", "PATHEXT", ...CODEX_CLI_VERSION_MANAGER_ROOT_ENV_SLOTS].map(name => name.toLowerCase()),
+  );
+  for (const name of Object.keys(inheritedEnv)) {
+    if (snapshotted.has(name.toLowerCase())) delete inheritedEnv[name];
+  }
+}
 const child = spawn(bun, [cliPath, `${NODE_LAUNCH_PROOF_PREFIX}${launchProof}`, ...process.argv.slice(2)], {
   stdio: "inherit",
   // A headless Windows parent (Task Scheduler, dashboard restart, shortcut) has no
@@ -538,7 +678,7 @@ const child = spawn(bun, [cliPath, `${NODE_LAUNCH_PROOF_PREFIX}${launchProof}`, 
   // the long-running Bun child, and closing that window kills the proxy (#1236).
   windowsHide: true,
   env: {
-    ...process.env,
+    ...inheritedEnv,
     [NODE_LAUNCH_CONTEXT_ENV]: launchContext,
     [BUN_RUNTIME_SOURCE_ENV]: bunRuntime.source,
     [BUN_RUNTIME_PATH_ENV]: bunRuntime.path,

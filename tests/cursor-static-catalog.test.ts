@@ -111,5 +111,47 @@ describe("Cursor static Codex catalog", () => {
       ]);
     expect(entries.find(item => item.slug === "cursor/glm-5.2")?.supported_reasoning_levels)
       .toMatchObject([{ effort: "high" }, { effort: "max" }, { effort: "ultra" }]);
+
+    for (const modelId of ["auto", "composer-2.5", "gpt-5.5", "gemini-3-pro"]) {
+      expect(
+        entries.find(item => item.slug === `cursor/${modelId}`)?.input_modalities,
+        `cursor/${modelId} should advertise image input`,
+      ).toEqual(["text", "image"]);
+    }
+  });
+});
+
+describe("Opus Fast catalog families (devlog 300, live-verified 260822)", () => {
+  // Umbrella merge (devlog 260828): the -fast rows folded into their bases.
+  // The alias path still resolves them with the exact live-verified ladders.
+  test("fast rows folded into bases; aliases keep resolving with tier semantics", async () => {
+    const { CURSOR_STATIC_MODELS } = await import("../src/adapters/cursor/discovery");
+    const { resolveCursorSelection } = await import("../src/adapters/cursor/catalog");
+    for (const id of ["claude-opus-4-7-fast", "claude-opus-4-8-fast", "claude-opus-5-fast"]) {
+      expect(CURSOR_STATIC_MODELS.some(model => model.id === id)).toBe(false);
+      // Alias never sends a bare -fast id (not_found on the wire).
+      expect(resolveCursorSelection(id, undefined).wireId.endsWith("-fast")).toBe(true);
+      expect(resolveCursorSelection(id, undefined).wireId).not.toBe(id);
+    }
+  });
+
+  test("tier ladders match the 260822 GetUsableModels dump", async () => {
+    const { cursorModelEffortLadder } = await import("../src/adapters/cursor/effort-map");
+    expect(cursorModelEffortLadder("claude-opus-4-7-fast")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(cursorModelEffortLadder("claude-opus-4-8-fast")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(cursorModelEffortLadder("claude-opus-5-fast")).toEqual(["low", "medium", "high"]);
+  });
+
+  test("wire-id derivation produces the live-verified suffixed forms and never a bare -fast id", async () => {
+    const { cursorWireModelIdWithEffort, cursorEffortSuffix } = await import("../src/adapters/cursor/effort-map");
+    expect(cursorWireModelIdWithEffort("claude-opus-4-8-fast", "high")).toBe("claude-opus-4-8-high-fast");
+    expect(cursorWireModelIdWithEffort("claude-opus-5-fast", "medium")).toBe("claude-opus-5-medium-fast");
+    expect(cursorWireModelIdWithEffort("claude-opus-4-7-fast", "max")).toBe("claude-opus-4-7-max-fast");
+    // No-effort requests must still resolve to a suffix (bare id is not_found on the wire).
+    for (const id of ["claude-opus-4-7-fast", "claude-opus-4-8-fast", "claude-opus-5-fast"]) {
+      expect(cursorEffortSuffix(id, undefined), `${id} must never send bare`).toBeTruthy();
+    }
+    // Out-of-ladder effort clamps within the family ladder (opus-5-fast has no xhigh).
+    expect(cursorEffortSuffix("claude-opus-5-fast", "xhigh")).toBe("high");
   });
 });

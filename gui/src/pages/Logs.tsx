@@ -21,6 +21,7 @@ import { formatEstimatedUsd, formatEstimatedUsdValue, summarizeEstimatedCosts } 
 import { cacheSplit, isCursorUsageProvider, tokensTitle } from "./logs-token-title";
 import type { LogSurface, LogSurfaceFilter } from "./logs-surface-filter";
 import { logMatchesSurface } from "./logs-surface-filter";
+import { logMatchesModelQuery } from "./logs-model-filter";
 import {
   sanitizeLogEntryRouteDecision,
   validCachedRouteDecision,
@@ -133,6 +134,15 @@ export interface LogEntry {
   provider: string;
   surface?: LogSurface;
   conversationId?: string;
+  /**
+   * The original helper model, when Shadow Call Intercept rewrote this request.
+   *
+   * Present ONLY for an intercepted request. A helper request that was not intercepted --
+   * interception off, no replacement model, or a slug the matcher does not recognize -- is
+   * indistinguishable here from ordinary traffic, which is why the filter below says
+   * "intercepted" rather than "helper".
+   */
+  shadowCallRewrittenFrom?: string;
   requestedEffort?: string;
   effectiveEffort?: string;
   reasoningWireField?: string;
@@ -174,6 +184,7 @@ function validCachedLogs(cached: LogEntry[] | null): LogEntry[] | null {
       || typeof entry.provider !== "string"
       || typeof entry.status !== "number"
       || typeof entry.durationMs !== "number"
+      || (entry.shadowCallRewrittenFrom !== undefined && typeof entry.shadowCallRewrittenFrom !== "string")
       || !validCachedRouteDecision(entry.routeDecision)
     ) {
       return null;
@@ -240,7 +251,9 @@ function formatTokPerSecond(result: TokPerSecondResult | undefined, localeTag?: 
   return `${result.estimated ? "~" : ""}${value}`;
 }
 
-/** Consecutive failed polls before a stale table is called out. Two seconds each, so ~6s. */
+const LOGS_POLL_INTERVAL_MS = 2000;
+const LOGS_POLL_BACKOFF_MAX_EXPONENT = 4;
+/** Consecutive failed polls before a stale table is called out. */
 const STALE_POLL_FAILURE_LIMIT = 3;
 
 const METRIC_REASON_KEYS = {
@@ -353,11 +366,19 @@ export default function Logs({ apiBase }: { apiBase: string }) {
   const resourceKey = logsCacheKey(apiBase);
   const cachedLogs = validCachedLogs(readSessionListCache<LogEntry[]>(resourceKey));
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [failureStreak, setFailureStreak] = useState<{ error: unknown; count: number }>(
+    { error: null, count: 0 },
+  );
   const [detail, setDetail] = useState<LogEntry | null>(null);
   const [surfaceFilter, setSurfaceFilter] = useState<LogSurfaceFilter>("all");
+  const [interceptedHelpersOnly, setInterceptedHelpersOnly] = useState(false);
   const [conversationFilter, setConversationFilter] = useState("");
+  const [modelFilter, setModelFilter] = useState("");
   const [conversationQueryHash, setConversationQueryHash] = useState<string | undefined>();
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const logRetryRef = useRef<{ key: string; failures: number; nextAttemptAt: number; error: unknown }>(
+    { key: resourceKey, failures: 0, nextAttemptAt: 0, error: null },
+  );
   const localeTag = LOCALES.find(l => l.code === locale)?.htmlLang;
   // The proxy's own zone, so timestamps read the same as the server's logs rather than being
   // silently shifted into the viewer's zone (#725). Fetched once: it cannot change while the
@@ -406,18 +427,36 @@ export default function Logs({ apiBase }: { apiBase: string }) {
   const selectTab = selectLogsTab;
 
   const loadLogs = useCallback(async (signal: AbortSignal): Promise<LogEntry[]> => {
-    const res = await fetch(`${apiBase}/api/logs?limit=2000`, { signal });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
-    const body = await res.json() as LogEntry[] | { logs?: LogEntry[] };
-    const raw = Array.isArray(body) ? body : (body.logs ?? []);
-    const next = raw.map(sanitizeLogEntryRouteDecision);
-    writeSessionListCache(resourceKey, next);
-    return next;
+    let retry = logRetryRef.current;
+    if (retry.key !== resourceKey) {
+      retry = { key: resourceKey, failures: 0, nextAttemptAt: 0, error: null };
+      logRetryRef.current = retry;
+    }
+    if (retry.failures > 0 && Date.now() < retry.nextAttemptAt) throw retry.error;
+    try {
+      const res = await fetch(`${apiBase}/api/logs?limit=2000`, { signal });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
+      const body = await res.json() as LogEntry[] | { logs?: LogEntry[] };
+      const raw = Array.isArray(body) ? body : (body.logs ?? []);
+      const next = raw.map(sanitizeLogEntryRouteDecision);
+      logRetryRef.current = { key: resourceKey, failures: 0, nextAttemptAt: 0, error: null };
+      writeSessionListCache(resourceKey, next);
+      return next;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      const normalized = error ?? new Error("log request failed");
+      const failures = retry.failures + 1;
+      const backoffMs = LOGS_POLL_INTERVAL_MS * (2 ** Math.min(
+        failures,
+        LOGS_POLL_BACKOFF_MAX_EXPONENT,
+      ));
+      logRetryRef.current = { key: resourceKey, failures, nextAttemptAt: Date.now() + backoffMs, error: normalized };
+      throw normalized;
+    }
   }, [apiBase, resourceKey]);
 
-  // The resource layer owns the request and the 2s poll. It keeps held rows through a quiet
-  // poll on its own, which is what the old silent/non-silent split was hand-rolling — and an
-  // empty successful response is now a real empty result rather than a cold load.
+  // The resource layer owns the request and the 2s base poll. loadLogs backs off actual network
+  // attempts after failures while preserving those shared scheduler ticks and held rows.
   const logsResource = useDataSurface<LogEntry[]>(
     resourceKey,
     [apiBase],
@@ -425,13 +464,17 @@ export default function Logs({ apiBase }: { apiBase: string }) {
     {
       isEmpty: rows => rows.length === 0,
       enabled: tab === "logs",
-      pollMs: autoRefresh ? 2000 : undefined,
+      pollMs: autoRefresh ? LOGS_POLL_INTERVAL_MS : undefined,
       initialData: cachedLogs ?? undefined,
     },
   );
   const logsState = logsResource.state;
   const logs = logsState.data ?? cachedLogs ?? [];
   const fetchLogs = logsResource.refresh;
+  const retryLogs = useCallback(() => {
+    logRetryRef.current = { key: resourceKey, failures: 0, nextAttemptAt: 0, error: null };
+    fetchLogs({ forceLoading: true });
+  }, [fetchLogs, resourceKey]);
 
   // A single failed tick on a two-second poll is noise, but an outage that never recovers must not
   // leave the user reading stale rows as if they were current. Count consecutive failures and speak
@@ -442,9 +485,6 @@ export default function Logs({ apiBase }: { apiBase: string }) {
   // in sync and no frame painted with a stale banner. `streak` counts CONSECUTIVE failed
   // settlements: it is stored keyed by the error identity that produced it, so repeated
   // renders of the same failure do not inflate the count and a success clears it.
-  const [failureStreak, setFailureStreak] = useState<{ error: unknown; count: number }>(
-    { error: null, count: 0 },
-  );
   if (settledSuccess && failureStreak.count !== 0) {
     setFailureStreak({ error: null, count: 0 });
   } else if (settledFailure && failureStreak.error !== logsState.error) {
@@ -472,6 +512,8 @@ export default function Logs({ apiBase }: { apiBase: string }) {
 
   const filteredLogs = logs.filter(log => (
     logMatchesSurface(log, surfaceFilter)
+    && (!interceptedHelpersOnly || Boolean(log.shadowCallRewrittenFrom))
+    && logMatchesModelQuery(log, modelFilter)
     && (!conversationQuery || matchesLogConversationId(log.conversationId, conversationQuery, conversationQueryHash))
   ));
   const conversationTotals = conversationQuery ? summarizeFilteredLogs(filteredLogs) : null;
@@ -481,8 +523,12 @@ export default function Logs({ apiBase }: { apiBase: string }) {
   const rowVirtualizer = useVirtualizer({
     count: filteredLogs.length,
     getScrollElement: () => scrollContainerRef.current,
-    estimateSize: () => 44,
+    estimateSize: () => 92,
     overscan: 15,
+    getItemKey: index => {
+      const log = filteredLogs[filteredLogs.length - 1 - index]!;
+      return log.requestId ?? `${log.timestamp}:${log.model}:${log.provider}`;
+    },
   });
   const virtualRows = rowVirtualizer.getVirtualItems();
   const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
@@ -547,7 +593,6 @@ export default function Logs({ apiBase }: { apiBase: string }) {
         aria-labelledby="logs-tab-logs"
         hidden={tab !== "logs"}
       >
-      <p className="page-sub">{t("logs.subtitle")}</p>
 
       <div className="logs-toolbar">
         <span className="muted text-control">{t("logs.filter.surface.label")}</span>
@@ -566,6 +611,20 @@ export default function Logs({ apiBase }: { apiBase: string }) {
             </button>
           ))}
         </div>
+        {/*
+          "Intercepted", not "helper". The marker only exists when Shadow Call Intercept
+          rewrote the request, so a helper request that was not intercepted looks exactly like
+          ordinary traffic here. A broader label would promise a classification this data
+          cannot support.
+        */}
+        <label className="muted text-control logs-filter-field">
+          <input
+            type="checkbox"
+            checked={interceptedHelpersOnly}
+            onChange={event => setInterceptedHelpersOnly(event.target.checked)}
+          />
+          {t("logs.filter.interceptedHelpersOnly")}
+        </label>
         <label className="muted text-control logs-filter-field">
           {t("logs.filter.conversation.label")}
           <input
@@ -575,6 +634,17 @@ export default function Logs({ apiBase }: { apiBase: string }) {
             onChange={e => setConversationFilter(e.target.value)}
             placeholder={t("logs.filter.conversation.placeholder")}
             aria-label={t("logs.filter.conversation.label")}
+          />
+        </label>
+        <label className="muted text-control logs-filter-field">
+          {t("logs.filter.model.label")}
+          <input
+            type="search"
+            className="input mono"
+            value={modelFilter}
+            onChange={e => setModelFilter(e.target.value)}
+            placeholder={t("logs.filter.model.placeholder")}
+            aria-label={t("logs.filter.model.label")}
           />
         </label>
         {conversationQuery && (
@@ -620,7 +690,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
       {logsState.kind === "failed-cold" && (
         <Notice tone="err">
           {logsState.error instanceof Error ? `${t("logs.loadError")} ${logsState.error.message}` : t("logs.loadError")}{" "}
-          <button type="button" className="btn btn-ghost btn-sm" onClick={() => fetchLogs({ forceLoading: true })} disabled={logsState.refreshing}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={retryLogs} disabled={logsState.refreshing}>
             {t("common.retry")}
           </button>
         </Notice>
@@ -630,7 +700,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
       {pollFailing && logs.length > 0 && (
         <Notice tone="err">
           {t("logs.loadError")}{" "}
-          <button type="button" className="btn btn-ghost btn-sm" onClick={() => fetchLogs({ forceLoading: true })} disabled={logsResource.refreshing}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={retryLogs} disabled={logsResource.refreshing}>
             {t("common.retry")}
           </button>
         </Notice>
@@ -646,6 +716,18 @@ export default function Logs({ apiBase }: { apiBase: string }) {
         <>
         <div ref={scrollContainerRef} className="tbl-wrap logs-table-wrap">
           <table className="tbl logs-table">
+            <colgroup>
+              <col className="logs-col-time" />
+              <col className="logs-col-tokens" />
+              <col className="logs-col-rate" />
+              <col className="logs-col-cost" />
+              <col className="logs-col-model" />
+              <col className="logs-col-effort" />
+              <col className="logs-col-provider" />
+              <col className="logs-col-status" />
+              <col className="logs-col-request" />
+              <col className="logs-col-duration" />
+            </colgroup>
             <thead>
              <tr>
                <th>{t("logs.col.time")}</th>
@@ -672,7 +754,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
                 const when = formatLogDateParts(log.timestamp, localeTag, serverTimeZone);
                 return (
                <tr
-                 key={log.requestId ?? `${log.timestamp}-${virtualRow.index}`}
+                 key={virtualRow.key}
                  data-index={virtualRow.index}
                  ref={rowVirtualizer.measureElement}
                >
@@ -717,8 +799,17 @@ export default function Logs({ apiBase }: { apiBase: string }) {
                     {formatEstimatedUsd(log.displayMetrics?.cost, t, localeTag)}
                   </td>
                  <td className="mono log-col-model" title={modelTitle(log, t)}>
-                   <span className="logs-model-cell">
-                    <span>{modelLabel(log.resolvedModel ?? log.model)}</span>
+                  <span className="logs-model-cell">
+                   <span>{modelLabel(log.resolvedModel ?? log.model)}</span>
+                      {log.shadowCallRewrittenFrom && (
+                        <span
+                          className="badge badge-muted"
+                          style={{ whiteSpace: "nowrap" }}
+                          title={t("logs.badge.interceptedHelperTitle")}
+                        >
+                          {t("logs.badge.interceptedHelper", { model: log.shadowCallRewrittenFrom })}
+                        </span>
+                      )}
                       {(log.surface === "claude" || log.surface === "claude-desktop") && (
                         <span className="badge badge-accent">{t("logs.badge.claude")}</span>
                       )}
@@ -726,12 +817,10 @@ export default function Logs({ apiBase }: { apiBase: string }) {
                       {speedLabel(log) && <span className="badge badge-amber">{speedLabel(log)}</span>}
                     </span>
                   </td>
-                  <td className="mono log-reasoning-cell" title={reasoningWire}>
-                    <span className="logs-stack-start">
-                      <span>{effortLabel(log)}</span>
-                      {reasoningWire && <span className="muted text-caption leading-tight">{reasoningWire}</span>}
-                    </span>
-                  </td>
+                  {/* The wire field (reasoning_effort=high) stays in the title and the detail
+                      dialog; as a second line it repeated the label and, in mono, outgrew the
+                      9% column and painted over the provider cell. */}
+                  <td className="mono log-reasoning-cell" title={reasoningWire}>{effortLabel(log)}</td>
                   <td className="muted">{formatProviderDisplayName(log.provider, t)}</td>
                   <td>
                     <span className="log-status-cell">

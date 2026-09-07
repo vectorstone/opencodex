@@ -413,7 +413,31 @@ describe("Cursor discovery bounded retry", () => {
       }
       stream.respond({ ":status": 200, "content-type": "application/proto" });
       stream.end(body);
-    }, baseUrl => fetchCursorUsableModels({ apiKey: "test-token", baseUrl, timeoutMs: 120 }));
+      // 120ms was enough on a quiet machine but the retry attempt shares the
+      // same budget (min(timeoutMs, retry cap)) and flaked on loaded CI
+      // runners: the second, succeeding attempt also timed out. 1s keeps the
+      // test deterministic; the never-responding first attempt still bounds
+      // total runtime at ~1.5s.
+    }, baseUrl => fetchCursorUsableModels({ apiKey: "test-token", baseUrl, timeoutMs: 1_000 }));
+
+    expect(requests).toBe(2);
+    expect(result).toEqual({ ok: true, models: ["gpt-5.5-high"] });
+  });
+
+  test("retries an HTTP/2 stream that ends before response headers", async () => {
+    const body = toBinary(GetUsableModelsResponseSchema, create(GetUsableModelsResponseSchema, {
+      models: [create(ModelDetailsSchema, { modelId: "gpt-5.5-high" })],
+    }));
+    let requests = 0;
+    const result = await withDiscoveryServer(stream => {
+      requests += 1;
+      if (requests === 1) {
+        stream.close(http2.constants.NGHTTP2_NO_ERROR);
+        return;
+      }
+      stream.respond({ ":status": 200, "content-type": "application/proto" });
+      stream.end(body);
+    }, baseUrl => fetchCursorUsableModels({ apiKey: "test-token", baseUrl }));
 
     expect(requests).toBe(2);
     expect(result).toEqual({ ok: true, models: ["gpt-5.5-high"] });
@@ -623,6 +647,60 @@ describe("Cursor live transport unexpected EOF", () => {
     expect(seenSessionId).toBe("cursor_from_gjc_session");
   });
 
+  test("settles as a failure when clean EOF synthesis exceeds the transport budget", async () => {
+    const textFrame = encodeConnectFrame(toBinary(AgentServerMessageSchema, create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: {
+            case: "textDelta",
+            value: create(TextDeltaUpdateSchema, { text: "x" }),
+          },
+        }),
+      },
+    })));
+    const connectEnd = encodeConnectFrame(new TextEncoder().encode("{}"), {
+      flags: CONNECT_FLAG_END_STREAM,
+    });
+
+    await withDiscoveryServer(stream => {
+      stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+      stream.end(Buffer.from(new Uint8Array([
+        ...Array.from({ length: 37 }, () => [...textFrame]).flat(),
+        ...connectEnd,
+      ])));
+    }, async baseUrl => {
+      const budget = createTestTranslatorBudget({ maxTurnBytes: 1_000 });
+      const transport = createLiveCursorTransport({
+        provider: { adapter: "cursor", baseUrl, apiKey: "test-token" },
+        translatorBudget: budget,
+        firstFrameTimeoutMs: 2_000,
+      });
+      const iterator = transport.run({
+        modelId: "composer-2",
+        conversationId: "cursor_clean_eof_budget_test",
+        system: [],
+        messages: [{ role: "user", content: "hello" }],
+      })[Symbol.asyncIterator]();
+      let failure: Error | undefined;
+      try {
+        expect(await iterator.next()).toMatchObject({ value: { type: "text" } });
+        await Bun.sleep(20);
+        while (!(await iterator.next()).done) {}
+      } catch (err) {
+        failure = err instanceof Error ? err : new Error(String(err));
+      } finally {
+        await transport.close?.();
+      }
+
+      expect(failure).toMatchObject({
+        name: "TranslatorBudgetExceededError",
+        code: "translation_buffer_limit",
+      });
+      expect(budget.snapshot().currentBytes).toBe(0);
+    });
+  });
+
   test("synthesizes done after createPlanRequestQuery text on clean Connect EOF", async () => {
     const planFrame = encodeConnectFrame(toBinary(AgentServerMessageSchema, create(AgentServerMessageSchema, {
       message: {
@@ -689,8 +767,8 @@ describe("Cursor live transport unexpected EOF", () => {
                   case: "mcpToolCall",
                   value: create(McpToolCallSchema, {
                     args: create(McpArgsSchema, {
-                      name: "get_time",
-                      toolName: "get_time",
+                      name: "ocx_client_get_time",
+                      toolName: "ocx_client_get_time",
                       toolCallId: "call_1",
                       providerIdentifier: "opencodex-responses",
                     }),

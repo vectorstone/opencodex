@@ -11,6 +11,8 @@ export const FILE_INTEGRATION_CLIENTS = [
   "dsh",
   "mcode",
   "zcode",
+  "prime",
+  "aside",
 ] as const;
 
 export type FileIntegrationClientId = (typeof FILE_INTEGRATION_CLIENTS)[number];
@@ -52,7 +54,7 @@ export interface IntegrationStateListEnvelope {
 export interface IntegrationJournalRow {
   opId: string;
   clientId: IntegrationClientId;
-  kind: "apply" | "disable" | "refresh" | "restore";
+  kind: "apply" | "disable" | "refresh" | "restore" | "overwrite";
   at: string;
   configPath: string;
   snapshot: "none" | "stored" | "expired";
@@ -219,12 +221,17 @@ export async function toggleIntegration(
   client: FileIntegrationClientId,
   enabled: boolean,
   signal?: AbortSignal,
+  /**
+   * Opt in to replacing a conflicted block. Deliberately last and optional: no
+   * existing call site can acquire it, and a caller has to name it.
+   */
+  overwriteConflict?: boolean,
 ) {
   return readResponse<IntegrationToggleResult>(
     await fetch(`${apiBase}/api/client-integrations/${encodeURIComponent(client)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify(overwriteConflict === true ? { enabled, overwriteConflict: true } : { enabled }),
       signal,
     }),
   );
@@ -325,6 +332,8 @@ export async function loadClaudeDesktopStatus(apiBase: string, signal?: AbortSig
   const body = await readOptional<{
     applied?: unknown;
     stale?: unknown;
+    drift?: unknown;
+    driftReason?: unknown;
     activeProfile?: unknown;
     appliedAt?: unknown;
     desiredEnabled?: unknown;
@@ -338,6 +347,8 @@ export async function loadClaudeDesktopStatus(apiBase: string, signal?: AbortSig
     observedKind: body.observedKind,
     applied: body.applied === true,
     stale: body.stale === true,
+    drift: body.drift === true,
+    driftReason: typeof body.driftReason === "string" ? body.driftReason : null,
     // Tri-state on purpose: `null` means undeterminable, which must not be
     // read as "Desktop is serving someone else's profile".
     activeProfile: typeof body.activeProfile === "boolean" ? body.activeProfile : null,

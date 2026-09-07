@@ -12,7 +12,7 @@ description: 리스너, 원격 접근, admission 키, 타임아웃, 저장소, �
 | `port` | `number` | `10100` | 프록시 수신 포트입니다. |
 | `hostname?` | `string` | `"127.0.0.1"` | 바인드 주소입니다. 루프백이 아닌 바인드에는 `OPENCODEX_API_AUTH_TOKEN`이 필요합니다. |
 | `proxy?` | `string` | — | 송신용 HTTP(S) 프록시 URL 또는 `${ENV_VAR}`입니다. 해당 변수가 비어 있을 때만 `HTTP_PROXY` / `HTTPS_PROXY`에 적용되며, 루프백은 `NO_PROXY`에 그대로 남습니다. |
-| `emptyCompletionRetry?` | `boolean` | `false` | 텍스트나 도구 호출 없이 완료된 Responses 요청을 한 번 동일하게 재시도하도록 선택합니다. 재시도에는 비용이 발생할 수 있습니다. `OCX_EMPTY_COMPLETION_RETRY=0`은 설정을 바꾸지 않고 비활성화하며, combo 및 routed-compaction turn은 제외됩니다. |
+| `emptyCompletionRetry?` | `boolean` | `false` | 텍스트나 도구 호출이 없는 Responses 턴을, 터미널 이벤트 전에 스트림이 종료된 경우를 포함해 동일한 요청으로 한 번 재시도하도록 선택합니다. 재시도에는 비용이 발생할 수 있습니다. `OCX_EMPTY_COMPLETION_RETRY=0`은 설정을 바꾸지 않고 비활성화하며, combo 및 routed-compaction turn은 제외됩니다. |
 | `stallTimeoutSec?` | `number` | `300` | 업스트림 데이터가 없을 때 `response.incomplete`가 되기까지의 초 수입니다. 최소 1입니다. |
 | `connectTimeoutMs?` | `number` | `200000` | 시도별 DNS/TCP/TLS/최종 헤더 기한입니다. 본문 생성 전에 끝납니다. |
 | `shutdownTimeoutMs?` | `number` | `5000` | 진행 중인 turn을 중단하기 전에 허용하는 정상 종료 드레인 기한입니다. |
@@ -24,12 +24,13 @@ description: 리스너, 원격 접근, admission 키, 타임아웃, 저장소, �
 | `codexAutoStart?` | `boolean` | `true` | Codex shim이 Codex를 실행하기 전에 `ocx ensure`를 돌리도록 허용합니다. `false`이면 ensure는 아무 작업도 하지 않습니다. |
 | `codexShimAutoRestore?` | `boolean` | `true` | 완료된 외부 Codex 업데이트가 설치된 shim을 교체한 뒤 복원합니다. 환경 변수로 끌 수 있습니다: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | 되돌릴 수 있는 Codex App history 호환성입니다. 원래 메타데이터는 `ocx stop` / `ocx restore`가 백업하고 복원합니다. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 인식된 Codex 보조/섀도 호출을 선택한 모델로 낮은 노력 수준에서 다시 보냅니다. 기본 source prefix는 `gpt-5.6-luna`입니다. 0.144.x 이하의 이전 클라이언트는 `gpt-5.4-mini`를 사용했으며 `sourceModels`로 복원할 수 있습니다. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 인식된 Codex 보조/섀도 호출을 요청에 설정된 reasoning effort를 유지한 채 선택한 모델로 다시 보냅니다. 기본 source prefix는 `gpt-5.6-luna`입니다. 0.144.x 이하의 이전 클라이언트는 `gpt-5.4-mini`를 사용했으며 `sourceModels`로 복원할 수 있습니다. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | on when usable | 웹 검색 사이드카 옵션입니다. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | on when usable | 이미지 설명 사이드카 옵션입니다. |
 | `images?` | `OcxImagesConfig` | automatic OpenAI selection | Codex `image_gen`용 독립형 Images 릴레이 옵션입니다. |
 
-오래된 개발 빌드가 백업 지원이 생기기 전에 resume-history 메타데이터를 바꿨다면, native-provider 복구를 강제로 수행하려면 `ocx recover-history --legacy-openai`를 실행합니다.
+오래된 개발 빌드가 백업 지원이 생기기 전에 resume-history 메타데이터를 바꿨다면, native-provider 복구를 강제로 수행하려면 `ocx recover-history --legacy-openai --yes`를 실행합니다.
+이 명령은 정상적인 dedicated-provider history를 포함해 사용자 메시지가 있는 모든 `opencodex` row를 재태깅합니다. 실행하기 전에 lifecycle reference의 전체 범위 경고를 확인하세요.
 
 ## Remote access
 
@@ -105,7 +106,7 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 
 ## Shadow calls
 
-Codex는 제목과 커밋 메시지 같은 작업에 작은 보조 모델을 사용합니다. 인식된 source-model prefix를 다른 구성된 모델로 돌리려면 `shadowCallIntercept`를 활성화합니다. 대체 호출은 낮은 노력 수준으로 실행됩니다. 클라이언트가 다른 helper id를 사용할 때만 `sourceModels`를 설정합니다.
+Codex는 제목과 커밋 메시지 같은 작업에 작은 보조 모델을 사용합니다. 인식된 source-model prefix를 다른 구성된 모델로 돌리려면 `shadowCallIntercept`를 활성화합니다. 대체 호출은 요청에 설정된 reasoning effort를 유지합니다. 클라이언트가 다른 helper id를 사용할 때만 `sourceModels`를 설정합니다.
 
 ```json
 {
@@ -133,14 +134,16 @@ Codex는 제목과 커밋 메시지 같은 작업에 작은 보조 모델을 사
 | 필드 | 형식 | 기본값 | 의미 |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | on when usable | 주 스위치입니다. |
-| `backend?` | `"openai" \| "anthropic"` | auto | 명시값이 우선입니다. 그 외에는 사용 가능한 저장된 Anthropic OAuth가 있으면 `anthropic`을, 아니면 `openai`를 선택합니다. |
-| `model?` | `string` | backend-dependent | OpenAI는 `gpt-5.6-luna`, Anthropic은 `claude-sonnet-5`입니다. 레거시로 명시된 `gpt-5.4-mini`는 시작 시 마이그레이션됩니다. |
+| `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | 명시값이 우선입니다. 생략하면 항상 `openai`입니다. `anthropic`과 `xai`는 명시적으로 설정할 때만 실행되며, `gemini`와 `exa`는 executor가 제공될 때까지 예약 상태입니다. |
+| `model?` | `string` | backend-dependent | OpenAI는 `gpt-5.6-luna`, Anthropic은 `claude-sonnet-5`, xAI는 `grok-4.6`입니다. 레거시로 명시된 `gpt-5.4-mini`는 시작 시 마이그레이션됩니다. |
+| `exaApiKey?` | `string` | 없음 | `exa` 백엔드용 운영자 키입니다. 쓰기 전용이며 관리 API 조회에서는 저장된 값을 반환하지 않습니다. |
+| `xSearch?` | `object` | 생략 | xAI 전용 `x_search` opt-in입니다. `enabled`, 서로 배타적인 `allowedXHandles` / `excludedXHandles` 배열(최대 20개), ISO `fromDate` / `toDate`(`YYYY-MM-DD`)를 지원합니다. |
 | `reasoning?` | `string` | `low` | 사이드카 노력 수준입니다. `minimal`은 web search와 함께 거부됩니다. |
 | `maxSearchesPerTurn?` | `number` | `3` | 메인 모델 턴당 허용되는 실제 검색 수입니다. |
 | `routedModelStallTimeoutMs?` | `number` | `200000` | 설정 파일 전용 routed-model 원시 본문 비활성 기한입니다. 정수 1–2147483647이며, 비어 있지 않은 모든 청크가 이를 다시 시작합니다. |
 | `timeoutMs?` | `number` | `60000` | 한 번의 hosted search에 대한 기한입니다. |
 
-OpenAI 백엔드는 ChatGPT 로그인과 활성화된 ChatGPT `forward` provider를 요구합니다. Claude-inbound routed replay는 메인 ChatGPT 인증을 내부 요청에 주입합니다. Anthropic 백엔드는 활성화된 Anthropic OAuth provider에서 현재 저장된 자격 증명을 사용합니다. 명시적으로 선택한 Anthropic 백엔드에 사용할 수 있는 계정이 없으면 폴백하지 않고 닫힌 상태로 실패합니다. Anthropic 실행기는 자체 `web_search_20250305` 도구를 사용합니다.
+OpenAI 백엔드는 ChatGPT 로그인과 활성화된 ChatGPT `forward` provider를 요구합니다. Claude-inbound routed replay는 메인 ChatGPT 인증을 내부 요청에 주입합니다. Anthropic 백엔드는 활성화된 Anthropic OAuth provider에서 현재 저장된 자격 증명을 사용합니다. 명시적으로 선택한 Anthropic 백엔드에 사용할 수 있는 계정이 없으면 폴백하지 않고 닫힌 상태로 실패합니다. Anthropic 실행기는 자체 `web_search_20250305` 도구를 사용합니다. xAI 백엔드는 사용 가능한 저장된 Grok OAuth 계정을 요구하고 hosted `web_search`를 사용하며, `xSearch.enabled`가 true이면 hosted `x_search`를 추가합니다. 잘못된 `xSearch` 관리 입력은 `400`을 반환하고, 잘못 저장된 블록은 계획 단계에서 닫힌 상태로 실패합니다. `gemini`와 `exa`는 자격 증명 탐색이나 폴백으로 절대 활성화되지 않으며 운영자가 명시적으로 선택해야 합니다. `exaApiKey`는 쓰기에서 허용되지만 관리 응답에서는 생략됩니다.
 
 검색에는 네 가지 시계가 작동합니다: 기본 `stallTimeoutSec`, `connectTimeoutMs`, routed-model 비활성 시간, 그리고 hosted-search 제한 시간입니다. 실제 bridge watchdog은 이들 중 최댓값에 30초를 더한 값입니다. Routed stall은 비활성 가드이지, 전체 생성 기한이 아닙니다.
 
@@ -149,7 +152,7 @@ OpenAI 백엔드는 ChatGPT 로그인과 활성화된 ChatGPT `forward` provider
 | 필드 | 형식 | 기본값 | 의미 |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | on when usable | 주 이미지 설명 스위치입니다. |
-| `backend?` | `"openai" \| "anthropic"` | auto | web search와 같은, 명시값 우선 및 Anthropic 자격 증명 인식 선택 방식입니다. |
+| `backend?` | `"openai" \| "anthropic"` | auto | 명시값이 우선하며, 미설정 시 사용 가능한 저장된 Anthropic OAuth 자격 증명을 우선하고 없으면 `openai`를 사용합니다. |
 | `model?` | `string` | backend-dependent | OpenAI는 `gpt-5.4-mini`, Anthropic은 `claude-sonnet-5`입니다. |
 | `reasoning?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"low"` | OpenAI Responses 추론 강도입니다. Anthropic은 무시합니다. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | 메인 턴당 허용되는 새 설명 캐시 미스 수입니다. `0`이면 호출이 비활성화되며, 잘못된 값은 기본값을 사용합니다. |
@@ -158,3 +161,9 @@ OpenAI 백엔드는 ChatGPT 로그인과 활성화된 ChatGPT `forward` provider
 지원되는 수준은 업스트림 제공자의 역량과 선택한 모델이 공개한 추론 사다리에 따라 제한됩니다. Vision은 provider의 `noVisionModels`에 속한 모델로 보낸 이미지에만 활성화됩니다. OpenAI는 검색과 같은 로그인/forward 요건을 갖고 있으며, 명시적으로 선택한 Anthropic은 사용할 수 있는 자격 증명이 없으면 닫힌 상태로 실패합니다. 성공한 `data:` 설명은 backend, model, detail, image bytes, 그리고 정규화된 메시지 컨텍스트를 키로 하는 bounded cache를 사용합니다. OpenAI 키에는 reasoning effort도 포함됩니다(Anthropic 키에는 없습니다). 히트와 같은 턴의 중복은 한도를 소모하지 않습니다. 원격 `https:` 이미지와 실패했거나 비어 있는 설명은 캐시하지 않습니다.
 
 Anthropic OAuth 사이드카는 opencodex의 기존 Claude Code OAuth fingerprint를 재사용합니다. 의도한 계정과 워크로드로 소크 테스트를 수행합니다.
+
+## Remote Hub 키와 기본값
+
+`runtimeRole` 기본값은 `standalone`입니다. 허브는 `hub.managementPublicOrigin`, 로컬에만 열리는 `hub.managementIngress`(없으면 `enabled:false`), 정확한 `remoteGui.allowedTailscaleUsers`(없으면 빈 목록)를 사용합니다. 클라이언트 데이터 키는 `config.json`이 아니라 `service-api-token`에 저장되며 교체 중에는 `service-api-token.prev`가 잠시 생길 수 있습니다. 사용량 기록은 서로 복제하지 않습니다.
+
+`remoteGui.allowInsecureHttp`는 이전 strict-schema 설정을 계속 읽기 위해서만 남겨 둔 폐기된 no-op입니다. 설정에서 제거하세요. 페어링 grant는 loopback 또는 인증된 HTTPS에서만 허용되며, 이 값을 `true`로 설정해도 평문 HTTP 페어링은 다시 활성화되지 않습니다.

@@ -144,23 +144,39 @@ describe("workspace account integration seam", () => {
   });
 
   test("wires OAuth re-authenticate handlers into the workspace detail", async () => {
-    const [page, panel, details, overview] = await Promise.all([
+    const [page, panel, details, overview, loginHint] = await Promise.all([
       providersPageSeam(),
       Bun.file("gui/src/components/provider-workspace/ProviderAuthPanel.tsx").text(),
       Bun.file("gui/src/components/provider-workspace/ProviderDetails.tsx").text(),
       Bun.file("gui/src/components/provider-workspace/ProviderOverview.tsx").text(),
+      Bun.file("gui/src/components/login-url-block.tsx").text(),
     ]);
     expect(page).toContain("onReauth:");
     expect(page).toContain("onCancelLogin: cancelLoginOAuth");
-    expect(page).toContain("loginOAuth(provider, true, accountId)");
+    // Reauth reaches login through the ToS-warning gate rather than calling loginOAuth
+    // directly: a high-risk provider (anthropic, google-antigravity, meta-muse) must show
+    // its warning before a REauthentication too, not only before the first login.
+    // `requestLoginOAuth` is the warning-aware entry point and forwards the same
+    // (provider, addAccount, accountId) triple.
+    expect(page).toContain("requestLoginOAuth(provider, true, accountId)");
+    expect(page).toContain("void loginOAuth(pending.provider, pending.addAccount, pending.accountId)");
     expect(page).toContain("accountId: reauthTargetId, reauth: true");
     expect(page).toContain("prov.reauthIdentityMismatch");
     expect(page).toContain("oauthLoginGenerationRef");
     expect(page).toContain("/api/oauth/login/cancel");
     expect(page).toContain("deviceCode");
-    expect(panel).toContain("pwi-device-code");
+    // The device-code widget is now owned by the shared login-hint component so
+    // every login surface renders the same one. The panel's obligation is to
+    // pass the code through; the widget itself lives with the component.
+    expect(panel).toContain("deviceCode: hintForThis.deviceCode");
+    expect(loginHint).toContain("pwi-device-code");
+    // The workspace can accept a pasted redirect URL — previously only the
+    // add-provider modal could, which stranded remote/SSH re-authentication.
+    expect(panel).toContain("/api/oauth/login/code");
     // Add Provider account row CTA: OAuth uses loginOAuth; openai deep-links to Codex Auth.
-    expect(page).toContain('href: "#codex-auth"');
+    // The page is now Codex Set; `#codex-auth` still resolves through the legacy
+    // redirect, but the CTA links to the live route rather than the old one.
+    expect(page).toContain('href: "#codex-set"');
     expect(panel).toContain("onReauth");
     expect(panel).toContain("pws.reauthenticate");
     expect(panel).toContain("onCancelLogin");

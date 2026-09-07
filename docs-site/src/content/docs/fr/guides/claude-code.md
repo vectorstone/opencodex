@@ -15,7 +15,8 @@ ajouter un compte). Par défaut, chaque requête utilise uniquement le compte **
 Un groupe de comptes Claude **expérimental et facultatif** (`anthropicAccountPool.enabled`) ajoute l'affinité de
 session et le basculement en cas de délai de récupération 429 entre ces comptes OAuth. Pour les **nouvelles**
 sessions uniquement, `anthropicAccountPool.strategy` sélectionne un compte éligible : `quota` (par défaut)
-choisit la plus faible utilisation connue sur 5 heures lorsqu'elle dépasse `autoSwitchThreshold` ; `round-robin`
+choisit la plus faible utilisation connue dans la fenêtre configurée par `anthropicAccountPool.quotaWindow`
+(`five-hour` par défaut, `weekly` ou `max-utilization`) lorsqu'elle dépasse `autoSwitchThreshold` ; `round-robin`
 répartit les sessions uniformément (`stickyLimit`, `1` par défaut) ; `fill-first` utilise le compte actif jusqu'à
 un délai de récupération, une réauthentification ou le seuil, puis passe au suivant. Cette fonction est
 **désactivée par défaut**, affiche un avertissement dans l'interface et n'a pas été éprouvée en production.
@@ -31,6 +32,9 @@ Comportement lorsque cette option est activée :
   sélection jusqu'à sa réauthentification.
 - Si chaque compte éligible est en temporisation, le proxy renvoie **429** (et non 401) avec `Retry-After`
   lorsqu'il est connu.
+- La récupération, y compris le basculement 429, utilise `quotaWindow` pour classer les comptes de
+  remplacement admissibles, sans modifier les limites existantes de temporisation ou de basculement ;
+  `round-robin` ignore `quotaWindow`.
 
 Voir [Configuration](/fr/reference/configuration/providers/#anthropicaccountpool-expérimental).
 
@@ -142,7 +146,10 @@ par le proxy sans nécessiter le wrapper `ocx claude`. Les shells déjà ouverts
 
 `ocx stop` et l'arrêt du proxy **suppriment les variables injectées** (ils ne restaurent pas les valeurs précédentes —
 seules les clés injectées par opencodex sont supprimées). Le proxy écrit également `~/.opencodex/claude-env.sh` ;
-`ocx start` installe un hook source `.zshrc` qui le charge automatiquement.
+`ocx start` installe le hook source `.zshrc` uniquement lorsqu’un exécutable Claude Code CLI est
+présent dans le `PATH`. Au démarrage et avec `ocx ensure`, le hook appartenant à OpenCodex est supprimé
+si aucun exécutable du CLI Claude Code n’est trouvé dans le `PATH` ou si l’intégration de l’environnement
+système est inactive. Claude Desktop utilise son propre profil et ne déclenche pas l’installation du hook shell.
 
 Désactivez cette intégration avec `claudeCode.systemEnv: false` dans la configuration ou avec le commutateur de l'interface.
 La fonctionnalité est réservée à macOS ; sur les autres plateformes, utilisez `ocx claude`.

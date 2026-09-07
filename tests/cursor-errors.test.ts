@@ -5,6 +5,7 @@ import {
   isCursorInvalidArgumentError,
   safeCursorErrorMessage,
 } from "../src/adapters/cursor/cursor-errors";
+import { inferHttpStatusFromAdapterMessage } from "../src/lib/errors";
 
 describe("classifyCursorError", () => {
   test("rate limit and resource exhaustion stay distinct", () => {
@@ -12,9 +13,7 @@ describe("classifyCursorError", () => {
     expect(classifyCursorError("rate limit exceeded for model")).toBe("Cursor rate limit exceeded");
   });
 
-  test("generic resource_exhausted is quota-style rate limiting, not a too-large request", () => {
-    // The live retry-storm shape: no detail beyond "Error" — must map to 429 so Codex backs off.
-    expect(classifyCursorError("Cursor Connect error resource_exhausted: Error")).toBe("Cursor rate limit exceeded");
+  test("explicit quota-cue resource_exhausted is rate limiting; bare overflow is context limit (T01)", () => {
     expect(classifyCursorError("resource_exhausted: too many requests")).toBe("Cursor rate limit exceeded");
     expect(classifyCursorError("resource_exhausted while loading tool catalog: quota exhausted")).toBe("Cursor rate limit exceeded");
     // Concurrency limits are quota shapes, not request-size overflow (a bare "limit"
@@ -32,6 +31,20 @@ describe("classifyCursorError", () => {
     expect(classifyCursorError("resource_exhausted: request size exceeds maximum allowed limit")).toBe("Cursor resource limit exceeded");
   });
 
+  test("bare resource_exhausted with no quota cue and no size phrase is payload overflow (T01)", () => {
+    // senpi #1009 / #1036: a huge session hits the context window and Cursor returns a bare
+    // gRPC resource_exhausted end-stream with no detail. Classifying it as 429 makes Codex
+    // back off instead of compacting, which burns retries on an unfixable-by-retry failure.
+    expect(classifyCursorError("Cursor Connect error resource_exhausted: Error")).toBe("Cursor context limit exceeded");
+    expect(classifyCursorError("resource_exhausted")).toBe("Cursor context limit exceeded");
+    expect(classifyCursorError("resource exhausted")).toBe("Cursor context limit exceeded");
+  });
+
+  test("explicit quota wording still maps to rate limit even without a size phrase", () => {
+    expect(classifyCursorError("resource_exhausted: too many requests for this model")).toBe("Cursor rate limit exceeded");
+    expect(classifyCursorError("resource_exhausted while loading tool catalog: quota exhausted")).toBe("Cursor rate limit exceeded");
+  });
+
   test("authentication / permission denied", () => {
     expect(classifyCursorError("unauthenticated: invalid bearer token")).toBe("Cursor authentication failed");
     expect(classifyCursorError("permission_denied: account suspended")).toBe("Cursor authentication failed");
@@ -45,6 +58,39 @@ describe("classifyCursorError", () => {
   test("invalid request / not found", () => {
     expect(classifyCursorError("model not found: bad-model-id")).toBe("Cursor invalid request");
     expect(classifyCursorError("invalid request: malformed tool schema")).toBe("Cursor invalid request");
+  });
+
+  test("failed_precondition is a deterministic non-retryable rejection, not overload", () => {
+    // Live evidence: a plan-gated model (claude-fable-5) invoked on a plan without it
+    // returns "Cursor Connect error failed_precondition: Error". gRPC FAILED_PRECONDITION
+    // is non-retryable by definition; as "Cursor upstream error" (502) clients retried it
+    // as overload, and the Claude inbound surfaced it as a misleading 529.
+    expect(classifyCursorError("Cursor Connect error failed_precondition: Error")).toBe("Cursor invalid request");
+    expect(inferHttpStatusFromAdapterMessage("Cursor invalid request: Cursor Connect error failed_precondition: Error")).toBe(400);
+  });
+
+  test("failed_precondition wins over overload keywords in the same message", () => {
+    // The original arm sat AFTER the overload keywords, so the shape this branch exists
+    // to catch slipped straight past it: a plan-gated rejection normally reads
+    // "failed_precondition: model unavailable for this plan", which matched "unavailable"
+    // first and came back "Cursor server overloaded" -> 503. Clients then retried a
+    // deterministic rejection forever. The explicit gRPC status is a structured signal
+    // from the backend; "unavailable" and "temporarily" here are just words near it.
+    expect(classifyCursorError("failed_precondition: model unavailable for this plan"))
+      .toBe("Cursor invalid request");
+    expect(classifyCursorError("failed_precondition: model temporarily gated"))
+      .toBe("Cursor invalid request");
+    expect(inferHttpStatusFromAdapterMessage("Cursor invalid request: failed_precondition: model unavailable for this plan"))
+      .toBe(400);
+
+    // A real overload with no gRPC precondition code must still be retryable.
+    expect(classifyCursorError("service temporarily unavailable")).toBe("Cursor server overloaded");
+    expect(classifyCursorError("backend overloaded, retry")).toBe("Cursor server overloaded");
+    expect(classifyCursorError("server is busy")).toBe("Cursor server overloaded");
+
+    // Authentication is checked earlier and stays authoritative over both.
+    expect(classifyCursorError("failed_precondition: unauthorized token"))
+      .toBe("Cursor authentication failed");
   });
 
   test("timeout / deadline", () => {
@@ -102,9 +148,10 @@ describe("safeCursorErrorMessage", () => {
     expect(msg).not.toContain("rate limit");
   });
 
-  test("end-to-end: quota-style resource exhaustion carries the rate-limit prefix", () => {
+  test("end-to-end: bare resource_exhausted carries the overflow prefix; explicit quota carries the rate-limit prefix", () => {
+    // Bare resource_exhausted is payload overflow (T01): the 400-class prefix lets Codex compact.
     expect(safeCursorErrorMessage("Cursor Connect error resource_exhausted: Error"))
-      .toContain("Cursor rate limit exceeded");
+      .toContain("Cursor context limit exceeded");
     expect(safeCursorErrorMessage("resource_exhausted: too many requests"))
       .toContain("Cursor rate limit exceeded");
     expect(safeCursorErrorMessage("resource_exhausted while loading tool catalog: quota exhausted"))
@@ -121,5 +168,36 @@ describe("isCursorInvalidArgumentError", () => {
     expect(isCursorInvalidArgumentError({ code: "invalid_argument", message: "Cursor invalid request" })).toBe(true);
     expect(isCursorInvalidArgumentError(new Error("Cursor invalid request: Cursor Connect error invalid_argument: Error"))).toBe(true);
     expect(isCursorInvalidArgumentError(new Error("Cursor connection failed"))).toBe(false);
+  });
+});
+
+describe("bare resource_exhausted size prior (devlog 260)", () => {
+  const BARE = "Cursor Connect error resource_exhausted: Error";
+
+  test("a provably small request keeps the 429 class (plan-gated model, live probe 210)", () => {
+    expect(classifyCursorError(BARE, { estimatedInputTokens: 20, contextWindow: 200_000 }))
+      .toBe("Cursor rate limit exceeded");
+  });
+
+  test("a plausibly large request still classifies as context overflow", () => {
+    expect(classifyCursorError(BARE, { estimatedInputTokens: 150_000, contextWindow: 200_000 }))
+      .toBe("Cursor context limit exceeded");
+  });
+
+  test("unknown estimate or window keeps today's overflow mapping (prior only removes provable false overflows)", () => {
+    expect(classifyCursorError(BARE)).toBe("Cursor context limit exceeded");
+    expect(classifyCursorError(BARE, {})).toBe("Cursor context limit exceeded");
+    expect(classifyCursorError(BARE, { estimatedInputTokens: 20 })).toBe("Cursor context limit exceeded");
+    expect(classifyCursorError(BARE, { contextWindow: 200_000 })).toBe("Cursor context limit exceeded");
+  });
+
+  test("explicit quota cues stay 429 regardless of size context", () => {
+    expect(classifyCursorError("resource_exhausted: quota exhausted", { estimatedInputTokens: 150_000, contextWindow: 200_000 }))
+      .toBe("Cursor rate limit exceeded");
+  });
+
+  test("explicit size phrases stay resource-limit regardless of size context", () => {
+    expect(classifyCursorError("resource_exhausted: request body exceeds maximum allowed size", { estimatedInputTokens: 20, contextWindow: 200_000 }))
+      .toBe("Cursor resource limit exceeded");
   });
 });

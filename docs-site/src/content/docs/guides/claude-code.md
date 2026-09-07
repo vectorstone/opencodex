@@ -13,9 +13,10 @@ You can log in multiple Claude accounts via the Providers dashboard (`ocx login 
 add-account). By default every request uses the **active** account only.
 
 An **experimental, opt-in** Claude account pool (`anthropicAccountPool.enabled`) adds sticky
-session affinity and 429 cooldown failover across those OAuth accounts. For **new** sessions
-only, `anthropicAccountPool.strategy` selects among eligible accounts: `quota` (default) picks
-lowest known 5-hour usage when above `autoSwitchThreshold`; `round-robin` spreads evenly
+session affinity and 429 cooldown failover across those OAuth accounts. For **new** sessions,
+`anthropicAccountPool.strategy` selects among eligible accounts: `quota` (default) picks the
+lowest known usage in the window set by `quotaWindow` (`five-hour` by default, or `weekly` /
+`max-utilization`) when above `autoSwitchThreshold`; `round-robin` spreads evenly
 (`stickyLimit`, default `1`); `fill-first` drains the active account until cooldown,
 reauthentication, or threshold, then advances. It is **off by default**, shows a GUI warning,
 and is not battle-tested — Anthropic may restrict accounts that look like automated rotation;
@@ -31,6 +32,11 @@ Operational contract when enabled:
   selection until re-authenticated.
 - If every eligible account is cooling, the proxy returns **429** (not 401) with `Retry-After`
   when known.
+- Recovery, including 429 failover, uses `quotaWindow` to rank eligible replacements without
+  changing the existing cooldown or failover limits; `round-robin` ignores `quotaWindow`.
+- `autoSwitchThreshold: 0` turns off **proactive** usage-based switching only. New-session
+  selection and 429 recovery still consult `quotaWindow`, so the window is inert only under
+  `round-robin`. `fill-first` evaluates its drain threshold in the selected window.
 
 See [Configuration](/reference/configuration/#anthropicaccountpool-experimental).
 
@@ -108,6 +114,7 @@ You can also manage the same profile from the command line:
 ```bash
 ocx claude desktop [apply]
 ocx claude desktop show [--json]
+ocx claude desktop status [--json]
 ocx claude desktop move <route> <opus|fable|sonnet|haiku> [--default]
 ocx claude desktop default <opus|fable|sonnet|haiku> <route|none>
 ocx claude desktop export <path|->
@@ -115,10 +122,18 @@ ocx claude desktop import <path> [--apply]
 ```
 
 `ocx claude desktop` and `apply` both write the current profile to Claude Desktop. `show` gives a
-readable summary; add `--json` for scripts. `export -` writes versioned JSON to standard output.
+readable summary; `status` reports the applied profile, drift, request activity, and Windows
+managed-policy health. Add `--json` for scripts. `export -` writes versioned JSON to standard output.
 Import validates the complete file before saving, so an invalid file leaves the current profile
 unchanged. Add `--apply` to write a valid imported profile to Desktop immediately. Use `none` only
 for an empty family; every non-empty family must keep one default.
+
+On Windows, a machine-managed Claude policy can make Desktop ignore the local third-party profile.
+OpenCodex reports this as `present`; a policy it cannot read is `unknown`, which is also a warning
+rather than a clean result. The diagnostic reports only that state—it does not expose policy value
+names or data, and it never removes or bypasses policy. Resolve the policy with your administrator,
+then fully quit and reopen Claude Desktop. Applying again also preserves profile keys that OpenCodex
+does not own while refreshing its gateway and model fields.
 
 Apply writes to Claude Desktop's real Electron user-data `configLibrary`: `~/Library/Application
 Support/Claude/configLibrary` on macOS, `%APPDATA%\Claude\configLibrary` on Windows, and
@@ -142,7 +157,10 @@ requiring the `ocx claude` wrapper. Already-open shells are unaffected and must 
 
 `ocx stop` and proxy shutdown **unset the injected keys** (it does not restore previous values —
 only the keys opencodex injected are removed). The proxy also writes `~/.opencodex/claude-env.sh`;
-`ocx start` installs a `.zshrc` source hook that loads it automatically.
+`ocx start` installs a `.zshrc` source hook that loads it automatically only when an executable
+Claude Code CLI is present on `PATH`. Startup and `ocx ensure` remove the OpenCodex-owned hook when
+Claude Code is absent or system environment integration is inactive. Claude Desktop uses its
+separate profile and does not cause shell-hook installation.
 
 Disable with `claudeCode.systemEnv: false` in the configuration or with the GUI toggle. This
 feature is macOS-only; on other platforms, use `ocx claude`.
@@ -260,8 +278,8 @@ When both `tierModels.haiku` and `smallFastModel` are absent, OpenCodex leaves b
 
 ## Roster agents (injectAgents)
 
-`ocx claude` (and the system-env daemon) syncs your featured subagent roster (Subagents tab,
-up to 5 models) plus `ocx-self` into `~/.claude/agents/ocx-*.md`.
+Proxy startup/ensure, `ocx claude`, and relevant dashboard saves sync your featured subagent roster
+(Subagents tab, up to 5 models) plus `ocx-self` into `~/.claude/agents/ocx-*.md`.
 
 - **`ocx-self`** pins your `/model` picker default (falling back to `claudeCode.model`); omitted
   when neither exists. It does NOT use model inheritance.
@@ -273,7 +291,8 @@ up to 5 models) plus `ocx-self` into `~/.claude/agents/ocx-*.md`.
   overwritten or pruned; your own agents are never touched.
 - Files are atomically synced per file (write + rename).
 - `enabled: false` or `injectAgents: false` prunes all verified-owned definitions.
-- GUI PUT and roster changes resync immediately; launcher/system-env sync at launch.
+- GUI PUT and roster changes resync immediately; every foreground or background proxy start/ensure
+  reconciles the owned files before a later Claude Code launch reads them.
 
 Dispatch: `subagent_type: "ocx-gpt-5-6-sol"`. 1M-capable targets carry `[1m]` automatically.
 
@@ -329,8 +348,9 @@ Both sidecars can use either backend:
 | `openai` | A small GPT model through the ChatGPT `forward` provider | A ChatGPT login and an enabled `authMode: "forward"` provider |
 | `anthropic` | Claude through stored Anthropic OAuth; web search uses `web_search_20250305` and vision sends the image to Claude for description | An enabled `adapter: "anthropic"`, `authMode: "oauth"` provider whose active stored account is not marked `needsReauth` |
 
-An explicit `backend` always wins. When it is omitted, opencodex selects `anthropic` if a usable
-stored Anthropic OAuth account exists; otherwise it selects `openai`. Explicitly selecting
+An explicit `backend` always wins. When it is omitted, the **web-search** sidecar always selects
+`openai` (`anthropic` runs only when explicitly configured), while the **vision** sidecar selects
+`anthropic` if a usable stored Anthropic OAuth account exists, otherwise `openai`. Explicitly selecting
 `anthropic` without a usable credential **fails closed**: opencodex does not silently borrow
 ChatGPT credentials or switch backends. The OpenAI backend likewise stays off without both login
 auth and a forward provider.

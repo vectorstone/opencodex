@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyProfile, handleClaudeDesktopCommand } from "../src/cli/claude-desktop";
 import { buildClaudeDesktopState } from "../src/server/management-api";
 import { loadConfig, saveConfig } from "../src/config";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let dir = "";
 let previousHome: string | undefined;
@@ -31,7 +32,7 @@ afterEach(() => {
   else process.env.OPENCODEX_HOME = previousHome;
   if (previousDesktopDir === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
   else process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = previousDesktopDir;
-  rmSync(dir, { recursive: true, force: true });
+  removeTreeWithRetry(dir);
 });
 
 test("show --json, move, default and export use the same persisted profile", async () => {
@@ -147,6 +148,22 @@ test("no-arg and legacy mode flags apply Desktop config", async () => {
     expect(await handleClaudeDesktopCommand(["--static"], noProxy)).toBe(0);
     expect(readFileSync(join(process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR!, "_meta.json"), "utf8")).toContain("opencodex");
     expect(error).not.toHaveBeenCalled();
+  } finally {
+    log.mockRestore();
+    error.mockRestore();
+  }
+});
+
+test("usage errors on desktop verbs exit 2, not 1", async () => {
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const error = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect(await handleClaudeDesktopCommand(["status", "--wat"])).toBe(2);
+    expect(await handleClaudeDesktopCommand(["status", "extra"])).toBe(2);
+    expect(await handleClaudeDesktopCommand(["show", "--wat"])).toBe(2);
+    expect(await handleClaudeDesktopCommand(["move"])).toBe(2);
+    expect(await handleClaudeDesktopCommand(["nope"])).toBe(2);
+    expect(await handleClaudeDesktopCommand(["apply", "--wat"])).toBe(2);
   } finally {
     log.mockRestore();
     error.mockRestore();

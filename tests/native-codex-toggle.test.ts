@@ -12,13 +12,14 @@
  * act on — rather than artifacts the next start silently undoes.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { handleManagementAPI } from "../src/server/management-api";
 import type { ManagementApiDeps } from "../src/server/management/context";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let fixtureRoot = "";
 let previousOpencodexHome: string | undefined;
@@ -86,7 +87,7 @@ beforeEach(() => {
 afterEach(() => {
   if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
-  while (cleanup.length) rmSync(cleanup.pop()!, { recursive: true, force: true });
+  while (cleanup.length) removeTreeWithRetry(cleanup.pop()!);
 });
 
 describe("request validation", () => {
@@ -100,6 +101,39 @@ describe("request validation", () => {
     const result = await put(baseConfig(), {});
     expect(result.status).toBe(400);
     expect(persistedCodexIntent()).toBeUndefined();
+  });
+
+  test("mode and enabled cannot be combined", async () => {
+    const result = await put(baseConfig(), { mode: "catalog-only", enabled: true });
+    expect(result.status).toBe(400);
+    expect(persistedCodexIntent()).toBeUndefined();
+  });
+});
+
+describe("catalog-only mode", () => {
+  test("persists mode and refreshes without routing injection", async () => {
+    let syncCalls = 0;
+    const result = await put(baseConfig(), { mode: "catalog-only" }, testDeps({
+      syncModelsToCodex: async () => {
+        syncCalls += 1;
+        return {
+          status: "catalog-only", ok: true, added: 1, catalogPath: "/tmp/catalog.json",
+          catalogExists: true, catalogWritten: true, cacheSynced: true, message: "catalog refreshed",
+        };
+      },
+    }));
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ ok: true, mode: "catalog-only", desiredEnabled: true, state: "current" });
+    expect(syncCalls).toBe(1);
+    expect(persistedCodexIntent()).toBe("catalog-only");
+  });
+
+  test("GET reports the persisted mode instead of the startup snapshot", async () => {
+    writeFileSync(join(fixtureRoot, "config.json"), JSON.stringify({ ...baseConfig(), clientIntegrations: { codex: "catalog-only" } }, null, 2));
+    const response = await dispatch(baseConfig(), "/api/native-integrations");
+    expect(response!.status).toBe(200);
+    const body = await response!.json() as { clients: Array<Record<string, unknown>> };
+    expect(body.clients.find(row => row.clientId === "codex")).toMatchObject({ mode: "catalog-only", desiredEnabled: true });
   });
 });
 

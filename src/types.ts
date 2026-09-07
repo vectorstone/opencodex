@@ -3,8 +3,11 @@
 
 export type { OcxTool, OcxToolChoice } from "./types/tools";
 export {
+  CODE_MODE_EXEC_TOOL_NAME,
   namespacedToolName,
+  normalizeDeclaredToolName,
   toolChoiceAliases,
+  createToolChoiceResolver,
   toolChoiceCandidates,
   toolAllowedByChoice,
   resolveToolChoiceWireName,
@@ -43,6 +46,7 @@ export type {
   OcxAssistantContentPart,
   OcxRequestOptions,
   OcxMessagePhase,
+  OcxProviderContinuationOwner,
   OcxProviderContinuationState,
   AdapterEvent,
   OcxUrlCitation,
@@ -58,10 +62,17 @@ export type {
   OcxCustomModel,
   OcxApiKeyEntry,
   OcxClientIntegrationsConfig,
+  OcxConfigRebaseProvenance,
+  OcxHubConfig,
+  OcxRemoteGuiConfig,
+  OcxConnectedClientId,
+  OcxClientConnectionConfig,
   OcxConfig,
   OcxAccountPoolRotationStrategy,
+  OcxAccountPoolQuotaWindow,
   OcxComboStrategy,
   OcxComboDefaultEffort,
+  OcxComboReasoningEffortMode,
   OcxComboTarget,
   OcxComboConfig,
   OcxRoutingUnknownEvidenceMode,
@@ -84,8 +95,10 @@ export type {
 export type {
   RefreshPolicy,
   OpenRouterProviderRouting,
+  VercelGatewayRouting,
   ResponsesItemIdRepairConfig,
   RateLimitRetryPolicy,
+  TransientRetryPolicy,
   ProviderCostOverlay,
   RequestPacingRule,
   ProviderRequestPacingConfig,
@@ -101,4 +114,3 @@ export type {
   CodexAccountCredentials,
   CodexAccountCredentialRecord,
 } from "./types/accounts";
-

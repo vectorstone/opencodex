@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync, unlinkSync } from "node:fs";
+import { mkdtempSync, readdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../src/config";
@@ -10,6 +10,7 @@ import {
 import {
   clearResponseStateForTests,
   clearResponseStateMemoryForTests,
+  flushPendingResponseSpillsForTests,
   rememberResponseState,
   responseStateMetrics,
   setResponseStateByteCapForTests,
@@ -21,6 +22,7 @@ import type { OcxConfig } from "../src/types";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 import { SERVER_BUDGET_MS } from "./helpers/test-budget";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const originalFetch = globalThis.fetch;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
@@ -93,7 +95,7 @@ function completedSse(responseId: string, text: string): string {
       response: {
         id: responseId,
         status: "completed",
-        model: "gpt-5.6-sol",
+        model: "gpt-5.5",
         output: [item],
       },
     })}`,
@@ -165,7 +167,7 @@ async function runForwardScenario(
         method: "POST",
         headers: requestHeaders,
         body: JSON.stringify({
-          model: "gpt-5.6-sol",
+          model: "gpt-5.5",
           input: [inputMessage(HISTORICAL_USER_SENTINEL)],
           stream: true,
           store: false,
@@ -192,7 +194,7 @@ async function runForwardScenario(
       method: "POST",
       headers: { ...requestHeaders, ...resumeHeaders },
       body: JSON.stringify({
-        model: "gpt-5.6-sol",
+        model: "gpt-5.5",
         previous_response_id: FIRST_RESPONSE_ID,
         input: [inputMessage(CURRENT_USER_SENTINEL)],
         stream: true,
@@ -236,7 +238,7 @@ afterEach(() => {
   resetSubagentModelFallbackStateForTests();
   isolatedCodexHome?.restore();
   isolatedCodexHome = null;
-  if (testHome) rmSync(testHome, { recursive: true, force: true });
+  if (testHome) removeTreeWithRetry(testHome);
   testHome = "";
   if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
@@ -249,11 +251,14 @@ describe("Issue #702 expired forward replay state", () => {
     const responseId = "resp_issue_702_missing_spill";
     setResponseStateByteCapForTests(1_024);
     rememberResponseState(
-      { model: "openai/gpt-5.6-sol", input: "x".repeat(8_000), store: false },
+      { model: "openai/gpt-5.5", input: "x".repeat(8_000), store: false },
       { id: responseId, status: "completed", output: [{ role: "assistant", content: "done" }] },
       undefined,
       { force: true },
     );
+    // Windows publishes spills asynchronously; the case is about a spill that later goes
+    // MISSING, so let the publication settle before deleting it.
+    await flushPendingResponseSpillsForTests();
     const spillDir = responseSpillDirectory(testHome);
     const spill = readdirSync(spillDir).find(name => name.endsWith(".spill.json"));
     expect(spill).toBeDefined();
@@ -265,7 +270,7 @@ describe("Issue #702 expired forward replay state", () => {
       throw new Error("upstream must not be called");
     }) as typeof fetch;
     const routeClasses: Array<{ config: OcxConfig; model: string }> = [
-      { config: forwardConfig(), model: "gpt-5.6-sol" },
+      { config: forwardConfig(), model: "gpt-5.5" },
       {
         config: {
           port: 0,
@@ -278,11 +283,11 @@ describe("Issue #702 expired forward replay state", () => {
               baseUrl: "https://runtime.us-east-1.kiro.dev",
               authMode: "key",
               apiKey: "synthetic-token",
-              models: ["gpt-5.6-sol"],
+              models: ["gpt-5.5"],
             },
           },
         } as OcxConfig,
-        model: "kiro-test/gpt-5.6-sol",
+        model: "kiro-test/gpt-5.5",
       },
       {
         config: {
@@ -296,11 +301,11 @@ describe("Issue #702 expired forward replay state", () => {
               baseUrl: "https://api.openai.com/v1",
               authMode: "key",
               apiKey: "provider-key",
-              models: ["gpt-5.6-sol"],
+              models: ["gpt-5.5"],
             },
           },
         } as OcxConfig,
-        model: "test-openai/gpt-5.6-sol",
+        model: "test-openai/gpt-5.5",
       },
     ];
 
@@ -418,7 +423,7 @@ describe("Issue #702 expired forward replay state", () => {
             baseUrl: `${upstream.url.toString().replace(/\/$/, "")}/v1`,
             allowPrivateNetwork: true,
             apiKey: "provider-key",
-            defaultModel: "gpt-5.6-sol",
+            defaultModel: "gpt-5.5",
           },
         },
       } as OcxConfig);
@@ -428,7 +433,7 @@ describe("Issue #702 expired forward replay state", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          model: "test-openai/gpt-5.6-sol",
+          model: "test-openai/gpt-5.5",
           previous_response_id: "resp_upstream_native_state",
           input: [inputMessage(CURRENT_USER_SENTINEL)],
           stream: true,

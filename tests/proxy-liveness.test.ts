@@ -11,6 +11,12 @@ import {
   proxyIdentityAt,
   validateReadyzBody,
 } from "../src/server/proxy-liveness";
+import {
+  checkRemoteProtocolCompatibility,
+  parseRemoteReadyMetadata,
+  readyProtocolMetadata,
+} from "../src/remote/protocol";
+import { getDefaultConfig } from "../src/config";
 
 function healthz(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
@@ -21,6 +27,7 @@ const OURS = { status: "ok", service: "opencodex", version: "2.6.17", uptime: 12
 describe("isOpencodexHealthz", () => {
   test("accepts the explicit service marker", () => {
     expect(isOpencodexHealthz(OURS)).toBe(true);
+    expect(isOpencodexHealthz({ ...OURS, guiPairCapability: "v1" })).toBe(true);
   });
 
   test("accepts the legacy pre-identity body (still-running old proxy after update)", () => {
@@ -32,6 +39,35 @@ describe("isOpencodexHealthz", () => {
     expect(isOpencodexHealthz({ status: "ok" })).toBe(false);
     expect(isOpencodexHealthz({ service: "something-else", status: "ok", version: "1", uptime: 1 })).toBe(false);
     expect(isOpencodexHealthz({ healthy: true } as never)).toBe(false);
+    expect(isOpencodexHealthz({ guiPairCapability: "v1", pid: 4242, port: 10100 })).toBe(false);
+  });
+});
+
+describe("remote protocol feature negotiation", () => {
+  test("intersects additive features and rejects incompatible floors", () => {
+    const compatible = checkRemoteProtocolCompatibility({
+      protocol: 2,
+      minimumClientProtocol: 1,
+      managementUrl: "https://hub.example.test",
+      features: ["rotation", "future"],
+    }, { protocol: 1, minimumHubProtocol: 1, features: ["rotation"] });
+    expect(compatible.ok).toBe(true);
+    if (compatible.ok) expect([...compatible.features]).toEqual(["rotation"]);
+    expect(checkRemoteProtocolCompatibility({
+      protocol: 2, minimumClientProtocol: 2, managementUrl: "https://hub.example.test",
+    }, { protocol: 1, minimumHubProtocol: 1 }).ok).toBe(false);
+    expect(checkRemoteProtocolCompatibility({
+      protocol: 1, minimumClientProtocol: 1, managementUrl: "https://hub.example.test",
+    }, { protocol: 2, minimumHubProtocol: 2 }).ok).toBe(false);
+  });
+
+  test.each([undefined, 0, Number.NaN, 1.5, -1])("rejects malformed protocol %p as invalid", protocol => {
+    const result = checkRemoteProtocolCompatibility({
+      protocol,
+      minimumClientProtocol: 1,
+      managementUrl: "https://hub.example.test",
+    });
+    expect(result).toMatchObject({ ok: false, reason: "invalid" });
   });
 });
 
@@ -53,7 +89,7 @@ describe("probeHostname", () => {
 describe("proxyIdentityAt", () => {
   test("returns the reported pid for our proxy", async () => {
     const identity = await proxyIdentityAt(10100, {}, { fetchFn: (async () => healthz(OURS)) as typeof fetch });
-    expect(identity).toEqual({ pid: 4242 });
+    expect(identity).toEqual({ pid: 4242, version: "2.6.17" });
   });
 
   test("rejects foreign 200s, non-OK responses, and pid mismatches", async () => {
@@ -76,7 +112,7 @@ describe("proxyIdentityAt", () => {
         return healthz(OURS);
       }) as typeof fetch,
     });
-    expect(identity).toEqual({ pid: 4242 });
+    expect(identity).toEqual({ pid: 4242, version: "2.6.17" });
     expect(calls).toBe(3);
     expect(sleeps).toEqual([100, 100]);
   });
@@ -103,7 +139,7 @@ describe("proxyIdentityAt", () => {
         return healthz(OURS);
       }) as typeof fetch,
     });
-    expect(identity).toEqual({ pid: 4242 });
+    expect(identity).toEqual({ pid: 4242, version: "2.6.17" });
     expect(calls).toBe(1);
   });
 
@@ -141,7 +177,7 @@ describe("findLiveProxy", () => {
       }) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: 4242, port: 58195, source: "runtime" });
+    expect(live).toEqual({ pid: 4242, port: 58195, source: "runtime", version: "2.6.17" });
     expect(urls).toEqual(["http://127.0.0.1:58195/healthz"]);
   });
 
@@ -154,7 +190,7 @@ describe("findLiveProxy", () => {
       fetchFn: (async () => healthz(OURS)) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: 4242, port: 10100, source: "config" });
+    expect(live).toEqual({ pid: 4242, port: 10100, source: "config", version: "2.6.17" });
   });
 
   test("a foreign listener on the configured port is not treated as our proxy", async () => {
@@ -181,7 +217,7 @@ describe("findLiveProxy", () => {
       }) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: 4242, port: 58195, hostname: "::1", source: "runtime" });
+    expect(live).toEqual({ pid: 4242, port: 58195, hostname: "::1", source: "runtime", version: "2.6.17" });
     expect(urls).toEqual(["http://[::1]:58195/healthz"]);
   });
 
@@ -197,7 +233,7 @@ describe("findLiveProxy", () => {
 
     // The record's pid 1111 may be dead/reused — synthesizing it would let `ocx stop`
     // kill an unrelated process via the taskkill/kill fallback.
-    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime" });
+    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
   });
 
   test("an orphaned record whose healthz pid mismatches is rejected (config fallback still runs)", async () => {
@@ -222,7 +258,7 @@ describe("findLiveProxy", () => {
     });
 
     // healthz-reported pids must pass identity verification before they become kill targets.
-    expect(live).toEqual({ pid: null, port: 58195, source: "config" });
+    expect(live).toEqual({ pid: null, port: 58195, source: "config", version: "2.6.17" });
   });
 
   test("a pidless legacy healthz never promotes an unverified cheap pid to a kill target", async () => {
@@ -235,7 +271,7 @@ describe("findLiveProxy", () => {
       fetchFn: (async () => healthz(legacyBody)) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime" });
+    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
   });
 
   test("a pidless legacy healthz returns the cheap pid once full identity verification echoes it", async () => {
@@ -253,7 +289,7 @@ describe("findLiveProxy", () => {
     });
 
     expect(verified).toEqual([1111]);
-    expect(live).toEqual({ pid: 1111, port: 58195, hostname: undefined, source: "runtime" });
+    expect(live).toEqual({ pid: 1111, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
   });
 
   test("a verifier answering with a DIFFERENT pid than the candidate is rejected (TOCTOU guard)", async () => {
@@ -266,7 +302,7 @@ describe("findLiveProxy", () => {
       fetchFn: (async () => healthz(legacyBody)) as typeof fetch,
     });
 
-    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime" });
+    expect(live).toEqual({ pid: null, port: 58195, hostname: undefined, source: "runtime", version: "2.6.16" });
   });
 });
 
@@ -399,7 +435,7 @@ describe("findLiveProxy single-deadline candidate gating", () => {
     });
     expect(urls).toEqual(["http://127.0.0.1:58195/healthz", "http://127.0.0.1:10100/healthz"]);
     expect(urls).toHaveLength(2);
-    expect(live).toEqual({ pid: 4242, port: 10100, hostname: undefined, source: "config" });
+    expect(live).toEqual({ pid: 4242, port: 10100, hostname: undefined, source: "config", version: "2.6.17" });
   });
 });
 
@@ -530,6 +566,18 @@ describe("validateReadyzBody strict contract", () => {
     expect(validateReadyzBody(VALID_BODY, 10100)).toEqual({ ready: true, status: "ready", pid: 4242, port: 10100 });
   });
 
+  test("accepts additive remote protocol and unknown future fields without weakening identity", () => {
+    const additive = {
+      ...VALID_BODY,
+      protocol: 1,
+      minimumClientProtocol: 1,
+      managementUrl: "https://hub.example.test",
+      futureCapability: { enabled: true },
+    };
+    expect(validateReadyzBody(additive, 10100)).toEqual({ ready: true, status: "ready", pid: 4242, port: 10100 });
+    expect(validateReadyzBody({ ...additive, service: "foreign" }, 10100)).toBeNull();
+  });
+
   test("accepts pending/failed bodies as not-ready with the same fixed status", () => {
     expect(validateReadyzBody({ ...VALID_BODY, status: "pending" }, 10100)).toEqual({ ready: false, status: "pending", pid: 4242, port: 10100 });
     expect(validateReadyzBody({ ...VALID_BODY, status: "failed" }, 10100)).toEqual({ ready: false, status: "failed", pid: 4242, port: 10100 });
@@ -610,6 +658,110 @@ describe("validateReadyzBody strict contract", () => {
     expect(validateReadyzBody(null, 10100)).toBeNull();
     expect(validateReadyzBody("opencodex", 10100)).toBeNull();
     expect(validateReadyzBody(undefined, 10100)).toBeNull();
+  });
+});
+
+describe("remote readiness protocol metadata", () => {
+  const metadata = {
+    protocol: 1,
+    minimumClientProtocol: 1,
+    managementUrl: "https://hub.example.test",
+  };
+  const invalidMessage = "OpenCodex hub returned invalid remote protocol metadata; upgrade or repair ocx on the hub.";
+
+  test("parses required fields, canonicalizes the origin, and ignores additive fields", () => {
+    expect(parseRemoteReadyMetadata({
+      ...metadata,
+      managementUrl: "https://hub.example.test:443/",
+      future: true,
+    })).toEqual(metadata);
+  });
+
+  test("builds one stable shape for standalone, hub, and client roles", () => {
+    for (const runtimeRole of ["standalone", "hub", "client"] as const) {
+      expect(readyProtocolMetadata(
+        { ...getDefaultConfig(), runtimeRole },
+        new Request("https://hub.example.test/readyz"),
+      )).toEqual(metadata);
+    }
+  });
+
+  test("uses the observed Host and ignores forwarding headers", () => {
+    expect(readyProtocolMetadata(getDefaultConfig(), new Request("http://127.0.0.1/readyz", {
+      headers: {
+        Host: "hub.example.test:8443",
+        Forwarded: "host=attacker.test;proto=https",
+        "X-Forwarded-Host": "attacker.test",
+        "X-Forwarded-Proto": "https",
+      },
+    }))).toEqual({
+      protocol: 1,
+      minimumClientProtocol: 1,
+      managementUrl: "http://hub.example.test:8443",
+    });
+  });
+
+  test("configured hub management origin wins while other roles keep the observed fallback", () => {
+    const request = new Request("http://127.0.0.1/readyz", {
+      headers: { Host: "observed.example.test:8443" },
+    });
+    expect(readyProtocolMetadata({
+      ...getDefaultConfig(),
+      runtimeRole: "hub",
+      hub: { managementPublicOrigin: "https://hub.example.test:443" },
+    }, request).managementUrl).toBe("https://hub.example.test");
+    expect(readyProtocolMetadata({
+      ...getDefaultConfig(),
+      runtimeRole: "client",
+      hub: { managementPublicOrigin: "https://ignored.example.test" },
+    }, request).managementUrl).toBe("http://observed.example.test:8443");
+  });
+
+  test("classifies a hub that requires a newer client with the exact message", () => {
+    expect(checkRemoteProtocolCompatibility({ ...metadata, protocol: 2, minimumClientProtocol: 2 })).toEqual({
+      ok: false,
+      reason: "hub-too-new",
+      message: "OpenCodex hub requires remote protocol 2; this client supports protocol 1. Upgrade ocx on this client.",
+    });
+  });
+
+  test("classifies a hub below the client floor with the exact message", () => {
+    expect(checkRemoteProtocolCompatibility(metadata, { protocol: 2, minimumHubProtocol: 2 })).toEqual({
+      ok: false,
+      reason: "hub-too-old",
+      message: "OpenCodex hub provides remote protocol 1; this client requires at least 2. Upgrade ocx on the hub.",
+    });
+  });
+
+  test("malformed metadata is invalid, never a version mismatch", () => {
+    const malformed = [
+      { ...metadata, protocol: 0 },
+      { minimumClientProtocol: 1, managementUrl: metadata.managementUrl },
+      { protocol: 1, managementUrl: metadata.managementUrl },
+      { ...metadata, protocol: "1" },
+      { ...metadata, protocol: Number.MAX_SAFE_INTEGER + 1 },
+      { ...metadata, minimumClientProtocol: 2 },
+      { ...metadata, managementUrl: "https://hub.example.test/path" },
+      { ...metadata, managementUrl: "https://hub.example.test/?query=1" },
+      { ...metadata, managementUrl: "https://hub.example.test/#fragment" },
+      { ...metadata, managementUrl: "https://user@hub.example.test" },
+    ];
+    for (const value of malformed) {
+      expect(parseRemoteReadyMetadata(value)).toBeNull();
+      expect(checkRemoteProtocolCompatibility(value)).toEqual({
+        ok: false,
+        reason: "invalid",
+        message: invalidMessage,
+      });
+    }
+  });
+
+  test("accepts an additive protocol level when the v1 intervals intersect", () => {
+    expect(checkRemoteProtocolCompatibility({ ...metadata, protocol: 2 })).toEqual({
+      ok: true,
+      metadata: { ...metadata, protocol: 2 },
+      features: new Set(),
+    });
   });
 });
 

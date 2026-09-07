@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleManagementAPI } from "../src/server/management-api";
@@ -7,6 +7,7 @@ import * as modelRows from "../src/server/management/model-rows";
 import type { OcxConfig } from "../src/types";
 import { BASELINE_VISION_MODELS } from "../src/vision/eligibility";
 import { ManagementRequest as Request } from "./helpers/management-auth";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 async function getSidecarSettings(config: OcxConfig): Promise<Response> {
   const url = new URL("http://localhost/api/sidecar-settings");
@@ -67,7 +68,7 @@ describe("sidecar-settings vision model filter", () => {
   afterEach(() => {
     if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousHome;
-    if (isolatedHome) rmSync(isolatedHome, { recursive: true, force: true });
+    if (isolatedHome) removeTreeWithRetry(isolatedHome);
     isolatedHome = undefined;
   });
 
@@ -295,9 +296,12 @@ describe("sidecar-settings vision model filter", () => {
     }
   });
 
-  test("14. the web-search sidecar is deliberately NOT gated", async () => {
-    // False-positive guard: only the vision describer needs eyes. If this ever
-    // starts failing, the gate has leaked into the wrong field.
+  test("14. the web-search sidecar now has its OWN membership gate (#2188)", async () => {
+    // This test used to pin "deliberately NOT gated". #2188 replaced that
+    // contract: web-search rejects on non-membership (closed executor set),
+    // while vision keeps rejecting only on proven blindness. The two gates
+    // remain different predicates; full web-search coverage lives in
+    // tests/sidecar-settings-web-search-gate.test.ts.
     const config = emptyConfig();
     const url = new URL("http://localhost/api/sidecar-settings");
     const response = await handleManagementAPI(
@@ -309,7 +313,7 @@ describe("sidecar-settings vision model filter", () => {
       url,
       config,
     );
-    expect(response?.status).toBe(200);
-    expect(config.webSearchSidecar?.model).toBe("o3-mini");
+    expect(response?.status).toBe(400);
+    expect(config.webSearchSidecar?.model).toBeUndefined();
   });
 });

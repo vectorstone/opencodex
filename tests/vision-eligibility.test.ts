@@ -4,6 +4,7 @@ import type { OcxConfig } from "../src/types";
 import {
   BASELINE_VISION_MODELS,
   isVisionEligibleModel,
+  isVisionSidecarConsumer,
   modelAcceptsImageInput,
   visionBackendForCandidate,
   visionEligibleModelOptions,
@@ -52,6 +53,24 @@ describe("vision eligibility core", () => {
     };
     expect(isVisionEligibleModel(config, candidate)).toBe(false);
     expect(modelAcceptsImageInput(config, candidate)).toBe(false);
+  });
+
+  test("2b. configured text-only rows are consumers, but audio-only rows are not", () => {
+    const config = configWithProviders({
+      test: {
+        adapter: "openai-chat",
+        baseUrl: "https://example.test/v1",
+        modelInputModalities: {
+          "text-only": ["text"],
+          "audio-only": ["audio"],
+          "text-and-image": ["text", "image"],
+        },
+      },
+    });
+
+    expect(isVisionSidecarConsumer(config, "test", "text-only")).toBe(true);
+    expect(isVisionSidecarConsumer(config, "test", "audio-only")).toBe(false);
+    expect(isVisionSidecarConsumer(config, "test", "text-and-image")).toBe(false);
   });
 
   test("3a. silent catalog rows fall back to generated metadata (live /api/models shape)", () => {
@@ -245,9 +264,10 @@ describe("vision eligibility core", () => {
     expect(matches[0]?.baseline).toBe(true);
   });
 
-  test("8. backend routing excludes image-capable rows with no executor", () => {
-    // cursor has no vision sidecar executor — backend is undefined and the row is absent
-    // from the options list even when it is image-capable.
+  test("8. non-forward rows map to routed; absent unless routed is enabled", () => {
+    // cursor has no DEDICATED describe executor — the row now belongs to the
+    // "routed" loopback executor (#2188 roadmap 170 revised) and appears only
+    // when the caller enables that backend, as a NAMESPACED value.
     const config = configWithProviders({
       cursor: {
         adapter: "openai-chat",
@@ -259,7 +279,7 @@ describe("vision eligibility core", () => {
       id: "cursor-vision-capable",
       inputModalities: ["text", "image"],
     };
-    expect(visionBackendForCandidate(config, candidate)).toBeUndefined();
+    expect(visionBackendForCandidate(config, candidate)).toBe("routed");
     expect(isVisionEligibleModel(config, candidate)).toBe(true);
     const options = visionEligibleModelOptions(config, [candidate], ["openai", "anthropic"]);
     expect(options.some((o) => o.value === candidate.id)).toBe(false);
@@ -268,5 +288,8 @@ describe("vision eligibility core", () => {
       BASELINE_VISION_MODELS.openai,
       BASELINE_VISION_MODELS.anthropic,
     ]);
+    // enabling routed surfaces the row, namespaced.
+    const withRouted = visionEligibleModelOptions(config, [candidate], ["openai", "anthropic", "routed"]);
+    expect(withRouted.some((o) => o.value === "cursor/cursor-vision-capable" && o.backend === "routed")).toBe(true);
   });
 });

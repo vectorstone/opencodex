@@ -1,3 +1,5 @@
+import { idleDeadline } from "./abort";
+
 /** Maximum number of response-body bytes that may be retained for an error. */
 export const BOUNDED_BODY_MAX_BYTES = 65_536;
 
@@ -49,6 +51,8 @@ export interface BoundedBytesOptions {
 	signal?: AbortSignal;
 	/** Maximum number of raw bytes retained from the response body. */
 	maxBytes: number;
+	/** Deadline between non-empty raw chunks. Omitted means no body-read deadline. */
+	inactivityTimeoutMs?: number;
 }
 
 export interface BoundedBytesResult {
@@ -103,6 +107,16 @@ function cancelWithoutWaiting(reader: ReadableStreamDefaultReader<Uint8Array>, r
 	}
 }
 
+function cancelBodyWithoutWaiting(body: ReadableStream<Uint8Array>, reason?: unknown): void {
+	// A signal can already be aborted before a reader is attached. Still settle the
+	// original body so fetch-backed streams cannot retain a rejected read in that gap.
+	try {
+		void body.cancel(reason).catch(() => undefined);
+	} catch {
+		// A locked or non-conforming stream may throw synchronously from cancel().
+	}
+}
+
 /**
  * Consume the original response body as raw bytes under a strict memory ceiling.
  *
@@ -126,6 +140,15 @@ export async function readBoundedResponseBytes(
 	let retainedBytes = 0;
 	let mustCancel = false;
 	let cancelReason: unknown;
+	const inactivityReason = new DOMException("Response body stalled", "TimeoutError");
+	let rejectForInactivity: ((reason: unknown) => void) | undefined;
+	const inactive = new Promise<never>((_resolve, reject) => {
+		rejectForInactivity = reject;
+	});
+	const inactivity = options.inactivityTimeoutMs === undefined
+		? null
+		: idleDeadline(options.inactivityTimeoutMs, () => rejectForInactivity?.(inactivityReason));
+	inactivity?.reset();
 
 	let rejectForAbort: ((reason: unknown) => void) | undefined;
 	const aborted = new Promise<never>((_resolve, reject) => {
@@ -141,7 +164,7 @@ export async function readBoundedResponseBytes(
 			const read = reader.read();
 			// Observe a late read rejection when abort/cancellation wins the race.
 			void read.catch(() => undefined);
-			const outcome = await Promise.race([read, aborted]);
+			const outcome = await Promise.race([read, aborted, inactive]);
 			if (signal?.aborted) {
 				mustCancel = true;
 				cancelReason = signal.reason;
@@ -153,6 +176,7 @@ export async function readBoundedResponseBytes(
 				return { bytes: retained.subarray(0, retainedBytes), oversized: false };
 			}
 			if (!value || value.byteLength === 0) continue;
+			inactivity?.reset();
 
 			if (value.byteLength > maxBytes - retainedBytes) {
 				mustCancel = true;
@@ -177,6 +201,7 @@ export async function readBoundedResponseBytes(
 		cancelReason = error;
 		throw error;
 	} finally {
+		inactivity?.cancel();
 		signal?.removeEventListener("abort", onAbort);
 		if (mustCancel) cancelWithoutWaiting(reader, cancelReason);
 		try {
@@ -208,9 +233,11 @@ export async function readBoundedResponseBody(
 	options: BoundedBodyOptions = {},
 ): Promise<BoundedBodyResult> {
 	const signal = options.signal;
-	if (signal?.aborted) throw signal.reason;
-
 	const body = response.body;
+	if (signal?.aborted) {
+		if (body) cancelBodyWithoutWaiting(body, signal.reason);
+		throw signal.reason;
+	}
 	if (!body) {
 		return {
 			text: "",

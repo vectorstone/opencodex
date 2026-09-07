@@ -74,6 +74,7 @@ interface CleanupPolicy {
       skipped?: string;
       deferred?: string;
       error?: string;
+      metadataPersistenceError?: "missing" | "invalid" | "conflict" | "write_failed";
       mode?: string;
       freedBytes?: number;
       removed?: number;
@@ -888,6 +889,9 @@ function AutoCleanupPolicyPanel({
 
       if (outcome.skipped === "disabled") {
         setStatus(t("storage.policy.skippedDisabled"));
+      } else if (outcome.ok && outcome.metadataPersistenceError) {
+        setError(t("storage.policy.metadataSaveWarning"));
+        if (outcome.removed !== undefined) onDone();
       } else if (outcome.skipped === "under_threshold") {
         setStatus(t("storage.policy.skippedUnder"));
       } else if (outcome.skipped === "nothing_selected") {
@@ -1440,7 +1444,7 @@ export default function Storage({ apiBase }: { apiBase: string }) {
       ) : (
         <>
           {reportState.showError && <div className="alert alert-err" role="alert">{t("storage.error")}</div>}
-          {empty ? <EmptyState title={t("storage.empty")} /> : data && data.total.fileCount > 0 && <StorageWorkspace report={data} locale={locale} />}
+          {empty ? <EmptyState title={t("storage.empty")} /> : data && data.total.fileCount > 0 && <StorageWorkspace report={data} locale={locale} apiBase={apiBase} />}
         </>
       )}
 

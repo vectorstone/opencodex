@@ -6,12 +6,14 @@ import {
   atomicWriteFile,
   getConfigDir,
   loadConfig,
+} from "../config";
+import {
   readPid,
   readRuntimePort,
   removePid,
   removeRuntimePort,
   verifyPidIdentity,
-} from "../config";
+} from "../config/process-state";
 import { isProcessAlive, killProxy } from "../lib/process-control";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
 import { killWindowsSchedulerWrappers } from "../lib/windows-service-wrappers";
@@ -49,6 +51,11 @@ const RELEASE_NOTES_URL = "https://github.com/lidge-jun/opencodex/releases/lates
 const UPDATE_JOB_FILENAME = "update-job.json";
 const UPDATE_TIMEOUT_MS = 180_000;
 const RESTART_TIMEOUT_MS = 60_000;
+// A Windows `service repair` can spend up to 45s in its own serving probe after
+// Task Scheduler/ACL work. The generic 60s child ceiling can kill that valid repair
+// and launch a competing foreground proxy. Keep this below the update worker's 180s
+// ceiling while covering the measured probe plus bounded Windows setup work.
+const WINDOWS_SERVICE_REPAIR_TIMEOUT_MS = 150_000;
 const RESTART_HEALTH_TIMEOUT_MS = 30_000;
 const RESTART_STABILITY_WINDOW_MS = 15_000;
 /** Legacy active records did not persist a worker PID, so age is their only safe recovery signal. */
@@ -457,8 +464,8 @@ export function restartCommand(
   const startArgs = pinPort
     ? [launcher, "start", "--port", String(Math.trunc(port))]
     : [launcher, "start"];
-  // Default to the non-registering refresh: an update path reaching here has an already
-  // installed service, and `install` would demand elevation on Windows scheduler backends.
+  // Default to the in-place refresh: `install` always registers, while repair reuses a healthy
+  // Windows scheduler definition and re-registers only when the live definition is stale.
   const svcArgs = serviceInstalled ? [launcher, ...(serviceArgs ?? ["service", "repair"])] : startArgs;
   if (installer === "npm") {
     const bin = nodeBin();
@@ -685,7 +692,12 @@ export function startUpdateJob(
  * and a bounded, structured summary — enough to tell a user which step failed and how, with no
  * free-form vendor text passing through the boundary. Detailed output stays ephemeral.
  */
-function runLoggedCommand(job: UpdateJobState, bin: string, args: string[], timeout: number): { status: number | null; signal: NodeJS.Signals | null } {
+function runLoggedCommand(
+  job: UpdateJobState,
+  bin: string,
+  args: string[],
+  timeout: number,
+): { status: number | null; signal: NodeJS.Signals | null; timedOut: boolean } {
   job = updateJob(job, {}, `$ ${formatCommand(bin, args)}`);
   const result = spawnSync(bin, args, {
     encoding: "utf8",
@@ -696,7 +708,11 @@ function runLoggedCommand(job: UpdateJobState, bin: string, args: string[], time
   const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
   const summary = summarizeCommandOutput(stdout, stderr, result.status, result.signal);
   if (summary) updateJob(job, {}, summary);
-  return { status: result.status, signal: result.signal };
+  return {
+    status: result.status,
+    signal: result.signal,
+    timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT",
+  };
 }
 
 /**
@@ -985,7 +1001,8 @@ export interface RestartIo {
     job: UpdateJobState,
     bin: string,
     args: string[],
-  ) => { status: number | null; signal?: NodeJS.Signals | null };
+    timeoutMs: number,
+  ) => { status: number | null; signal?: NodeJS.Signals | null; timedOut?: boolean };
   /** Override the explicit restart path (used by finishGuiUpdateRestart tests). */
   restartAfterUpdateFn?: (
     job: UpdateJobState,
@@ -1114,12 +1131,10 @@ async function restartAfterUpdate(
     const preServiceAllow = reclaimKillAllowlist();
     const freed = await waitFn(port, hostname, reclaimOptsFor(preServiceAllow));
     let skipServiceInstall = false;
-    // This skip existed because the refresh ran `ocx service install`, whose Windows
-    // scheduler path always reaches `schtasks /create` — elevation the GUI update worker
-    // (OCX_SERVICE=1) never has. `service repair` rewrites the wrapper assets and
-    // restarts the EXISTING task with no `/create`, so the reason no longer applies and
-    // skipping would leave the dashboard-triggered update — the most common Windows
-    // path — with a stale service it could have refreshed.
+    // This skip existed because refresh ran `ocx service install`, whose Windows path always
+    // registers. `service repair` normally reuses the live task and can refresh a stale
+    // definition through its guarded create/elevation path, so the install-only skip no longer
+    // applies and would leave the common dashboard update with stale service assets.
     //
     // Only a caller that still passes install argv keeps the old behavior.
     const refreshRegisters = (svcArgs ?? []).includes("install");
@@ -1155,13 +1170,27 @@ async function restartAfterUpdate(
       process.env.OCX_BAKE_PORT = String(Math.trunc(port));
       let serviceOk = false;
       try {
-        const run = io.runService ?? ((j, bin, args) => runLoggedCommand(j, bin, args, RESTART_TIMEOUT_MS));
-        const result = run(job, cmd.bin, cmd.args);
+        const repairTimeoutMs = (io.platform ?? process.platform) === "win32"
+          ? WINDOWS_SERVICE_REPAIR_TIMEOUT_MS
+          : RESTART_TIMEOUT_MS;
+        const run = io.runService ?? ((j, bin, args, timeoutMs) => runLoggedCommand(j, bin, args, timeoutMs));
+        const result = run(job, cmd.bin, cmd.args, repairTimeoutMs);
         serviceOk = result.status === 0;
         if (!serviceOk) {
-          // The refresh that just failed was `ocx service repair` (serviceReinstallArgs),
-          // which needs no elevation because it never calls `schtasks /create`. Advising
-          // `install` here would send the user to re-registration — a UAC prompt on
+          if (result.timedOut) {
+            // UAC and scheduler mutation can outlive a fixed child deadline. Once the
+            // worker kills that child, ownership is ambiguous: launching a foreground
+            // proxy here can race a registration that completes moments later.
+            updateJob(job, {}, "Service repair timed out with Task Scheduler state unknown; refusing a competing direct start.");
+            throw new Error(
+              "Service repair timed out with Task Scheduler state unknown; refusing a competing direct start. "
+              + "Run 'ocx service status', then 'ocx service repair' by hand.",
+            );
+          }
+          // The refresh that just failed was `ocx service repair` (serviceReinstallArgs).
+          // It normally reuses a healthy registration, but a stale definition may have tried
+          // guarded re-registration/elevation. Advising `install` here would unconditionally
+          // send the user to re-registration — a UAC prompt on
           // Windows and a possible WinSW-to-scheduler backend switch — to fix a service
           // that is already registered. Point at the same command that failed so its
           // output explains why, on every platform.

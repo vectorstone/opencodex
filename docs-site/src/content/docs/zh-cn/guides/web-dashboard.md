@@ -45,7 +45,7 @@ bun run dev:gui
 | **Logs** | 自动刷新近期请求，显示 token、请求强度以及（可用时）实际发送强度、实际模型、provider、状态、request id、耗时和错误详情。适配器发送 reasoning 参数时，详情中还会显示准确的 wire field。可按不透明会话/对话 ID（客户端提供时）筛选，并对当前已加载的 Logs 环形缓冲合计 token 与估算标价成本。 |
 | **Usage / Debug** | 查看 token usage 覆盖率与趋势，或启用可选的 provider transport 和 usage 提取诊断。 |
 | **Storage** | 只读查看 CODEX_HOME 磁盘占用（会话、归档、数据库、附件）。可选归档清理：预览最旧 N%，默认隔离到 `CODEX_HOME/.trash`，或勾选后永久删除。**自动清理策略**为可选且**默认关闭**（`storageCleanupPolicy.enabled`）；可在 Storage 页配置阈值/目标/计划/模式，或点「立即运行」。可在 Storage 页从隔离区恢复（JSONL + 线程）。活动会话保持只读。Codex 锁定最新/活动的 `state_*.sqlite` 时拒绝清理与恢复。 |
-| **Stop** | 优雅地停止代理和已安装的后台服务，恢复原生 Codex 并退出（`POST /api/stop`）。 |
+| **Stop** | 优雅地停止代理和已安装的后台服务，恢复原生 Codex 并退出（`POST /api/stop`）。在使用任务计划程序后端的 Windows 上，仪表板会拒绝并提示改用 `ocx stop`：任务结束后包装器仍可能重新拉起代理，只有运行在代理之外的 stop 才能在恢复客户端配置前确认这个重启窗口。被拒绝时不会做任何更改。 |
 
 ### 链接到某个部分
 
@@ -73,6 +73,10 @@ Dashboard 的 **Sub-agent delegation** 选择器会保存 `injectionModel`，以
 启用委派指引或触发委派。两者都不是代理侧的逐次跨模型路由器。v1/base/v2 的
 权威说明见 [子代理界面](/zh-cn/guides/sub-agent-surface/)。
 :::
+
+## Remote Hub 会话、密钥与用量
+
+控制台管理平面与 client→hub 的模型流量相互独立。**Integrations → API Keys** 显示待处理轮换，只显示一次替换密钥，并要求显式提交或中止。浏览器 logout 只使当前会话失效。连接时从 hub 按 `apiKeyId` 过滤用量；断开后使用本地记录，两者不会镜像。
 
 选择器会列出已启用的原生与路由模型，以及全局 Codex reasoning 阶梯。API 会先验证所选强度是否
 属于全局阶梯；Codex 仍会根据目标目录条目再次校验该 spawn 强度。
@@ -139,7 +143,7 @@ GUI 是代理 JSON 管理 API 之上的轻量客户端。常用 endpoint 包括�
 | `POST /api/codex-auth/login` · `GET /api/codex-auth/login-status` | 通过浏览器登录添加池账号。 |
 | `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | 使用 tail、provider、精确状态码或状态类别筛选近期请求元数据。`limit`/`offset` 从最新一行向前分页（`offset=0` 为最新一页）。响应为 `{ timeZone, total, logs }`，其中 `total` 为分页前的匹配行数。 |
 | `GET` / `PUT /api/subagent-models` | 读取或设置五个置顶的 `spawn_agent` override 模型。 |
-| `POST /api/stop` | 停止代理/服务，恢复原生 Codex 并退出。 |
+| `POST /api/stop` | 停止代理/服务，恢复原生 Codex 并退出。在 Windows 任务计划程序后端会以 `respawnable_service` 拒绝，无法读取该状态时以 `service_state_unknown` 拒绝；两种情况都不会做任何更改。 |
 
 :::tip
 从仪表盘添加 **Ollama Cloud** 或其他目录型 provider 时，其文本/视觉模型分类会写入保存的

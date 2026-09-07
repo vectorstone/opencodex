@@ -115,7 +115,7 @@ ocx logout <provider>
 
 | Fournisseur | Adaptateur | URL de base | Remarques |
 | --- | --- | --- | --- |
-| `xai` | `openai-chat` | `https://api.x.ai/v1` | Catalogue Grok découvert en direct en priorité ; `grok-4.5` est le modèle de repli par défaut. |
+| `xai` | `openai-chat` | `https://cli-chat-proxy.grok.com/v1` | OAuth utilise la passerelle d'abonnement Grok CLI distincte. Le remplacement par clé API utilise `https://api.x.ai/v1` et peut injecter Priority Processing. Catalogue Grok découvert en direct en priorité ; `grok-4.5` est le modèle de repli par défaut. |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | Modèles Claude ; liste des modèles récupérée en direct depuis `/v1/models`. |
 | `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Modèles de programmation Kimi K2.7/K2.6/K2.5. |
 | `nous` | `openai-chat` | `https://inference-api.nousresearch.com/v1` | Passerelle d'abonnement Nous Research (le même service en amont que celui utilisé par Hermes Agent). Connexion par autorisation d'appareil auprès de `portal.nousresearch.com` ; le jeton d'accès est le JWT d'inférence envoyé avec chaque requête. Le catalogue mixte de modèles payants et `:free` (`tencent/hy3:free`, `stepfun/step-3.7-flash:free`, ...) est découvert en direct pour le compte connecté. Les jetons d'actualisation sont à usage unique et renouvelés à chaque actualisation. |
@@ -574,14 +574,23 @@ connexion par clé.
 
 ### Ollama Cloud
 
-Ollama Cloud est une version hébergée — et non locale — d'Ollama, compatible avec OpenAI à l'adresse
-`https://ollama.com/v1` et accessible avec une clé créée sur
-[ollama.com/settings/keys](https://ollama.com/settings/keys). opencodex classe les modèles cloud selon leurs
+Ollama Cloud est une version hébergée — et non locale — d'Ollama, à configurer à l'adresse
+`https://ollama.com/v1` avec une clé créée sur
+[ollama.com/settings/keys](https://ollama.com/settings/keys). opencodex l'atteint via l'API REST
+native d'Ollama (`POST /api/chat`) plutôt que via la surface compatible OpenAI, et découvre la
+liste des modèles auprès du fournisseur : les nouveaux modèles Ollama Cloud apparaissent sans
+modifier la configuration. opencodex classe les modèles cloud selon leurs
 capacités visuelles, afin que le [service auxiliaire de vision](/fr/guides/sidecars/) n'intervienne que pour les modèles
 exclusivement textuels. Ces derniers, par exemple `glm-5.2`, `deepseek-v4-pro`, `gpt-oss`, `qwen3-coder`,
 `minimax-m2.x` et `nemotron-3-*`, figurent dans `noVisionModels` ; les modèles à vision native, comme
 `kimi-k2.6`, `minimax-m3`, `gemma4`, `qwen3.5` et `gemini-3-flash-preview`, n'y figurent pas. La correspondance
 tolère les balises `:size` d'Ollama : `gpt-oss` couvre donc `gpt-oss:120b` et `gpt-oss:20b`.
+
+Ollama documente actuellement la sortie structurée comme non prise en charge sur Ollama Cloud.
+Pour `ollama-cloud` canonique, opencodex refuse donc les requêtes à sortie structurée
+(`text.format`) avec une erreur explicite plutôt que de renvoyer silencieusement une prose libre ;
+les points de terminaison locaux et personnalisés `ollama-native` conservent le comportement
+natif `format` d'Ollama.
 
 ## 4. Fournisseurs locaux
 

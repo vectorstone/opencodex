@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleManagementAPI } from "../src/server/management-api";
@@ -11,6 +11,7 @@ import {
   type RequestLogEntry,
 } from "../src/server/request-log";
 import type { OcxConfig } from "../src/types";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const config = { providers: [] } as unknown as OcxConfig;
 
@@ -30,7 +31,7 @@ afterEach(() => {
   clearRequestLogsForTests();
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
-  if (testDir) rmSync(testDir, { recursive: true, force: true });
+  if (testDir) removeTreeWithRetry(testDir);
 });
 
 async function readLogs(): Promise<Array<Record<string, any>>> {
@@ -93,6 +94,31 @@ describe("GET /api/logs display metrics", () => {
     expect(dto!.displayMetrics.cost.estimate.estimated).toBe(true);
     expect(dto!.displayMetrics.cost.estimateReasons).toContain("usage_estimated");
     expect(dto!.displayMetrics.cost.estimateReasons).toContain("cache_detail_missing");
+  });
+
+  test("confirmed xAI priority plus long context is exposed as a cost lower bound", async () => {
+    addRequestLog(baseEntry({
+      provider: "xai",
+      model: "grok-4.6",
+      usage: {
+        inputTokens: 200_000,
+        outputTokens: 10_000,
+        cacheReadInputTokens: 50_000,
+      },
+      tierOutcome: {
+        canonical: "priority",
+        wireKind: "service-tier",
+        wireValue: "priority",
+        fastOutcome: "applied",
+        confirmation: "confirmed",
+        responseServiceTier: "priority",
+      },
+    }));
+    const [dto] = await readLogs();
+    expect(dto!.displayMetrics.cost.kind).toBe("value");
+    expect(dto!.displayMetrics.cost.estimate.priorityLowerBound).toBe(true);
+    expect(dto!.displayMetrics.cost.estimate.cost.total).toBeCloseTo(0.77, 9);
+    expect(dto!.displayMetrics.cost.estimateReasons).toContain("priority_lower_bound");
   });
 
   test("unmatched price is unavailable instead of zero", async () => {

@@ -35,6 +35,7 @@ function sources(overrides: Partial<OverviewSources> = {}): OverviewSources {
     claude: null,
     claudeDesktop: null,
     grok: null,
+    cursor: null,
     native: null,
     nativeSettled: true,
     ...overrides,
@@ -49,14 +50,14 @@ function rowById(built: ReturnType<typeof buildOverviewRows>, id: string) {
 
 test("a null source is unknown, never absent, and is counted in neither total", () => {
   const built = buildOverviewRows(sources());
-  for (const id of ["codex", "claude", "claudeDesktop", "grok"]) {
+  for (const id of ["codex", "claude", "claudeDesktop", "grok", "cursor"]) {
     expect(rowById(built, id).state).toBe("unknown");
   }
   const counts = countOverviewRows(built.rows);
   expect(counts.detected).toBe(0);
   expect(counts.applied).toBe(0);
-  // Four, not five: keys is a credential surface and never a client row.
-  expect(counts.unknown).toBe(4);
+  // Five, not six: keys is a credential surface and never a client row.
+  expect(counts.unknown).toBe(5);
 });
 
 test("Codex reads routingInjected, not status", () => {
@@ -78,6 +79,17 @@ test("Codex reads routingInjected, not status", () => {
     sources({ codex: { routingInjected: true, status: "error" } }),
   );
   expect(rowById(broken, "codex").state).toBe("stale");
+});
+
+test("Codex catalog-only is applied even when routing is owned by another provider", () => {
+  const built = buildOverviewRows(sources({
+    codex: { routingInjected: false, status: "at-risk" },
+    native: [{
+      clientId: "codex", state: "current", installed: true, configPath: "/tmp/config.json",
+      desiredEnabled: true, mode: "catalog-only", disableBlocked: null,
+    }],
+  }));
+  expect(rowById(built, "codex")).toMatchObject({ state: "current", applied: true, toggleOn: true, detailKey: "integrations.detail.codexCatalogOnly" });
 });
 
 test("Claude Desktop: applied but not the served profile reads as stale", () => {
@@ -109,6 +121,51 @@ test("Claude Desktop: applied but not the served profile reads as stale", () => 
     sources({ native: desktopNative, claudeDesktop: { desiredEnabled: true, installed: true, applied: true, stale: false, activeProfile: null } }),
   );
   expect(rowById(unknownProfile, "claudeDesktop").state).toBe("current");
+
+  // Desired OFF with the gateway gone is absent.
+  const desiredOff = buildOverviewRows(
+    sources({
+      native: [{ ...desktopNative[0]!, desiredEnabled: false, state: "absent" }],
+      claudeDesktop: { desiredEnabled: false, installed: true, applied: false, stale: false, activeProfile: false },
+    }),
+  );
+  expect(rowById(desiredOff, "claudeDesktop")).toMatchObject({
+    state: "absent",
+    applied: false,
+    toggleOn: false,
+    detailKey: "integrations.detail.desktopDesiredOff",
+  });
+});
+
+test("Claude Desktop: desired-off with a still-selected gateway is stale cleanup-pending", () => {
+  const desktopNative = [{
+    clientId: "claude-desktop" as const,
+    state: "current" as const,
+    installed: true,
+    configPath: "/tmp/desktop",
+    desiredEnabled: false,
+    disableBlocked: null,
+  }];
+  const leftoverGateway = buildOverviewRows(
+    sources({
+      native: desktopNative,
+      claudeDesktop: {
+        desiredEnabled: false,
+        installed: true,
+        applied: true,
+        stale: false,
+        drift: true,
+        driftReason: "desired_off_gateway_selected",
+        activeProfile: true,
+      },
+    }),
+  );
+  expect(rowById(leftoverGateway, "claudeDesktop")).toMatchObject({
+    state: "stale",
+    applied: true,
+    toggleOn: false,
+    detailKey: "integrations.detail.desktopDesiredOffCleanupPending",
+  });
 });
 
 test("file clients keep their existing badge and applied semantics", () => {
@@ -167,21 +224,31 @@ test("every client counts toward the summary, not just the file clients", () => 
       disableBlocked: null,
     }],
     grok: { present: true, models: [{}, {}] },
+    cursor: {
+      privateInference: { installed: true, path: "/Applications/Cursor Private Inference.app", version: "3.18.25" },
+      regularCursor: { installed: false, path: null },
+      gateway: { baseUrl: "http://127.0.0.1:10100/v1", apiKeyMode: "placeholder", placeholder: "opencodex-loopback" },
+      lastSeen: { at: Date.now() - 60_000, userAgent: "Cursor/3.18.25" },
+      models: [],
+      guideUrl: "https://example.invalid/guide",
+    },
   }));
   const counts = countOverviewRows(rows.rows);
-  // codex + claude + desktop + grok + opencode. Keys are deliberately absent:
+  // codex + claude + desktop + grok + cursor + opencode. Keys are deliberately absent:
   // an issued credential is not an applied client.
-  expect(counts.applied).toBe(5);
+  expect(counts.applied).toBe(6);
   expect(counts.stale).toBe(1);
   expect(counts.unknown).toBe(0);
 });
 
 test("an unsettled file list renders unknown rows instead of dropping them", () => {
   const built = buildOverviewRows(sources({ clients: [], clientsSettled: false }));
-  expect(built.rows).toHaveLength(14);
+  expect(built.rows).toHaveLength(17);
   expect(rowById(built, "omp").state).toBe("unknown");
   expect(rowById(built, "mcode").state).toBe("unknown");
   expect(rowById(built, "zcode").state).toBe("unknown");
+  expect(rowById(built, "prime").state).toBe("unknown");
+  expect(rowById(built, "aside").state).toBe("unknown");
   expect(rowById(built, "kimi").state).toBe("unknown");
   expect(rowById(built, "dsh")).toMatchObject({
     hash: "integrations/dsh",
@@ -191,7 +258,7 @@ test("an unsettled file list renders unknown rows instead of dropping them", () 
 
   // Once settled, a client the server omitted is genuinely gone.
   const settled = buildOverviewRows(sources({ clients: [], clientsSettled: true }));
-  expect(settled.rows).toHaveLength(4);
+  expect(settled.rows).toHaveLength(5);
   expect(settled.rows.some(row => row.hash === "integrations/keys")).toBe(false);
 });
 

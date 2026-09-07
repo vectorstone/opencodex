@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as oauthModule from "../src/oauth";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let oauthAccessError: Error | undefined;
 mock.module("../src/oauth", () => ({
@@ -312,7 +313,9 @@ describe("Anthropic vision planning and management config", () => {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            webSearch: { model: "claude-search", backend: "anthropic", reasoning: "high" },
+            // Auth-slot id: survives the #2188 membership gate on a config with
+            // no providers, so the vision round-trip below still executes.
+            webSearch: { model: "claude-haiku-4-5", backend: "anthropic", reasoning: "high" },
             vision: { model: "claude-sonnet-5", backend: "anthropic", maxDescriptionsPerTurn: 4 },
           }),
         }),
@@ -328,7 +331,7 @@ describe("Anthropic vision planning and management config", () => {
         maxDescriptionsPerTurn: 4,
         timeoutMs: 45_000,
       });
-      expect(config.webSearchSidecar).toEqual({ model: "claude-search", backend: "anthropic", reasoning: "high" });
+      expect(config.webSearchSidecar).toEqual({ model: "claude-haiku-4-5", backend: "anthropic", reasoning: "high" });
 
       const get = await handleManagementAPI(
         new Request("http://localhost/api/sidecar-settings"),
@@ -336,7 +339,7 @@ describe("Anthropic vision planning and management config", () => {
         config,
       );
       const getBody = await get!.json() as Record<string, any>;
-      expect(getBody.webSearch).toEqual({ model: "claude-search", backend: "anthropic", streamRoutedModelOutput: false });
+      expect(getBody.webSearch).toEqual({ model: "claude-haiku-4-5", backend: "anthropic", streamRoutedModelOutput: false });
       expect(getBody.vision).toEqual({
         enabled: true,
         model: "claude-sonnet-5",
@@ -403,7 +406,7 @@ describe("Anthropic vision planning and management config", () => {
     } finally {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
-      rmSync(isolatedHome, { recursive: true, force: true });
+      removeTreeWithRetry(isolatedHome);
     }
   });
 
@@ -433,7 +436,7 @@ describe("Anthropic vision planning and management config", () => {
     } finally {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
-      rmSync(isolatedHome, { recursive: true, force: true });
+      removeTreeWithRetry(isolatedHome);
     }
   });
 });

@@ -3,9 +3,10 @@ import { buildWinswXml, ensureWinswBinary, parseWinswStatus, probeScmRegistratio
 import { parseServiceArgs, serviceInstallArgs, serviceReinstallArgs } from "../src/service";
 import { loadServiceTokenFromFile } from "../src/lib/service-secrets";
 import { getConfigDir } from "../src/config";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const entry = { bun: "C:\\OpenCodex\\bun.exe", bunRuntimeSource: "bundled" as const, cli: "C:\\Open Codex\\cli & co\\index.ts" };
 
@@ -234,6 +235,10 @@ describe("service backend CLI parsing", () => {
     expect(parseServiceArgs([])).toEqual({ sub: "install", backend: null, invalid: [] });
   });
 
+  test("restart aliases the existing no-admin repair path", () => {
+    expect(parseServiceArgs(["restart"])).toEqual({ sub: "repair", backend: null, invalid: [] });
+  });
+
   test("--scheduler and unknown flags are recognized separately", () => {
     expect(parseServiceArgs(["install", "--scheduler"]).backend).toBe("scheduler");
     expect(parseServiceArgs(["install", "--bogus"]).invalid).toEqual(["--bogus"]);
@@ -273,7 +278,7 @@ describe("app-side service token loading", () => {
       expect(loadServiceTokenFromFile({})).toBeNull();
       expect(loadServiceTokenFromFile({ OCX_API_TOKEN_FILE: join(dir, "missing") })).toBeNull();
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTreeWithRetry(dir);
     }
   });
 });

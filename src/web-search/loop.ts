@@ -6,10 +6,14 @@ import type { AttemptRecoveryKind } from "../usage/log";
 import { bridgeToResponsesSSE } from "../bridge";
 import { runWebSearch, type SidecarOutcome, type SidecarOutcomeRecorder, type SidecarSettings } from "./executor";
 import { runAnthropicWebSearch } from "./anthropic-executor";
+import { runXaiWebSearch, type XaiSearchOptions } from "./xai-executor";
+import { runGeminiWebSearch } from "./gemini-executor";
+import { runExaWebSearch } from "./exa-executor";
+import type { WebSearchBackendId } from "./index";
 import { clearableDeadline } from "../lib/abort";
 import { redactSecretString } from "../lib/redact";
 import { readBoundedResponseBody } from "../lib/bounded-body";
-import { fetchWithResetRetry, prepareSameTarget429Wait } from "../lib/upstream-retry";
+import { applyUpstreamRecoveryInit, fetchWithResetRetry, prepareSameTarget429Wait } from "../lib/upstream-retry";
 import { rateLimitRetryDelayMs } from "../providers/key-failover";
 import {
   isTranslatorBudgetExceededError,
@@ -250,12 +254,24 @@ export interface WebSearchLoopDeps {
   parsed: OcxParsedRequest;
   adapter: ProviderAdapter;
   incomingMeta: IncomingMeta;
-  /** Which executor runs searches. Defaults to "openai" so existing callers keep the ChatGPT path (audit F4). */
-  backend?: "openai" | "anthropic";
+  /**
+   * Which executor runs searches. Defaults to "openai" so existing callers keep the ChatGPT path
+   * (audit F4). The widened ids (xai/gemini/exa) cannot reach the loop yet: planWebSearch returns
+   * no plan for them (inert 060 arms), and the dispatch below only branches on "anthropic".
+   */
+  backend?: WebSearchBackendId;
   /** Required for the openai backend; unused (and typically undefined) for the anthropic backend. */
   forwardProvider?: OcxProviderConfig;
   /** Required for the anthropic backend: the stored-OAuth provider that runs web_search_20250305. */
   anthropicSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Required for the xai backend: the stored Grok OAuth provider (L7). */
+  xaiSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Required for the gemini backend: the stored Antigravity CCA provider (L8). */
+  geminiSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Required for the exa backend: the operator key, read from config at plan unpack (L9). */
+  exaApiKey?: string;
+  /** Opt-in x_search options for the xai backend. */
+  xaiSearchOptions?: XaiSearchOptions;
   hostedTool: Record<string, unknown>;
   selectedForwardHeaders: Headers;
   settings: SidecarSettings;
@@ -288,12 +304,15 @@ export interface WebSearchLoopDeps {
   /** Called before each routed-model dispatch in the loop, for attempt telemetry. Same-target 429 replays pass the `rate-limit-429` recovery kind. */
   onAttemptSend?: (recovery?: AttemptRecoveryKind) => void;
   /**
-   * 429 key-failover hook: rotate the provider's active pool key and return a rebuilt adapter,
-   * or null when the pool is exhausted (same semantics as the normal routed path).
+   * 429 failover hook: rotate the provider's active credential and return a rebuilt adapter,
+   * or null when the pool is exhausted. Async hooks support OAuth refresh; existing synchronous
+   * key-pool hooks remain valid.
    */
-  on429?: (retryAfterHeader: string | null) => ProviderAdapter | null;
+  on429?: (retryAfterHeader: string | null) => ProviderAdapter | null | Promise<ProviderAdapter | null>;
   /** Opt-in same-target 429 policy (key-auth providers). When present, 429 replays on the SAME key before on429 rotation. */
   retryOn429Policy?: Required<RateLimitRetryPolicy> | null;
+  /** Called only when the final bridged Responses stream reaches completed or incomplete. */
+  onCompletedResponse?: (response: Record<string, unknown>) => void;
 }
 
 /**
@@ -304,6 +323,7 @@ export interface WebSearchLoopDeps {
  */
 export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Response> {
   const translatorBudget = deps.incomingMeta.translatorBudget;
+  const routedProviderFetch = deps.incomingMeta.providerFetch ?? globalThis.fetch;
   const { parsed, selectedForwardHeaders, forwardProvider, hostedTool, settings, maxSearches, abortSignal, recordSidecarOutcome } = deps;
   const backend = deps.backend ?? "openai";
   const anthropicSidecar = deps.anthropicSidecar;
@@ -407,6 +427,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           request = cachedRequest;
         } else {
           request = await requestAdapter.buildRequest(iterParsed, {
+            ...deps.incomingMeta,
             headers: selectedForwardHeaders,
             abortSignal: headerDeadline.signal,
             translatorBudget,
@@ -428,6 +449,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
               timeoutMs: connectTimeoutMs,
               returnRawErrors: true,
               stream: true,
+              executor: routedProviderFetch,
             });
           } else {
             response = await fetchWithResetRetry(
@@ -438,12 +460,17 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
                 deps.onAttemptSend?.(retryRecovery ?? recovery);
                 const h = new Headers(request.headers);
                 if (!h.has("accept-encoding")) h.set("accept-encoding", "identity");
-                return fetch(request.url, {
+                // A connection-reset replay must leave the half-closed pooled socket, not just
+                // ask politely: Bun has ignored a bare `Connection: close` (oven-sh/bun#20492),
+                // so the transport-level `keepalive: false` this helper adds is what actually
+                // opens a new connection. Spending `retryRecovery` on telemetry alone left every
+                // replay on this leg eligible for the same dead socket the reset came from.
+                return routedProviderFetch(request.url, applyUpstreamRecoveryInit({
                   method: request.method,
                   headers: h,
                   body: request.body,
                   signal: headerDeadline.signal,
-                });
+                }, retryRecovery));
               },
               { abortSignal: headerDeadline.signal, label: "web-search-loop" },
             );
@@ -491,7 +518,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       // 429 key-failover parity with the normal routed path: rotate pool keys until one responds
       // or the pool is exhausted (deps.on429 returns null — cooldown map guarantees termination).
       while (prepared.response.status === 429 && deps.on429) {
-        const rotated = deps.on429(prepared.response.headers.get("retry-after"));
+        const rotated = await deps.on429(prepared.response.headers.get("retry-after"));
         if (!rotated) break;
         // Never let a broken body's cancel promise outlive the cumulative header deadline. Observe
         // it, but proceed immediately to the rotated fetch under the SAME deadline signal.
@@ -656,9 +683,30 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         // signal.aborted both after the await and in the catch (a fulfilled {error} on an aborted
         // signal would otherwise look like an ordinary degradable failure).
         try {
-          outcome = backend === "anthropic" && anthropicSidecar
-            ? await runAnthropicWebSearch(query, anthropicSidecar.providerName, anthropicSidecar.provider, settings, signal)
-            : await runWebSearch(query, hostedTool, forwardProvider!, selectedForwardHeaders, settings, signal, recordSidecarOutcome);
+          if (backend === "anthropic" && anthropicSidecar) {
+            outcome = await runAnthropicWebSearch(query, anthropicSidecar.providerName, anthropicSidecar.provider, settings, signal);
+          } else if (backend === "xai") {
+            // L7: stored Grok OAuth to the pinned api.x.ai Responses endpoint; same
+            // never-throws contract and no Codex/OpenAI pool outcome recording (F5 parity).
+            // A missing xaiSidecar is an invariant violation — fail CLOSED with an error
+            // outcome rather than falling through to the forward-header OpenAI executor
+            // (review High: that fallthrough would be credential-sensitive).
+            outcome = deps.xaiSidecar
+              ? await runXaiWebSearch(query, deps.xaiSidecar.providerName, deps.xaiSidecar.provider, settings, deps.xaiSearchOptions ?? {}, signal)
+              : { text: "", sources: [], error: "xai backend selected without a resolved Grok OAuth provider" };
+          } else if (backend === "gemini") {
+            // L8: Antigravity CCA grounding; same fail-closed invariant stance as xai.
+            outcome = deps.geminiSidecar
+              ? await runGeminiWebSearch(query, deps.geminiSidecar.providerName, deps.geminiSidecar.provider, settings, signal)
+              : { text: "", sources: [], error: "gemini backend selected without a resolved Antigravity provider" };
+          } else if (backend === "exa") {
+            // L9: non-LLM lane; key comes from the loop deps, never the plan. Fail closed.
+            outcome = deps.exaApiKey
+              ? await runExaWebSearch(query, deps.exaApiKey, settings, signal)
+              : { text: "", sources: [], error: "exa backend selected without an exaApiKey" };
+          } else {
+            outcome = await runWebSearch(query, hostedTool, forwardProvider!, selectedForwardHeaders, settings, signal, recordSidecarOutcome);
+          }
           if (signal.aborted) throw new LoopError(499, "client closed request during web-search");
         } catch (e) {
           if (e instanceof LoopError) throw e;
@@ -847,6 +895,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       ...(deps.stallTimeoutSec !== undefined ? { stallTimeoutSec: deps.stallTimeoutSec } : {}),
       ...(deps.onFirstOutput ? { onFirstOutput: deps.onFirstOutput } : {}),
       ...(deps.onUsage ? { onUsage: deps.onUsage } : {}),
+      ...(deps.onCompletedResponse ? { onCompletedResponse: deps.onCompletedResponse } : {}),
     },
   );
   return new Response(sse, { headers: SSE_HEADERS });

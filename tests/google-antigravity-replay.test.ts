@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getConfigDir } from "../src/config";
@@ -14,6 +14,8 @@ import {
   antigravityReplaySessionKeysForTests,
   antigravityUsesReplayCache,
   applyAntigravityReplay,
+  antigravitySupportsThoughtSignatureSentinel,
+  applyAntigravityThoughtSignatureFallback,
   clearAntigravityReplay,
   evictOldestAntigravityReplayForBudget,
   flushAntigravityReplay,
@@ -25,7 +27,14 @@ import {
 } from "../src/adapters/google-antigravity-replay";
 import { sanitizeAntigravityClaudeSignatures } from "../src/adapters/google-antigravity-wire";
 
-afterEach(() => setAntigravityReplayLimitsForTests());
+import { setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../src/lib/windows-secret-acl";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
+
+afterEach(() => {
+  setAntigravityReplayLimitsForTests();
+  setIcaclsRunnerForTests(null);
+  setAsyncIcaclsRunnerForTests(null);
+});
 
 // Sandbox OPENCODEX_HOME: the replay cache now snapshots to disk, and these tests must
 // never touch the real ~/.opencodex.
@@ -33,12 +42,14 @@ let replayTestHome: string;
 const priorOpenCodexHome = process.env["OPENCODEX_HOME"];
 
 beforeEach(() => {
+  setIcaclsRunnerForTests(() => ({ success: true, exitCode: 0, timedOut: false, stdout: "processed file: 1" }));
+  setAsyncIcaclsRunnerForTests(async () => ({ success: true, exitCode: 0, timedOut: false, stdout: "processed file: 1" }));
   replayTestHome = mkdtempSync(join(tmpdir(), "ocx-antigravity-replay-test-"));
   process.env["OPENCODEX_HOME"] = replayTestHome;
 });
 
 afterEach(() => {
-  rmSync(replayTestHome, { recursive: true, force: true });
+  removeTreeWithRetry(replayTestHome);
   if (priorOpenCodexHome === undefined) delete process.env["OPENCODEX_HOME"];
   else process.env["OPENCODEX_HOME"] = priorOpenCodexHome;
 });
@@ -92,6 +103,33 @@ describe("antigravity reasoning-replay cache", () => {
       { thought: true, thoughtSignature: SIG },
       fcPart("get_x", { a: 1 }),
     ]);
+    const contents = [{ role: "model", parts: [{ functionCall: { name: "get_x", args: { a: 1 } } }] }];
+    applyAntigravityReplay(MODEL, SESSION, contents);
+    expect((contents[0].parts[0] as { thoughtSignature?: string }).thoughtSignature).toBe(SIG);
+  });
+
+  test("a signature on a standalone thought part replays onto all subsequent functionCalls in the same turn", () => {
+    observeAntigravityReplay(MODEL, SESSION, [
+      { thought: true, thoughtSignature: SIG },
+      fcPart("get_x", { a: 1 }),
+      fcPart("get_y", { b: 2 }),
+    ]);
+    const contents = [{
+      role: "model",
+      parts: [
+        { functionCall: { name: "get_x", args: { a: 1 } } },
+        { functionCall: { name: "get_y", args: { b: 2 } } },
+      ],
+    }];
+    applyAntigravityReplay(MODEL, SESSION, contents);
+    expect((contents[0].parts[0] as { thoughtSignature?: string }).thoughtSignature).toBe(SIG);
+    expect((contents[0].parts[1] as { thoughtSignature?: string }).thoughtSignature).toBe(SIG);
+  });
+
+  test("carried thought signature across separate stream chunks pairs with subsequent functionCalls", () => {
+    const carried = observeAntigravityReplay(MODEL, SESSION, [{ thought: true, thought_signature: SIG }]);
+    expect(carried).toBe(SIG);
+    observeAntigravityReplay(MODEL, SESSION, [fcPart("get_x", { a: 1 })], carried);
     const contents = [{ role: "model", parts: [{ functionCall: { name: "get_x", args: { a: 1 } } }] }];
     applyAntigravityReplay(MODEL, SESSION, contents);
     expect((contents[0].parts[0] as { thoughtSignature?: string }).thoughtSignature).toBe(SIG);
@@ -176,6 +214,80 @@ describe("antigravity reasoning-replay cache", () => {
     const contents = [{ role: "model", parts: [{ functionCall: { name: "e", args: { a: { q: 2, p: 1 } } } }] }];
     applyAntigravityReplay(MODEL, SESSION, contents);
     expect((contents[0].parts[0] as { thoughtSignature?: string }).thoughtSignature).toBe("sig-orderindep00000");
+  });
+
+  test("matches freeform/custom_tool_call {input: string} against observed parsed JSON args", () => {
+    // Upstream saw functionCall with parsed args { cmd: "ls -la" }
+    observeAntigravityReplay(MODEL, SESSION, [fcPart("default_api:exec", { cmd: "ls -la" }, "sig-freeform-exec-1111")]);
+    // Client replays custom_tool_call with serialized input { input: '{"cmd":"ls -la"}' }
+    const contents = [{
+      role: "model",
+      parts: [{ functionCall: { name: "default_api:exec", args: { input: JSON.stringify({ cmd: "ls -la" }) } } }],
+    }];
+    applyAntigravityReplay(MODEL, SESSION, contents);
+    expect((contents[0].parts[0] as { thoughtSignature?: string }).thoughtSignature).toBe("sig-freeform-exec-1111");
+  });
+
+  test("matches alternate key even when wrapped representation exceeds canonical key limit (ck undefined)", () => {
+    observeAntigravityReplay(MODEL, SESSION, [fcPart("default_api:exec", { cmd: "x" }, "sig-whitespace-overflow")]);
+    // 2 MiB of leading/trailing whitespace makes the raw string large, but trimmed payload is small (under 64 KiB).
+    // It must parse the trimmed slice directly rather than passing the 2 MiB string to JSON.parse.
+    const smallJson = JSON.stringify({ cmd: "x" });
+    const bigWhitespaceJson = " ".repeat(2 * 1024 * 1024) + smallJson + " ".repeat(1024);
+    let parsedString = "";
+    const originalParse = JSON.parse;
+    JSON.parse = (text, reviver) => {
+      if (typeof text === "string" && text.includes('"cmd":"x"')) {
+        parsedString = text;
+      }
+      return originalParse(text, reviver);
+    };
+    const contents = [{
+      role: "model",
+      parts: [{ functionCall: { name: "default_api:exec", args: { input: bigWhitespaceJson } } }],
+    }];
+    try {
+      applyAntigravityReplay(MODEL, SESSION, contents);
+      expect((contents[0].parts[0] as { thoughtSignature?: string }).thoughtSignature).toBe("sig-whitespace-overflow");
+      expect(parsedString).toBe(smallJson);
+    } finally {
+      JSON.parse = originalParse;
+    }
+  });
+
+  test("rejects oversized input before JSON.parse without matching or allocating", () => {
+    observeAntigravityReplay(MODEL, SESSION, [fcPart("default_api:exec", { data: "huge" }, "sig-should-not-match")]);
+    // 100 KiB of valid JSON payload exceeds REPLAY_MAX_CANONICAL_ARGS_BYTES and must be rejected before TextEncoder.encode / JSON.parse.
+    let parseCalled = false;
+    let encodeCalledOnPayload = false;
+    const originalParse = JSON.parse;
+    const originalEncode = TextEncoder.prototype.encode;
+    JSON.parse = (text, reviver) => {
+      if (typeof text === "string" && text.includes('"data":')) {
+        parseCalled = true;
+      }
+      return originalParse(text, reviver);
+    };
+    TextEncoder.prototype.encode = function (input) {
+      if (typeof input === "string" && input.includes('"data":')) {
+        encodeCalledOnPayload = true;
+      }
+      return originalEncode.call(this, input);
+    };
+    const oversizedPayload = JSON.stringify({ data: "a".repeat(100 * 1024) });
+    const contents = [{
+      role: "model",
+      parts: [{ functionCall: { name: "default_api:exec", args: { input: oversizedPayload } } }],
+    }];
+    try {
+      applyAntigravityReplay(MODEL, SESSION, contents);
+      expect((contents[0].parts[0] as { thoughtSignature?: string }).thoughtSignature).toBeUndefined();
+      expect(parseCalled).toBe(false);
+      expect(encodeCalledOnPayload).toBe(false);
+    } finally {
+      JSON.parse = originalParse;
+      TextEncoder.prototype.encode = originalEncode;
+    }
   });
 
   test("claude models do not use the replay cache", () => {
@@ -890,5 +1002,131 @@ describe("durable antigravity replay snapshot", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe("thought-signature validator-bypass fallback (#2693)", () => {
+  const BYPASS = "skip_thought_signature_validator";
+  const sigOf = (part: unknown) => (part as { thoughtSignature?: string }).thoughtSignature;
+  const modelTurn = (parts: unknown[]) => [{ role: "model", parts }];
+
+  test("the FIRST functionCall gets the sentinel even when a later sibling is signed", () => {
+    // The original attempt tracked a turn-wide "any part is signed" boolean, so a second call
+    // matching the cache voted away the sentinel the first call still required. Gemini rejects
+    // that turn: the requirement is about the first functionCall, not about the turn.
+    observeAntigravityReplay(MODEL, SESSION, [fcPart("second", {}, SIG)]);
+    const contents = modelTurn([
+      { functionCall: { name: "first", args: {} } },
+      { functionCall: { name: "second", args: {} } },
+    ]);
+    applyAntigravityReplay(MODEL, SESSION, contents);
+    applyAntigravityThoughtSignatureFallback(MODEL, contents);
+    expect(sigOf(contents[0].parts[1])).toBe(SIG);
+    expect(sigOf(contents[0].parts[0])).toBe(BYPASS);
+  });
+
+  test("a valid NESTED signature counts as signed and gets no competing sentinel", () => {
+    // extra_content.google.thought_signature is a wire shape this module already supports, but a
+    // bare key-presence check cannot see it, so it added a second, conflicting signature.
+    const contents = modelTurn([fcPart("get_x", {}, SIG, true)]);
+    applyAntigravityThoughtSignatureFallback(MODEL, contents);
+    expect(sigOf(contents[0].parts[0])).toBeUndefined();
+    expect((contents[0].parts[0] as { extra_content?: { google?: { thought_signature?: string } } })
+      .extra_content?.google?.thought_signature).toBe(SIG);
+  });
+
+  test("a present but too-short signature still gets the sentinel", () => {
+    // "short" is below MIN_SIGNATURE_LEN, so extractSignature rejects it. A presence check reads
+    // the key as set and suppresses the fallback on a turn that genuinely needs it.
+    const contents = modelTurn([fcPart("get_x", {}, "short")]);
+    applyAntigravityThoughtSignatureFallback(MODEL, contents);
+    expect(sigOf(contents[0].parts[0])).toBe(BYPASS);
+  });
+
+  test("a non-Gemini model never receives the Gemini-only sentinel", () => {
+    // antigravityUsesReplayCache is !/claude/i, so gating on it injected this token into
+    // gpt-oss-120b-medium. Replay scope is broad by design; sentinel scope must not be.
+    const contents = modelTurn([{ functionCall: { name: "get_x", args: {} } }]);
+    applyAntigravityThoughtSignatureFallback("gpt-oss-120b-medium", contents);
+    expect(sigOf(contents[0].parts[0])).toBeUndefined();
+  });
+
+  test("a Gemini turn with no cache entry at all still gets the sentinel", () => {
+    // The feature's whole point: nothing was recorded for this session, so replay cannot help.
+    const contents = modelTurn([{ functionCall: { name: "never_seen", args: {} } }]);
+    applyAntigravityReplay(MODEL, "session-with-no-entry", contents);
+    applyAntigravityThoughtSignatureFallback(MODEL, contents);
+    expect(sigOf(contents[0].parts[0])).toBe(BYPASS);
+  });
+
+  test("the Vertex transport-prefixed model id is recognised as Gemini", () => {
+    // src/adapters/google.ts builds vertex:<project>:<location>:<modelId>. A predicate matching
+    // only "/" would skip every Vertex Gemini request while looking correct on CCA ids.
+    expect(antigravitySupportsThoughtSignatureSentinel("vertex:proj:global:gemini-3-pro")).toBe(true);
+    expect(antigravitySupportsThoughtSignatureSentinel("google/gemini-3-pro")).toBe(true);
+    expect(antigravitySupportsThoughtSignatureSentinel("gemini-3-pro")).toBe(true);
+    expect(antigravitySupportsThoughtSignatureSentinel("vertex:proj:global:gpt-oss-120b")).toBe(false);
+    expect(antigravitySupportsThoughtSignatureSentinel("geminibot")).toBe(false);
+  });
+
+
+  test("a later sibling signed ON THE WIRE does not vote away the first call's sentinel", () => {
+    // Sibling arm of defect 2, with NO cache involved. A patch that only ignores cache-set
+    // signatures would still pass the cache-hit case above while leaving this open, so bind it
+    // explicitly: the decision reads the FIRST functionCall, never the turn.
+    const contents = [{
+      role: "model",
+      parts: [
+        { functionCall: { name: "first", args: {} } },
+        { functionCall: { name: "second", args: {} }, thoughtSignature: SIG },
+      ],
+    }];
+    applyAntigravityThoughtSignatureFallback(MODEL, contents);
+    expect(sigOf(contents[0].parts[0])).toBe(BYPASS);
+    expect(sigOf(contents[0].parts[1])).toBe(SIG);
+  });
+
+  test("Vertex-prefixed Gemini turns still receive the sentinel end to end", () => {
+    // The Vertex replay key is vertex:<project>:<location>:<modelId>. Asserting only the
+    // predicate would let a regex that matches "/" but not ":" look correct; drive the real
+    // function with the real identity instead.
+    const vertexModel = "vertex:api-key:global:gemini-3-pro";
+    const contents = [{ role: "model", parts: [{ functionCall: { name: "get_x", args: {} } }] }];
+    applyAntigravityThoughtSignatureFallback(vertexModel, contents);
+    expect(sigOf(contents[0].parts[0])).toBe(BYPASS);
+
+    const vertexNonGemini = "vertex:api-key:global:gpt-oss-120b-medium";
+    const other = [{ role: "model", parts: [{ functionCall: { name: "get_x", args: {} } }] }];
+    applyAntigravityThoughtSignatureFallback(vertexNonGemini, other);
+    expect(sigOf(other[0].parts[0])).toBeUndefined();
+  });
+
+  test("a gemini-named Vertex PROJECT does not arm the sentinel for a non-Gemini model", () => {
+    // The Vertex replay key is vertex:<project>:<location>:<modelId> and the project id is
+    // operator-chosen. Scanning the whole identity meant a project called "gemini-prod" armed
+    // the Gemini-only sentinel for gpt-oss-120b — the same class of defect the predicate exists
+    // to prevent, one layer up. Reduce to the model component before matching.
+    expect(antigravitySupportsThoughtSignatureSentinel("vertex:gemini-prod:global:gpt-oss-120b"))
+      .toBe(false);
+    expect(antigravitySupportsThoughtSignatureSentinel("vertex:gemini-team:us:claude-fable-5"))
+      .toBe(false);
+
+    const contents = [{
+      role: "model",
+      parts: [{ functionCall: { name: "get_x", args: {} } }],
+    }];
+    applyAntigravityThoughtSignatureFallback("vertex:gemini-prod:global:gpt-oss-120b", contents);
+    expect(sigOf(contents[0].parts[0])).toBeUndefined();
+
+    // The positive control still holds under the same parsing.
+    const gemini = [{ role: "model", parts: [{ functionCall: { name: "get_x", args: {} } }] }];
+    applyAntigravityThoughtSignatureFallback("vertex:gemini-prod:global:gemini-3-pro", gemini);
+    expect(sigOf(gemini[0].parts[0])).toBe(BYPASS);
+  });
+
+  test("a user-role turn is untouched", () => {
+    const contents = [{ role: "user", parts: [{ functionCall: { name: "get_x", args: {} } }] }];
+    applyAntigravityThoughtSignatureFallback(MODEL, contents);
+    expect(sigOf(contents[0].parts[0])).toBeUndefined();
   });
 });

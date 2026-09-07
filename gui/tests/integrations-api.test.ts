@@ -13,12 +13,13 @@ import {
   toggleIntegration,
   type IntegrationJournalEnvelope,
 } from "../src/pages/integrations/integration-api";
+import { loadNativeIntegrations, setCodexIntegrationMode } from "../src/pages/integrations/native-api";
 
 const originalFetch = globalThis.fetch;
 
-test("DSH is a file integration client", () => {
+test("DSH and Aside are file integration clients", () => {
   expect(FILE_INTEGRATION_CLIENTS).toEqual([
-    "opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode",
+    "opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside",
   ]);
 });
 
@@ -105,6 +106,21 @@ test("mutation adapters send the exact WP4 methods and bodies", async () => {
     body: JSON.stringify({ opId: "op-2", confirmDrift: true }),
     signal: controller.signal,
   });
+});
+
+test("Codex mode adapter sends the mode contract and preserves the response", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input, init) => {
+    requests.push({ url: String(input), init });
+    if (String(input).endsWith("/api/native-integrations")) {
+      return Response.json({ clients: [{ clientId: "codex", state: "current", installed: true, configPath: "/tmp/config.json", desiredEnabled: true, mode: "catalog-only", disableBlocked: null }] });
+    }
+    return Response.json({ ok: true, clientId: "codex", changed: true, state: "current", desiredEnabled: true, mode: "catalog-only", message: "ok" });
+  }) as typeof fetch;
+
+  expect(await loadNativeIntegrations("/management")).toMatchObject({ clients: [{ mode: "catalog-only" }] });
+  expect(await setCodexIntegrationMode("/management", "catalog-only")).toMatchObject({ mode: "catalog-only" });
+  expect(requests[1].init).toMatchObject({ method: "PUT", body: JSON.stringify({ mode: "catalog-only" }) });
 });
 
 test("refusals route by reason and preserve manual recovery fields end to end", async () => {

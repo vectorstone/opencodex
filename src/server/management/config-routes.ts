@@ -5,6 +5,7 @@ import { catalogModelSlug, invalidateCodexModelsCache, nativeContextLimits, nati
 import {
   DEFAULT_SUBAGENT_MODELS,
   codexAutoStartEnabled,
+  deleteConfigTopLevelKey,
   hasOwnProvider,
   isValidProviderName,
   multiAgentGuidanceEnabled,
@@ -37,7 +38,7 @@ import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
-import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import {
@@ -70,6 +71,13 @@ import {
   visionDescriberRejection,
   visionModelOptionsFor,
 } from "./vision-sidecar-options";
+import {
+  webSearchCandidateRows,
+  webSearchModelIsRejected,
+  webSearchModelOptionsFrom,
+  webSearchModelRejection,
+} from "./web-search-sidecar-options";
+import { validateXaiSearchOptions } from "../../web-search/xai-executor";
 import { getDebugLogEntries } from "../../lib/debug-log-buffer";
 import { getInjectionDebugLogEntries } from "../../lib/injection-debug-log";
 import {
@@ -80,6 +88,7 @@ import {
   type DebugFlag,
 } from "../../lib/debug-settings";
 import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import { shadowCallTargetError } from "./shadow-call-validation";
 import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
@@ -106,8 +115,14 @@ async function sidecarVisionResponseSettings(config: OcxConfig): Promise<{
   // Match the runtime's one selected Anthropic executor for both backend fallback
   // and catalog reachability; resolving it once prevents the two projections drifting.
   const anthropicSidecar = findAnthropicVisionProvider(config);
-  const backend = resolveVisionBackend(vs.backend, anthropicSidecar);
-  const model = resolveEffectiveVisionModel(config, backend);
+  // The routed backend reports its own namespaced model verbatim: it is the
+  // dispatched value, and collapsing it through the legacy resolver would
+  // display a describer the runtime is not using (roadmap 190).
+  const routedActive = vs.backend === "routed" && !!vs.model && vs.model.includes("/");
+  const backend = routedActive ? "routed" as const : resolveVisionBackend(vs.backend, anthropicSidecar);
+  const model = routedActive && vs.model
+    ? vs.model
+    : resolveEffectiveVisionModel(config, backend === "routed" ? resolveVisionBackend(undefined, anthropicSidecar) : backend);
   const reasoning = normalizeVisionReasoningForModel(model, vs.reasoning) ?? "low";
   const models = await visionModelOptionsFor(config, anthropicSidecar);
   // Display-only grandfather: a persisted id stays selectable, but the write gate
@@ -120,21 +135,22 @@ async function sidecarVisionResponseSettings(config: OcxConfig): Promise<{
 
 /** One client's outcome from a fan-out sync. Absent from the list means "left alone". */
 interface ClientIntegrationSyncOutcome {
-  readonly client: "grok" | "claude-desktop";
+  readonly client: "grok" | "claude-desktop" | "mcode";
   readonly ok: boolean;
   readonly changed?: boolean;
   readonly reason?: string;
 }
 
 /**
- * Re-inject every client integration the operator has switched ON.
+ * Re-inject native clients that are switched ON and file integrations whose
+ * OpenCodex ownership record is the operator's durable opt-in.
  *
  * Only Codex used to run here, so a catalog change reached Codex and nothing else: a Grok
  * fence or a written Desktop profile kept the context windows it was created with until the
  * next `ocx start`. The startup path already gates each client on its own toggle
  * (`src/cli/index.ts`), and this is that same fan-out for the on-demand command.
  *
- * A client that is OFF is omitted from the result rather than reported as skipped — the
+ * A client that is OFF or never connected is omitted from the result rather than reported as skipped — the
  * caller has to be able to tell "not touched" from "tried and failed". A client that fails
  * does not fail the sync: Codex is the one that matters for routing, and a broken Grok file
  * should surface as a warning, not as a 500 on a command that did its main job.
@@ -181,6 +197,31 @@ async function syncEnabledClientIntegrations(
     } catch (error) {
       out.push({ client: "claude-desktop", ok: false, reason: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  try {
+    const { refreshOwnedIntegration } = await import("../../integrations/owned-refresh");
+    const result = await refreshOwnedIntegration({
+      clientId: "mcode",
+      models: async () => {
+        const { loadExportModels } = await import("./model-rows");
+        return loadExportModels(config);
+      },
+      config,
+      port,
+    });
+    if (result) {
+      out.push(result.ok
+        ? {
+            client: "mcode",
+            ok: true,
+            changed: result.changed === true,
+            ...(result.reason ? { reason: result.reason } : {}),
+          }
+        : { client: "mcode", ok: false, reason: result.reason });
+    }
+  } catch (error) {
+    out.push({ client: "mcode", ok: false, reason: error instanceof Error ? error.message : String(error) });
   }
 
   return out;
@@ -259,6 +300,14 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       streamMode: config.streamMode ?? "auto",
       appOwnedMemoryBudgetMb: config.appOwnedMemoryBudgetMb ?? 256,
       codexAccountPickerEnabled: codexAccountPickerEnabled(config),
+      // Absent means hidden, so the GUI renders the switch without having to know that
+      // `undefined` and `false` mean the same thing.
+      showCodexSparkQuota: config.showCodexSparkQuota === true,
+      // Absent means the historical auto-open, so the GUI can render the toggle
+      // without having to know that `undefined` and `true` mean the same thing.
+      oauthOpenBrowser: config.oauthOpenBrowser !== false,
+      // Absent means off (today's Design B injection), so the GUI/CLI render a plain switch.
+      codexDesktopAuthless: config.codexDesktopAuthless === true,
       startupHealth: await readStartupHealth(config),
       codexRuntime: {
         path: displayCodexRuntimePath(resolved.runtime.command),
@@ -343,15 +392,24 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       streamMode?: unknown;
       appOwnedMemoryBudgetMb?: unknown;
       codexAccountPickerEnabled?: unknown;
+      oauthOpenBrowser?: unknown;
+      showCodexSparkQuota?: unknown;
+      codexDesktopAuthless?: unknown;
     };
     if (body.codexAutoStart === undefined
       && body.streamMode === undefined
       && body.appOwnedMemoryBudgetMb === undefined
-      && body.codexAccountPickerEnabled === undefined) {
-      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, or codexAccountPickerEnabled" }, 400);
+      && body.codexAccountPickerEnabled === undefined
+      && body.oauthOpenBrowser === undefined
+      && body.showCodexSparkQuota === undefined
+      && body.codexDesktopAuthless === undefined) {
+      return jsonResponse({ error: "provide codexAutoStart, streamMode, appOwnedMemoryBudgetMb, codexAccountPickerEnabled, oauthOpenBrowser, showCodexSparkQuota, or codexDesktopAuthless" }, 400);
     }
     if (body.codexAutoStart !== undefined && typeof body.codexAutoStart !== "boolean") {
       return jsonResponse({ error: "codexAutoStart boolean is required" }, 400);
+    }
+    if (body.oauthOpenBrowser !== undefined && typeof body.oauthOpenBrowser !== "boolean") {
+      return jsonResponse({ error: "oauthOpenBrowser boolean is required" }, 400);
     }
     if (body.streamMode !== undefined && !isStreamMode(body.streamMode)) {
       return jsonResponse({ error: "streamMode must be auto, legacy-tee, or eager-relay" }, 400);
@@ -359,6 +417,12 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     if (body.codexAccountPickerEnabled !== undefined
       && typeof body.codexAccountPickerEnabled !== "boolean") {
       return jsonResponse({ error: "codexAccountPickerEnabled boolean is required" }, 400);
+    }
+    if (body.showCodexSparkQuota !== undefined && typeof body.showCodexSparkQuota !== "boolean") {
+      return jsonResponse({ error: "showCodexSparkQuota boolean is required" }, 400);
+    }
+    if (body.codexDesktopAuthless !== undefined && typeof body.codexDesktopAuthless !== "boolean") {
+      return jsonResponse({ error: "codexDesktopAuthless boolean is required" }, 400);
     }
     if (body.appOwnedMemoryBudgetMb !== undefined && (
       typeof body.appOwnedMemoryBudgetMb !== "number"
@@ -379,16 +443,23 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       hasCodexAccountNamespaces: Object.hasOwn(config, "codexAccountNamespaces"),
       codexAccountPickerEnabled: config.codexAccountPickerEnabled,
       hasCodexAccountPickerEnabled: Object.hasOwn(config, "codexAccountPickerEnabled"),
+      oauthOpenBrowser: config.oauthOpenBrowser,
+      hasOauthOpenBrowser: Object.hasOwn(config, "oauthOpenBrowser"),
+      showCodexSparkQuota: config.showCodexSparkQuota,
+      hasShowCodexSparkQuota: Object.hasOwn(config, "showCodexSparkQuota"),
+      codexDesktopAuthless: config.codexDesktopAuthless,
+      hasCodexDesktopAuthless: Object.hasOwn(config, "codexDesktopAuthless"),
     };
     const pickerWasEnabled = codexAccountPickerEnabled(config);
     let pickerIsEnabled = pickerWasEnabled;
+    const authlessWasEnabled = config.codexDesktopAuthless === true;
     try {
       if (typeof body.codexAutoStart === "boolean") {
         config.codexAutoStart = body.codexAutoStart;
       }
       if (body.streamMode !== undefined) {
         if (body.streamMode === "auto") {
-          delete config.streamMode;
+          deleteConfigTopLevelKey(config, "streamMode");
         } else {
           config.streamMode = body.streamMode as "legacy-tee" | "eager-relay";
         }
@@ -402,29 +473,49 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       } else if (body.codexAccountPickerEnabled === false) {
         config.codexAccountPickerEnabled = false;
       }
+      if (typeof body.oauthOpenBrowser === "boolean") {
+        config.oauthOpenBrowser = body.oauthOpenBrowser;
+      }
+      if (typeof body.showCodexSparkQuota === "boolean") {
+        config.showCodexSparkQuota = body.showCodexSparkQuota;
+      }
+      if (body.codexDesktopAuthless === true) config.codexDesktopAuthless = true;
+      else if (body.codexDesktopAuthless === false) deleteConfigTopLevelKey(config, "codexDesktopAuthless");
       pickerIsEnabled = codexAccountPickerEnabled(config);
       (deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode)(config);
     } catch (error) {
       if (previousSettings.hasCodexAutoStart) config.codexAutoStart = previousSettings.codexAutoStart;
-      else delete config.codexAutoStart;
+      else deleteConfigTopLevelKey(config, "codexAutoStart");
       if (previousSettings.hasStreamMode) config.streamMode = previousSettings.streamMode;
-      else delete config.streamMode;
+      else deleteConfigTopLevelKey(config, "streamMode");
       if (previousSettings.hasAppOwnedMemoryBudgetMb) {
         config.appOwnedMemoryBudgetMb = previousSettings.appOwnedMemoryBudgetMb;
-      } else delete config.appOwnedMemoryBudgetMb;
+      } else deleteConfigTopLevelKey(config, "appOwnedMemoryBudgetMb");
       if (previousSettings.hasCodexAccountNamespaces) {
         config.codexAccountNamespaces = previousSettings.codexAccountNamespaces;
-      } else delete config.codexAccountNamespaces;
+      } else deleteConfigTopLevelKey(config, "codexAccountNamespaces");
       if (previousSettings.hasCodexAccountPickerEnabled) {
         config.codexAccountPickerEnabled = previousSettings.codexAccountPickerEnabled;
-      } else delete config.codexAccountPickerEnabled;
+      } else deleteConfigTopLevelKey(config, "codexAccountPickerEnabled");
+      if (previousSettings.hasOauthOpenBrowser) {
+        config.oauthOpenBrowser = previousSettings.oauthOpenBrowser;
+      } else deleteConfigTopLevelKey(config, "oauthOpenBrowser");
+      if (previousSettings.hasShowCodexSparkQuota) {
+        config.showCodexSparkQuota = previousSettings.showCodexSparkQuota;
+      } else deleteConfigTopLevelKey(config, "showCodexSparkQuota");
+      if (previousSettings.hasCodexDesktopAuthless) {
+        config.codexDesktopAuthless = previousSettings.codexDesktopAuthless;
+      } else deleteConfigTopLevelKey(config, "codexDesktopAuthless");
       throw error;
     }
     if (typeof body.appOwnedMemoryBudgetMb === "number") {
       configureAppOwnedMemoryBudget(resolveAppOwnedMemoryBudgetBytes(body.appOwnedMemoryBudgetMb));
       enforceAppOwnedMemoryBudget();
     }
-    const catalogRefresh = pickerWasEnabled !== pickerIsEnabled
+    // The authless switch changes the injected config.toml shape, so converge now rather than
+    // waiting for the next start; the injector re-reads config and rewrites the form.
+    const authlessIsEnabled = config.codexDesktopAuthless === true;
+    const catalogRefresh = pickerWasEnabled !== pickerIsEnabled || authlessWasEnabled !== authlessIsEnabled
       ? await convergeCodexCatalog()
       : undefined;
     const catalogRefreshPending = catalogRefresh
@@ -437,7 +528,10 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       streamMode: config.streamMode ?? "auto",
       appOwnedMemoryBudgetMb: config.appOwnedMemoryBudgetMb ?? 256,
       codexAccountPickerEnabled: pickerIsEnabled,
+      oauthOpenBrowser: config.oauthOpenBrowser !== false,
       catalogRefreshPending,
+      showCodexSparkQuota: config.showCodexSparkQuota === true,
+      codexDesktopAuthless: authlessIsEnabled,
       startupHealth: await readStartupHealth(config),
     });
   }
@@ -451,7 +545,10 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
   if (url.pathname === "/api/sync" && req.method === "POST") {
     const { syncModelsToCodex } = await import("../../codex/sync");
     const { attachStaleAppServerHint } = await import("../../codex/app-server-processes");
-    const { readRuntimePort, loadConfig } = await import("../../config");
+    const [{ readRuntimePort }, { loadConfig }] = await Promise.all([
+      import("../../config/process-state"),
+      import("../../config"),
+    ]);
     // Never use the server-captured startup object for a durable integration
     // decision. A toggle may have persisted while this process was gathering.
     const runtime = readRuntimePort(process.pid);
@@ -511,14 +608,19 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
   if (url.pathname === "/api/sidecar-settings" && req.method === "GET") {
     const ws = config.webSearchSidecar ?? {};
     const vision = await sidecarVisionResponseSettings(config);
+    const webSearchCandidates = await webSearchCandidateRows(config);
     return jsonResponse({
       webSearch: {
         model: ws.model ?? "gpt-5.6-luna",
         backend: ws.backend,
         streamRoutedModelOutput: ws.streamRoutedModelOutput === true,
+        ...(ws.xSearch ? { xSearch: ws.xSearch } : {}),
       },
       vision: publicVisionSidecarSettings(config, vision),
       visionModels: vision.models,
+      // ALWAYS present: the dashboard treats an omitted list as "no filter" and
+      // falls back to the full model union, so empty must be [] (review B3).
+      webSearchModels: webSearchModelOptionsFrom(config, webSearchCandidates),
     });
   }
 
@@ -531,7 +633,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     if (raw.webSearch !== undefined && !isPlainRecord(raw.webSearch)) return jsonResponse({ error: "webSearch must be an object" }, 400);
     if (raw.vision !== undefined && !isPlainRecord(raw.vision)) return jsonResponse({ error: "vision must be an object" }, 400);
     const body = raw as {
-      webSearch?: { model?: unknown; backend?: unknown; reasoning?: unknown; streamRoutedModelOutput?: unknown };
+      webSearch?: { model?: unknown; backend?: unknown; reasoning?: unknown; streamRoutedModelOutput?: unknown; exaApiKey?: unknown; xSearch?: unknown };
       vision?: {
         model?: unknown;
         backend?: unknown;
@@ -541,17 +643,22 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
         timeoutMs?: unknown;
       };
     };
+    const WEB_SEARCH_BACKENDS_UNION = ["openai", "anthropic", "xai", "gemini", "exa"] as const;
     if (body.webSearch && body.webSearch.backend !== undefined && body.webSearch.backend !== null
-      && body.webSearch.backend !== "openai" && body.webSearch.backend !== "anthropic") {
-      return jsonResponse({ error: "webSearch.backend must be openai, anthropic, or null" }, 400);
+      && !WEB_SEARCH_BACKENDS_UNION.includes(body.webSearch.backend as never)) {
+      return jsonResponse({ error: "webSearch.backend must be openai, anthropic, xai, gemini, exa, or null" }, 400);
+    }
+    if (body.webSearch?.model !== undefined && typeof body.webSearch.model !== "string") {
+      return jsonResponse({ error: "webSearch.model must be a string" }, 400);
     }
     if (body.webSearch && body.webSearch.streamRoutedModelOutput !== undefined
       && typeof body.webSearch.streamRoutedModelOutput !== "boolean") {
       return jsonResponse({ error: "webSearch.streamRoutedModelOutput must be a boolean" }, 400);
     }
     if (body.vision && body.vision.backend !== undefined
-      && body.vision.backend !== null && body.vision.backend !== "openai" && body.vision.backend !== "anthropic") {
-      return jsonResponse({ error: "vision.backend must be openai, anthropic, or null" }, 400);
+      && body.vision.backend !== null && body.vision.backend !== "openai" && body.vision.backend !== "anthropic"
+      && body.vision.backend !== "routed") {
+      return jsonResponse({ error: "vision.backend must be openai, anthropic, routed, or null" }, 400);
     }
     if (body.vision && body.vision.maxDescriptionsPerTurn !== undefined
       && (typeof body.vision.maxDescriptionsPerTurn !== "number"
@@ -579,8 +686,20 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       const requested = body.vision.model;
       const candidates = await visionCandidateRows(config);
       const hint = body.vision.backend === "anthropic" || body.vision.backend === "openai"
+        || body.vision.backend === "routed"
         ? body.vision.backend
         : config.visionSidecar?.backend;
+      // Coherence (roadmap 170 r2): the forward/OAuth executors POST the model
+      // string VERBATIM, so a namespaced id on those backends persists a wire
+      // id they cannot run; and "routed" without a namespace cannot route.
+      const effectiveBackend = hint ?? "openai";
+      const namespaced = requested.includes("/");
+      if (namespaced && effectiveBackend !== "routed") {
+        return jsonResponse({ error: `vision.model "${requested}" is provider-namespaced; it requires vision.backend "routed"` }, 400);
+      }
+      if (!namespaced && effectiveBackend === "routed") {
+        return jsonResponse({ error: `vision.backend "routed" requires a provider-namespaced vision.model ("provider/model"); got "${requested}"` }, 400);
+      }
       if (visionDescriberIsProvablyBlind(config, requested, candidates, hint)) {
         return jsonResponse(visionDescriberRejection("vision.model", requested, config, candidates), 400);
       }
@@ -600,21 +719,101 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     }
 
     if (body.webSearch) {
-      config.webSearchSidecar = { ...config.webSearchSidecar };
+      const pairTouched = body.webSearch.model !== undefined || body.webSearch.backend !== undefined;
+      // Validate against the backend the caller SUBMITTED, across the whole
+      // union — not just openai/anthropic (#2457). The union check above has
+      // already refused unknown literals, so a surviving string is a member;
+      // Array.includes does not narrow, hence the cast. Falling back to the
+      // stored backend for xai/gemini/exa both rejected legal pairs and
+      // accepted illegal ones: a submitted gemini was checked against a stored
+      // openai. null means "unset the backend", and unset resolves to openai.
+      const submittedBackend = body.webSearch.backend;
+      const effectiveBackend = typeof submittedBackend === "string"
+        && WEB_SEARCH_BACKENDS_UNION.includes(submittedBackend as never)
+        ? submittedBackend as typeof WEB_SEARCH_BACKENDS_UNION[number]
+        : submittedBackend === null
+          ? "openai"
+          : config.webSearchSidecar?.backend ?? "openai";
+      const effectiveModel = typeof body.webSearch.model === "string"
+        ? body.webSearch.model || undefined
+        : config.webSearchSidecar?.model;
+      if (pairTouched && effectiveModel) {
+        const candidates = await webSearchCandidateRows(config);
+        if (webSearchModelIsRejected(effectiveBackend, effectiveModel, candidates)) {
+          return jsonResponse(webSearchModelRejection("webSearch.model", effectiveBackend, effectiveModel, candidates), 400);
+        }
+      }
+      const webSearchCandidate = { ...config.webSearchSidecar };
       if (typeof body.webSearch.model === "string") {
-        if (body.webSearch.model === "") delete config.webSearchSidecar.model;
-        else config.webSearchSidecar.model = body.webSearch.model;
+        if (body.webSearch.model === "") delete webSearchCandidate.model;
+        else webSearchCandidate.model = body.webSearch.model;
       }
-      if (body.webSearch.backend === null) delete config.webSearchSidecar.backend;
-      else if (body.webSearch.backend === "openai" || body.webSearch.backend === "anthropic") {
-        config.webSearchSidecar.backend = body.webSearch.backend;
+      if (body.webSearch.backend === null) delete webSearchCandidate.backend;
+      else if (WEB_SEARCH_BACKENDS_UNION.includes(body.webSearch.backend as never)) {
+        webSearchCandidate.backend = body.webSearch.backend as typeof WEB_SEARCH_BACKENDS_UNION[number];
       }
-      if (typeof body.webSearch.reasoning === "string") config.webSearchSidecar.reasoning = body.webSearch.reasoning;
+      if (typeof body.webSearch.reasoning === "string") webSearchCandidate.reasoning = body.webSearch.reasoning;
+      // Operator secret for the exa backend: string sets, empty string clears. The GET
+      // payload deliberately never carries it and redact.ts strips the key from logs.
+      if (typeof body.webSearch.exaApiKey === "string") {
+        if (body.webSearch.exaApiKey === "") delete webSearchCandidate.exaApiKey;
+        else webSearchCandidate.exaApiKey = body.webSearch.exaApiKey;
+      }
+      // Opt-in x_search block (L7): null clears; an object is doc-validated before persisting.
+      if (body.webSearch.xSearch === null) delete webSearchCandidate.xSearch;
+      else if (body.webSearch.xSearch !== undefined) {
+        if (!isPlainRecord(body.webSearch.xSearch)) {
+          return jsonResponse({ error: "webSearch.xSearch must be an object or null" }, 400);
+        }
+        const x = body.webSearch.xSearch as Record<string, unknown>;
+        const allowedXSearchKeys = new Set([
+          "enabled",
+          "allowedXHandles",
+          "excludedXHandles",
+          "fromDate",
+          "toDate",
+        ]);
+        const unknownKey = Object.keys(x).find(key => !allowedXSearchKeys.has(key));
+        if (unknownKey !== undefined) {
+          return jsonResponse({ error: `webSearch.xSearch.${unknownKey} is not a supported field` }, 400);
+        }
+        if (x.enabled !== undefined && typeof x.enabled !== "boolean") {
+          return jsonResponse({ error: "webSearch.xSearch.enabled must be a boolean" }, 400);
+        }
+        for (const field of ["allowedXHandles", "excludedXHandles"] as const) {
+          const value = x[field];
+          if (value !== undefined && (!Array.isArray(value) || !value.every(handle => typeof handle === "string"))) {
+            return jsonResponse({ error: `webSearch.xSearch.${field} must be an array of strings` }, 400);
+          }
+        }
+        for (const field of ["fromDate", "toDate"] as const) {
+          if (x[field] !== undefined && typeof x[field] !== "string") {
+            return jsonResponse({ error: `webSearch.xSearch.${field} must be an ISO-8601 date (YYYY-MM-DD)` }, 400);
+          }
+        }
+        const candidate = {
+          ...(x.enabled === true ? { enabled: true } : {}),
+          ...(x.allowedXHandles !== undefined ? { allowedXHandles: x.allowedXHandles as string[] } : {}),
+          ...(x.excludedXHandles !== undefined ? { excludedXHandles: x.excludedXHandles as string[] } : {}),
+          ...(x.fromDate !== undefined ? { fromDate: x.fromDate as string } : {}),
+          ...(x.toDate !== undefined ? { toDate: x.toDate as string } : {}),
+        };
+        const invalid = validateXaiSearchOptions({
+          xSearch: candidate.enabled,
+          allowedXHandles: candidate.allowedXHandles,
+          excludedXHandles: candidate.excludedXHandles,
+          fromDate: candidate.fromDate,
+          toDate: candidate.toDate,
+        });
+        if (invalid) return jsonResponse({ error: `webSearch.xSearch invalid: ${invalid}` }, 400);
+        webSearchCandidate.xSearch = candidate;
+      }
       if (typeof body.webSearch.streamRoutedModelOutput === "boolean") {
         // `false` is the default — drop the key so config files stay minimal.
-        if (body.webSearch.streamRoutedModelOutput) config.webSearchSidecar.streamRoutedModelOutput = true;
-        else delete config.webSearchSidecar.streamRoutedModelOutput;
+        if (body.webSearch.streamRoutedModelOutput) webSearchCandidate.streamRoutedModelOutput = true;
+        else delete webSearchCandidate.streamRoutedModelOutput;
       }
+      config.webSearchSidecar = webSearchCandidate;
     }
     if (body.vision) {
       config.visionSidecar = { ...config.visionSidecar };
@@ -623,7 +822,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
         else config.visionSidecar.model = body.vision.model;
       }
       if (body.vision.backend === null) delete config.visionSidecar.backend;
-      else if (body.vision.backend === "openai" || body.vision.backend === "anthropic") {
+      else if (body.vision.backend === "openai" || body.vision.backend === "anthropic"
+        || body.vision.backend === "routed") {
         config.visionSidecar.backend = body.vision.backend;
       }
       if (typeof body.vision.maxDescriptionsPerTurn === "number") {
@@ -645,15 +845,21 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     saveConfigPreservingClaudeCode(config);
     const ws = config.webSearchSidecar ?? {};
     const vision = await sidecarVisionResponseSettings(config);
+    const savedWebSearchCandidates = await webSearchCandidateRows(config);
     return jsonResponse({
       ok: true,
       webSearch: {
         model: ws.model ?? "gpt-5.6-luna",
         backend: ws.backend,
         streamRoutedModelOutput: ws.streamRoutedModelOutput === true,
+        ...(ws.xSearch ? { xSearch: ws.xSearch } : {}),
       },
       vision: publicVisionSidecarSettings(config, vision),
       visionModels: vision.models,
+      // Echoed for the same reason GET always carries it: the dashboard rebuilds
+      // its sidecar state from this body, and an omitted key reads as "old
+      // server" and falls back to the full union (review F1).
+      webSearchModels: webSearchModelOptionsFrom(config, savedWebSearchCandidates),
     });
   }
 
@@ -677,6 +883,13 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
     if (body.model !== undefined && typeof body.model !== "string") {
       return jsonResponse({ error: "model must be a string" }, 400);
     }
+    const candidateModel = typeof body.model === "string"
+      ? body.model
+      : body.enabled === true
+        ? config.shadowCallIntercept?.model
+        : undefined;
+    const targetError = shadowCallTargetError(config, candidateModel);
+    if (targetError) return jsonResponse({ error: targetError }, 400);
     config.shadowCallIntercept = { ...config.shadowCallIntercept };
     if (typeof body.enabled === "boolean") config.shadowCallIntercept.enabled = body.enabled;
     if (typeof body.model === "string") {

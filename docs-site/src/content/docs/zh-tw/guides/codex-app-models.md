@@ -178,6 +178,26 @@ allowlist 上的項目。opencodex 無法介入該清單；上游錯誤追蹤於
 - 改用 Codex CLI 或 TUI 而不是 Desktop 選擇器；它們不會套用 allowlist，會正常列出路由模型。
 
 ## 重新整理模型狀態
+## 原生配額回退限制
+
+Codex 應用程式用完原生的五小時配額後，可能切換到預備回退模型，並把選擇器裡其他列變灰。如 [#2813](https://github.com/lidge-jun/opencodex/issues/2813) 所報告，這個限制同樣會隱藏 opencodex 路由的列，而那些列使用的是無關的供應商憑證，不消耗任何 ChatGPT 配額。
+
+這個限制由用戶端在請求抵達代理之前施加，因此 opencodex 無法解除。路由列寫入時帶 `visibility: "list"`，目錄過濾只讀取 `disabledModels` 與各供應商的 `selectedModels`，任何配額值都不參與路由列的可見性。
+
+明確選擇路由模型不會經過選擇器。在 `config.toml` 中設定模型：
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+或直接送出：
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+**請求抵達代理之後**，兩條路徑都能正確路由，這點有測試覆蓋。但預備模式生效時，Codex 桌面應用程式不會送出已設定的模型：它依自己的 `wham/usage` 輪詢（`luna_reserve` 升級提示加上仍被允許的 `gpt-reserve` 附加限額）判定預備狀態，並在請求送出前把模型設定強制改為 `gpt-reserve`，所以 `config.toml` 這條路會在應用程式內被覆寫。在視窗重設之前，請使用 `ocx access test`、經代理的 Claude Code（`ocx claude`）或任何直連 `/v1` 的用戶端。參見[Codex 預備模式下的路由模型](/guides/codex-integration/#routed-models-during-codex-reserve-mode)。
+
 
 如果選擇器仍顯示舊條目，請重新整理目錄並重新開啟目標 Codex 介面：
 

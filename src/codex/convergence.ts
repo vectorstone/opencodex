@@ -1,6 +1,7 @@
 import { join } from "node:path";
 
-import { getConfigDir, websocketsEnabled, withExpectedConfigGenerationSync } from "../config";
+import { getConfigDir, saveConfigPreservingClaudeCode, websocketsEnabled, withExpectedConfigGenerationSync } from "../config";
+import { reconcileSuccessfulModelDiscoveries } from "../providers/new-model-policy";
 import { COMBO_NAMESPACE } from "../combos";
 import { getAuthStorePath } from "../oauth/store";
 import type { OcxConfig } from "../types";
@@ -32,7 +33,7 @@ import {
   import {
   catalogBackupPathFor,
   catalogHasRoutedEntries,
-  findNativeTemplate,
+  findSupportedNativeTemplate,
   legacyCatalogBackupPath,
   parseCatalogJson,
   type RawCatalog,
@@ -41,6 +42,7 @@ import {
   import {
   buildCatalogEntriesFromObservedState,
   CANONICAL_NATIVE_CATALOG_CONTENT_POLICY,
+  finalizeAutoReviewModelOverride,
   mergeCatalogEntriesFromObservedState,
   mergeCatalogModelsWithNativeRecovery,
   orderForSubagents,
@@ -54,6 +56,7 @@ import {
   disabledNativeSlugs,
   desktopAllowlistSuppressedNativeSlugs,
   NATIVE_OPENAI_MODELS,
+  nativeContextLimits,
   shouldIncludeAccountBoundNativeOpenAi,
   shouldIncludeNativeOpenAi,
 } from "./catalog/metadata";
@@ -66,6 +69,18 @@ import {
   supportedCodexReasoningEffortsFromObservedCatalog,
 } from "./catalog/effort";
 import { codexRuntimeStatePath, peekCodexRuntimeProcessCache } from "./runtime";
+import { codexAccountNamespaceEntries, isMainCodexAccountTarget } from "./account-namespaces";
+import { MAIN_CODEX_ACCOUNT_ID } from "./main-account";
+import {
+  availableAccountGatedNativeModels,
+  codexModelEntitlementStateForAccount,
+  isCodexModelEntitlementSnapshotCurrent,
+  resolveCodexModelEntitlements,
+  type CodexModelEntitlementSnapshot,
+} from "./model-entitlements";
+import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "./catalog/native-models";
+import { providerCodexAccountMode } from "../providers/registry";
+import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { withCatalogWriteSerialization } from "./catalog-write-serialization";
 import {
   publishHashedCodexCatalogBackup,
@@ -95,7 +110,7 @@ export interface CatalogWriteReceipt {
 
 export type CodexCatalogCommitResult =
   | { readonly kind: "committed"; readonly changed: boolean; readonly writes: CatalogWriteReceipt }
-  | { readonly kind: "stale"; readonly reason: "generation" | "home-selection" | "source-observation" | "process-local" | "target-identity" | "candidate-consumed" }
+  | { readonly kind: "stale"; readonly reason: "generation" | "home-selection" | "source-observation" | "process-local" | "target-identity" | "candidate-consumed" | "account-entitlement" }
   | { readonly kind: "refused"; readonly reason: "source-unreadable" | "source-ambiguous" | "target-unsafe" }
   | { readonly kind: "failed"; readonly surface: "disk"; readonly writes: CatalogWriteReceipt };
 
@@ -122,6 +137,8 @@ interface CandidateState {
   readonly legacyBackup?: PreparedCatalogFileWrite;
   readonly changed: boolean;
   readonly notices: readonly CatalogNotice[];
+  readonly modelEntitlements: CodexModelEntitlementSnapshot;
+  readonly discoveryConfig?: OcxConfig;
 }
 
 const candidateStates = new WeakMap<object, CandidateState>();
@@ -217,11 +234,13 @@ function prepareCatalog(
   baseline: ReadonlyMap<string, number>,
   baselineCatalogModels: readonly Readonly<Record<string, unknown>>[],
   degradedProviderNames: ReadonlySet<string>,
+  modelEntitlements: CodexModelEntitlementSnapshot,
   nativeRecoverySources: readonly (readonly RawEntry[])[] = [],
   observedAccountNativeEntries: readonly RawEntry[] = [],
 ): RawCatalog {
   const catalog = JSON.parse(JSON.stringify(source.catalog)) as RawCatalog;
-  const template = findNativeTemplate(catalog);
+  // Strict selector: an unknown bare row must never become the routed template (#2813).
+  const template = findSupportedNativeTemplate(catalog);
   const enabled = filterCatalogVisibleModels(routedModels, config);
   const featured = config.subagentModels ?? [];
   const ordered = orderForSubagents(enabled, featured);
@@ -229,23 +248,51 @@ function prepareCatalog(
   const multiAgentMode = config.multiAgentMode === "v1" || config.multiAgentMode === "v2"
     ? config.multiAgentMode : "default";
   const exactComboSlugs = exactComboCatalogSlugs(config);
-  const suppressedBareNativeSlugs = desktopAllowlistSuppressedNativeSlugs(config);
+  const bareEligibleAccountIds = providerCodexAccountMode(
+    OPENAI_CODEX_PROVIDER_ID,
+    config.providers[OPENAI_CODEX_PROVIDER_ID],
+  ) === "direct" ? new Set([MAIN_CODEX_ACCOUNT_ID]) : undefined;
+  const availableBareGatedNativeSlugs = availableAccountGatedNativeModels(
+    modelEntitlements,
+    bareEligibleAccountIds,
+  );
+  const availableAccountGatedNativeSlugs = availableAccountGatedNativeModels(modelEntitlements);
+  const availableBareNativeSlugs = NATIVE_OPENAI_MODELS.filter(slug => (
+    !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableBareGatedNativeSlugs.has(slug)
+  ));
+  const availableAccountNativeSlugs = NATIVE_OPENAI_MODELS.filter(slug => (
+    !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableAccountGatedNativeSlugs.has(slug)
+  ));
+  const suppressedBareNativeSlugs = new Set([
+    ...desktopAllowlistSuppressedNativeSlugs(config),
+    ...[...ACCOUNT_GATED_NATIVE_OPENAI_MODELS].filter(slug => !availableBareGatedNativeSlugs.has(slug)),
+  ]);
   const hasPhysicalComboProvider = Object.hasOwn(config.providers, COMBO_NAMESPACE);
   const enabledProviders = Object.entries(config.providers).filter(([, provider]) => provider.disabled !== true);
   const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
   const accountSelectors = shouldIncludeAccountBoundNativeOpenAi(config)
     ? visibleCodexAccountSelectors(config)
     : [];
-  const accountNativeSlugs = accountSelectors.length > 0
-    ? accountBoundNativeOpenAiSlugs(observedAccountNativeEntries)
-    : [];
+  const accountTargets = new Map(codexAccountNamespaceEntries(config));
   const accountNativeSlugsBySelector = accountSelectors.length > 0
-    ? accountBoundNativeOpenAiSlugsBySelector(config, observedAccountNativeEntries)
+    ? new Map([...accountBoundNativeOpenAiSlugsBySelector(config, observedAccountNativeEntries)].map(([selector, slugs]) => {
+      const target = accountTargets.get(selector);
+      const accountId = target && isMainCodexAccountTarget(target) ? MAIN_CODEX_ACCOUNT_ID : target;
+      return [selector, slugs.filter(slug => (
+        !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug)
+        || (accountId !== undefined
+          && codexModelEntitlementStateForAccount(modelEntitlements, accountId, slug) === "granted")
+      ))] as const;
+    }))
     : new Map<string, readonly string[]>();
+  const accountNativeSlugs = accountSelectors.length > 0
+    ? [...new Set([...accountNativeSlugsBySelector.values()].flatMap(slugs => [...slugs]))]
+    : [];
   // Unknown account-native ids have no safe bare/global identity. They are only projected through
   // selector-qualified rows when a live selector is configured.
   const observedNativeSlugs: string[] = [];
   const disabledNative = disabledNativeSlugs(config);
+  const openaiContextCap = nativeContextLimits(config);
   const nativeCatalogModels = mergeCatalogModelsWithNativeRecovery(
     active?.models ?? catalog.models ?? [],
     [catalog.models ?? [], ...nativeRecoverySources],
@@ -264,12 +311,13 @@ function prepareCatalog(
     suppressedBareNativeSlugs,
     disabledNativeAccountSlugs: new Set(),
     multiAgentV2Enabled,
+    openaiContextCap,
   });
   const accountBoundEntries = accountSelectors.length === 0
     ? []
     : buildCatalogEntriesFromObservedState({
       template: template ? JSON.parse(JSON.stringify(template)) : null,
-      gptSlugs: NATIVE_OPENAI_MODELS,
+      gptSlugs: availableAccountNativeSlugs,
       goModels: [],
       featured,
       wsEnabled: websocketsEnabled(config),
@@ -280,6 +328,7 @@ function prepareCatalog(
       disabledNativeAccountSlugs: new Set([...disabledNative].filter(slug => suppressedBareNativeSlugs.has(slug))),
       multiAgentV2Enabled,
       keepNativeChatGptOnV1: config.keepNativeChatGptOnV1 === true,
+      openaiContextCap,
       accountNativeSlugs,
       accountNativeSlugsBySelector,
     }).filter(entry => trustedAccountBoundNativeCatalogSlug(entry) !== undefined);
@@ -312,9 +361,10 @@ function prepareCatalog(
     includeNativeOpenAi,
     accountBoundEntries,
     suppressedBareNativeSlugs,
+    openaiContextCap,
     policy: {
       ...CANONICAL_NATIVE_CATALOG_CONTENT_POLICY,
-      nativeBackfillSlugs: [...NATIVE_OPENAI_MODELS, ...observedNativeSlugs],
+      nativeBackfillSlugs: [...availableBareNativeSlugs, ...observedNativeSlugs],
       warningPolicy: "suppress",
     },
   });
@@ -324,6 +374,7 @@ function prepareCatalog(
       ? supportedCodexReasoningEffortsFromObservedCatalog(source.runtimeSupport.catalog)
       : null,
   );
+  finalizeAutoReviewModelOverride(mergedModels, catalogModels);
   catalog.models = mergedModels;
   return catalog;
 }
@@ -356,11 +407,14 @@ export async function gatherCodexCatalogCandidate(
     const providerModelOutcomes: CatalogGatherProviderModelOutcome[] = [];
     const discoveryPolicies: CatalogProviderDiscoveryPolicySnapshot[] = [];
     providerGatherStarted = true;
-    const routedModels = await gatherRoutedModelsForCatalogGather(snapshot.config, session, {
-      providerAuthOutcomes: authOutcomes,
-      providerModelOutcomes,
-      discoveryPolicySnapshots: discoveryPolicies,
-    });
+    const [routedModels, modelEntitlements] = await Promise.all([
+      gatherRoutedModelsForCatalogGather(snapshot.config, session, {
+        providerAuthOutcomes: authOutcomes,
+        providerModelOutcomes,
+        discoveryPolicySnapshots: discoveryPolicies,
+      }),
+      resolveCodexModelEntitlements(snapshot.config),
+    ]);
     const processLocal = processEvidence(source);
     const sourceEvidence = sealCatalogGatherEvidenceSession(session);
     if (!same(sourceEvidence.required, snapshot.sourceEvidence.required)) {
@@ -388,8 +442,17 @@ export async function gatherCodexCatalogCandidate(
           ? active
           : !hasRoutedEntries(source.catalog) ? source.catalog : null)
         : null);
+    const discoveryConfig = structuredClone(snapshot.config) as OcxConfig;
+    const discoveryChanged = reconcileSuccessfulModelDiscoveries({
+      config: discoveryConfig,
+      models: routedModels,
+      authoritativeProviders: providerModelOutcomes
+        .filter(outcome => outcome.state === "authoritative")
+        .map(outcome => outcome.provider),
+      now: new Date().toISOString(),
+    });
     const preparedCatalog = prepareCatalog(
-      snapshot.config,
+      discoveryConfig,
       source,
       active,
       routedModels,
@@ -399,6 +462,7 @@ export async function gatherCodexCatalogCandidate(
       new Set(providerModelOutcomes
         .filter(outcome => outcome.state === "degraded")
         .map(outcome => outcome.provider)),
+      modelEntitlements,
       [
         catalogFrom(keyedBackupBytes)?.models ?? [],
         catalogFrom(legacyBackupBytes)?.models ?? [],
@@ -452,6 +516,8 @@ export async function gatherCodexCatalogCandidate(
       changed: Buffer.from(activeBytes ?? []).toString("utf8") !== preparedCatalogBytes
         || Buffer.from(cacheBytes ?? []).toString("utf8") !== preparedCacheBytes,
       notices: Object.freeze([...notices]),
+      modelEntitlements,
+      ...(discoveryChanged ? { discoveryConfig } : {}),
     });
     return { kind: "candidate", candidate };
   } catch (error) {
@@ -469,6 +535,9 @@ export async function gatherCodexCatalogCandidate(
 }
 
 function revalidateCandidate(state: CandidateState): CodexCatalogCommitResult | null {
+  if (!isCodexModelEntitlementSnapshotCurrent(state.modelEntitlements)) {
+    return { kind: "stale", reason: "account-entitlement" };
+  }
   let session: CatalogFilesystemEvidenceSession;
   let validatingTargets = false;
   try {
@@ -596,6 +665,12 @@ export async function convergeCodexCatalog(
   const state = candidateStates.get(gathered.candidate as object)!;
   lifecycle.onCommitBegin?.();
   const committed = await commitCodexCatalogCandidate(gathered.candidate, request.deadlineMs);
+  if (committed.kind === "committed" && state.discoveryConfig) {
+    const mutable = snapshot.config as OcxConfig;
+    mutable.modelDiscovery = state.discoveryConfig.modelDiscovery;
+    mutable.disabledModels = state.discoveryConfig.disabledModels;
+    saveConfigPreservingClaudeCode(mutable);
+  }
   return {
     changed: committed.kind === "committed" ? committed.changed : false,
     catalogRefresh: projectCommit(committed, state.notices),

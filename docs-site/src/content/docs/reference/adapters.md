@@ -1,6 +1,6 @@
 ---
 title: Adapters
-description: The seven provider adapters — what each targets, how it builds requests, and its quirks.
+description: The provider adapters — what each targets, how it builds requests, and its quirks.
 ---
 
 An **adapter** translates between opencodex's internal request/response model and one provider wire
@@ -26,7 +26,7 @@ then turns the events into Responses SSE.
 ## `openai-chat`
 
 **Targets:** OpenAI **Chat Completions** (`POST {baseUrl}/chat/completions`; a trailing `/chat/completions` or `/` on `baseUrl` is stripped first) and every compatible
-provider — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (local & cloud), and more.
+provider — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (local), and more.
 **Auth:** `key` (Bearer).
 
 - Converts internal messages to OpenAI roles; maps tools to `{type:"function", function:{…}}` and
@@ -40,18 +40,77 @@ provider — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (local & cloud),
   `xhigh` and `max` remain distinct labels unless a provider explicitly configures an alias. The
   adapter **omits it entirely** for ids in `provider.noReasoningModels`.
 - Streams `delta.content` (text), `delta.reasoning_content` (thinking), and `delta.tool_calls[]`;
-  collects `usage`.
+  collects `usage`. Providers listed in `reasoningDetailsModels` (MiniMax M-series) instead read
+  structured `delta.reasoning_details` segments, whose `text` arrives as cumulative snapshots and
+  is prefix-diffed, and replay preserved reasoning as a `reasoning_details` array.
 - ClinePass uses the live-verified gateway format `reasoning: { enabled: true, effort }` (or
   `{ enabled: false }` when reasoning is disabled); its public API docs do not currently specify
   this request shape. The adapter preserves requested `low`, `medium`, `high`, `xhigh`, and `max`
   tiers, accepts reasoning deltas from either `delta.reasoning_content` or `delta.reasoning`, requests
   streamed usage with `stream_options.include_usage`, and reads usage from non-stream response envelopes.
 
+## `ollama-native`
+
+**Targets:** Ollama's own **Chat API** (`POST /api/chat`) rather than its OpenAI-compatible
+surface. The built-in `ollama-cloud` provider is registry-selected onto this adapter; it can also
+be configured on a separately named custom or self-hosted Ollama provider with
+`adapter: "ollama-native"`.
+**Auth:** `key` (Bearer) for cloud/custom endpoints; no credential is sent to loopback or
+`authMode: "local"` targets.
+
+- **Registry selection is load-bearing.** The built-in `ollama-cloud` row keeps the base URL
+  `https://ollama.com/v1` for `/v1/models` live discovery, while inference is normalized onto
+  `POST https://ollama.com/api/chat`. A config-level `adapter` is discarded for that provider row.
+  Ordinary built-in local Ollama stays on `openai-chat`; choosing `ollama-native` for a local or
+  self-hosted endpoint is an explicit provider-configuration decision, detected by host so a
+  non-Ollama destination is never silently rewritten.
+- **Model metadata:** `/v1/models` carries no per-model metadata, so for canonical Ollama Cloud the
+  adapter's provider enriches each discovered id through a *bounded* `POST /api/show` (256 KiB per
+  response, 8 s per request, concurrency 4, 48 requests, a 12 s deadline for the whole phase) to fill
+  the true context window and vision capability. The show request is same-origin and never follows a
+  redirect; failures degrade that one model and never fail discovery.
+- **Streaming:** Ollama's native NDJSON. Text and `message.thinking` deltas are forwarded as they
+  arrive; a turn completes only on a `done: true` terminal record, and buffered `done: false` or a
+  missing terminal suppresses partial text and tool calls entirely.
+- **Reasoning:** maps onto Ollama's native `think` field (`low`/`medium`/`high`/`max`, plus
+  booleans), clamped to the model's advertised ladder, and honours the `__omit__` sentinel semantics
+  upstream configures.
+- **Images:** sent natively in the message `images` array where the model is vision-capable; video
+  is refused rather than mis-sent, and remote image URLs are not fetched.
+- **Tools:** declared in Ollama's native shape, streamed tool calls are whole-call records with
+  object-valued `arguments`, and tool-result replay is paired strictly by call id and tool name.
+  `tool_choice: "none"` and `auto` behave normally; **`required` or an exact named choice fails
+  closed**, because Ollama's `/api/chat` has no `tool_choice` field to enforce it with.
+- **Structured output is refused on canonical Ollama Cloud.** Ollama currently documents structured
+  outputs as unsupported on its Cloud, and Cloud does not enforce the `format` field, so OpenCodex
+  fails that request closed rather than returning unconstrained prose in answer to a schema-shaped
+  request. Local and custom `ollama-native` endpoints keep Ollama's native `format` mapping
+  (`json_object` → `"json"`, `json_schema` → the schema object).
+
 ## `openai-responses`
 
-**Targets:** the OpenAI **Responses API**. **`passthrough: true`** — forwards the raw request body and
-streams the response back **untranslated**.
-**Auth:** `forward` (relay the caller's headers) or `key`.
+**Targets:** the OpenAI **Responses API**. **`passthrough: true`** — normally forwards the raw request
+body and response, with narrow compatibility rewrites for routed gateways.
+**Auth:** canonical OpenAI `forward` relays only the safe caller-header allowlist; noncanonical
+`forward` uses configured static headers without relaying caller authorization; `key` uses the
+configured provider key.
+
+Noncanonical Responses gateways receive Codex's client-executed `tool_search` declaration as a
+collision-safe public function tool. Matching request history and JSON/SSE function calls are
+translated back to the private `tool_search` lifecycle for the client. Canonical OpenAI forward
+keeps the native private type unchanged.
+
+The canonical ChatGPT Codex forward destination also normalizes two public Responses shapes that
+its stricter backend rejects: fully textual `system` messages inside `input` are appended to the
+top-level `instructions` string in request order, and the top-level `truncation` field is removed.
+This rewrite is destination-scoped. Key-auth public/custom Responses providers and noncanonical
+forward gateways keep both fields unchanged; a multimodal system message is never partially folded
+or silently dropped.
+
+For canonical forward continuations, client-only `prompt_cache_breakpoint` properties are removed
+recursively within bounded traversal limits. When `store: false`, `item_reference` rows are also
+omitted because the destination cannot resolve an item it did not persist. Function/tool `call_id`
+pairs and `reasoning.effort` are preserved.
 
 For `key` auth, [`retryOn429`](/reference/configuration/) applies here too: a pre-stream 429
 waits and replays the identical request on the same key before any other handling, exactly like
@@ -109,6 +168,19 @@ of the HTTP retry loop.
   opaque `thoughtSignature` values so tool-result continuations retain Gemini reasoning continuity.
   The signature cache is snapshotted to the config directory, so continuations also survive proxy
   restarts.
+- **Malformed response shapes fail closed.** A claimed candidate, its `content`, or its
+  `content.parts` that is not the documented container terminates the turn with a
+  `google response contained invalid …` error naming the structural reason and the offending
+  value's type — never its contents. Absence is handled separately from corruption: an absent,
+  `null` or empty `content` or `parts` still completes the turn normally, a streaming chunk whose
+  `candidates` is absent, `null` or empty is skipped so the turn completes on a later terminal
+  frame, and a buffered response that carries no candidate at all returns
+  `google response contained no candidates`. A root `data: null` keepalive frame is still skipped as
+  padding.
+- Tool-call batches are closed by one immediately adjacent user turn containing one ordered
+  `functionResponse` per representable call. Interrupted histories receive an explicit missing-result marker;
+  duplicate or standalone results are preserved as marked text (and image siblings) rather than
+  emitted as invalid unpaired `functionResponse` parts.
 - **Inline image output:** when the model is one of the explicit image-capable chat IDs
   (`gemini-3.1-flash-image`, `gemini-2.0-flash-preview-image-generation`, or
   `gemini-3-pro-image-preview`), the adapter sends `responseModalities: ["TEXT", "IMAGE"]`.
@@ -127,6 +199,15 @@ of the HTTP retry loop.
 
 - Builds Kiro `conversationState`, maps Codex tools and tool results, and sends image blocks supported
   by the Kiro wire.
+- Treats a client `parallel_tool_calls: true` value as permission rather than a wire requirement.
+  Kiro remains serialized: the routed catalog advertises no parallel-tool capability and the
+  adapter sends no parallel-control field upstream, but ordinary Codex tool turns are not rejected
+  solely because the client permits parallel calls.
+- Accepts Responses `text` controls that are not structured output — `text.verbosity` and
+  `text.format: {"type":"text"}` — without forwarding them. Kiro has no wire field for either, so
+  they are ignored rather than rejected. Structured output (`text.format` of type `json_schema`
+  or `json_object`) is still refused: the Kiro wire cannot constrain the response shape, and a
+  caller expecting JSON would otherwise receive prose.
 - Decodes `application/vnd.amazon.eventstream`, reconstructs text/thinking/tool events, detects
   truncated tool JSON, and estimates usage because the upstream does not return token counts.
 - Uses the configured `baseUrl` verbatim when it is custom. A canonical
@@ -138,6 +219,18 @@ of the HTTP retry loop.
   single post-cooldown probe prevent concurrent requests from exhausting independent retry budgets;
   hard quota failures and ordinary service errors are not replayed.
 - Its non-streaming parser drains the same event stream for the web-search loop.
+- Reports per-account usage. `AmazonCodeWhispererService.GetUsageLimits` on
+  `https://management.{region}.kiro.dev/` returns the plan allowance, which becomes the
+  monthly quota window for that account; a free-trial balance is reported as its own window.
+  The region comes from the account's profile ARN, then its stored API/SSO region. An
+  unreadable or unrecognised response is reported as unknown rather than as zero usage, and
+  an account whose overage is enabled is not treated as exhausted merely for passing its
+  limit. The operation is undocumented by AWS, so treat the numbers as best-effort.
+- Participates in multi-account rotation. Two or more logged-in Kiro accounts enable
+  automatic failover on a 429, and rotation prefers the account with the most known
+  headroom; an account whose allowance is provably spent is cooled until its window resets
+  (bounded between five minutes and a day) instead of being retried every minute. Each
+  rotated bearer carries its own profile ARN and region.
 
 ### Completion semantics
 
@@ -163,6 +256,15 @@ starts or the stream ends, then releases it as commentary unless the private too
 answer. When the web-search sidecar is active, released
 commentary still streams ahead of the terminal event; only the events needed to decide whether the
 model requested a synthetic search remain buffered.
+
+A question the model cannot proceed without is also a final answer. The injected contract tells a
+routed model that when it needs a decision, a piece of information, or a clarification only the user
+can give, it should deliver that question through `codex_kiro_final_answer` and stop, rather than
+writing the question as ordinary text and continuing. Such a turn arrives like any other completed
+answer: final text with the turn ended, not commentary and not a client tool call. Without this,
+the contract described only "still working" and "fully complete", and a model holding a blocking
+question had no way to say so — the observed result was a question and a self-override emitted as one
+message, followed by another tool call from the same inference.
 
 If Kiro stops without calling the completion tool, the adapter makes one continuation. Reasoning-
 only retries preserve the original valid user/tool-result turn rather than manufacturing an empty
@@ -198,6 +300,22 @@ compatibility pair: `agent.v1.AgentService/RunSSE` for server output and
 - Replays conversation state through content-addressed blobs, maps server tool calls back to Codex,
   discovers live Cursor models through the protobuf `GetUsableModels` RPC, and retries only before a
   run request is committed to the wire.
+- After a successful no-tool turn, the adapter keeps Cursor's returned ConversationStateStructure
+  in a process-local store and reuses that checkpoint on the next validated linear continuation
+  instead of rebuilding the full root history. Tool-result turns reuse the last completed-turn
+  checkpoint plus only the uncovered suffix when the covered message boundary is known.
+  Ref-less prefix lookup requires a remembered Cursor conversation or stable client thread
+  (including the bounded Desktop session/thread fallback) and a checkpoint owned by that same
+  provider conversation; otherwise it full-replays.
+  Compaction, helper/shadow isolation, account/model mismatch, missing refs, decode failures,
+  forced-fresh recovery, and invalid_argument retries fall back to the existing full replay. A
+  process restart drops the in-memory store and full-replays. Cursor Connect still does not expose
+  authoritative cache_read_tokens, so OpenCodex usage is not a cache-hit counter.
+  The bounded Desktop fallback stores only a process-local HMAC-derived owner; raw session/thread
+  headers and OAuth/authorization material are never written to checkpoint state. Cursor's
+  OAuth-backed live transport and account-filtered model discovery remain experimental; see the
+  [provider guide](/guides/providers/) and [Cursor provider configuration](/reference/configuration/providers/#cursor-provider-adapter-cursor)
+  for login and transport settings. Checkpoint reuse itself is automatic and has no user setting.
 - Honors `upstreamHttpVersion` for both live model discovery and inference. `auto`, `http2`, and `h2`
   preserve the existing HTTP/2 transport; only `http1.1` and `h1` select compatibility mode.
 - Exposes Cursor Router as `cursor/auto` plus explicit `cursor/auto-cost`,

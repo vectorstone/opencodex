@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { syncModelsToCodex } from "../src/codex/sync";
 import { MANAGED_AGENTS_TABLE_MARKER, MANAGED_SUBAGENT_DEFAULT_MARKER } from "../src/codex/subagent-defaults";
 import type { OcxConfig } from "../src/types";
 import type { OrcaCodexHomeDiagnostic } from "../src/codex/home";
-import { claimOwnedServiceHome } from "./helpers/owned-service-home";
+import { claimOwnedServiceHome, withOwnedServiceHomePreload } from "./helpers/owned-service-home";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const TEST_DIR = join(import.meta.dir, ".tmp-codex-sync-api");
 const TEST_CODEX_HOME = join(TEST_DIR, "codex");
@@ -18,6 +19,8 @@ let prevCodexHome: string | undefined;
 let prevOpenCodexHome: string | undefined;
 let prevHome: string | undefined;
 let prevUserProfile: string | undefined;
+let serviceManagerEnv: Record<string, string> = {};
+let serviceManagerPreloadPath: string | undefined;
 
 const config = {
   port: 0,
@@ -34,7 +37,17 @@ const config = {
 } as OcxConfig;
 
 function claimTempHome(codexHome: string, ocxHome: string, home: string): void {
-  claimOwnedServiceHome(codexHome, ocxHome, home);
+  const fixture = claimOwnedServiceHome(codexHome, ocxHome, home);
+  serviceManagerEnv = fixture.env;
+  serviceManagerPreloadPath = fixture.preloadPath;
+}
+
+function childEnv(overrides: Record<string, string> = {}): Record<string, string> {
+  return { ...process.env, ...serviceManagerEnv, ...overrides } as Record<string, string>;
+}
+
+function childArgs(args: readonly string[]): string[] {
+  return withOwnedServiceHomePreload(args, serviceManagerPreloadPath);
 }
 
 const admittedSync = () => ({ kind: "admitted" as const });
@@ -58,7 +71,7 @@ describe("GUI/CLI Codex sync backend", () => {
     prevOpenCodexHome = process.env.OPENCODEX_HOME;
     prevHome = process.env.HOME;
     prevUserProfile = process.env.USERPROFILE;
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_CODEX_HOME, { recursive: true });
     mkdirSync(TEST_OCX_HOME, { recursive: true });
     mkdirSync(TEST_HOME, { recursive: true });
@@ -80,7 +93,30 @@ describe("GUI/CLI Codex sync backend", () => {
     else process.env.HOME = prevHome;
     if (prevUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = prevUserProfile;
-    if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+    serviceManagerEnv = {};
+    serviceManagerPreloadPath = undefined;
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+  });
+
+  test("durable catalog-only refreshes catalog/cache without injection", async () => {
+    writeFileSync(join(TEST_OCX_HOME, "config.json"), JSON.stringify({ ...config, clientIntegrations: { codex: "catalog-only" } }));
+    let refreshed = false;
+    let injected = false;
+    const result = await syncModelsToCodex(12345, config, null, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        refreshed = true;
+        return { added: 2, path: "/tmp/opencodex-catalog.json", catalogExists: true, catalogWritten: true, cacheSynced: true, comboOmissions: [] };
+      },
+      injectCodexConfig: async () => {
+        injected = true;
+        throw new Error("catalog-only must not inject");
+      },
+      currentExternalCodexModelProvider: () => "global-infra",
+    });
+    expect(refreshed).toBe(true);
+    expect(injected).toBe(false);
+    expect(result).toMatchObject({ status: "catalog-only", ok: true, catalogWritten: true, cacheSynced: true });
   });
   test("returns the structured sync result used by POST /api/sync", async () => {
     let injectedPort = 0;
@@ -170,19 +206,18 @@ describe("GUI/CLI Codex sync backend", () => {
     const journalPath = join(TEST_CODEX_HOME, "opencodex-journal.json");
     const before = readFileSync(configPath, "utf8");
 
-    const child = spawnSync(process.execPath, ["-e", `
+    const child = spawnSync(process.execPath, childArgs(["-e", `
       const { injectCodexConfig } = await import("./src/codex/inject.ts");
       const result = await injectCodexConfig(10100, ${JSON.stringify(config)}, { validateOnly: true });
       console.log(JSON.stringify(result));
-    `], {
+    `]), {
       cwd: repoRoot,
-      env: {
-        ...process.env,
+      env: childEnv({
         HOME: TEST_HOME,
         USERPROFILE: TEST_HOME,
         CODEX_HOME: TEST_CODEX_HOME,
         OPENCODEX_HOME: TEST_OCX_HOME,
-      },
+      }),
       encoding: "utf8",
     });
 
@@ -333,11 +368,13 @@ describe("GUI/CLI Codex sync backend", () => {
         '  const result = await syncModelsToCodex(12345, snapshot, null, {',
         '    refreshCodexModelCatalog: async () => {',
         '      // The provider-discovery window: a second real process persists OFF.',
+        '      // This child only flips desired state; do not propagate the service-probe flag.',
+        '      const flipEnv = { ...process.env }; delete flipEnv.OCX_TEST_SERVICE_HOME_PROBE;',
         '      const flip = spawnSync(process.execPath, ["--eval",',
         '        \'const { setIntegrationEnabled } = require("./src/codex/desired-state");\'',
         '        + \'const r = setIntegrationEnabled("codex", false);\'',
         '        + \'if (!r.ok) { console.error(JSON.stringify(r)); process.exit(1); }\',',
-        '      ], { cwd: process.cwd(), env: process.env, encoding: "utf8" });',
+        '      ], { cwd: process.cwd(), env: flipEnv, encoding: "utf8" });',
         '      if (flip.status !== 0) throw new Error("flip failed: " + flip.stderr);',
         '      return { added: 0, path: "/tmp/none.json", catalogExists: false, catalogWritten: false, cacheSynced: false, comboOmissions: [] };',
         '    },',
@@ -347,15 +384,14 @@ describe("GUI/CLI Codex sync backend", () => {
         '})();',
       ].join("\n");
       const before = readFileSync(join(raceCodexHome, "config.toml"), "utf8");
-      const child = spawnSync(process.execPath, ["--eval", script], {
+      const child = spawnSync(process.execPath, childArgs(["--eval", script]), {
         cwd: repoRoot,
-        env: {
-          ...process.env,
+        env: childEnv({
           HOME: raceHome,
           USERPROFILE: raceHome,
           CODEX_HOME: raceCodexHome,
           OPENCODEX_HOME: raceOcxHome,
-        },
+        }),
         encoding: "utf8",
       });
       expect(child.status).toBe(0);
@@ -364,7 +400,7 @@ describe("GUI/CLI Codex sync backend", () => {
       // The stale ON snapshot wrote nothing: the fixture config is untouched.
       expect(readFileSync(join(raceCodexHome, "config.toml"), "utf8")).toBe(before);
     } finally {
-      rmSync(raceRoot, { recursive: true, force: true });
+      removeTreeWithRetry(raceRoot);
     }
   }, 15_000);
 
@@ -489,7 +525,7 @@ describe("GUI/CLI Codex sync backend", () => {
       "",
     ].join("\n"), "utf8");
 
-    const child = spawnSync(process.execPath, ["-e", `
+    const child = spawnSync(process.execPath, childArgs(["-e", `
       const { handleManagementAPI } = await import("./src/server/management-api.ts");
       const config = { port: 10100, defaultProvider: "openai", providers: {} };
       const response = await handleManagementAPI(
@@ -498,9 +534,9 @@ describe("GUI/CLI Codex sync backend", () => {
         config,
       );
       console.log(JSON.stringify({ status: response.status, body: await response.json() }));
-    `], {
+    `]), {
       cwd: join(import.meta.dir, ".."),
-      env: { ...process.env, CODEX_HOME: TEST_CODEX_HOME, OPENCODEX_HOME: ocxHome },
+      env: childEnv({ CODEX_HOME: TEST_CODEX_HOME, OPENCODEX_HOME: ocxHome }),
       encoding: "utf8",
     });
 

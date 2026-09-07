@@ -120,6 +120,11 @@ Authorization: Bearer <admin-token>
 | `POST /api/storage/cleanup-policy/run` | 수동 cleanup-policy 실행을 시작합니다 | 409 `already_running`; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | 테스트 전용 policy stream 훅입니다 | 사용할 수 없으면 404 `not_found` |
 
+`models`, `providers`, `days[].models`의 행에도 `cacheHitRate`가 포함됩니다. 이 값은 공급자의 프롬프트 캐시에서
+제공된 입력 토큰의 비율이며 `[0, 1]` 범위로 제한됩니다. 공급자가 캐시 텔레메트리를 보고하지 않았거나 행에 입력
+토큰이 없으면 `0`이 아니라 항상 `null`입니다. "캐시 데이터 없음"과 "실제 적중률 0%"는 서로 다른 사실이며,
+이를 똑같이 표시하는 차트는 오해를 부르기 때문입니다.
+
 :::caution
 저장소 cleanup 엔드포인트는 archived session 데이터를 이동하거나 영구적으로 제거할 수 있습니다. 항상 먼저 미리 보고, 반환된 digest를 제출하십시오. 복구가 필요할 수 있으면 quarantine를 우선하십시오.
 :::
@@ -193,7 +198,7 @@ Authorization: Bearer <admin-token>
 | --- | --- | --- |
 | `GET /api/system/memory` | 프로세스, heap, stream, response-state, watchdog, active-turn의 스칼라 메트릭을 반환합니다 | — |
 | `POST /api/system/restart` | 클라이언트 injection을 제거하지 않고 drain-aware 프로세스 재시작을 시작합니다 | 202 반환; 반복 호출은 기존 drain을 보고합니다 |
-| `POST /api/stop` | 서비스를 중지하고, native Codex를 복원하며, 관리형 Grok injection을 제거하고, 프록시를 drain합니다 | 409 서비스 소유권 충돌 |
+| `POST /api/stop` | 서비스를 중지하고, native Codex를 복원하며, 관리형 Grok injection을 제거하고, 프록시를 drain합니다 | 409 서비스 소유권 충돌; Windows 작업 스케줄러 래퍼가 프록시를 다시 띄울 수 있고 호출자가 `ocx stop`이 아니면 409 `respawnable_service`(아무것도 바뀌지 않음); 설치된 관리자가 정지를 거부하면 409; 작업 스케줄러 상태를 읽을 수 없으면 409 `service_state_unknown`(아무것도 바뀌지 않음, 조회를 고친 뒤 재시도) |
 
 ### Codex 인증 위임
 
@@ -238,3 +243,7 @@ account의 selector binding은 남아 있어 계정이 없을 때 exact route가
 ## 클라이언트 선택
 
 일반적인 관리 작업에는 [Web Dashboard](/guides/web-dashboard/)가 가장 안전한 안내형 워크플로를 제공합니다. 헤드리스 호스트와 자동화에는 대응하는 `ocx` 명령을 사용하십시오. 이 명령들은 동일한 실시간 API를 호출하며, 프록시에 접근할 수 없거나 작업이 실패하면 0이 아닌 결과를 반환합니다. 직접 HTTP는 위의 정확한 엔드포인트 계약이 필요한 통합에 가장 유용합니다.
+
+## 원격 세션과 데이터 키 교체
+
+`POST /api/keys/rotate {id}`는 최대 10분의 전환을 시작하며 새 데이터 키를 한 번만 반환합니다. `POST /api/keys/rotate/commit {id,rotationId}`는 확정하고, `DELETE /api/keys/rotate {id,rotationId}`는 취소합니다. 모두 관리 인증이 필요하며 데이터 키로 호출할 수 없습니다. `POST /api/session/logout`은 현재 `gui-session`, 일치하는 Origin, CSRF가 필요합니다. 관리자 토큰은 403을 받고 동의 세션을 만들거나 교환할 수 없습니다.

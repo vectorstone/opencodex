@@ -5,7 +5,6 @@ import {
   mkdtempSync,
   readFileSync,
   renameSync,
-  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -15,6 +14,7 @@ import {
   buildWindowsTrayLauncherScript,
   buildWindowsTrayPowerShellCommand,
   buildWindowsTrayRunCommand,
+  launchInstalledWindowsTray,
   launchWindowsTrayHost,
   parseWindowsTrayRunValue,
   readWindowsTrayRunValueWithAsyncRunner,
@@ -39,6 +39,7 @@ import { handleManagementAPI } from "../src/server/management-api";
 import { MEMORY_DRAIN_RESTART_MS, REPLACEMENT_READY_TIMEOUT_MS } from "../src/server/management/system-restart";
 import type { OcxConfig } from "../src/types";
 import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "./helpers/test-budget";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const entry: WindowsTrayEntry = {
   bun: "C:\\사용자 공간\\%TEMP% ! ^ ( ) & 검증\\bun.exe",
@@ -86,7 +87,7 @@ describe("Windows tray packaging and command safety", () => {
       resetHardenedStateForTests();
       if (previousUsername === undefined) delete process.env.USERNAME;
       else process.env.USERNAME = previousUsername;
-      rmSync(root, { recursive: true, force: true });
+      removeTreeWithRetry(root);
     }
   });
 
@@ -132,6 +133,31 @@ describe("Windows tray packaging and command safety", () => {
     expect(runCommand.toLowerCase()).toContain("wscript.exe");
     expect(runCommand.length).toBeLessThanOrEqual(260);
   });
+
+  test("launches the installed tray through hidden wscript with bounded stdio", () => {
+    const calls: Array<{
+      file: string;
+      args: readonly string[];
+      options: { stdio: "ignore"; windowsHide: true; timeout: number };
+    }> = [];
+    const launcherPath = "C:\\Users\\Test\\.opencodex\\opencodex-tray.vbs";
+
+    launchInstalledWindowsTray(launcherPath, {
+      systemRoot: "C:\\Windows",
+      run: (file, args, options) => { calls.push({ file, args, options }); },
+    });
+
+    expect(calls).toEqual([{
+      file: "C:\\Windows\\System32\\wscript.exe",
+      args: ["//B", "//NoLogo", launcherPath],
+      options: {
+        stdio: "ignore",
+        windowsHide: true,
+        timeout: 15_000,
+      },
+    }]);
+  });
+
   test("keeps UNC backslashes literal in the VBS Run command", () => {
     const uncRoot = "\\\\server\\share";
     const uncEntry: WindowsTrayEntry = {
@@ -306,9 +332,16 @@ describe("Windows tray packaging and command safety", () => {
     const cli = readFileSync(join(import.meta.dir, "..", "src", "cli", "index.ts"), "utf8");
     expect(typescript).not.toContain("\u0000");
     expect(typescript).toContain("OCX_TRAY_ENTRY_B64");
-    expect(typescript).toContain("$startInfo.UseShellExecute = $true");
+    expect(typescript).not.toContain("$startInfo.UseShellExecute = $true");
+    expect(typescript).toContain("$startInfo.UseShellExecute = $false");
+    expect(typescript).toContain("$startInfo.CreateNoWindow = $true");
+    expect(typescript).toContain("$startInfo.EnvironmentVariables['OCX_TRAY_ENTRY_B64'] = $env:OCX_TRAY_ENTRY_B64");
     expect(source).toContain("System.Threading.Mutex");
     expect(source).toContain("System.Threading.EventWaitHandle");
+    expect(source).toContain("[System.Windows.Forms.Application]::EnableVisualStyles()");
+    expect(source.indexOf("[void]$stopEvent.Reset()")).toBeGreaterThan(source.indexOf("if (-not $createdNew)"));
+    expect(source).toMatch(/\$timer\.add_Tick\(\{\s*try \{/);
+    expect(source).toContain('Write-ActionLog "timer tick failed: $($_.Exception.GetType().Name)"');
     expect(source).toContain("GetFullPath");
     expect(source).toContain("GetPathRoot");
     expect(source).toContain("$heartbeat.hostPid = $HostPid");
@@ -416,7 +449,7 @@ describe("Windows tray packaging and command safety", () => {
       if (childPid > 0) {
         try { process.kill(childPid); } catch { /* exact test child already exited */ }
       }
-      rmSync(directory, { recursive: true, force: true });
+      removeTreeWithRetry(directory);
     }
   }, { timeout: TRAY_LAUNCH_TIMEOUT_MS });
 

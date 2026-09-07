@@ -44,6 +44,13 @@ are emitted only as selector-qualified rows whose account provenance matches. Th
 the bare native or API-key model list. This keeps account-scoped upstream ids such as
 `gpt-daybreak-blue-latest` callable without treating them as a static release allowlist.
 
+Account-gated native ids are a stricter subset. Their authenticated ChatGPT `/models` roster is
+cached per credential generation with a bounded timeout. A bare gated row is emitted only when at
+least one confirmed eligible account reports it; a selector-qualified row is emitted only when the
+mapped account reports it. A failed or malformed discovery is not positive evidence and therefore
+hides the gated row until a later refresh. The same snapshot gates Pool selection, so the catalog
+and runtime cannot disagree by advertising through one account and dispatching through another.
+
 The app-server's model list comes from this shared catalog, not from patching the App. Codex Desktop
 may still apply its remote native-only allowlist after `model/list`; an explicitly configured combo
 `nativeAlias` is the bounded compatibility path. It replaces one supported bare native row with a
@@ -72,7 +79,9 @@ instead. Codex's own `models_cache.json` is a different cache, invalidated by ca
 ## Startup readiness
 
 Each `startServer` invocation owns a private, one-shot readiness gate created before the listener
-binds. `handleStart` supplies its gate and transitions it after the shared catalog sync settles.
+binds. `handleStart` supplies its gate and transitions it only after the shared catalog sync and
+best-effort Claude Code roster reconciliation have both settled. The catalog sync remains the
+authority for ready versus failed; a roster warning does not make an otherwise healthy proxy fail.
 Calls without a supplied gate receive a fresh private gate that intentionally remains pending. Only
 `ok: true` with no nonempty warning becomes ready; `null`, a throw, `ok !== true`, or a nonempty
 warning becomes failed. State is isolated per server instance.
@@ -92,8 +101,11 @@ liveness contract.
 ## Entry shape
 
 Routed entries keep Codex-required metadata such as reasoning levels, shell type, API support flags,
-base instructions, modalities, auto-compact fields, and strict parser booleans. The public slug and
-display name use `provider/model`.
+base instructions, modalities, auto-compact fields, and strict parser booleans. The public slug uses
+the canonical `provider/model`. Its display name uses the provider's exact `modelDisplayNames` override first,
+then trusted catalog metadata such as a configured qualified provider/model alias, then the public slug.
+This overlay never changes route identity or the upstream wire model, and its catalog fingerprint makes
+a label edit refresh Codex output.
 
 ## Native passthrough
 
@@ -161,6 +173,23 @@ with `multiAgentMode` field.
 The `multi_agent_v2` feature flag and the logical maximum thread count are separate from
 `multiAgentMode` (`src/codex/features.ts`): the mode decides which surface Codex advertises, while
 the flag and thread count decide what the native runtime allows.
+
+`keepNativeChatGptOnV1` makes mode `v2` a catalog-driven hybrid: OpenCodex disables the global
+`multi_agent_v2` override because codex-rs resolves that override before a model row's explicit
+`multi_agent_version`. Native ChatGPT rows then select v1 from the catalog and routed rows select
+v2. An explicit attempt to enable the global flag while the hybrid pin is active is rejected.
+
+Routed V2 collaboration calls use a separate wire-level plaintext contract. Codex marks the
+`message` schema on `collaboration.spawn_agent`, `send_message`, and `followup_task` as encrypted;
+when those namespace children are flattened for a third-party Responses provider,
+`src/responses/namespace-tool-compat.ts` removes only that nested marker so the provider returns
+ordinary JSON arguments. During authorized alias restoration it attaches
+`encrypted_function_args: []` to the same three calls. Codex 0.151+ interprets that exact marker as
+`DirectPlaintextMessage`, so child and peer `agent_message` items contain `input_text` rather than
+ChatGPT-only ciphertext. The marker is stripped from replay before the history is sent back to a
+third-party gateway; the ordinary JSON arguments remain. Other encrypted schema fields, non-empty
+encrypted metadata, and other tools are preserved, and the routed unreadable-task guard remains the
+fail-closed boundary.
 
 ### What the five-model `spawn_agent` window is, and how V1 differs from V2
 
@@ -281,6 +310,21 @@ the request, and they never raise it.
   연결한 사용자 설정에는 이 capability 분류가 전파되지 않는다.
 
 [Decision Log]
+- 목적과 의도: GitHub Copilot의 live model catalog가 명시하는 모델별 image-input 지원을
+  Codex catalog에 정확히 보존한다.
+- 기존 구현 및 제약 조건: 공용 discovery parser는 직접 `capabilities.vision`과 표준 modality
+  필드는 읽었지만 Copilot의 `capabilities.supports.vision` 중첩 boolean은 읽지 않아 모든
+  Copilot 모델이 text-only fallback으로 축소되었다.
+- 검토한 주요 대안: 모든 Copilot 모델에 정적 vision seed를 추가하기, 모델 이름을 외부
+  metadata alias에 연결하기, live 모델별 boolean을 공용 parser에서 해석하기.
+- 선택한 방식: 직접 vision boolean이 없을 때만 중첩 `supports.vision`의 명시적 boolean을
+  사용하고, `false`도 보존하며 malformed 값은 추론하지 않는다.
+- 다른 대안 대신 이 방식을 선택한 이유: live 응답이 모델별 capability의 가장 좁은 근거라서
+  새 모델에도 적용되며 text-only 모델을 image-capable로 과장하지 않는다.
+- 장점, 단점 및 영향: Copilot vision 모델은 image attachment를 받을 수 있고 명시적 text-only
+  모델은 계속 차단된다. Capability를 제공하지 않는 모델은 기존 fallback을 유지한다.
+
+[Decision Log]
 - 목적과 의도: bare `defaultModel` selectors that route into third-party providers must keep their
   adapter-owned effort ladder; only true ChatGPT-native requests should receive the mock-max repair.
 - 기존 구현 및 제약 조건: `nativeEffortClamp` already needed the original request id because
@@ -333,3 +377,23 @@ native passthrough is enabled; `modelMap` claims and `nativePassthrough:false` r
 guard avoids creating oversized skill messages before the proxy can intervene; inbound elision remains
 the fallback if a client still sends a blocked bundle. An explicit empty list disables both routed-model
 behaviors.
+
+[Decision Log]
+- 목적과 의도: keep generated Claude Code `ocx-*.md` roster files synchronized when the proxy is
+  started or ensured on Linux, Windows, and macOS, including background service restarts.
+- 기존 구현 및 제약 조건: explicit `ocx claude` launches and Management API writes reconciled the
+  files, while the startup call inside `injectSystemEnv` ran only on macOS with system-env enabled.
+  `startServer` is also used as an in-process library/test primitive and cannot safely mutate the
+  real user home on every invocation.
+- 검토한 주요 대안: write from `startServer`; duplicate hooks in each OS service manager; reconcile
+  once from the owning CLI lifecycle after the listener becomes available.
+- 선택한 방식: the foreground/service start and live-proxy ensure paths call one best-effort helper
+  after bind, using the live Management API context-window map and the existing marker-verified
+  atomic roster writer. macOS system-env startup keeps its existing shared-window sync and skips the
+  duplicate call.
+- 다른 대안 대신 이 방식을 선택한 이유: it covers every supported service entrypoint without
+  adding home-directory side effects to server-library consumers or creating a second roster format.
+- 장점, 단점 및 영향: stale OpenCodex-owned definitions converge on every daemon start, disabled integration
+  prunes them without provider discovery, and catalog failure falls back to unmarked definitions so
+  startup remains available. A later dashboard save or `ocx claude` launch restores missing context
+  markers after a transient failure.

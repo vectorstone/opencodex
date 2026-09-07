@@ -3,6 +3,7 @@ import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import type { OcxRequestOptions, OcxTool } from "../../types";
 import { namespacedToolName, toolChoiceAliases } from "../../types";
 import { McpToolDefinitionSchema, McpToolsSchema, type McpToolDefinition } from "./gen/agent_pb";
+import { CODE_MODE_RESULT_ECHO_SENTENCE } from "../exec-tool-result-normalize";
 
 export const OCX_RESPONSES_TOOL_PROVIDER = "opencodex-responses";
 export const CODEX_EXEC_COMMAND_TOOL = "exec_command";
@@ -11,6 +12,7 @@ export const CODEX_SHELL_COMMAND_TOOL = "shell_command";
 export const CODEX_UNIFIED_EXEC_TOOL = "exec";
 export const CODEX_WAIT_TOOL = "wait";
 export const CODEX_APPLY_PATCH_TOOL = "apply_patch";
+export const CODEX_TOOL_SEARCH_TOOL = "tool_search";
 export const CURSOR_EDIT_FILE_TOOL = "edit_file";
 export const CURSOR_MULTI_EDIT_TOOL = "multi_edit";
 export const CURSOR_STRUCTURED_EDIT_TOOLS = [CURSOR_EDIT_FILE_TOOL, CURSOR_MULTI_EDIT_TOOL] as const;
@@ -168,8 +170,10 @@ function cursorToolChoiceMatches(
     }
     return tool.name === choiceName || cursorToolWireName(tool) === choiceName;
   }
-  if (tool.name === choiceName || cursorToolWireName(tool) === choiceName) return true;
-  return cursorToolChoiceAliases(tool).includes(choiceName);
+  if (tool.name === choiceName) return true;
+  if (cursorToolChoiceAliases(tool).includes(choiceName)) return true;
+  return cursorToolWireName(tool) === choiceName
+    && !catalog.some(candidate => candidate.name === choiceName);
 }
 
 export function isBareCodexShellBridgeTool(tool: Pick<OcxTool, "namespace" | "name">): boolean {
@@ -319,8 +323,37 @@ export function cursorRequestAdvertisesStructuredEdits(
   return cursorStructuredEditTools(tools, toolChoice).length > 0;
 }
 
+const CURSOR_CLIENT_TOOL_WIRE_PREFIX = "ocx_client_";
+const CURSOR_PROXY_OWNED_BARE_TOOL_NAMES = new Set([
+  CODEX_UNIFIED_EXEC_TOOL,
+  CODEX_WAIT_TOOL,
+  CODEX_EXEC_COMMAND_TOOL,
+  CODEX_SHELL_COMMAND_TOOL,
+  CODEX_APPLY_PATCH_TOOL,
+  CURSOR_EDIT_FILE_TOOL,
+  CURSOR_MULTI_EDIT_TOOL,
+  CODEX_TOOL_SEARCH_TOOL,
+]);
+
+/** Avoid collisions with Cursor's private bare-tool namespace. */
+function isCursorBareClientToolWireAliased(
+  tool: Pick<OcxTool, "namespace" | "name">,
+): boolean {
+  return !tool.namespace
+    && !CURSOR_PROXY_OWNED_BARE_TOOL_NAMES.has(tool.name);
+}
+
 export function cursorToolWireName(tool: Pick<OcxTool, "namespace" | "name">): string {
+  if (isCursorBareClientToolWireAliased(tool)) {
+    return `${CURSOR_CLIENT_TOOL_WIRE_PREFIX}${tool.name}`;
+  }
   return namespacedToolName(tool.namespace, tool.name);
+}
+
+function clientSemanticToolNameFromCursorWire(name: string): string {
+  return name.startsWith(CURSOR_CLIENT_TOOL_WIRE_PREFIX)
+    ? name.slice(CURSOR_CLIENT_TOOL_WIRE_PREFIX.length)
+    : name;
 }
 
 /**
@@ -334,6 +367,26 @@ const CURSOR_MCP_DISPLAY_PREFIX = `mcp_${OCX_RESPONSES_TOOL_PROVIDER}_`;
 
 export function normalizeCursorWireName(name: string): string {
   return name.startsWith(CURSOR_MCP_DISPLAY_PREFIX) ? name.slice(CURSOR_MCP_DISPLAY_PREFIX.length) : name;
+}
+
+/**
+ * #2305: some models emit a TEXTUAL pseudo tool call ("[TOOL_CALL]name[ARGS]{...}")
+ * instead of a real frame, using Cursor's display alias as the name. Text-mode clients
+ * (Pi) parse that text and then cannot dispatch the undeclared display name. Rewrite the
+ * display alias to the advertised wire name ONLY inside the marker pair — prose that
+ * merely mentions the alias stays untouched, and the scope guard is the exact
+ * `mcp_${OCX_RESPONSES_TOOL_PROVIDER}_` prefix, never generic `mcp_`.
+ * Known limit (recorded in devlog 230): a marker split across two streaming deltas is
+ * not rewritten; tail-buffering is deferred until a live trace shows split markers.
+ */
+const CURSOR_TEXT_TOOL_MARKER = new RegExp(
+  String.raw`\[TOOL_CALL\](${CURSOR_MCP_DISPLAY_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^\[\]]+)\[ARGS\]`,
+  "g",
+);
+
+export function normalizeCursorTextToolMarkers(text: string): string {
+  if (!text.includes(CURSOR_MCP_DISPLAY_PREFIX)) return text;
+  return text.replace(CURSOR_TEXT_TOOL_MARKER, (_match, name: string) => `[TOOL_CALL]${normalizeCursorWireName(name)}[ARGS]`);
 }
 
 export function responsesToolNameFromCursorWire(name: string, cursorToolNameMap?: ReadonlyMap<string, string>): string {
@@ -570,7 +623,7 @@ function quotedNames(names: readonly string[]): string {
 }
 
 function advertisedCoversNeighbor(wireNames: readonly string[], neighbor: (typeof NEIGHBOR_AGENT_TOOL_NAMES)[number]): boolean {
-  const advertised = new Set(wireNames.map(name => name.toLowerCase()));
+  const advertised = new Set(wireNames.map(name => clientSemanticToolNameFromCursorWire(name).toLowerCase()));
   if (advertised.has(neighbor.toLowerCase())) return true;
   return NEIGHBOR_AGENT_TOOL_ALIASES[neighbor].some(alias => advertised.has(alias.toLowerCase()));
 }
@@ -581,7 +634,7 @@ function unavailableNeighborAgentToolNames(wireNames: readonly string[]): string
 
 function discoveryToolLabel(wireNames: readonly string[]): string | undefined {
   const labels: string[] = [];
-  if (wireNames.includes("tool_search")) labels.push("`tool_search`");
+  if (wireNames.includes(CODEX_TOOL_SEARCH_TOOL)) labels.push(`\`${CODEX_TOOL_SEARCH_TOOL}\``);
   if (wireNames.some(name => name.startsWith("mcp__"))) labels.push("MCP");
   if (wireNames.some(name => /resource/i.test(name))) labels.push("resource discovery");
   return labels.length > 0 ? labels.join(", ") : undefined;
@@ -631,10 +684,13 @@ export function buildCursorToolGuidanceSystemNote(
     // Code mode: shell/edit/MCP live inside freeform `exec` as nested helpers. Without this the
     // model probes for a top-level shell tool that is not there.
     codeMode
-      ? `\`${CODEX_UNIFIED_EXEC_TOOL}\` is Codex code mode: its body is JavaScript evaluated in a V8 isolate, not a shell command and not Node. Shell, file edits, and MCP are nested helpers called INSIDE that body as \`await tools.<name>(...)\`, for example \`await tools.exec_command({cmd: \"ls\"})\`. Read the tool description and the isolate global \`ALL_TOOLS\` (not \`tools.ALL_TOOLS\`) for helpers this turn provides; absence from the top-level catalog or from \`exec\`'s description is not absence. Those nested helpers are not themselves top-level tools, so do not call \`exec_command\` or \`shell_command\` at the top level here${codeModeOtherTopLevelNames.length > 0 ? `; every other tool this turn lists, including ${quotedNames(codeModeOtherTopLevelNames)}, remains callable at the top level as usual` : ""}.`
+      ? `\`${CODEX_UNIFIED_EXEC_TOOL}\` is Codex code mode: its body is JavaScript evaluated in a V8 isolate, not a shell command and not Node. Shell, file edits, and MCP are nested helpers called INSIDE that body as \`await tools.<name>(...)\`, for example \`await tools.exec_command({cmd: \"ls\"})\`. Read the tool description and the isolate global \`ALL_TOOLS\` (not \`tools.ALL_TOOLS\`) for helpers this turn provides; absence from the top-level catalog or from \`exec\`'s description is not absence. Those nested helpers are not themselves top-level tools, so do not call \`exec_command\` or \`shell_command\` at the top level here${codeModeOtherTopLevelNames.length > 0 ? `; every other tool this turn lists, including ${quotedNames(codeModeOtherTopLevelNames)}, remains callable at the top level as usual` : ""}. Nested \`tools.apply_patch(input)\` is host-executed: the string must begin exactly with \`*** Begin Patch\` and end with \`*** End Patch\` (no trailing \`***\` on those lines). OpenCodex does not rewrite JavaScript inside exec, so a decorated \`*** Begin Patch ***\` envelope is rejected by Codex before the file is touched.`
       : undefined,
     codeMode
-      ? "In code mode the isolate returns nothing on its own: call `text(...)` (or `notify(...)`) on any value you need to see, or the call completes with empty output. There is no `require`, no `module`, and no filesystem or network globals; reach the host only through the nested helpers."
+      ? CODE_MODE_RESULT_ECHO_SENTENCE + " There is no `require`, no `module`, and no filesystem or network globals; reach the host only through the nested helpers."
+      : undefined,
+    codeMode
+      ? "NEVER attempt Cursor-native Shell, Read, Grep, List, or any tool absent from the catalog — they are not executed in this environment and every probe wastes a turn. The exec code cell (with its nested helpers) is the ONLY execution surface; go to it directly on the FIRST attempt and do not narrate switching surfaces."
       : undefined,
     hasBareExec
       ? `${shellBridgeLabel} is the Codex Responses shell bridge for this turn, exposed through Cursor's tool protocol; it is not an external MCP server tool. \`shell_command\` and \`exec_command\` are aliases of the same bridge.`
@@ -643,7 +699,10 @@ export function buildCursorToolGuidanceSystemNote(
       ? "Your tool list may display it under a longer `mcp_opencodex-responses_shell_command` / `mcp_opencodex-responses_exec_command` name; those are the SAME tool — call whichever your list shows, and do not comment on the naming difference to the user."
       : undefined,
     hasBareExec
-      ? `Prefer the Codex shell bridge over Cursor-native Shell/Read. If a Cursor-native file read, directory listing, grep, or shell operation is rejected, continue with the listed catalog tool ${shellBridgeLabel}.`
+      ? `NEVER attempt Cursor-native Shell, Read, Grep, List, or any tool not in the catalog above — they are not executed locally in this environment and every attempt wastes a turn and can stall the session. ${shellBridgeLabel} is the ONLY shell surface; go to it directly on the FIRST attempt, never as a fallback after probing a native tool. Do not narrate switching surfaces ("native is blocked, using the bridge instead") — there is exactly one surface.`
+      : undefined,
+    hasBareExec
+      ? "Tool-selection commentary is forbidden: for any shell, read, grep, list, or file operation, your FIRST visible action is the bridge call itself — never a sentence about which tool you will use, which tool was redirected, or switching surfaces. Words like 차단/전환/blocked/switching must not appear in your output for tool-routing reasons."
       : undefined,
     hostShellNote,
     "Cursor product features (Chronicle, screen recording, Notes, Plans, background agents) are available only if this turn's catalog lists a matching tool; do not offer or promise them otherwise.",
@@ -654,6 +713,9 @@ export function buildCursorToolGuidanceSystemNote(
       ? structuredEditNames.length > 0
         ? `For file edits, prefer the structured edit tools ${quotedNames(structuredEditNames)} — they take replacements that OpenCodex converts into Codex \`apply_patch\` changes. Include exact leading whitespace in old_string/new_string. Use \`apply_patch\` directly only with a \`*** Begin Patch\` envelope and bare \`@@\` hunks (never git-style \`@@ -n,m +n,m @@\`); never emit patch-like plain text as tool arguments.`
         : "For file edits, use the `apply_patch` tool, not built-in file write/delete tools."
+      : undefined,
+    hasApplyPatch
+      ? "Creating or modifying file CONTENT via shell redirection (`>`, `>>`, `printf`/`echo` into a file, `cat <<EOF`, `sed -i`) is forbidden while apply_patch or the structured edit tools are advertised — use those edit tools so the change is reviewable. Shell output redirection is fine for logs/scratch pipes that are not the deliverable file."
       : undefined,
     hasBareExec
       ? "For tool-count demos, each counted tool must be a separate Codex shell-bridge invocation/result; do not collapse several requested tools into one chained shell command."
@@ -667,7 +729,7 @@ export function buildCursorToolGuidanceSystemNote(
       : undefined,
     "Do not count or report a tool call unless a tool result was actually returned.",
     hasBareExec
-      ? `If a Cursor-native file read, directory listing, grep, or shell operation is rejected by the runtime, use ${shellBridgeLabel} with an equivalent host-shell-safe command (POSIX: \`cat\`/\`ls\`/\`rg\`; Windows PowerShell: \`Get-Content\`/\`Get-ChildItem\`/\`Select-String\`). For file edits, use ${structuredEditNames.length > 0 ? `the structured edit tools (${quotedNames(structuredEditNames)}) or ` : ""}\`apply_patch\` when available.`
+      ? `For every file read, directory listing, grep, or shell operation use ${shellBridgeLabel} directly with host-shell-safe commands (POSIX: \`cat\`/\`ls\`/\`rg\`; Windows PowerShell: \`Get-Content\`/\`Get-ChildItem\`/\`Select-String\`). For file edits, use ${structuredEditNames.length > 0 ? `the structured edit tools (${quotedNames(structuredEditNames)}) or ` : ""}\`apply_patch\` when available.`
       : undefined,
   ].filter((note): note is string => typeof note === "string");
   return notes.join(" ");

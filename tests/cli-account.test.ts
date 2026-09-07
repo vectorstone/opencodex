@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { PassThrough, Readable } from "node:stream";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,7 @@ import {
 } from "../gui/src/account-priority";
 import type { OcxConfig } from "../src/types";
 import { ACCOUNT_IMPORT_MAX_BYTES } from "../src/oauth/account-import";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const RAW_SENTINEL = "test-key-rawsentinel1234567890";
 const MASKED_SENTINEL = "test****7890";
@@ -52,6 +53,8 @@ let activeReadFailure: { status: number; error: string } | null = null;
 let oauthListFailure: { provider: string; status: number; error: string } | null = null;
 let keyListFailure: { provider: string; status: number; error: string } | null = null;
 let codexRefreshFailure: MockFailure | null = null;
+/** When set, the provider-quotas stub includes this row as a passive Muse observation. */
+let museProviderQuotaReport: Record<string, unknown> | null = null;
 let autoSwitchUpdateFailure: MockFailure | null = null;
 let deleteFailure: MockFailure | null = null;
 let postDeleteReadFailure: MockFailure | null = null;
@@ -103,6 +106,11 @@ function fixtureConfig(): OcxConfig {
         baseUrl: "https://openrouter.ai/api/v1",
         authMode: "key",
         apiKey: RAW_SENTINEL,
+      },
+      "meta-muse": {
+        adapter: "openai-responses",
+        baseUrl: "https://api.meta.ai/v1",
+        authMode: "oauth",
       },
       ollama: {
         adapter: "openai-chat",
@@ -197,13 +205,16 @@ async function mockManagementApi(req: Request): Promise<Response> {
   if (req.method === "GET" && url.pathname === "/api/provider-quotas") {
     return json({
       generatedAt: Date.now(),
-      reports: [{
-        provider: "anthropic",
-        label: "Anthropic",
-        source: "anthropic:usage",
-        quota: { fiveHourPercent: 31, fiveHourResetAt: 1_800_000_000, updatedAt: 1_700_000_000 },
-        updatedAt: 1_700_000_000,
-      }],
+      reports: [
+        {
+          provider: "anthropic",
+          label: "Anthropic",
+          source: "anthropic:usage",
+          quota: { fiveHourPercent: 31, fiveHourResetAt: 1_800_000_000, updatedAt: 1_700_000_000 },
+          updatedAt: 1_700_000_000,
+        },
+        ...(museProviderQuotaReport ? [museProviderQuotaReport] : []),
+      ],
     });
   }
 
@@ -323,6 +334,16 @@ async function mockManagementApi(req: Request): Promise<Response> {
   }
 
   if (req.method === "POST" && url.pathname === "/api/codex-auth/login") {
+    // A device login answers with the verification page plus the short code,
+    // exactly as the Codex-auth route does once #3366 stops dropping it.
+    if ((body as { device?: boolean } | undefined)?.device === true) {
+      return json({
+        url: "https://auth.openai.com/codex/device",
+        flowId: "flow-device",
+        deviceCode: "ABCD-EFGH",
+        instructions: "Enter code: ABCD-EFGH",
+      });
+    }
     return json({ url: "https://auth.example/authorize", flowId: "flow-mock" });
   }
 
@@ -395,6 +416,92 @@ async function run(args: string[], deps: AccountDeps = defaultDeps()): Promise<C
   return { code, stdout, stderr, output: [stdout, stderr].filter(Boolean).join("\n") };
 }
 
+/**
+ * `--device` is the headless login path (#3366): the operator reads a short
+ * code here and enters it on another machine, so the code and the verification
+ * URL both have to reach stdout.
+ */
+describe("account login --device", () => {
+  test("prints the verification URL and device code to a piped stdout while polling", async () => {
+    // The block is written to fd 1 directly (#1007), so it needs a real pipe.
+    const child = Bun.spawn({
+      cmd: [process.execPath, "run", fileURLToPath(new URL("./helpers/account-login-device-child.ts", import.meta.url))],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const reader = child.stdout.getReader();
+      let received = "";
+      // The marker is emitted when the request lands, which is BEFORE the CLI
+      // prints its block — wait for both, not just the first one.
+      while (!received.includes("device-requested") || !received.includes("Flow: flow-device")) {
+        const { value, done } = await Promise.race([
+          reader.read(),
+          Bun.sleep(5_000).then(() => ({ value: undefined, done: true }) as const),
+        ]);
+        if (done) break;
+        if (value) received += new TextDecoder().decode(value);
+      }
+      expect(received).toContain("https://auth.openai.com/codex/device");
+      expect(received).toContain("Device code: ABCD-EFGH");
+      expect(received).toContain("Flow: flow-device");
+      // The flag reached the server, not just the terminal.
+      expect(received).toContain("device-requested");
+      // Still polling: a device login must not give up while the user is away.
+      expect(child.exitCode).toBeNull();
+    } finally {
+      child.kill();
+      await child.exited.catch(() => {});
+    }
+  }, 15_000);
+
+  test("asks the server for device mode", async () => {
+    requests.length = 0;
+    await run(["login", "openai", "--device", "--no-wait", "--json"]);
+
+    const start = requests.find(entry => entry.path === "/api/codex-auth/login");
+    expect((start?.body as { device?: boolean } | undefined)?.device).toBe(true);
+  });
+
+  test("preserves the device code under --no-wait --json", async () => {
+    const result = await run(["login", "openai", "--device", "--no-wait", "--json"]);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      deviceCode: "ABCD-EFGH",
+      url: "https://auth.openai.com/codex/device",
+    });
+  });
+
+  test("is rejected for providers that have no device flow", async () => {
+    const result = await run(["login", "anthropic", "--device", "--no-wait"]);
+
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain("--device is not supported for provider 'anthropic'");
+  });
+
+  test("is accepted as a no-op for providers that are already device flows", async () => {
+    // kimi/nous/github-copilot have no other login, so --device is true of them.
+    const result = await run(["login", "kimi", "--device", "--no-wait", "--json"]);
+
+    expect(result.code).toBe(0);
+  });
+
+  test("waits out the full 15-minute grant instead of the 5-minute browser budget", async () => {
+    // A budget regression to 150 attempts is invisible to an output assertion,
+    // so read the loop bound from the source itself.
+    const source = await Bun.file(new URL("../src/cli/account-auth.ts", import.meta.url)).text();
+    const budget = /const maxAttempts = device \? (\d+) : (\d+);/.exec(source);
+    expect(budget).toBeTruthy();
+    // 2s per attempt. 900s is the grant itself; the budget must also leave
+    // settlement margin for the token exchange after the final poll, so 450
+    // (exactly 900s) is a regression, not a pass.
+    expect(Number(budget?.[1]) * 2).toBeGreaterThanOrEqual(960);
+    // The browser path is unchanged.
+    expect(budget?.[2]).toBe("150");
+  });
+});
+
 beforeAll(() => {
   server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: mockManagementApi });
   baseUrl = `http://127.0.0.1:${server.port}`;
@@ -411,6 +518,7 @@ beforeEach(() => {
   oauthListFailure = null;
   keyListFailure = null;
   codexRefreshFailure = null;
+  museProviderQuotaReport = null;
   autoSwitchUpdateFailure = null;
   deleteFailure = null;
   postDeleteReadFailure = null;
@@ -550,10 +658,14 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     expect(result.stderr).toContain("anthropic");
   });
 
-  test("9: an OAuth API 404 exits one and surfaces the server error", async () => {
+  test("9: an OAuth API 404 exits four and surfaces the server error", async () => {
     const result = await run(["use", "anthropic", "nope"]);
 
-    expect(result.code).toBe(1);
+    // 4 (not 1) since #2698 aligned the account client with the exit-code vocabulary
+    // runtime-api.ts already used: 2 usage, 4 not-found, 5 conflict, 1 otherwise. Before
+    // that, every account failure exited 1, so a script could not tell a missing account
+    // from a concurrent mutation or a dead proxy. Scripts testing `!== 0` are unaffected.
+    expect(result.code).toBe(4);
     expect(result.stderr).toContain("anthropic account nope was not found");
   });
 
@@ -585,12 +697,15 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     expect(machine.output).not.toContain(RAW_SENTINEL);
   });
 
-  test("12: list kiro prints the single-slot replacement note", async () => {
+  test("12: list kiro does not claim a single login slot", async () => {
+    // Kiro pools multiple accounts since d82b3049d (quota-aware ranking + 429 rotation), so
+    // the old replacement-style note contradicted the runtime. Asserting its ABSENCE is what
+    // keeps the CLI and the docs from drifting apart again.
     const result = await run(["list", "kiro"]);
 
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("single login slot");
-    expect(result.stdout).toContain("re-login replaces the current account");
+    expect(result.stdout).not.toContain("single login slot");
+    expect(result.stdout).not.toContain("re-login replaces the current account");
   });
 
   test("13: bare account and use without an id return usage errors", async () => {
@@ -757,6 +872,40 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     )).toHaveLength(4);
   });
 
+  /*
+   * A passively observed quota has nothing to probe, so the generic "no quota report
+   * available" line describes a failure that never happened. The refresh must stay
+   * probe-free -- obtaining a fresh Muse value would mean spending an inference turn --
+   * so only the message changes.
+   */
+  test("19b: refresh meta-muse explains that nothing is probed instead of reporting a failure", async () => {
+    const human = await run(["refresh", "meta-muse"]);
+
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain("reports usage only during a streaming response");
+    expect(human.stdout).toContain("nothing to refresh");
+    expect(human.stdout).not.toContain("no quota report available");
+  });
+
+  /*
+   * Once the active account has an observation, the same refresh prints it -- still with
+   * zero upstream calls, because the row comes from the passive cache, not a probe.
+   */
+  test("19c: refresh meta-muse prints the cached observation when one exists", async () => {
+    museProviderQuotaReport = {
+      provider: "meta-muse",
+      label: "Meta Muse Code (CLI credential)",
+      source: "meta-muse:subscription-observation",
+      quota: { fiveHourPercent: 21, fiveHourResetAt: 1_800_000_000, updatedAt: 1_700_000_000 },
+      updatedAt: 1_700_000_000,
+    };
+    const human = await run(["refresh", "meta-muse"]);
+
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain("5h 21%");
+    expect(human.stdout).not.toContain("nothing to refresh");
+  });
+
   test("20: auto-switch on, off, threshold and status use the exact contracts", async () => {
     const on = await run(["auto-switch", "openai", "on"]);
     const off = await run(["auto-switch", "openai", "off"]);
@@ -785,7 +934,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     const missingProvider = await run(["auto-switch"]);
 
     expect(wrongProvider.code).toBe(1);
-    expect(wrongProvider.stderr).toContain("auto-switch only applies to the openai Codex account pool");
+    expect(wrongProvider.stderr).toContain("auto-switch only applies to the openai Codex account pool or a generic OAuth provider pool");
     expect(invalidThreshold.code).toBe(1);
     expect(invalidThreshold.stderr).toContain("integer 0-100");
     expect(missingProvider.code).toBe(1);
@@ -1676,7 +1825,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
       expect(file.stdout).toContain("1 imported, 0 updated, 0 failed");
       expect(file.output).not.toContain(canary);
     } finally {
-      rmSync(directory, { recursive: true, force: true });
+      removeTreeWithRetry(directory);
     }
 
     const beforeOversized = requests.length;

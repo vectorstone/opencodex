@@ -36,8 +36,8 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   {
     name: "recover-history",
-    usage: "ocx recover-history --legacy-openai",
-    summary: "Explicitly recover pre-backup syncResumeHistory rows.",
+    usage: "ocx recover-history --legacy-openai --yes",
+    summary: "Force all user-message opencodex rows to OpenAI for legacy recovery.",
   },
   {
     name: "uninstall",
@@ -61,10 +61,11 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   {
     name: "service",
-    usage: "ocx service [install|start|stop|status|uninstall|remove]",
+    usage: "ocx service [install|repair|restart|start|stop|status|uninstall|remove]",
     summary: "Run as a background service.",
     details: [
-      "With no subcommand, installs/updates and starts the background service.",
+      "With no subcommand, installs when absent or repairs/restarts an existing service.",
+      "`restart` aliases `repair`; healthy Windows tasks are reused, while stale definitions may re-register and elevate.",
       "Use `ocx service status` to see diagnostics and log paths.",
     ],
   },
@@ -86,21 +87,41 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   { name: "ensure", usage: "ocx ensure", summary: "Ensure the proxy is running and Codex config/cache are current." },
   {
+    name: "connect",
+    usage: "ocx connect <url> [--management-url <url>] (--pairing-code-stdin | --admin-token-stdin) [--clients codex,claude] [--management-transport direct|relay] [--catalog-timeout <seconds>] [--no-sync]",
+    summary: "Connect this machine to a remote OpenCodex hub without persisting the one-time authority.",
+    details: [
+      "Status: ocx connect status [--json]",
+      "Rotate or recover: ocx connect rotate (--pairing-code-stdin | --admin-token-stdin) [--json]",
+      "Revoke while connected: ocx connect revoke --admin-token-stdin [--json]",
+      "Machine resources: /api/machine/status, /api/machine/shim, /api/machine/clients, /api/machine/sync, /api/machine/disconnect, and the fixed /api/machine/hub-relay namespace.",
+      "Remote browser self-logout uses /api/session/logout from the GUI; it is distinct from client disconnect and key revocation.",
+      "Credentials are accepted only through stdin; argv and environment credential forms are not supported.",
+    ],
+  },
+  {
+    name: "disconnect",
+    usage: "ocx disconnect [--keep-catalog] [--json]",
+    summary: "Restore local client state offline and clear the remote-hub connection.",
+  },
+  {
     name: "sync",
-    usage: "ocx sync [--restart-codex]",
+    usage: "ocx sync [--restart-codex] [--restart-desktop-app]",
     summary: "Fetch provider models and inject them into Codex config.",
     details: [
       "After writing the catalog, warns if long-lived Codex app-server processes are still running.",
       "--restart-codex sends SIGTERM only to matching app-server / code-mode-host processes (may interrupt active turns).",
+      "--restart-desktop-app (Windows only, opt-in) fully restarts the Codex desktop app so its model picker re-reads the catalog. Never implied by --restart-codex: it ends live conversations.",
     ],
   },
   {
     name: "sync-cache",
-    usage: "ocx sync-cache [--restart-codex]",
+    usage: "ocx sync-cache [--restart-codex] [--restart-desktop-app]",
     summary: "Refresh Codex's model cache from the active catalog.",
     details: [
       "Warns when Codex app-server processes still hold an in-memory model list.",
       "--restart-codex sends SIGTERM only to matching app-server / code-mode-host processes (may interrupt active turns).",
+      "--restart-desktop-app (Windows only, opt-in) fully restarts the Codex desktop app so its model picker re-reads the catalog. Never implied by --restart-codex: it ends live conversations.",
     ],
   },
   { name: "status", usage: "ocx status", summary: "Check proxy server status." },
@@ -108,6 +129,10 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     name: "doctor",
     usage: "ocx doctor",
     summary: "Diagnose environment/network issues (paths, WSL /mnt, proxy env, ChatGPT reachability).",
+    details: [
+      "Default mode is observe-only and reports the native-write coordinator state and exact path.",
+      "After stopping the proxy/service, `--recover-zero-byte-coordinator --yes` moves only a proven zero-byte coordinator to a same-directory backup.",
+    ],
   },
   {
     name: "debug",
@@ -121,7 +146,15 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   { name: "login", usage: "ocx login <provider>", summary: "OAuth or API-key login for a provider." },
   { name: "logout", usage: "ocx logout <provider>", summary: "Remove a stored provider login." },
-  { name: "gui", usage: "ocx gui", summary: "Open the opencodex dashboard." },
+  {
+    name: "gui",
+    usage: "ocx gui [pair --origin <browser-origin> [--json]]",
+    summary: "Open the opencodex dashboard or create a secret single-use remote pairing grant.",
+    details: [
+      "Pairing requires an explicit allowed --origin; there is no localhost or config-derived default.",
+      "The printed grant is secret, single-use, short-lived, and must not be persisted.",
+    ],
+  },
   {
     name: "update",
     usage: "ocx update [--tag latest|preview]",
@@ -158,9 +191,14 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     ],
   },
   {
+    name: "alias",
+    usage: "ocx alias <list|set|rm|defaults> ...",
+    summary: "Manage short provider and model names.",
+  },
+  {
     name: "models",
     aliases: ["model"],
-    usage: "ocx models <list|live|add|edit|remove|enable|disable|provider|selected|context|shadow> ...",
+    usage: "ocx models <list|live|add|edit|remove|enable|disable|provider|selected|preset|context|shadow> ...",
     summary: "List models and manage custom (manually registered) models.",
     details: [
       "List available models from static config with no subcommand (liveModels may add more at runtime).",
@@ -182,7 +220,7 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   {
     name: "combo",
     usage: "ocx combo <list|show|set|remove> ...",
-    summary: "Manage combo failover and round-robin virtual models.",
+    summary: "Manage combo virtual models and routing strategies.",
     details: ["Alias hierarchy: ocx route combo ...", "Use --targets provider/model[:weight],provider/model[:weight]."],
   },
   {
@@ -200,24 +238,44 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     usage: "ocx observe <logs|usage|storage|memory|debug|claude-inbound|injection> ...",
     summary: "Inspect proxy requests, usage, storage, memory, and debug data.",
   },
+  {
+    name: "inspect",
+    usage: "ocx inspect <config|catalog|routing-analytics|pacing|key-providers|codex-prompt|client-config|star|windows-tray> ...",
+    summary: "Read effective config, catalog, analytics, pacing, and the generated client-config snippet.",
+    details: [
+      "`inspect star` reads the repository star status only. Starring uses your GitHub identity and is available from the dashboard alone.",
+    ],
+  },
   { name: "logs", usage: "ocx logs [filters] [--follow] [--json|--jsonl]", summary: "Alias of ocx observe logs." },
   {
     name: "usage",
-    usage: "ocx usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]",
+    usage: "ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]",
     summary: "Alias of ocx observe usage.",
   },
-  { name: "storage", usage: "ocx storage [--json]", summary: "Alias of ocx observe storage." },
+  {
+    name: "storage",
+    usage: "ocx storage <report|cleanup|trash|policy> ...",
+    summary: "Storage report, archived-session cleanup, trash restore, and the cleanup policy.",
+    details: [
+      "A bare `ocx storage` prints the report, as it did when this was an alias of `observe storage`.",
+      "`cleanup` previews by default and only deletes under --yes; `trash restore` and `policy run` also require --yes.",
+    ],
+  },
   { name: "memory", usage: "ocx memory [--json]", summary: "Alias of ocx observe memory." },
   {
     name: "access",
     usage: "ocx access <key|endpoints|models|test> ...",
     summary: "Manage OpenCodex admission API keys and inspect external endpoints.",
+    details: [
+      "Key rotation start uses POST /api/keys/rotate and returns the replacement secret once.",
+      "Commit uses POST /api/keys/rotate/commit; abort uses DELETE /api/keys/rotate with the returned rotation id.",
+    ],
   },
-  { name: "api-key", usage: "ocx api-key <list|create|remove> ...", summary: "Alias of ocx access key." },
+  { name: "api-key", usage: "ocx api-key <list|create|rotate|remove> ...", summary: "Alias of ocx access key." },
   {
     name: "export",
-    usage: "ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode> [--json] [--out <path>] [--force]",
-    summary: "Print a client config (OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness, MiniMax Code, ZCode) wired to the running proxy.",
+    usage: "ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside> [--json] [--out <path>] [--force]",
+    summary: "Print a client config (OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness, MiniMax Code, ZCode, Prime Agent, Aside) wired to the running proxy.",
     details: [
       "--json prints the generated document as JSON on stdout; use --out for the client's native format.",
       "--out <path> writes the native config there and refuses to replace an existing file without --force.",
@@ -230,11 +288,23 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     usage: "ocx grok <status|exclude|include|set|clear|apply> ...",
     summary: "Manage and apply the Grok Build model fence.",
   },
-  { name: "integration", usage: "ocx integration <claude|grok|client> ...", summary: "Manage supported client integrations." },
+  {
+    name: "integration",
+    usage: "ocx integration <claude|grok|client|native> ...",
+    summary: "Manage supported client integrations, and the native client toggles.",
+    details: [
+      "`native` shows or flips the native Claude/Claude Desktop/Codex/Grok toggles; the other subcommands manage the reversible file integrations.",
+    ],
+  },
   {
     name: "system",
-    usage: "ocx system <status|settings|startup|diagnostics|sync|update> ...",
-    summary: "Manage headless runtime settings, startup, sync, diagnostics, and updates.",
+    usage: "ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...",
+    summary: "Manage headless runtime settings, startup, sync, diagnostics, OpenCodex updates, and read-only Codex CLI inspection.",
+    details: [
+      "system update manages OpenCodex itself.",
+      "ocx system codex-cli-update check [--json]",
+      "The Codex CLI inspection command makes no package-registry request, does not execute Codex or npm, install or repair software, control a process, or write configuration or cache state.",
+    ],
   },
   {
     name: "config",
@@ -256,6 +326,7 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
       "Claude Desktop profile:",
       "  ocx claude desktop [apply]                         Save and apply the four-family profile",
       "  ocx claude desktop show [--json]                   Show routes, families, and defaults",
+      "  ocx claude desktop status [--json]                 Show applied state, drift, and health",
       "  ocx claude desktop move <route> <family> [--default]",
       "  ocx claude desktop default <family> <route|none>",
       "  ocx claude desktop export <path|->                 Export versioned JSON (`-` = stdout)",
@@ -273,11 +344,12 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     summary: "Launch opencode wired to the proxy (runtime provider config).",
     details: [
       "Ensures the proxy is running, then execs `opencode` with the generated `provider.opencodex`",
-      "block injected through OpenCode's inline runtime layer (`OPENCODE_CONFIG_CONTENT`). Any",
-      "existing inline config in the environment is preserved and only `provider.opencodex` is",
-      "overwritten for this launch.",
-      "Global/project opencode.json may be read to warn about an existing provider.opencodex",
-      "override; on-disk files are never modified.",
+      "and `providers.opencodex` blocks injected through OpenCode's inline runtime layer",
+      "(`OPENCODE_CONFIG_CONTENT`). Any existing inline config in the environment is preserved",
+      "and only `provider.opencodex` and `providers.opencodex` are overwritten for this launch.",
+      "Only the V2 block (`providers.opencodex`) carries the reasoning-effort variants.",
+      "Global/project opencode.json may be read to warn about an existing provider.opencodex or",
+      "providers.opencodex override; on-disk files are never modified.",
       "Routed models appear in the model picker as opencodex/<provider>/<model>.",
       "Stop using `ocx opencode` and plain `opencode` behaves exactly as before.",
     ],
@@ -336,6 +408,15 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     usage: "ocx health [--json]",
     summary: "Check proxy health. Exits 0 if healthy, 1 otherwise.",
     details: ["Use --json for structured output: {ok, pid, port}."],
+  },
+  {
+    name: "capabilities",
+    usage: "ocx capabilities [--json] [--mutating-only] [--route <path>]",
+    summary: "List the declared CLI capabilities and the management routes they drive.",
+    details: [
+      "The machine-readable surface index: start here when driving ocx programmatically instead of parsing help text.",
+      "--route <path> answers the inverse question: which commands drive this management route.",
+    ],
   },
   {
     name: "ready",

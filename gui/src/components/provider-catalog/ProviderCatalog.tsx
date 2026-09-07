@@ -11,6 +11,9 @@ import {
   filterPresets,
   type CatalogPreset,
 } from "./provider-presets";
+import { shouldShowLoginHint, type CatalogLoginHint } from "./login-hint-visibility";
+import { LoginHint } from "../login-url-block";
+import { ProviderIcon } from "../provider-workspace/ProviderRail";
 
 export type AccountLoginStatus = { loggedIn: boolean; email?: string; error?: string; needsReauth?: boolean };
 export type AccountLoginRow = {
@@ -38,6 +41,8 @@ export default function ProviderCatalog({
   accountRows = EMPTY_ACCOUNT_ROWS,
   accountStatus = EMPTY_ACCOUNT_STATUS,
   busyProvider = null,
+  loginHint = null,
+  paste,
   onLogin,
   onCancelLogin,
   onLogout,
@@ -53,6 +58,17 @@ export default function ProviderCatalog({
   accountRows?: AccountLoginRow[];
   accountStatus?: Record<string, AccountLoginStatus>;
   busyProvider?: string | null;
+  /** Authorization URL / device code for the account-row login in flight. */
+  loginHint?: CatalogLoginHint | null;
+  /** Paste-a-redirect-or-code state, owned by the modal so the catalog stays presentational. */
+  paste?: {
+    value: string;
+    busy: boolean;
+    message: string;
+    ok: boolean;
+    onChange: (value: string) => void;
+    onSubmit: (provider: string) => void;
+  };
   onLogin?: (provider: string, addAccount?: boolean) => void;
   onCancelLogin?: (provider: string) => void;
   onLogout?: (provider: string) => void;
@@ -134,6 +150,14 @@ export default function ProviderCatalog({
         )}
         {tier !== "accounts" && rows.map(p => (
           <button type="button" key={p.id} className="list-row" onClick={() => onSelectPreset(p)}>
+            {/*
+              The one list a user reads to CHOOSE a provider, and until now the only
+              provider surface with no marks at all. `CatalogPreset.id` is the
+              registry id, so this reuses `providerIconSrc` and, with it, the
+              mask/plate decision the rail already owns -- a mark cannot be legible
+              in the workspace and invisible here.
+            */}
+            <ProviderIcon name={p.id} adapter={p.adapter} cls="provider-icon provider-icon-sm" />
             <div>
               <div className="title">{p.label}</div>
               <div className="sub"><code className="chip">{p.adapter}</code>{p.note ? ` · ${p.note}` : ""}</div>
@@ -152,8 +176,16 @@ export default function ProviderCatalog({
           const statusText = loggedIn
             ? (status?.email ?? row.statusLabel ?? t("modal.accountLoggedIn"))
             : (status?.error ?? row.statusLabel ?? t("modal.accountLoggedOut"));
+          // A first-time add is the one moment the operator has no other way in:
+          // the provider has no workspace panel yet, so without this the
+          // authorization URL is computed and never drawn.
+          const showHint = shouldShowLoginHint(row, busyProvider, loginHint);
           return (
-            <div key={row.id} className="list-row provider-catalog-account-row">
+            <div key={row.id} className={`list-row provider-catalog-account-row${showHint ? " provider-catalog-account-row--waiting" : ""}`}>
+              <div className="provider-catalog-account-row-head">
+              {/* Account rows are providers too. A logo beside Cursor and a bare
+                  tile beside Kiro reads as a bug, not as a distinction. */}
+              <ProviderIcon name={row.id} cls="provider-icon provider-icon-sm" />
               <div>
                 <div className="title">{row.label}</div>
                 <div className="sub">{statusText}</div>
@@ -162,7 +194,7 @@ export default function ProviderCatalog({
                 {row.kind === "key" ? null : row.kind === "codex" ? (
                   <>
                     {loggedIn && (
-                      <a className="btn btn-ghost" href={row.href ?? "#codex-auth"}>{t("modal.accountManage")}</a>
+                      <a className="btn btn-ghost" href={row.href ?? "#codex-set"}>{t("modal.accountManage")}</a>
                     )}
                     {onLogin && (
                       <button type="button"
@@ -208,6 +240,24 @@ export default function ProviderCatalog({
                   onLogin && <button type="button" className="btn btn-primary" onClick={() => onLogin(row.id)}>{t("modal.accountLogin")}</button>
                 )}
               </div>
+              </div>
+              {showHint && loginHint && (
+                <LoginHint
+                  hint={{ url: loginHint.url, deviceCode: loginHint.deviceCode, instructions: loginHint.instructions }}
+                  {...(paste
+                    ? {
+                      paste: {
+                        value: paste.value,
+                        busy: paste.busy,
+                        message: paste.message,
+                        ok: paste.ok,
+                        onChange: paste.onChange,
+                        onSubmit: () => paste.onSubmit(row.id),
+                      },
+                    }
+                    : {})}
+                />
+              )}
             </div>
           );
         })}

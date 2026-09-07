@@ -1,4 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  GATED_MODEL_CLIENT_VERSION_FLOOR,
+  resetCodexModelEntitlementCacheForTests,
+  seedCodexModelEntitlementsForTests,
+} from "../src/codex/model-entitlements";
 import { handleManagementAPI } from "../src/server/management-api";
 import {
   OPENCODE_API_KEY_ENV,
@@ -10,17 +18,46 @@ import {
   opencodeGlobalConfigPath,
   type DshGeneratedConfig,
   type ExportModel,
+  type HermesGeneratedConfig,
+  type McodeGeneratedConfig,
   type OpencodeGeneratedConfig,
   type PiGeneratedConfig,
 } from "../src/clients/config-export";
 import type { OcxConfig } from "../src/types";
 import { catalogConvergenceFactory } from "./helpers/catalog-convergence";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 /**
  * A key that looks exactly like a real one. Every assertion about `ocx_` absence is
  * worthless unless the running config actually holds a serializable secret (030 §Security).
  */
 const REAL_LOOKING_KEY = "ocx_live_9f3c7a2b41d84e6fa05c8e17b3d92764";
+
+const originalOpenCodexHome = process.env.OPENCODEX_HOME;
+const originalCodexHome = process.env.CODEX_HOME;
+let entitlementTestRoot = "";
+let entitlementCodexHome = "";
+
+beforeAll(() => {
+  entitlementTestRoot = mkdtempSync(join(tmpdir(), "ocx-client-config-entitlement-"));
+  entitlementCodexHome = join(entitlementTestRoot, "codex");
+  mkdirSync(entitlementCodexHome, { recursive: true });
+  process.env.OPENCODEX_HOME = join(entitlementTestRoot, "opencodex");
+  process.env.CODEX_HOME = entitlementCodexHome;
+});
+
+afterAll(() => {
+  if (originalOpenCodexHome === undefined) delete process.env.OPENCODEX_HOME;
+  else process.env.OPENCODEX_HOME = originalOpenCodexHome;
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = originalCodexHome;
+  removeTreeWithRetry(entitlementTestRoot);
+});
+
+afterEach(() => {
+  resetCodexModelEntitlementCacheForTests();
+  rmSync(join(entitlementCodexHome, "auth.json"), { force: true });
+});
 
 interface ClientConfigEnvelope {
   client: string;
@@ -42,7 +79,9 @@ interface ModelRow {
   disabled: boolean;
   native?: boolean;
   displayName?: string;
+  displayNameSource?: "operator" | "provider" | "fallback";
   contextWindow?: number;
+  maxOutputTokens?: number;
   inputModalities?: string[];
   reasoningEfforts?: string[];
   defaultReasoningEffort?: string;
@@ -50,8 +89,8 @@ interface ModelRow {
 
 /**
  * Static provider catalogs (`liveModels: false`) so the model list is deterministic and no
- * test ever reaches the network. `b/no-context` carries no context window, which is what
- * makes `modelsWithoutLimits` non-zero and therefore actually assertable.
+ * test ever reaches the network. The rows intentionally omit output capability metadata,
+ * which makes `modelsWithoutLimits` non-zero and therefore actually assertable.
  */
 function baseConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
   return {
@@ -67,6 +106,8 @@ function baseConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
         liveModels: false,
         models: ["m1", "m2"],
         modelContextWindows: { m1: 128_000 },
+        modelInputModalities: { m1: ["text", "image"], m2: ["text"] },
+        modelReasoningEfforts: { m1: ["none", "minimal", "low", "high"] },
       },
       b: {
         adapter: "openai-chat",
@@ -109,8 +150,9 @@ function toExportModel(row: ModelRow): ExportModel {
     provider: row.provider,
     id: row.id,
     ...(row.native ? { native: true } : {}),
-    ...(row.displayName ? { displayName: row.displayName } : {}),
+    ...(row.displayName && row.displayNameSource !== "fallback" ? { displayName: row.displayName } : {}),
     ...(row.contextWindow !== undefined ? { contextWindow: row.contextWindow } : {}),
+    ...(row.maxOutputTokens !== undefined ? { maxOutputTokens: row.maxOutputTokens } : {}),
     ...(row.inputModalities ? { inputModalities: row.inputModalities } : {}),
     ...(row.reasoningEfforts ? { reasoningEfforts: row.reasoningEfforts } : {}),
     ...(row.defaultReasoningEffort ? { defaultReasoningEffort: row.defaultReasoningEffort } : {}),
@@ -119,7 +161,15 @@ function toExportModel(row: ModelRow): ExportModel {
 
 describe("GET /api/client-config", () => {
   test("opencode envelope carries the shared builder's exact bytes", async () => {
-    const config = baseConfig();
+    const config = baseConfig({
+      customModels: [{
+        id: "custom-output",
+        provider: "a",
+        modelId: "known-output",
+        contextWindow: 128_000,
+        maxOutputTokens: 64_000,
+      }],
+    });
     const response = await clientConfigApi(config, "?client=opencode");
     expect(response.status).toBe(200);
     const body = await response.json() as ClientConfigEnvelope;
@@ -144,8 +194,42 @@ describe("GET /api/client-config", () => {
     const document = body.config as OpencodeGeneratedConfig;
     expect(document.$schema).toBe(OPENCODE_CONFIG_SCHEMA);
     const models = document.provider[OPENCODE_PROVIDER_ID].models;
-    expect(models["a/m1"]).toEqual({ name: "m1 (a)", limit: { context: 128_000, output: 32_000 } });
+    expect(models["a/m1"]).toEqual({
+      name: "m1 (a)",
+      modalities: { input: ["text", "image"] },
+    });
+    expect(models["a/known-output"]).toEqual({
+      name: "known-output (a)",
+      limit: { context: 128_000, output: 64_000 },
+    });
     expect(models["b/no-context"]).toEqual({ name: "no-context (b)" });
+  }, 15_000);
+
+  test("a custom replacement inherits exact provider output metadata through /api/models", async () => {
+    const config = baseConfig({
+      defaultProvider: "anthropic",
+      providers: {
+        anthropic: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          liveModels: false,
+          models: ["claude-opus-5"],
+        },
+      },
+      customModels: [{
+        id: "custom-inherited-output",
+        provider: "anthropic",
+        modelId: "claude-opus-5",
+        contextWindow: 200_000,
+      }],
+    });
+    const rows = await modelRows(config);
+    expect(rows.find(row => row.namespaced === "anthropic/claude-opus-5")?.maxOutputTokens).toBe(128_000);
+
+    const response = await clientConfigApi(config, "?client=opencode");
+    const body = await response.json() as ClientConfigEnvelope;
+    const models = (body.config as OpencodeGeneratedConfig).provider[OPENCODE_PROVIDER_ID].models;
+    expect(models["anthropic/claude-opus-5"]?.limit).toEqual({ context: 200_000, output: 128_000 });
   }, 15_000);
 
   test("pi returns a models ARRAY under the same provider id", async () => {
@@ -187,6 +271,16 @@ describe("GET /api/client-config", () => {
   }, 15_000);
 
   test("DSH response keeps management reasoning metadata in the rc.6 model map", async () => {
+    writeFileSync(join(entitlementCodexHome, "auth.json"), JSON.stringify({
+      tokens: { access_token: "dsh-token", account_id: "dsh-main" },
+    }));
+    seedCodexModelEntitlementsForTests(
+      "main",
+      ["gpt-5.6-luna"],
+      Date.now(),
+      GATED_MODEL_CLIENT_VERSION_FLOOR,
+      "main:dsh-main",
+    );
     const response = await clientConfigApi(baseConfig(), "?client=dsh");
     expect(response.status).toBe(200);
     const body = await response.json() as ClientConfigEnvelope;
@@ -205,6 +299,87 @@ describe("GET /api/client-config", () => {
     });
   }, 15_000);
 
+  test("Hermes response projects catalog vision metadata through YAML", async () => {
+    const response = await clientConfigApi(baseConfig(), "?client=hermes");
+    expect(response.status).toBe(200);
+    const body = await response.json() as ClientConfigEnvelope;
+    const models = (body.config as HermesGeneratedConfig).providers[OPENCODE_PROVIDER_ID]!.models;
+
+    expect(Bun.YAML.parse(body.text)).toEqual(body.config as Record<string, unknown>);
+    expect(models["a/m1"]).toEqual({ supports_vision: true });
+    // Effective catalog hints may widen ordinary text rows to image-capable.
+    expect(models["a/m2"]).toEqual({ supports_vision: true });
+    expect(models["b/no-context"]).toEqual({});
+    expect(body.modelCount).toBe(Object.keys(models).length);
+  }, 15_000);
+
+  test("an expired management roster is refreshed once before client-config is projected", async () => {
+    writeFileSync(join(entitlementCodexHome, "auth.json"), JSON.stringify({
+      tokens: { access_token: "client-config-token", account_id: "client-config-account" },
+    }));
+    const originalFetch = globalThis.fetch;
+    let entitlementFetches = 0;
+    globalThis.fetch = (async input => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/models") {
+        entitlementFetches += 1;
+        return Response.json({ models: [
+          { slug: "gpt-5.6-sol", supported_in_api: true, visibility: "list" },
+          { slug: "gpt-5.6-terra", supported_in_api: true, visibility: "list" },
+          { slug: "gpt-5.6-luna", supported_in_api: true, visibility: "list" },
+        ] });
+      }
+      return originalFetch(input);
+    }) as typeof fetch;
+    try {
+      const config = baseConfig({
+        providers: {
+          ...baseConfig().providers,
+          openai: { authMode: "forward", liveModels: false, models: [] },
+        },
+      });
+      const response = await clientConfigApi(config, "?client=opencode");
+      expect(response.status).toBe(200);
+      const body = await response.json() as ClientConfigEnvelope;
+      const models = (body.config as OpencodeGeneratedConfig).provider[OPENCODE_PROVIDER_ID].models;
+      expect(entitlementFetches).toBe(1);
+      expect(Object.keys(models)).toEqual(expect.arrayContaining([
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+      ]));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }, 15_000);
+
+  test("an entitlement ensure rejection cannot turn client-config into a 503", async () => {
+    const config = baseConfig();
+    Object.defineProperty(config, "codexAccounts", {
+      get() { throw new Error("entitlement identity unavailable"); },
+      configurable: true,
+    });
+
+    const response = await clientConfigApi(config, "?client=opencode");
+    expect(response.status).toBe(200);
+  }, 15_000);
+
+  test("MCode response carries catalog context and its usable reasoning ladder", async () => {
+    const response = await clientConfigApi(baseConfig(), "?client=mcode");
+    expect(response.status).toBe(200);
+    const body = await response.json() as ClientConfigEnvelope;
+    const provider = (body.config as McodeGeneratedConfig).custom_provider[OPENCODE_PROVIDER_ID]!;
+
+    expect(body.format).toBe("yaml");
+    expect(Bun.YAML.parse(body.text)).toEqual(body.config as Record<string, unknown>);
+    expect(provider.models["a/m1"]).toEqual({
+      limit: { context: 128_000 },
+      thinking: { effortOptions: ["minimal", "low", "high"] },
+    });
+    expect(provider.models["b/no-context"]).toEqual({});
+    expect(body.modelsWithoutLimits).toBe(2);
+  }, 15_000);
+
   test("counts describe the emitted document, including models without limits", async () => {
     const config = baseConfig();
     const opencode = await (await clientConfigApi(config, "?client=opencode")).json() as ClientConfigEnvelope;
@@ -219,7 +394,9 @@ describe("GET /api/client-config", () => {
     const pi = await (await clientConfigApi(config, "?client=pi")).json() as ClientConfigEnvelope;
     const piModels = (pi.config as PiGeneratedConfig).providers[OPENCODE_PROVIDER_ID].models;
     expect(pi.modelCount).toBe(piModels.length);
-    expect(pi.modelsWithoutLimits).toBe(piModels.filter(model => model.contextWindow === undefined).length);
+    expect(pi.modelsWithoutLimits).toBe(piModels.filter(model => (
+      model.contextWindow === undefined || model.maxTokens === undefined
+    )).length);
   }, 15_000);
 
   test("disabled models are filtered before the config is built", async () => {
@@ -283,6 +460,77 @@ describe("GET /api/client-config", () => {
     const body = await response.json() as { error: string; config?: unknown };
     expect(body.error).toContain("catalog offline");
     expect(body.config).toBeUndefined();
+  }, 15_000);
+
+  /**
+   * A client's own environment override can name a path the resolver refuses.
+   * The CLI already surfaces that as a readable error, and the integration
+   * state and writer paths already catch it — this route did not, so the
+   * exception escaped `handleManagementAPI` and the dashboard download saw a
+   * generic 500 with the corrective message stripped. The hole was reachable
+   * for every client whose destination resolves an override (mcode, zcode,
+   * dsh); Pi joined that set when its resolver started honoring
+   * `PI_CODING_AGENT_DIR`.
+   */
+  test("a refused path override answers 400 with the bounded message, not a thrown 500", async () => {
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = "relative";
+    try {
+      const response = await clientConfigApi(baseConfig(), "?client=pi");
+      expect(response.status).toBe(400);
+      const body = await response.json() as { error: string; config?: unknown };
+      expect(body.error).toContain("PI_CODING_AGENT_DIR");
+      expect(body.error).toContain("absolute path");
+      // The refusal must not leak a half-built envelope.
+      expect(body.config).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  }, 15_000);
+
+  test("an accepted override still resolves through the route", async () => {
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    // One binding for the override, so the env value and the expectation cannot
+    // drift apart, and `join` for the separator: the resolver builds the
+    // destination with `join`, which is `\` on win32, so a hard-coded POSIX
+    // string asserted the platform rather than the override taking effect.
+    const overrideDir = "/tmp/opencodex-pi-route-fixture";
+    process.env.PI_CODING_AGENT_DIR = overrideDir;
+    try {
+      const response = await clientConfigApi(baseConfig(), "?client=pi");
+      expect(response.status).toBe(200);
+      const body = await response.json() as ClientConfigEnvelope;
+      expect(body.destination).toBe(join(overrideDir, "models.json"));
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
+  }, 15_000);
+
+  test("a refused override wins over a failing catalog, and skips the catalog work", async () => {
+    // The refusal is a property of the request, not of the catalog. Validating
+    // it after the load let 503 answer first and hid the corrective message.
+    const config = baseConfig();
+    let providersRead = 0;
+    Object.defineProperty(config, "providers", {
+      get() { providersRead += 1; throw new Error("catalog offline"); },
+      configurable: true,
+    });
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = "relative";
+    try {
+      const response = await clientConfigApi(config, "?client=pi");
+      expect(response.status).toBe(400);
+      const body = await response.json() as { error: string };
+      expect(body.error).toContain("PI_CODING_AGENT_DIR");
+      expect(body.error).not.toContain("catalog offline");
+      // Nothing enumerated the catalog for input that was going to be rejected.
+      expect(providersRead).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+    }
   }, 15_000);
 
   test("cross-origin admission is unchanged from every other /api route", async () => {

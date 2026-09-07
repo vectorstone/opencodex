@@ -4,6 +4,7 @@ import {
   restoreRoutedCustomCallsInJson,
   rewriteRoutedCustomToolsForUpstream,
 } from "../src/responses/custom-tool-compat";
+import { compileCodeModeHelperInput } from "../src/responses/code-mode-helper-compat";
 import { createRoutedCustomToolRestoreBlockRewrite } from "../src/server/responses-custom-tool-repair";
 import { handleResponses } from "../src/server/responses";
 import type { OcxConfig } from "../src/types";
@@ -19,7 +20,204 @@ function frame(event: string, payload: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify({ type: event, ...payload })}`;
 }
 
+const DECORATED_PATCH = "*** Begin Patch ***\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch ***";
+const CANONICAL_PATCH = "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch";
+const WRAPPED_DECORATED_PATCH = JSON.stringify({ input: DECORATED_PATCH });
+
 describe("routed Responses custom-tool compatibility", () => {
+  test("restores legacy structured shell aliases as executable unified-exec input", () => {
+    const declared = new Set(["exec"]);
+    const upstream = JSON.stringify({
+      id: "resp_shell",
+      output: [{
+        type: "function_call",
+        id: "fc_shell",
+        call_id: "call_shell",
+        name: "shell_command",
+        arguments: JSON.stringify({ command: "printf '%s' \\\"$HOME\\\"", workdir: "/tmp" }),
+        status: "completed",
+      }],
+    });
+
+    const restored = JSON.parse(restoreRoutedCustomCallsInJson(
+      upstream,
+      new Set(["exec"]),
+      new Set(),
+      declared,
+    )) as { output: Array<Record<string, unknown>> };
+    expect(restored.output[0]).toMatchObject({
+      type: "custom_tool_call",
+      name: "exec",
+      input: compileCodeModeHelperInput(
+        JSON.stringify({ command: "printf '%s' \\\"$HOME\\\"", workdir: "/tmp" }),
+        "shell_command",
+      ),
+    });
+    expect(restored.output[0]).not.toHaveProperty("arguments");
+  });
+
+  test("restores a native apply_patch stream through unified exec", () => {
+    const declared = new Set(["exec"]);
+    const rewrite = createRoutedCustomToolRestoreBlockRewrite(
+      new Set(["exec"]),
+      undefined,
+      new Set(),
+      declared,
+    );
+    const added = rewrite(frame("response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_patch_alias",
+        call_id: "call_patch_alias",
+        name: "apply_patch",
+        input: "",
+        status: "in_progress",
+      },
+    }));
+    expect(dataPayload(added[0]!).item).toMatchObject({
+      type: "custom_tool_call",
+      name: "exec",
+      input: "",
+    });
+
+    expect(rewrite(frame("response.custom_tool_call_input.delta", {
+      output_index: 0,
+      item_id: "ctc_patch_alias",
+      delta: CANONICAL_PATCH,
+    }))).toEqual([]);
+    const inputDone = rewrite(frame("response.custom_tool_call_input.done", {
+      output_index: 0,
+      item_id: "ctc_patch_alias",
+      input: CANONICAL_PATCH,
+    }));
+    expect(dataPayload(inputDone[0]!).input).toBe(
+      compileCodeModeHelperInput(CANONICAL_PATCH, "apply_patch"),
+    );
+
+    const itemDone = rewrite(frame("response.output_item.done", {
+      output_index: 0,
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_patch_alias",
+        call_id: "call_patch_alias",
+        name: "apply_patch",
+        input: CANONICAL_PATCH,
+        status: "completed",
+      },
+    }));
+    expect(dataPayload(itemDone[0]!).item).toMatchObject({
+      type: "custom_tool_call",
+      name: "exec",
+      input: compileCodeModeHelperInput(CANONICAL_PATCH, "apply_patch"),
+    });
+    rewrite.dispose?.();
+  });
+
+  test("restores streamed exec_command arguments through unified exec", () => {
+    const rewrite = createRoutedCustomToolRestoreBlockRewrite(
+      new Set(["exec"]),
+      undefined,
+      new Set(),
+      new Set(["exec"]),
+    );
+    const added = rewrite(frame("response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_shell_alias",
+        call_id: "call_shell_alias",
+        name: "exec_command",
+        arguments: "",
+        status: "in_progress",
+      },
+    }));
+    expect(dataPayload(added[0]!).item).toMatchObject({ type: "custom_tool_call", name: "exec" });
+    expect(rewrite(frame("response.function_call_arguments.delta", {
+      output_index: 0,
+      item_id: "fc_shell_alias",
+      delta: '{"cmd":"pwd"}',
+    }))).toEqual([]);
+    const done = rewrite(frame("response.function_call_arguments.done", {
+      output_index: 0,
+      item_id: "fc_shell_alias",
+      arguments: '{"cmd":"pwd"}',
+    }));
+    expect(dataPayload(done[0]!)).toMatchObject({
+      type: "response.custom_tool_call_input.done",
+      input: compileCodeModeHelperInput('{"cmd":"pwd"}', "exec_command"),
+    });
+    rewrite.dispose?.();
+  });
+
+  test("restores streamed write_stdin arguments through unified exec", () => {
+    const rewrite = createRoutedCustomToolRestoreBlockRewrite(
+      new Set(["exec"]),
+      undefined,
+      new Set(),
+      new Set(["exec"]),
+    );
+    const added = rewrite(frame("response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_stdin_alias",
+        call_id: "call_stdin_alias",
+        name: "write_stdin",
+        arguments: "",
+        status: "in_progress",
+      },
+    }));
+    expect(dataPayload(added[0]!).item).toMatchObject({ type: "custom_tool_call", name: "exec" });
+    expect(rewrite(frame("response.function_call_arguments.delta", {
+      output_index: 0,
+      item_id: "fc_stdin_alias",
+      delta: '{"session_id":17,"yield_time_ms":1000}',
+    }))).toEqual([]);
+    const done = rewrite(frame("response.function_call_arguments.done", {
+      output_index: 0,
+      item_id: "fc_stdin_alias",
+      arguments: '{"session_id":17,"yield_time_ms":1000}',
+    }));
+    expect(dataPayload(done[0]!)).toMatchObject({
+      type: "response.custom_tool_call_input.done",
+      input: compileCodeModeHelperInput(
+        '{"session_id":17,"yield_time_ms":1000}',
+        "write_stdin",
+      ),
+    });
+    rewrite.dispose?.();
+  });
+
+  test("restores a non-streaming write_stdin call through unified exec", () => {
+    const upstream = JSON.stringify({
+      id: "resp_stdin",
+      output: [{
+        type: "function_call",
+        id: "fc_stdin",
+        call_id: "call_stdin",
+        name: "write_stdin",
+        arguments: '{"session_id":17,"yield_time_ms":1000}',
+        status: "completed",
+      }],
+    });
+
+    const restored = JSON.parse(restoreRoutedCustomCallsInJson(
+      upstream,
+      new Set(["exec"]),
+      new Set(),
+      new Set(["exec"]),
+    )) as { output: Array<Record<string, unknown>> };
+    expect(restored.output[0]).toMatchObject({
+      type: "custom_tool_call",
+      name: "exec",
+      input: compileCodeModeHelperInput(
+        '{"session_id":17,"yield_time_ms":1000}',
+        "write_stdin",
+      ),
+    });
+  });
+
   test("rewrites exec definitions and paired history without touching apply_patch", () => {
     const raw = {
       model: "deepseek-v4-flash",
@@ -39,6 +237,7 @@ describe("routed Responses custom-tool compatibility", () => {
     expect(collectRoutedCustomToolNames(raw)).toEqual(new Set(["exec"]));
     const rewritten = rewriteRoutedCustomToolsForUpstream(raw);
     expect(rewritten.names).toEqual(new Set(["exec"]));
+    expect(rewritten.repairNames).toEqual(new Set(["apply_patch"]));
     expect(rewritten.body).not.toBe(raw);
     expect(raw.tools[0]?.type).toBe("custom");
 
@@ -86,6 +285,252 @@ describe("routed Responses custom-tool compatibility", () => {
     });
     expect(restored.output[0]).not.toHaveProperty("arguments");
     expect(restored.output[1]).toMatchObject({ type: "function_call", name: "ordinary", arguments: "{}" });
+  });
+
+  test("repairs an authorized native apply_patch custom call without changing its type", () => {
+    const upstream = JSON.stringify({
+      id: "resp_patch",
+      output: [{
+        type: "custom_tool_call",
+        id: "ctc_patch",
+        call_id: "call_patch",
+        name: "apply_patch",
+        input: DECORATED_PATCH,
+        status: "completed",
+      }],
+    });
+
+    const restored = JSON.parse(restoreRoutedCustomCallsInJson(
+      upstream,
+      new Set(),
+      new Set(["apply_patch"]),
+    )) as { output: Array<Record<string, unknown>> };
+    expect(restored.output[0]).toMatchObject({
+      type: "custom_tool_call",
+      id: "ctc_patch",
+      name: "apply_patch",
+      input: CANONICAL_PATCH,
+    });
+
+    const unnamed = JSON.stringify({
+      output: [{ type: "custom_tool_call", input: DECORATED_PATCH }],
+    });
+    expect(restoreRoutedCustomCallsInJson(
+      unnamed,
+      new Set(),
+      new Set(["apply_patch"]),
+    )).toBe(unnamed);
+
+    const metadataOnly = JSON.stringify({
+      id: "resp_metadata",
+      output: [],
+      metadata: {
+        shadow: {
+          type: "custom_tool_call",
+          name: "apply_patch",
+          input: DECORATED_PATCH,
+        },
+      },
+    });
+    expect(restoreRoutedCustomCallsInJson(
+      metadataOnly,
+      new Set(),
+      new Set(["apply_patch"]),
+    )).toBe(metadataOnly);
+
+    const wrappedNative = JSON.stringify({
+      id: "resp_wrapped_patch",
+      output: [{
+        type: "custom_tool_call",
+        id: "ctc_wrapped_patch",
+        name: "apply_patch",
+        input: WRAPPED_DECORATED_PATCH,
+      }],
+    });
+    expect(restoreRoutedCustomCallsInJson(
+      wrappedNative,
+      new Set(),
+      new Set(["apply_patch"]),
+    )).toBe(wrappedNative);
+
+    expect(restoreRoutedCustomCallsInJson(upstream, new Set())).toBe(upstream);
+  });
+
+  test("preserves decorated delimiters for a non-functions namespaced apply_patch tool", () => {
+    const rewritten = rewriteRoutedCustomToolsForUpstream({
+      tools: [{
+        type: "namespace",
+        name: "mcp",
+        tools: [{ type: "custom", name: "apply_patch", description: "Remote patch grammar" }],
+      }],
+    });
+    expect(rewritten.repairNames).toEqual(new Set());
+
+    const item = {
+      type: "custom_tool_call",
+      id: "ctc_remote_patch",
+      call_id: "call_remote_patch",
+      namespace: "mcp",
+      name: "apply_patch",
+      input: DECORATED_PATCH,
+      status: "completed",
+    };
+    const upstream = JSON.stringify({ id: "resp_remote_patch", output: [item] });
+    expect(restoreRoutedCustomCallsInJson(
+      upstream,
+      rewritten.names,
+      rewritten.repairNames,
+    )).toBe(upstream);
+
+    const block = frame("response.output_item.done", { output_index: 0, item });
+    const rewrite = createRoutedCustomToolRestoreBlockRewrite(
+      rewritten.names,
+      undefined,
+      rewritten.repairNames,
+    );
+    expect(rewrite(block)).toEqual([block]);
+    rewrite.dispose?.();
+  });
+
+  test("preserves a converted non-functions namespaced apply_patch payload", () => {
+    const rewritten = rewriteRoutedCustomToolsForUpstream({
+      tools: [{
+        type: "namespace",
+        name: "mcp",
+        tools: [{ type: "custom", name: "apply_patch", description: "Remote patch grammar" }],
+      }],
+    }, false);
+    expect(rewritten.names).toEqual(new Set(["mcp__apply_patch"]));
+
+    const upstream = JSON.stringify({
+      id: "resp_remote_patch",
+      output: [{
+        type: "function_call",
+        id: "fc_remote_patch",
+        call_id: "call_remote_patch",
+        namespace: "mcp",
+        name: "apply_patch",
+        arguments: WRAPPED_DECORATED_PATCH,
+        status: "completed",
+      }],
+    });
+    const restored = JSON.parse(restoreRoutedCustomCallsInJson(
+      upstream,
+      rewritten.names,
+      rewritten.repairNames,
+    )) as { output: Record<string, unknown>[] };
+    expect(restored.output[0]).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      input: DECORATED_PATCH,
+    });
+
+    const rewrite = createRoutedCustomToolRestoreBlockRewrite(
+      rewritten.names,
+      undefined,
+      rewritten.repairNames,
+    );
+    const added = rewrite(frame("response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_remote_patch",
+        call_id: "call_remote_patch",
+        namespace: "mcp",
+        name: "apply_patch",
+        arguments: "",
+        status: "in_progress",
+      },
+    }));
+    expect(dataPayload(added[0]!).item).toMatchObject({
+      type: "custom_tool_call",
+      namespace: "mcp",
+      name: "apply_patch",
+      input: "",
+    });
+    const inputDone = rewrite(frame("response.function_call_arguments.done", {
+      item_id: "fc_remote_patch",
+      output_index: 0,
+      arguments: WRAPPED_DECORATED_PATCH,
+    }));
+    expect(dataPayload(inputDone[0]!).input).toBe(DECORATED_PATCH);
+    rewrite.dispose?.();
+  });
+
+  test("repairs native apply_patch item and input-done events in an SSE lifecycle", () => {
+    const rewrite = createRoutedCustomToolRestoreBlockRewrite(
+      new Set(),
+      undefined,
+      new Set(["apply_patch"]),
+    );
+    const added = rewrite(frame("response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_patch",
+        call_id: "call_patch",
+        name: "apply_patch",
+        input: "",
+        status: "in_progress",
+      },
+    }));
+    expect(dataPayload(added[0]!).item).toMatchObject({ type: "custom_tool_call", name: "apply_patch" });
+
+    const inputDone = rewrite(frame("response.custom_tool_call_input.done", {
+      output_index: 0,
+      item_id: "ctc_patch",
+      input: DECORATED_PATCH,
+    }));
+    expect(dataPayload(inputDone[0]!)).toMatchObject({
+      type: "response.custom_tool_call_input.done",
+      input: CANONICAL_PATCH,
+    });
+
+    rewrite(frame("response.output_item.added", {
+      output_index: 1,
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_wrapped_patch",
+        name: "apply_patch",
+        input: "",
+      },
+    }));
+    const wrappedInputDone = rewrite(frame("response.custom_tool_call_input.done", {
+      output_index: 1,
+      item_id: "ctc_wrapped_patch",
+      input: WRAPPED_DECORATED_PATCH,
+    }));
+    expect(dataPayload(wrappedInputDone[0]!)).toMatchObject({ input: WRAPPED_DECORATED_PATCH });
+
+    const itemDone = rewrite(frame("response.output_item.done", {
+      output_index: 0,
+      metadata: {
+        shadow: {
+          type: "custom_tool_call",
+          name: "apply_patch",
+          input: DECORATED_PATCH,
+        },
+      },
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_patch",
+        call_id: "call_patch",
+        name: "apply_patch",
+        input: DECORATED_PATCH,
+        status: "completed",
+      },
+    }));
+    const itemDonePayload = dataPayload(itemDone[0]!);
+    expect(itemDonePayload.item).toMatchObject({ input: CANONICAL_PATCH });
+    expect(itemDonePayload.metadata).toEqual({
+      shadow: {
+        type: "custom_tool_call",
+        name: "apply_patch",
+        input: DECORATED_PATCH,
+      },
+    });
+    rewrite.dispose?.();
   });
 
   test("restores the streamed exec lifecycle and unwraps progressive input", () => {
@@ -528,6 +973,210 @@ describe("routed Responses custom-tool compatibility", () => {
     }
   });
 
+  test("handleResponses lowers and restores apply_patch when the destination denies custom tools", async () => {
+    const savedFetch = globalThis.fetch;
+    let outboundBody: Record<string, unknown> | undefined;
+    const upstreamItem = {
+      type: "function_call",
+      id: "fc_patch_next",
+      call_id: "call_patch_next",
+      name: "apply_patch",
+      arguments: JSON.stringify({ input: "*** Begin Patch\n*** End Patch" }),
+      status: "completed",
+    };
+    const upstream = [
+      frame("response.output_item.added", {
+        output_index: 0,
+        item: { ...upstreamItem, arguments: "", status: "in_progress" },
+      }),
+      frame("response.function_call_arguments.done", {
+        output_index: 0,
+        item_id: upstreamItem.id,
+        arguments: upstreamItem.arguments,
+      }),
+      frame("response.output_item.done", { output_index: 0, item: upstreamItem }),
+      frame("response.completed", {
+        response: { id: "resp_patch", status: "completed", output: [upstreamItem] },
+      }),
+      "data: [DONE]",
+    ].join("\n\n") + "\n\n";
+    globalThis.fetch = (async (_input, init) => {
+      outboundBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(upstream, { headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    const config = {
+      port: 0,
+      defaultProvider: "fixture",
+      providers: {
+        fixture: {
+          adapter: "openai-responses",
+          baseUrl: "https://fixture.test/v1",
+          authMode: "key",
+          apiKey: "fixture-key",
+          supportsResponsesCustomTools: false,
+        },
+      },
+    } as OcxConfig;
+
+    try {
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "fixture/grok-4.6",
+          stream: true,
+          input: [
+            {
+              type: "custom_tool_call",
+              id: "ctc_patch_prior",
+              call_id: "call_patch_prior",
+              name: "apply_patch",
+              input: "noop",
+            },
+            { type: "custom_tool_call_output", call_id: "call_patch_prior", output: "done" },
+          ],
+          tools: [{
+            type: "custom",
+            name: "apply_patch",
+            description: "Apply a patch",
+            format: { type: "grammar", syntax: "lark" },
+          }],
+        }),
+      }), config, { model: "", provider: "" });
+      const clientSse = await response.text();
+      const outboundTools = outboundBody?.tools as Array<Record<string, unknown>> | undefined;
+      const outboundInput = outboundBody?.input as Array<Record<string, unknown>> | undefined;
+
+      expect(outboundTools?.[0]).toMatchObject({ type: "function", name: "apply_patch" });
+      expect(outboundInput?.[0]).toMatchObject({
+        type: "function_call",
+        call_id: "call_patch_prior",
+        name: "apply_patch",
+        arguments: JSON.stringify({ input: "noop" }),
+      });
+      expect(outboundInput?.[1]).toMatchObject({
+        type: "function_call_output",
+        call_id: "call_patch_prior",
+        output: "done",
+      });
+      expect(clientSse).toContain('"type":"custom_tool_call"');
+      expect(clientSse).toContain('"id":"ctc_patch_next"');
+      expect(clientSse).toContain('"call_id":"call_patch_next"');
+      expect(clientSse).toContain('"name":"apply_patch"');
+      expect(clientSse).toContain('"type":"response.custom_tool_call_input.done"');
+      expect(clientSse).toContain("data: [DONE]");
+      expect(clientSse).not.toContain('"type":"function_call"');
+      expect(clientSse).not.toContain("response.function_call_arguments.done");
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+
+  test("handleResponses lowers apply_patch for a noncanonical forward destination that denies custom tools", async () => {
+    const savedFetch = globalThis.fetch;
+    let outboundBody: Record<string, unknown> | undefined;
+    let outboundAuthorization: string | null = null;
+    let outboundUrl = "";
+    const upstreamItem = {
+      type: "function_call",
+      id: "fc_patch_next",
+      call_id: "call_patch_next",
+      name: "apply_patch",
+      arguments: JSON.stringify({ input: "*** Begin Patch\n*** End Patch" }),
+      status: "completed",
+    };
+    const upstream = [
+      frame("response.output_item.added", {
+        output_index: 0,
+        item: { ...upstreamItem, arguments: "", status: "in_progress" },
+      }),
+      frame("response.function_call_arguments.done", {
+        output_index: 0,
+        item_id: upstreamItem.id,
+        arguments: upstreamItem.arguments,
+      }),
+      frame("response.output_item.done", { output_index: 0, item: upstreamItem }),
+      frame("response.completed", {
+        response: { id: "resp_patch", status: "completed", output: [upstreamItem] },
+      }),
+      "data: [DONE]",
+    ].join("\n\n") + "\n\n";
+    globalThis.fetch = (async (input, init) => {
+      outboundUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      outboundBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      outboundAuthorization = new Headers(init?.headers).get("authorization");
+      return new Response(upstream, { headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    const config = {
+      port: 0,
+      defaultProvider: "fixture",
+      providers: {
+        fixture: {
+          adapter: "openai-responses",
+          baseUrl: "https://provider.example/v1",
+          authMode: "forward",
+          headers: { authorization: "Bearer provider-static" },
+          supportsResponsesCustomTools: false,
+        },
+      },
+    } as OcxConfig;
+
+    try {
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer caller-secret" },
+        body: JSON.stringify({
+          model: "fixture/grok-4.6",
+          stream: true,
+          input: [
+            {
+              type: "custom_tool_call",
+              id: "ctc_patch_prior",
+              call_id: "call_patch_prior",
+              name: "apply_patch",
+              input: "noop",
+            },
+            { type: "custom_tool_call_output", call_id: "call_patch_prior", output: "done" },
+          ],
+          tools: [{
+            type: "custom",
+            name: "apply_patch",
+            description: "Apply a patch",
+            format: { type: "grammar", syntax: "lark" },
+          }],
+        }),
+      }), config, { model: "", provider: "" });
+      const clientSse = await response.text();
+      const outboundTools = outboundBody?.tools as Array<Record<string, unknown>> | undefined;
+      const outboundInput = outboundBody?.input as Array<Record<string, unknown>> | undefined;
+
+      expect(outboundUrl).toBe("https://provider.example/v1/responses");
+      expect(outboundAuthorization).toBe("Bearer provider-static");
+      expect(outboundTools?.[0]).toMatchObject({ type: "function", name: "apply_patch" });
+      expect(outboundInput?.[0]).toMatchObject({
+        type: "function_call",
+        call_id: "call_patch_prior",
+        name: "apply_patch",
+        arguments: JSON.stringify({ input: "noop" }),
+      });
+      expect(outboundInput?.[1]).toMatchObject({
+        type: "function_call_output",
+        call_id: "call_patch_prior",
+        output: "done",
+      });
+      expect(clientSse).toContain('"type":"custom_tool_call"');
+      expect(clientSse).toContain('"id":"ctc_patch_next"');
+      expect(clientSse).toContain('"call_id":"call_patch_next"');
+      expect(clientSse).toContain('"name":"apply_patch"');
+      expect(clientSse).toContain('"type":"response.custom_tool_call_input.done"');
+      expect(clientSse).toContain("data: [DONE]");
+      expect(clientSse).not.toContain('"type":"function_call"');
+      expect(clientSse).not.toContain("response.function_call_arguments.done");
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+
   test("handleResponses continuation rewrites custom_tool_call_output and keeps call_id ordered", async () => {
     const savedFetch = globalThis.fetch;
     const outboundBodies: Array<Record<string, unknown>> = [];
@@ -891,6 +1540,203 @@ describe("routed Responses custom-tool compatibility", () => {
       const body = await response.json() as { output: Array<Record<string, unknown>> };
 
       expect(body.output[0]).toEqual(upstreamItem);
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+
+  test("handleResponses preserves disallowed native apply_patch input in JSON and SSE", async () => {
+    const savedFetch = globalThis.fetch;
+    const config = {
+      port: 0,
+      defaultProvider: "fixture",
+      providers: {
+        fixture: {
+          adapter: "openai-responses",
+          baseUrl: "https://fixture.test/v1",
+          authMode: "key",
+          apiKey: "fixture-key",
+        },
+      },
+    } as OcxConfig;
+    const upstreamItem = {
+      type: "custom_tool_call",
+      id: "ctc_patch",
+      call_id: "call_patch",
+      name: "apply_patch",
+      input: DECORATED_PATCH,
+      status: "completed",
+    };
+
+    globalThis.fetch = (async (_input, init) => {
+      const outbound = JSON.parse(String(init?.body)) as { stream?: boolean };
+      if (outbound.stream === true) {
+        const upstream = [
+          frame("response.output_item.added", {
+            output_index: 0,
+            item: { ...upstreamItem, input: "", status: "in_progress" },
+          }),
+          frame("response.custom_tool_call_input.done", {
+            output_index: 0,
+            item_id: "ctc_patch",
+            input: DECORATED_PATCH,
+          }),
+          frame("response.output_item.done", { output_index: 0, item: upstreamItem }),
+          frame("response.completed", {
+            response: { id: "resp_patch_stream", status: "completed", output: [upstreamItem] },
+          }),
+          "data: [DONE]",
+        ].join("\n\n") + "\n\n";
+        return new Response(upstream, { headers: { "content-type": "text/event-stream" } });
+      }
+      return Response.json({ id: "resp_patch_json", status: "completed", output: [upstreamItem] });
+    }) as typeof fetch;
+
+    try {
+      for (const stream of [false, true]) {
+        const response = await handleResponses(new Request("http://localhost/v1/responses", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "fixture/deepseek-v4-flash",
+            stream,
+            input: [{ role: "user", content: [{ type: "input_text", text: "patch" }] }],
+            tools: [
+              {
+                type: "custom",
+                name: "apply_patch",
+                description: "Apply a patch",
+                format: { type: "grammar", syntax: "lark" },
+              },
+              {
+                type: "function",
+                name: "ordinary",
+                description: "Ordinary function",
+                parameters: { type: "object" },
+              },
+            ],
+            tool_choice: stream
+              ? {
+                  type: "allowed_tools",
+                  mode: "required",
+                  tools: [{ type: "function", name: "ordinary" }],
+                }
+              : { type: "function", name: "ordinary" },
+          }),
+        }), config, { model: "", provider: "" });
+
+        if (!stream) {
+          const body = await response.json() as { output: Array<Record<string, unknown>> };
+          expect(body.output[0]).toEqual(upstreamItem);
+          continue;
+        }
+
+        const blocks = (await response.text()).split("\n\n").filter(block => block.includes("data: {"));
+        const payloads = blocks.map(dataPayload);
+        const inputDone = payloads.find(payload => payload.type === "response.custom_tool_call_input.done");
+        expect(inputDone).toMatchObject({ input: DECORATED_PATCH });
+        const itemDone = payloads.find(payload => payload.type === "response.output_item.done") as {
+          item?: Record<string, unknown>;
+        } | undefined;
+        expect(itemDone?.item).toMatchObject({ type: "custom_tool_call", input: DECORATED_PATCH });
+        const completed = payloads.find(payload => payload.type === "response.completed") as {
+          response?: { output?: Array<Record<string, unknown>> };
+        } | undefined;
+        expect(completed?.response?.output?.[0]).toMatchObject({ input: DECORATED_PATCH });
+      }
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+
+  test("handleResponses repairs authorized native apply_patch calls in JSON and SSE", async () => {
+    const savedFetch = globalThis.fetch;
+    const config = {
+      port: 0,
+      defaultProvider: "fixture",
+      providers: {
+        fixture: {
+          adapter: "openai-responses",
+          baseUrl: "https://fixture.test/v1",
+          authMode: "key",
+          apiKey: "fixture-key",
+        },
+      },
+    } as OcxConfig;
+    const upstreamItem = {
+      type: "custom_tool_call",
+      id: "ctc_patch",
+      call_id: "call_patch",
+      name: "apply_patch",
+      input: DECORATED_PATCH,
+      status: "completed",
+    };
+
+    globalThis.fetch = (async (_input, init) => {
+      const outbound = JSON.parse(String(init?.body)) as { stream?: boolean };
+      if (outbound.stream === true) {
+        const upstream = [
+          frame("response.output_item.added", {
+            output_index: 0,
+            item: { ...upstreamItem, input: "", status: "in_progress" },
+          }),
+          frame("response.custom_tool_call_input.done", {
+            output_index: 0,
+            item_id: "ctc_patch",
+            input: DECORATED_PATCH,
+          }),
+          frame("response.output_item.done", { output_index: 0, item: upstreamItem }),
+          frame("response.completed", {
+            response: { id: "resp_patch_stream", status: "completed", output: [upstreamItem] },
+          }),
+          "data: [DONE]",
+        ].join("\n\n") + "\n\n";
+        return new Response(upstream, { headers: { "content-type": "text/event-stream" } });
+      }
+      return Response.json({ id: "resp_patch_json", status: "completed", output: [upstreamItem] });
+    }) as typeof fetch;
+
+    try {
+      for (const stream of [false, true]) {
+        const response = await handleResponses(new Request("http://localhost/v1/responses", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "fixture/deepseek-v4-flash",
+            stream,
+            input: [{ role: "user", content: [{ type: "input_text", text: "patch" }] }],
+            tools: [{
+              type: "custom",
+              name: "apply_patch",
+              description: "Apply a patch",
+              format: { type: "grammar", syntax: "lark" },
+            }],
+          }),
+        }), config, { model: "", provider: "" });
+
+        if (!stream) {
+          const body = await response.json() as { output: Array<Record<string, unknown>> };
+          expect(body.output[0]).toMatchObject({
+            type: "custom_tool_call",
+            name: "apply_patch",
+            input: CANONICAL_PATCH,
+          });
+          continue;
+        }
+
+        const blocks = (await response.text()).split("\n\n").filter(block => block.includes("data: {"));
+        const payloads = blocks.map(dataPayload);
+        const inputDone = payloads.find(payload => payload.type === "response.custom_tool_call_input.done");
+        expect(inputDone).toMatchObject({ input: CANONICAL_PATCH });
+        const itemDone = payloads.find(payload => payload.type === "response.output_item.done") as {
+          item?: Record<string, unknown>;
+        } | undefined;
+        expect(itemDone?.item).toMatchObject({ type: "custom_tool_call", input: CANONICAL_PATCH });
+        const completed = payloads.find(payload => payload.type === "response.completed") as {
+          response?: { output?: Array<Record<string, unknown>> };
+        } | undefined;
+        expect(completed?.response?.output?.[0]).toMatchObject({ input: CANONICAL_PATCH });
+      }
     } finally {
       globalThis.fetch = savedFetch;
     }

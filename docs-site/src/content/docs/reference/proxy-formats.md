@@ -54,6 +54,11 @@ non-empty `model`. `input` may be a string or an array of Responses items.
 
 Unknown item types are accepted as loose typed items for forward compatibility. Translated adapters
 handle only the item types they recognize, and may reject a feature their provider cannot represent.
+On the canonical ChatGPT Codex forward route, text-only `system` input messages are folded into
+top-level `instructions`, and `truncation` is removed because that destination rejects both public
+Responses shapes. Other Responses destinations preserve them.
+The same canonical boundary removes nested client-only `prompt_cache_breakpoint` markers and drops
+`item_reference` entries only on `store: false` continuations; tool call/result pairing is unchanged.
 
 ### JSON and SSE output
 
@@ -71,6 +76,22 @@ with a synthetic `response.failed` event followed by `data: [DONE]`. On the Resp
 bridge, the same condition emits a 502 `websocket_protocol_error` and cancels the upstream reader.
 A complete Responses terminal frame is authoritative: oversized or malformed trailing bytes after
 that terminal are dropped rather than replacing the completed turn with a transport failure.
+
+:::note
+For native passthrough, a Responses terminal event is authoritative. A premature `data: [DONE]` is
+held until that event. On the ordinary native path, a clean HTTP 200 EOF without a parsed terminal
+emits one `response.incomplete` with `incomplete_details.reason: "adapter_eof"`, followed by one
+`data: [DONE]`; syntactically valid delimiter-less terminal JSON is accepted exactly once, while
+malformed or truncated JSON remains incomplete. For providers opted into model-scoped terminal
+repair, unframed terminal-like suffixes and a premature `data: [DONE]` at EOF fail closed with
+`missing_terminal_event` when no complete lifecycle candidate can be promoted; a complete candidate
+is promoted to `response.completed`. High-confidence `cyber_policy`
+terminal shapes normalize to `response.failed` with `error.code: "cyber_policy"` for semantic
+logging/accounting (status 400), while an already-started streamed HTTP response remains 200. This
+committed-request boundary does not retry or replay and does not resolve
+[#2423](https://github.com/lidge-jun/opencodex/issues/2423) or
+[#2486](https://github.com/lidge-jun/opencodex/issues/2486).
+:::
 
 For canonical ChatGPT forward streaming, stable Bun 1.4.0 or newer may transparently use
 Codex's upstream WebSocket transport. Bundled Bun 1.3.14, prereleases, and unverifiable runtime
@@ -93,8 +114,23 @@ report those details:
 ```
 
 When available, `input_tokens_details` can also include `cache_write_tokens`. The always-present
-detail objects are a compatibility guarantee for strict Responses clients; zero can mean “not
-reported,” not necessarily “the provider performed no such work.”
+detail objects are a compatibility guarantee for strict Responses clients; zero can mean "not
+reported," not necessarily "the provider performed no such work."
+
+### Correlating a response with its request log
+
+Every admitted HTTP Responses reply carries an `x-opencodex-request-id` header holding a
+proxy-generated id of the form `ocx-<32 hex>`. It is the key that ties a response to its row in
+the request log and in usage reporting.
+
+The proxy always generates this value and overwrites any id supplied by the caller or returned by
+the upstream, so it is unique to this proxy and safe to trust as a correlation key. The header is
+named in `Access-Control-Expose-Headers`, which is what lets browser JavaScript read it
+cross-origin — a custom `x-` header is otherwise invisible to `response.headers.get()` even when
+it is on the wire.
+
+Responses rejected at authentication or origin admission never reach this wrapper and carry no id,
+so a missing header means the request was refused before it was logged.
 
 ### WebSocket upgrade on the same path
 
@@ -239,6 +275,18 @@ The proxy normalizes the upstream join URL and then transparently relays text an
 both directions. Client protocol headers are preserved while upstream authentication remains
 proxy-owned.
 
+Call creation and the sideband join must run under the same OpenAI account, or the join is refused
+upstream (`404`). Both legs carry Codex's `session-id` and `thread-id` headers; in Pool mode the
+account choice is bound to that pair (process-local), so a join that reaches the proxy reuses the
+account that created the call, while Direct mode forwards the caller's current bearer on both legs.
+The relayed client headers are exactly `openai-alpha`, `x-session-id`, `session-id`, `thread-id`,
+`originator`, and `x-oai-attestation` (`LIVE_CLIENT_PROTOCOL_HEADERS` in `src/server/live.ts`);
+`Authorization` and the ChatGPT account id are proxy-owned on ChatGPT-backed routes (Pool replaces
+them with the stored account, Direct forwards the validated caller bearer) and an API-key provider
+gets its own bearer. Codex only sends the join to the proxy when `experimental_realtime_ws_base_url`
+points at it; `ocx start` injects that key next to `openai_base_url` (see
+[Codex integration](/guides/codex-integration/)).
+
 ## `POST /v1/responses/compact`
 
 Compaction returns replacement history for clients that need to shorten a long Responses
@@ -248,6 +296,16 @@ conversation.
 | --- | --- |
 | Canonical ChatGPT or official OpenAI route | Forwards the request to the native `/responses/compact` endpoint with the resolved account and model authentication |
 | Other routed model | Runs an internal, non-streaming, no-tools compaction turn with a `compaction_trigger`; requires exactly one synthetic `compaction` item whose `encrypted_content` is an `ocx1:` envelope; decodes that summary into v1 replacement history |
+
+Codex names a bare OpenAI-family model (for example `gpt-5.6-sol`) for its compaction turns
+regardless of which provider the operator routes ordinary turns to. Ordinary requests reserve
+such ids for the canonical `openai` provider. On the compaction surface only — `POST
+/v1/responses/compact` and a `POST /v1/responses` turn carrying a `compaction_trigger` — a bare
+native model with no enabled canonical `openai` provider falls back to the configured
+`defaultProvider` as the summarizer instead of returning 404. The fallback applies only when the
+default provider is enabled and is not itself an OpenAI-family entry; account-qualified selectors
+such as `side/gpt-5.6-sol` still fail closed. The proxy logs one notice per provider when this
+fallback engages. Configurations with an enabled canonical `openai` provider are unchanged.
 
 Native compact responses are buffered with a 32 MiB maximum, including responses whose declared
 `Content-Length` already exceeds the limit. The compact-specific failures include:

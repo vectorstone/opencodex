@@ -80,6 +80,27 @@ on proven absence, never on an unreadable path.
 - 다른 대안 대신 이 방식을 선택한 이유: Physical credential ownership remains cross-process safe, while an inert optional subsystem can no longer create the reported lock/recovery catch-22.
 - 장점, 단점 및 영향: Fresh installs avoid the SQLite profile lock; any present or uncertain stage state retains the existing locked fail-closed cleanup and recovery behavior.
 
+The native-write coordinator is keyed by the canonical `CODEX_HOME` in the effective-user runtime
+namespace. A pathname alone is not authority: SQLite can expose a zero-byte file before its first
+schema write, and a terminated process can leave that remnant behind. Eligibility treats the file
+as non-authoritative only after an immutable SQLite read proves version zero with no tables, the
+filesystem identity remains unchanged, and the file has been settled for at least one second; a
+fresh zero-byte creator stays on the coordinated path so its lock cannot be bypassed. `ocx doctor` inspects the
+coordinator with immutable read-only SQLite flags so diagnosis never creates WAL/SHM sidecars. It
+distinguishes absent, zero-byte, unversioned, rowless, valid, unsupported, changed, unsafe, and
+unreadable states and prints the exact path. Explicit recovery is available only after the proxy is
+stopped and only for a proven zero-byte state. The command revalidates the same private
+regular-file identity under a non-blocking SQLite write lock and moves it to a same-directory
+backup; it never deletes or auto-adopts legacy routed residue.
+
+[Decision Log]
+- 목적과 의도: Recover a crashed zero-byte coordinator without mistaking SQLite's normal creation window for stale authority.
+- 기존 구현 및 제약 조건: Eligibility treated every existing pathname as coordinated, while initialization correctly refused a missing row over routed residue; catalog sync could therefore succeed before config injection failed permanently.
+- 검토한 주요 대안: Delete zero-byte files automatically, initialize a new row over residue, require a manual filesystem command, or add observe-only classification plus explicit guarded quarantine.
+- 선택한 방식: Treat only a settled, identity-stable, immutably verified zero-byte database like the existing legacy-uncoordinated boundary; keep fresh creators coordinated, diagnose all other database states immutably, and expose an opt-in zero-byte-only same-directory backup move with identity, ownership, sidecar, liveness, and SQLite-lock checks.
+- 다른 대안 대신 이 방식을 선택한 이유: Automatic deletion or adoption can race a live creator or erase transition evidence; a guarded backup preserves evidence and makes the operator action reproducible.
+- 장점, 단점 및 영향: A stale zero-byte file no longer wedges sync, valid/unrecognized databases remain fail-closed, and recovery requires the proxy to be stopped before `ocx sync` retries injection.
+
 OpenCodex never overrides an explicit `CODEX_HOME`. On Windows, `ocx doctor` and `ocx status`
 nevertheless diagnose the high-confidence Orca dual-home case: both `CODEX_HOME` and
 `ORCA_CODEX_HOME` select Orca's `orca/codex-runtime-home/home`, while the ChatGPT/Codex app uses the
@@ -101,6 +122,10 @@ the recorded service ownership.
 `atomicWriteFile` uses a temp file named `{path}.ocx.{pid}.{seq}.tmp` (process ID + incrementing
 sequence number) to avoid collisions when concurrent writers (e.g. `ocx stop` and the proxy's own
 shutdown handler) both restore Codex config simultaneously. The temp is renamed atomically into place.
+Storage cleanup run metadata uses the field-scoped persisted-config mutation path, so a background
+Worker cannot restore unrelated API keys or provider settings from a snapshot read before the lock.
+If that metadata write is unavailable after cleanup has already completed, the job retains the
+cleanup outcome and exposes a bounded persistence error instead of relabeling the run as a Worker failure.
 
 Windows secret-file hardening resolves the effective token SID through an absolute, trusted
 PowerShell path before granting the owner and removing inherited broad ACL entries. The normal
@@ -132,6 +157,34 @@ Hidden` inside an already-running PowerShell script, nor to .NET/VBS process-win
 - 다른 대안 대신 이 방식을 선택한 이유: Names and environment paths are caller-controlled, required secret writes must not silently skip ACLs, and elevation has a larger authority boundary that should remain FFI-only.
 - 장점, 단점 및 영향: Default Windows ARM64 installations can start and harden secrets; non-default Windows roots continue to fail closed until Bun exposes a trustworthy native system-directory API without FFI.
 
+The durable response-spill directory `~/.opencodex/responses-state-spill/` is bounded in
+aggregate, not only per file. Continuation state demoted out of the in-memory cap
+(`MAX_STORED_RESPONSE_BYTES`) is written there, and eviction past
+`MAX_SPILLED_RESPONSE_BYTES` removes oldest-first through the same deletion point that serves
+TTL and count eviction, so an evicted entry unlinks its file. One function owns that ceiling and
+three callers drive it: mutation pruning, the lazy load that follows a restart, and the periodic
+sweep. The periodic caller is not redundant — the mutation path runs only when traffic arrives, so a
+process that comes up over budget from a snapshot written under a larger ceiling would otherwise
+stay over it while idle.
+
+The ceiling bounds what the store can account for, which is every entry in the map plus the
+superseded generations queued for unlink, and deliberately not the directory as a whole. Spill files
+orphaned by a crash are absent from the map, so this accounting can neither see nor price them; they
+remain with the `recoverOrphanedResponseSpills` grace sweep described below, which is the only
+mechanism that reclaims them. A host that crashes repeatedly can therefore hold spill bytes above
+this ceiling for up to `RESPONSE_SPILL_ORPHAN_GRACE_MS` past each crash. Without that aggregate bound the
+directory was limited only per file (256 MiB) and per entry (1000) — a 250 GiB product — which
+left `RESPONSE_TTL_MS` as the only effective limit and made disk use a function of client
+request rate rather than of anything the process controls.
+
+[Decision Log]
+- 목적과 의도: Bound the durable spill directory in aggregate so demoted continuation state cannot consume the host disk.
+- 기존 구현 및 제약 조건: The resident map has an unconditional byte cap and demotes past it, but the disk it demotes onto had only a per-file ceiling and the shared 1000-entry count cap. Retention itself worked — the hour-long TTL did evict — so the gap was a missing budget, not a leak.
+- 검토한 주요 대안: Lower the per-file ceiling; shorten the TTL; sweep the directory on a timer; add a configurable budget key; carry a running byte counter.
+- 선택한 방식: A constant aggregate ceiling checked at the end of the existing prune, evicting oldest-first, with the total recomputed per prune rather than carried as a counter.
+- 다른 대안 대신 이 방식을 선택한 이유: Per-file or TTL changes alter retention semantics other bounds depend on; a timer adds a second owner for eviction; a config key would surface a knob the sibling bounds (count, TTL, per-file) do not have; and a running counter could silently disable the cap if any of the several insertion paths missed an increment, where a walk over at most 1000 entries cannot drift.
+- 장점, 단점 및 영향: Disk use stops tracking client request rate. Ordinary traffic is unaffected because the count cap binds at a comparable point for median-sized payloads; a workload of unusually large continuations loses its oldest spills earlier than the TTL would, surfacing as the existing `previous_response_not_found` continuation miss.
+
 Response-state loading performs a bounded recovery pass for interrupted snapshot writes. It only
 matches regular files named `responses-state.json.ocx.<pid>.<sequence>.tmp`, waits at least 15
 minutes, and skips the current or any live PID. Eligible files are truncated before unlinking so a
@@ -148,7 +201,77 @@ are consumed incrementally and at most 512 stale files are attempted per process
 - 다른 대안 대신 이 방식을 선택한 이유: It repairs known remnants without broad authority over unrelated temp files or active writers.
 - 장점, 단점 및 영향: Old dead-PID files are reclaimed automatically; locked or conservatively classified files remain for a later retry.
 
+Windows runtime response spills never wait on `icacls` through `Bun.spawnSync`. Linux and macOS
+retain the immediate synchronous publication path. On Windows, the resident continuation enters one
+serialized publication queue and remains replayable while `hardenSecretDirAsync` and
+`hardenSecretPathAsync` run. Publication installs a spill stub only when the map still contains the
+same resident object; a superseded job deletes its newly published file instead of overwriting newer
+state. Pending payloads are pinned and capped at 256 MiB, so an ACL outage cannot grow an unbounded
+queue or be misreported as evictable memory. One caller-owned retry is allowed after a real
+`ETIMEDOUT`; the first timeout does not install a `spill-failed` tombstone. Required ACL failures
+remain fail-closed after that bounded recovery. Optional config-directory hardening uses a separate
+per-directory async single-flight, while required config mutation writers retain their existing
+awaited or synchronous fail-closed boundary.
+
+Each ordinary async spill write attempt owns one 30-second ACL budget shared across directory, temp,
+and exclusive-copy destination hardening; the single timeout retry receives one fresh whole-attempt
+budget. No harden step may reopen an independent 30-second window inside either attempt.
+Both icacls and effective-principal subprocess waits are settlement-bounded: at deadline the child is
+killed, unref'd, and abandoned without awaiting `proc.exited`. The caller-level deadline also bounds
+injected/shared runners, so a child that ignores termination cannot pin the serialized spill queue.
+
+Graceful shutdown drains that serialized publication queue to a stable fixed point before snapshot
+serialization. The drain has a wall-clock cap with a reserved synchronous fallback budget; expiry
+supersedes the async writer, claims and removes any temp or destination it still owns, and only then
+starts fallback publication. The writer rechecks supersession before no-replace publication, while
+the fallback splits its reserve across the directory and file ACL hardens. This ordering is
+load-bearing because resident entries over 2 MiB are deliberately excluded from
+`responses-state.json`: serializing first could omit the resident before its durable spill stub
+exists, losing the continuation on restart. Cleanup is attempted for every abandoned writer; any
+failure is retained while fallback and snapshot persistence continue, then returned through the
+shutdown status so process exit is non-zero without sacrificing unrelated replay state.
+If the fallback reserve expires, every remaining resident candidate is terminalized as a bounded
+`spill-failed` tombstone before pruning, so no payload remains eligible for shutdown requeue and the
+snapshot flush always regains control.
+The terminalization pass itself is hard-capped at `MAX_STORED_RESPONSES + 1`; exceeding that
+structural bound records a bounded failure, fail-closes every remaining resident, and returns control
+to snapshot persistence instead of relying on the progress argument alone.
+
+[Decision Log]
+- 목적과 의도: Keep `/healthz` and unrelated requests responsive during intermittent Windows ACL stalls without publishing an unhardened continuation.
+- 기존 구현 및 제약 조건: Response demotion called the synchronous spill writer from request-time state mutations; `Bun.spawnSync(icacls)` could block the only Bun event loop for the full timeout and immediately replace replayable state with a tombstone.
+- 검토한 주요 대안: Increase the ACL timeout, weaken required ACL checks, publish before hardening, move every platform to async state mutation, or isolate only the Windows ACL-dependent publication boundary.
+- 선택한 방식: Preserve non-Windows behavior; serialize Windows publications through async ACL APIs, retain the exact resident generation until compare-before-swap succeeds, cap pending bytes, and retry one proven timeout.
+- 다른 대안 대신 이 방식을 선택한 이유: Longer waits worsen liveness, early publication weakens secret-file ACLs, and a cross-platform async rewrite would disturb mature immediate memory and crash-ordering contracts that do not cause this incident.
+- 장점, 단점 및 영향: Windows health stays schedulable and transient ACL stalls retain continuation replay; pending payloads can temporarily exceed the 64 MiB resident target but are pinned under a 256 MiB local ceiling and remain inside the documented 512 MiB process-owned worst case.
+
 ## Config surface
+
+### OpenCodex home and live process state
+
+`src/config/paths.ts` is the single owner of `OPENCODEX_HOME` expansion and resolution. It exposes
+the config directory and `config.json` path and retains the existing cache rule: a relative home is
+resolved once for each distinct raw environment value, so a later working-directory change cannot
+silently move the active installation.
+
+`src/config/process-state.ts` derives `ocx.pid` and `runtime-port.json` from that resolved directory.
+It owns their byte-compatible writes, parsing, expected-PID filters, cheap liveness, full OCX command
+identity, and snapshot-guarded removal. `RuntimePortState.attestationSecret` remains optional,
+owner-only state and is validated before a record is returned. `src/config.ts` re-exports the same
+symbols for compatibility, but new lifecycle-only callers import the process-state leaf directly.
+
+Both config and process-state writes use `src/config/atomic-write.ts`. The leaf preserves the shared
+process-wide temp sequence, symlink target resolution, real-home test guard, owner manifest,
+Windows ACL hardening, scrub-before-unlink failure path, and explicit residual-temp errors. A caller
+must not replace it with a local temp-and-rename shortcut.
+
+[Decision Log]
+- 목적과 의도: Make persisted config, path resolution, atomic file publication, and live process state distinct ownership boundaries.
+- 기존 구현 및 제약 조건: All four concerns lived in `src/config.ts`; process-state extraction could not safely import the facade without a cycle and could not copy the atomic writer without creating two security/correctness contracts.
+- 검토한 주요 대안: Keep one file, tolerate the cycle, duplicate only PID/runtime writes, or extract the minimal dependency leaves.
+- 선택한 방식: Preserve one implementation per concern under `src/config/` and keep facade re-exports for downstream compatibility.
+- 다른 대안 대신 이 방식을 선택한 이유: The dependency graph stays acyclic and every existing path, serialized shape, error, identity probe, and cleanup guard remains reusable from one owner.
+- 장점, 단점 및 영향: Internal lifecycle imports become narrow and testable; review must still treat changes to `atomic-write.ts` and `process-state.ts` as shared cross-platform runtime changes.
 
 `src/types.ts` is the shape and `src/config.ts` is the loader; neither is reproduced here. What
 matters for maintainers is which groups exist and who resolves them:
@@ -157,7 +280,7 @@ matters for maintainers is which groups exist and who resolves them:
 | --- | --- | --- |
 | Listener | `port`, `hostname` | The listener owns the port; `runtime-port.json` reports where it actually landed. |
 | Routing | `defaultProvider`, `providers`, per-provider `selectedModels` | Explicit `provider/model` wins over `defaultProvider`. |
-| Catalog | `disabledModels`, `customModels`, `modelCacheTtlMs`, `providerContextCaps`, `contextCapValue`, `codexAccountNamespaces`, `codexAccountPickerEnabled` | Catalog state is derived; config only records intent. The picker flag is an explicit visibility override, while selector mappings remain the durable exact-routing contract. |
+| Catalog | `disabledModels`, `customModels`, `modelCacheTtlMs`, `providerContextCaps`, `contextCapValue`, per-provider `modelDisplayNames`, `codexAccountNamespaces`, `codexAccountPickerEnabled` | Catalog state is derived; config only records intent. Exact provider model display names are durable display only overlays. The picker flag is an explicit visibility override, while selector mappings remain the durable exact-routing contract. |
 | Retained state | `appOwnedMemoryBudgetMb` | Process-wide eviction target for app-owned logs, caches, blobs, and continuation payloads. Default 256 MiB, valid 64..4096; pinned state may temporarily exceed the target, but every pin-capable store has a finite local cap and their documented aggregate stays below `APP_OWNED_WORST_CASE_PINNED_BYTES` (512 MiB). Neither value caps RSS or native runtime memory. |
 | Transport | stream mode, timeouts, proxy settings, `websockets`, `emptyCompletionRetry` | `streamMode` persists in config.json; Windows services need a persisted input, and macOS uses it for explicit eager-relay opt-in. Empty-completion replay is an explicit top-level opt-in because its second upstream request may be billable. |
 | Credentials | `apiKeys` | Data-plane only; never admitted to `/api/*`. |
@@ -179,10 +302,12 @@ openai_base_url = "http://127.0.0.1:10100/v1"
 ```
 
 Codex keeps the native `openai` provider id, so new threads stay under that identity instead of
-being re-tagged. History that an earlier legacy injection re-tagged as `opencodex` is migrated back
-to `openai` once, as restore machinery — a no-op when there is nothing to migrate. A user-owned root
-`openai_base_url` is preserved instead of overwritten, and that case also blocks managed sub-agent
-defaults rather than fighting the user for ownership.
+being re-tagged. History restore is manifest-authoritative: only rows whose original provider,
+source, and event marker were backed up for the same state database are restored exactly. A bare
+`opencodex` row is never assumed to have originated at OpenAI; it stays unchanged unless the user
+explicitly runs legacy OpenAI recovery. A user-owned root `openai_base_url` is preserved instead of
+overwritten, and that case also blocks managed sub-agent defaults rather than fighting the user for
+ownership.
 
 **API auth header (non-loopback).** The built-in `openai` provider cannot carry the
 `x-opencodex-api-key` env header, so this form re-tags the root provider and appends the table:
@@ -210,11 +335,30 @@ Native Codex sub-agent defaults are a separate, explicit opt-in. When
 overwritten. Disabling the option and fallback restore remove only marker-owned values; journal
 restore must preserve later user edits while stripping those managed values.
 
+### History backup manifest contract
+
+`src/codex/history-manifest.ts` is the pure schema-and-identity leaf for the versioned history
+backup manifest. It owns the accepted provider/source provenance tuples, platform-aware database
+path identity, backup filename id, and validation from unknown JSON to a typed manifest. It does
+not read files, inspect rollouts, open SQLite, retry, fingerprint, write, or delete anything.
+
+`history-provider.ts` remains the strict mutation owner and maps shared validation failures to its
+restore/no-op integrity states. `native-residue.ts` remains a read-only observer and maps the same
+result to clean, residue, or indeterminate before inspecting referenced rollout files.
+
+[Decision Log]
+- 목적과 의도: Make restore and native-residue inspection accept and reject exactly the same versioned history provenance contract.
+- 기존 구현 및 제약 조건: Both modules independently checked version, database identity, entry ids, absolute rollout paths, provider/source tuples, and event markers; drift could make one module restore a manifest that the other refused to classify.
+- 검토한 주요 대안: Keep duplicate validators synchronized through review, import the mutation-heavy history provider into residue inspection, or extract a pure shared leaf.
+- 선택한 방식: Extract only types, path identity, filename id, provenance, and unknown-data validation; keep all filesystem, rollout, SQLite, retry, and mutation policy in the existing callers.
+- 다른 대안 대신 이 방식을 선택한 이유: A pure leaf removes schema drift without pulling write-side effects or database ownership into the read-only startup inspection graph.
+- 장점, 단점 및 영향: Format changes now have one validator and shared invalid fixtures; callers still intentionally own different user-facing failure mappings, so contract changes require updating both mappings and this document.
+
 If the root config selects a provider other than `openai` or `opencodex`, injection must leave the
-config byte-for-byte unchanged and skip profile creation/updates and history migration. External
+config byte-for-byte unchanged and skip profile creation/updates and history metadata restoration. External
 provider managers own that routing configuration, and replacing their provider id can hide
 otherwise intact Codex sessions. This ownership check must run before catalog/cache refresh,
-journal creation, and the background history migration guardian.
+journal creation, and the background history restoration guardian.
 
 `ocx sync` and `ocx restore back` run the injector's non-writing preflight before provider
 discovery or catalog/cache replacement. Deterministic config and ownership refusals therefore
@@ -257,9 +401,29 @@ not context-window metadata. They are applied only when a Responses request omit
 `max_output_tokens`; an explicit request value wins, then a model-specific configured value, then
 the provider default, then the adapter omits `max_tokens`.
 
+Client-export capability is deliberately separate: `CatalogModel.maxOutputTokens` comes from an
+exact generated metadata bundle or `OcxCustomModel.maxOutputTokens`. Exporters must never read the
+wire-default fields above as a model maximum.
+
 Both fields must stay positive finite integers at disk-config and management validation boundaries.
 Registry entries may seed them through `providerConfigSeed`, key-login derivation, OAuth reconcile,
 and `routeModel`, but user config overrides registry defaults per field/key.
+
+## Provider validation ownership
+
+`src/config/provider-validation.ts` owns the pure provider payload checks shared by persisted config,
+CLI writes, and management DTO validation. `src/config.ts` imports those checks for Zod refinement
+and re-exports them as a compatibility facade; it must not grow a second copy. Validation error text,
+ordering, and cross-field rules are part of the write/load contract because management requests and
+hand-edited `config.json` must accept and reject the same provider shapes.
+
+[Decision Log]
+- 목적과 의도: Separate reusable provider payload validation from config file persistence without changing accepted configuration or error behavior.
+- 기존 구현 및 제약 조건: The Zod schema, CLI, and management API shared helpers defined inside `src/config.ts`, so callers needing one pure check depended on the full persistence module.
+- 검토한 주요 대안: Keep validation in the persistence module; duplicate checks per caller; extract one leaf and retain compatibility re-exports.
+- 선택한 방식: Use one pure validation leaf, consume it from config refinement and direct DTO callers, and keep `src/config.ts` re-exports during migration.
+- 다른 대안 대신 이 방식을 선택한 이유: One implementation preserves load/write parity while reducing dependency breadth and avoiding a flag-day import rewrite.
+- 장점, 단점 및 영향: Validation can be characterized independently and config persistence becomes smaller; a temporary facade remains until all internal callers migrate.
 
 ## Restore
 
@@ -276,3 +440,7 @@ uninstall with their exact paths.
 Legacy nonempty config directories are deliberately not retroactively claimed. If either ownership
 file is missing, malformed, or bound to another root, uninstall refuses config deletion and reports
 the residual directory for manual review; there is no recursive-delete fallback.
+
+## Remote client key files
+
+Client connection metadata stores a stable `apiKeyId` and a non-secret rotation `pendingOperation`. The current data secret remains only in `service-api-token`; a bounded rotation temporarily keeps the old secret in owner-only `service-api-token.prev`. Commit or recovery clears the marker before orphan cleanup. `ocx disconnect` is local-only and leaves remote revocation to the hub's **Integrations → API Keys** page. Hub and local usage stores are not mirrored.

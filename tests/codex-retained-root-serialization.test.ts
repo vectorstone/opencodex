@@ -16,7 +16,8 @@ import {
   resolveCodexCatalogSerializationDatabasePath,
   resolveEffectiveUserIdentity,
 } from "../src/codex/user-identity";
-import { claimOwnedServiceHome } from "./helpers/owned-service-home";
+import { claimOwnedServiceHome, withOwnedServiceHomePreload } from "./helpers/owned-service-home";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const sandboxes: Sandbox[] = [];
@@ -26,6 +27,8 @@ interface Sandbox {
   readonly codexHome: string;
   readonly opencodexHome: string;
   readonly env: Record<string, string>;
+  readonly serviceManagerEnv: Record<string, string>;
+  readonly preloadPath?: string;
 }
 
 function nativeEntry(slug: string, visibility = "list"): Record<string, unknown> {
@@ -65,7 +68,7 @@ function makeSandbox(prefix: string): Sandbox {
     mkdirSync(path, { recursive: true });
     chmodSync(path, 0o700);
   }
-  const serviceManagerEnv = claimOwnedServiceHome(codexHome, opencodexHome, home).env;
+  const serviceHome = claimOwnedServiceHome(codexHome, opencodexHome, home);
   const sandbox = {
     root,
     codexHome,
@@ -81,14 +84,23 @@ function makeSandbox(prefix: string): Sandbox {
       TMP: runtime,
       XDG_RUNTIME_DIR: runtime,
       LOCALAPPDATA: join(home, "LocalAppData"),
-      ...serviceManagerEnv,
     },
+    serviceManagerEnv: serviceHome.env,
+    preloadPath: serviceHome.preloadPath,
   };
   sandboxes.push(sandbox);
   return sandbox;
 }
 
-async function waitForPath(path: string, timeoutMs = 10_000): Promise<void> {
+function sandboxChildEnv(sandbox: Sandbox): Record<string, string> {
+  return { ...sandbox.env, ...sandbox.serviceManagerEnv };
+}
+
+// A `bun --eval` child on a loaded windows-latest shard takes 8-11 s just to boot and
+// reach its marker (runs 33590540220 and 33605898170), so a 10 s wait was the coin flip,
+// not the child. Every caller passes a deadline that sits inside its own test budget so
+// the helper's diagnostic, not Bun's timeout, is what reports a slow child.
+async function waitForPath(path: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${path}`);
@@ -100,9 +112,9 @@ async function runChild(
   sandbox: Sandbox,
   script: string,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn([process.execPath, "--eval", script], {
+  const child = Bun.spawn([process.execPath, ...withOwnedServiceHomePreload(["--eval", script], sandbox.preloadPath)], {
     cwd: repoRoot,
-    env: sandbox.env,
+    env: sandboxChildEnv(sandbox),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -137,7 +149,7 @@ async function holdCatalogLock(sandbox: Sandbox): Promise<{
     stdout: "pipe",
     stderr: "pipe",
   });
-  await waitForPath(ready);
+  await waitForPath(ready, 12_000);
   return { release: () => writeFileSync(release, "release"), child };
 }
 
@@ -153,7 +165,7 @@ afterEach(() => {
   for (const sandbox of sandboxes.splice(0)) {
     const database = resolveCodexCatalogSerializationDatabasePath(identity, sandbox.codexHome);
     for (const suffix of ["", "-journal", "-wal", "-shm"]) rmSync(`${database}${suffix}`, { force: true });
-    rmSync(sandbox.root, { recursive: true, force: true });
+    removeTreeWithRetry(sandbox.root);
   }
 });
 
@@ -177,9 +189,12 @@ test("startup and CLI sync-cache cannot write models_cache while another process
     expect(startupProbe.exitCode).toBe(0);
     expect(existsSync(cachePath)).toBe(false);
 
-    const cli = Bun.spawnSync([process.execPath, "run", "src/cli/index.ts", "sync-cache"], {
+    const cli = Bun.spawnSync([
+      process.execPath,
+      ...withOwnedServiceHomePreload(["run", "src/cli/index.ts", "sync-cache"], sandbox.preloadPath),
+    ], {
       cwd: repoRoot,
-      env: sandbox.env,
+      env: sandboxChildEnv(sandbox),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -287,16 +302,16 @@ for (const publisher of ["convergence", "retained"] as const) {
     };
     writeFileSync(join(sandbox.opencodexHome, "config.json"), JSON.stringify(config));
     try {
-      const sync = Bun.spawn([process.execPath, "--eval", `
+      const sync = Bun.spawn([process.execPath, ...withOwnedServiceHomePreload(["--eval", `
         const config = ${JSON.stringify(config)};
         const { handleManagementAPI } = await import("./src/server/management-api.ts");
         const req = new Request("http://localhost/api/sync", { method: "POST", headers: { Host: "localhost" } });
         const response = await handleManagementAPI(req, new URL(req.url), config);
         console.log(JSON.stringify({ status: response.status, body: await response.json() }));
-      `], { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe" });
+      `], sandbox.preloadPath)], { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" });
 
       await Promise.race([
-        waitForPath(requested),
+        waitForPath(requested, 16_000),
         sync.exited.then(async exitCode => {
           const stdout = await new Response(sync.stdout).text();
           const stderr = await new Response(sync.stderr).text();
@@ -366,7 +381,7 @@ test("a persisted runtime selection moved by another process during the await bl
     },
   };
 
-  const sync = Bun.spawn([process.execPath, "--eval", `
+  const sync = Bun.spawn([process.execPath, ...withOwnedServiceHomePreload(["--eval", `
     import { existsSync, writeFileSync } from "node:fs";
     const config = ${JSON.stringify(config)};
     config.providers.together.fetch = async () => {
@@ -376,10 +391,10 @@ test("a persisted runtime selection moved by another process during the await bl
     };
     const { syncCatalogModels } = await import("./src/codex/catalog/sync.ts");
     console.log(JSON.stringify(await syncCatalogModels(config)));
-  `], { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe" });
+  `], sandbox.preloadPath)], { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" });
 
   await Promise.race([
-    waitForPath(requested),
+    waitForPath(requested, 16_000),
     sync.exited.then(async exitCode => {
       const stdout = await new Response(sync.stdout).text();
       const stderr = await new Response(sync.stderr).text();
@@ -497,8 +512,8 @@ test("two processes at the post-approval management seam serialize instead of in
     writeFileSync(catalogPath, seeded);
 
     const children = (["a", "b"] as const).map(marker => Bun.spawn(
-      [process.execPath, "--eval", routeScript(marker)],
-      { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe" },
+      [process.execPath, ...withOwnedServiceHomePreload(["--eval", routeScript(marker)], sandbox.preloadPath)],
+      { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" },
     ));
 
     results = await Promise.all(children.map(async child => {

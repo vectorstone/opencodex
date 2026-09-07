@@ -7,10 +7,18 @@ import {
   clearCursorThreadContinuityForTests,
   lookupCursorThreadConversation,
 } from "../src/adapters/cursor/thread-continuity";
+import {
+  clearCursorCheckpointsForTests,
+  commitCursorCheckpoint,
+  getCursorCheckpoint,
+} from "../src/adapters/cursor/checkpoint-store";
+import { create, toBinary } from "@bufbuild/protobuf";
+import { ConversationStateStructureSchema } from "../src/adapters/cursor/gen/agent_pb";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../src/types";
 import type { CursorClientMessage, CursorRunRequest, CursorServerMessage } from "../src/adapters/cursor/types";
 import type { CursorTransportFactoryInput } from "../src/adapters/cursor/transport";
 import { withTestTranslatorBudget } from "./helpers/translator-budget";
+import { CursorRootEnvelopeLimitError } from "../src/adapters/cursor/cursor-errors";
 
 const createCursorAdapter = (...args: Parameters<typeof createCursorAdapterProduction>) =>
   withTestTranslatorBudget(createCursorAdapterProduction(...args));
@@ -85,11 +93,9 @@ describe("Cursor adapter live transport", () => {
     expect(requests[0]?.modelId).toBe("default");
     expect(requests[0]?.routingLevel).toBeUndefined();
     expect(writes).toEqual([]);
-    expect(events).toEqual([
-      { type: "thinking_delta", thinking: "검토 중" },
-      { type: "text_delta", text: "안녕하세요" },
-      { type: "done", usage: { inputTokens: 3, outputTokens: 5 } },
-    ]);
+    expect(events[0]).toEqual({ type: "thinking_delta", thinking: "검토 중" });
+    expect(events[1]).toEqual({ type: "text_delta", text: "안녕하세요" });
+    expect(events[2]).toMatchObject({ type: "done", usage: { inputTokens: 3, outputTokens: 5 } });
   });
 
   test("runTurn forwards the router-prepared provider fetch to the live transport", async () => {
@@ -113,6 +119,51 @@ describe("Cursor adapter live transport", () => {
 
     expect(inputs).toHaveLength(1);
     expect(inputs[0]?.fetch).toBe(pacedFetch);
+  });
+
+  // #1527: the envelope rejection is raised locally while building the request, so it surfaces
+  // through the same terminal catch as a transport fault. Review found the class was flattened to
+  // a bare message there, losing the stable code a caller needs to tell "this conversation cannot
+  // be sent" from a transient upstream error — and the message carried a doubled prefix.
+  test("a local envelope rejection surfaces as a typed 400, not a bare message", async () => {
+    // Raised from the transport seam because that is where it actually originates: encoding
+    // happens inside the live transport (`prepareCursorRunRequest` in live-transport.ts), which a
+    // mock replaces, so a mocked run can never reach the guard itself. What is under test here is
+    // the adapter's terminal catch, not the guard — the guard has its own tests in
+    // tests/cursor-blob.test.ts.
+    const adapter = createCursorAdapter(provider, {
+      createTransport: () => ({
+        async *run(): AsyncGenerator<CursorServerMessage> {
+          throw new CursorRootEnvelopeLimitError(194, 600_000, 192, 524_288);
+        },
+        writeClient() {},
+      }),
+    });
+    const events: AdapterEvent[] = [];
+
+    await adapter.runTurn?.(
+      {
+        ...parsed,
+        modelId: "cursor/gpt-5.6-sol-xhigh",
+        context: { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      },
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+
+    const error = events.find(event => event.type === "error");
+    expect(error).toBeDefined();
+    expect(error).toMatchObject({
+      status: 400,
+      errorType: "invalid_request_error",
+      code: "cursor_root_envelope_limit",
+      retryable: false,
+    });
+    // One prefix, not two.
+    const message = String((error as { message?: unknown }).message ?? "");
+    expect(message.match(/Cursor invalid request/g)?.length).toBe(1);
+    // And the operator-facing numbers survive the boundary.
+    expect(message).toContain("194");
   });
 
   test("runTurn preserves explicit Cursor Router optimization levels", async () => {
@@ -352,6 +403,116 @@ describe("Cursor adapter live transport", () => {
     expect(events.filter(event => event.type === "error")).toHaveLength(0);
   });
 
+  test("forced-fresh recovery remembers a Cursor-only Desktop owner", async () => {
+    clearCursorThreadContinuityForTests();
+    const seen: string[] = [];
+    let attempts = 0;
+    const adapter = createCursorAdapter({
+      ...provider,
+      apiKey: "cursor-token",
+    }, {
+      createTransport: () => ({
+        async *run(request) {
+          attempts += 1;
+          seen.push(request.conversationId);
+          if (attempts === 1) {
+            throw Object.assign(
+              new Error("Cursor invalid request: Cursor Connect error invalid_argument: Error"),
+              { code: "invalid_argument" },
+            );
+          }
+          yield { type: "done" } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+      }),
+    });
+
+    const owner = "app:desktop-recovery-owner";
+    const identityScope = "acct-desktop-recovery";
+    const body: OcxParsedRequest = {
+      modelId: "cursor/gpt-5.6-sol",
+      context: {
+        messages: [
+          { role: "user", content: "first turn", timestamp: 1 },
+          { role: "assistant", content: [{ type: "text", text: "ack" }], timestamp: 2 },
+          { role: "user", content: "second turn", timestamp: 3 },
+        ],
+      },
+      stream: false,
+      options: { reasoning: "xhigh" },
+      _cursorClientThreadId: owner,
+      _cursorConversationId: "cursor_stale_desktop",
+      _cursorIdentityScope: identityScope,
+    };
+
+    await adapter.runTurn?.(body, { headers: new Headers() }, () => {});
+
+    expect(attempts).toBe(2);
+    expect(seen[1]).not.toBe(seen[0]);
+    expect(lookupCursorThreadConversation(owner, identityScope)).toBe(seen[1]);
+    clearCursorThreadContinuityForTests();
+  });
+
+  test("forced-fresh recovery keeps the new checkpoint instead of deleting it", async () => {
+    clearCursorCheckpointsForTests();
+    const parentBytes = toBinary(ConversationStateStructureSchema, create(ConversationStateStructureSchema, {
+      pendingToolCalls: ["parent-stale"],
+    }));
+    const parentRef = commitCursorCheckpoint({
+      conversationId: "cursor_stale",
+      identityScope: "acct-fresh",
+      modelId: "gpt-5.6-sol",
+      checkpointBytes: parentBytes,
+    });
+    expect(parentRef).toBeDefined();
+    const recoveredBytes = toBinary(ConversationStateStructureSchema, create(ConversationStateStructureSchema, {
+      pendingToolCalls: ["recovered"],
+    }));
+    let attempts = 0;
+    const adapter = createCursorAdapter({
+      ...provider,
+      apiKey: "cursor-token",
+    }, {
+      createTransport: () => ({
+        async *run() {
+          attempts += 1;
+          if (attempts === 1) {
+            throw Object.assign(
+              new Error("Cursor invalid request: Cursor Connect error invalid_argument: Error"),
+              { code: "invalid_argument" },
+            );
+          }
+          yield { type: "done" } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+        capturedConversationCheckpoint() {
+          return attempts === 1 ? undefined : recoveredBytes;
+        },
+      }),
+    });
+    const body: OcxParsedRequest = {
+      modelId: "cursor/gpt-5.6-sol",
+      context: { messages: [{ role: "user", content: "retry me", timestamp: 1 }] },
+      stream: false,
+      options: {},
+      _cursorConversationId: "cursor_stale",
+      _cursorIdentityScope: "acct-fresh",
+      _providerContinuation: {
+        cursor: { conversationId: "cursor_stale", checkpointUsable: true, checkpointRef: parentRef },
+      },
+    };
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn?.(body, { headers: new Headers() }, event => events.push(event));
+    expect(attempts).toBe(2);
+    expect(getCursorCheckpoint(parentRef)).toBeUndefined();
+    const done = events.find(event => event.type === "done");
+    const newRef = done && done.type === "done" ? done.providerState?.cursor?.checkpointRef : undefined;
+    expect(newRef).toBeDefined();
+    expect(newRef).not.toBe(parentRef);
+    expect(getCursorCheckpoint(newRef)?.conversationId).toBe(body._cursorConversationId);
+    clearCursorCheckpointsForTests();
+  });
+
   test("does not replay invalid_argument after a local side effect", async () => {
     let attempts = 0;
     const adapter = createCursorAdapter({
@@ -566,5 +727,93 @@ describe("Cursor adapter live transport", () => {
     expect(attempts).toBe(1);
     expect(events.some(event => event.type === "text_delta")).toBe(true);
     expect(events.some(event => event.type === "error")).toBe(true);
+  });
+
+  test("attaches a committed checkpoint ref on done so stream persist can reuse it", async () => {
+    clearCursorCheckpointsForTests();
+    const checkpointBytes = toBinary(ConversationStateStructureSchema, create(ConversationStateStructureSchema, {
+      pendingToolCalls: ["stream-fixture"],
+    }));
+    const adapter = createCursorAdapter({
+      ...provider,
+      apiKey: "cursor-token",
+    }, {
+      createTransport: () => ({
+        async *run() {
+          yield { type: "text", text: "remembered" } satisfies CursorServerMessage;
+          yield { type: "done", usage: { inputTokens: 1, outputTokens: 1 } } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+        capturedConversationCheckpoint() {
+          return checkpointBytes;
+        },
+      }),
+    });
+
+    const events: AdapterEvent[] = [];
+    const body: OcxParsedRequest = {
+      ...parsed,
+      modelId: "cursor/grok-4.6",
+      context: { messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+      _cursorConversationId: "cursor_stream_persist",
+      _cursorIdentityScope: "acct-stream",
+    };
+    await adapter.runTurn?.(body, { headers: new Headers() }, event => events.push(event));
+
+    const done = events.find(event => event.type === "done");
+    expect(done?.type).toBe("done");
+    if (done?.type !== "done") throw new Error("expected done");
+    expect(done.providerState?.cursor?.checkpointRef).toBeDefined();
+    expect(done.providerState?.cursor?.checkpointUsable).toBe(true);
+    expect(getCursorCheckpoint(done.providerState?.cursor?.checkpointRef)?.conversationId).toBe("cursor_stream_persist");
+    expect(body._providerContinuation?.cursor?.checkpointRef).toBe(done.providerState?.cursor?.checkpointRef);
+    clearCursorCheckpointsForTests();
+  });
+
+  test("isolated helper turns do not inherit or invalidate a parent checkpoint ref", async () => {
+    clearCursorCheckpointsForTests();
+    const checkpointBytes = toBinary(ConversationStateStructureSchema, create(ConversationStateStructureSchema, {
+      pendingToolCalls: ["isolate-fixture"],
+    }));
+    const parentRef = commitCursorCheckpoint({
+      conversationId: "cursor_parent_real",
+      identityScope: "acct-isolate-test",
+      modelId: "default",
+      checkpointBytes,
+      coveredMessageCount: 1,
+    });
+    expect(parentRef).toBeDefined();
+
+    const adapter = createCursorAdapter({
+      ...provider,
+      apiKey: "cursor-token",
+    }, {
+      createTransport: () => ({
+        async *run() {
+          yield { type: "done" } satisfies CursorServerMessage;
+        },
+        writeClient() {},
+      }),
+    });
+    const body: OcxParsedRequest = {
+      modelId: "cursor/auto",
+      context: { messages: [{ role: "user", content: "summarize", timestamp: 1 }] },
+      stream: false,
+      options: {},
+      _cursorConversationId: "cursor_parent_real",
+      _cursorIsolateConversation: true,
+      _cursorIdentityScope: "acct-isolate-test",
+      _providerContinuation: {
+        cursor: { conversationId: "cursor_parent_real", checkpointUsable: true, checkpointRef: parentRef },
+      },
+    };
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn?.(body, { headers: new Headers() }, event => events.push(event));
+
+    expect(getCursorCheckpoint(parentRef)?.ref).toBe(parentRef);
+    expect(body._providerContinuation?.cursor?.checkpointRef).toBeUndefined();
+    const done = events.find(event => event.type === "done");
+    expect(done && done.type === "done" ? done.providerState?.cursor?.checkpointRef : undefined).toBeUndefined();
+    clearCursorCheckpointsForTests();
   });
 });

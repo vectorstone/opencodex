@@ -1,3 +1,5 @@
+import { composeCursorClaudeWireId, normalizeCursorClaudeId } from "./claude-id";
+
 /**
  * Per-model Cursor reasoning-effort mapping.
  *
@@ -23,17 +25,51 @@ const CURSOR_MODEL_EFFORT_TIERS: Record<string, readonly string[]> = {
   // max is always the top tier (canonical order: low < medium < high < xhigh < max), confirmed
   // against Anthropic's effort ladder docs and Cursor's live model lineup.
   "claude-fable-5": ["low", "medium", "high", "xhigh", "max"],
+  // Fable 5.1 aliases normalize onto this sole capability ladder.
+  "claude-fable-5-1": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-4-7": ["low", "medium", "high", "xhigh", "max"],
+  // Opus Fast tiers from the 260822 GetUsableModels dump (devlog .../300): the wire
+  // exposes {base-without-fast}-{effort}-fast only; suffix derivation at the bottom of
+  // this file produces those ids. opus-5-fast has no xhigh/max (non-thinking) yet.
+  "claude-opus-4-7-fast": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-4-8": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4-8-fast": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-5-fast": ["low", "medium", "high"],
   "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
   "glm-5.2": ["high", "max"],
+  // 260825 live GetUsableModels. gemini-3.6-flash is the only Cursor model exposing `minimal`;
+  // listing it here is also what admits the suffix into CANONICAL_EFFORT_SUFFIXES below.
+  "gemini-3.6-flash": ["minimal", "low", "medium", "high"],
+  "gemini-3.7-flash": ["low", "medium", "high"],
+  // 260903 preemptive: gemini-3.8-flash seeded ahead of Cursor's lineup update, the same way
+  // glm-5.3 was. Google documents low/medium/high with no `minimal` for this generation,
+  // unlike 3.6. The seed is inert until Cursor's live roster lists the id.
+  "gemini-3.8-flash": ["low", "medium", "high"],
+  // Explicit-thinking variants (260825 live roster). Tiers are the rungs the wire actually
+  // lists for each family, which is not always the same set the non-thinking id carries:
+  // 4.6-opus thinks only at high/max, 4.5-opus only at high, 4.6-sonnet only at medium.
+  "claude-opus-5-thinking": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-5-thinking-fast": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4-8-thinking": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4-8-thinking-fast": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4-7-thinking": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-4-7-thinking-fast": ["low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-5-thinking": ["low", "medium", "high", "xhigh", "max"],
+  "claude-fable-5-thinking": ["low", "medium", "high", "xhigh", "max"],
+  "claude-fable-5-1-thinking": ["low", "medium", "high", "xhigh", "max"],
+  "claude-4.6-opus-thinking": ["high", "max"],
+  "claude-4.5-opus-thinking": ["high"],
+  "claude-4.6-sonnet-thinking": ["medium"],
   // 260814 preemptive: glm-5.3 seeded ahead of Cursor's lineup update. Unlike 5.2, Z.AI folds
   // 5.3 efforts into low/high/max (docs.z.ai/devpack/latest-model), so `low` is a real tier.
   "glm-5.3": ["low", "high", "max"],
   // GetUsableModels (2026-07-28) lists kimi-k3 only as effort-suffixed kimi-k3-{low,high,max};
   // the bare id returns not_found. Tiers mirror the native Kimi provider's K3 ladder.
   "kimi-k3": ["low", "high", "max"],
+  // Synthetic ultra picker variant (devlog 260826 070): same tier ladder as kimi-k3; the -1m
+  // marker is stripped before wire-id composition, so these tiers never form a wire suffix.
+  "kimi-k3-1m": ["low", "high", "max"],
   // Cursor renamed the Grok 4.5 slugs to cursor-grok-4.5-{low,medium,high} and
   // cursor-grok-4.5-{low,medium,high}-fast. The bare Fast id returns not_found.
   "grok-4.5": ["low", "medium", "high"],
@@ -65,9 +101,56 @@ export const CANONICAL_EFFORT_SUFFIXES: ReadonlySet<string> = new Set([
 
 const CANONICAL_CODEX_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/**
+ * Cursor's explicit-thinking variants, exposed as first-class Codex model ids the same way the
+ * `-fast` families were.
+ *
+ * `source` is the id whose wire name the variant is built from; `order` is where Cursor puts the
+ * thinking marker relative to the effort rung. All three shapes exist in the live roster
+ * (GetUsableModels, 260825), and using the wrong one is rejected with ERROR_BAD_MODEL_NAME:
+ *
+ *   thinking-then-effort  claude-opus-5-thinking-high, claude-opus-5-thinking-high-fast
+ *   effort-then-thinking  claude-4.6-opus-high-thinking
+ *   bare                  claude-4.5-sonnet-thinking (the model has no effort rung)
+ */
+const CURSOR_THINKING_FAMILIES: Readonly<Record<string, { source: string; order: "thinking-then-effort" | "effort-then-thinking" | "bare" }>> = {
+  "claude-opus-5-thinking": { source: "claude-opus-5", order: "thinking-then-effort" },
+  "claude-opus-5-thinking-fast": { source: "claude-opus-5-fast", order: "thinking-then-effort" },
+  "claude-opus-4-8-thinking": { source: "claude-opus-4-8", order: "thinking-then-effort" },
+  "claude-opus-4-8-thinking-fast": { source: "claude-opus-4-8-fast", order: "thinking-then-effort" },
+  "claude-opus-4-7-thinking": { source: "claude-opus-4-7", order: "thinking-then-effort" },
+  "claude-opus-4-7-thinking-fast": { source: "claude-opus-4-7-fast", order: "thinking-then-effort" },
+  "claude-sonnet-5-thinking": { source: "claude-sonnet-5", order: "thinking-then-effort" },
+  "claude-fable-5-thinking": { source: "claude-fable-5", order: "thinking-then-effort" },
+  "claude-fable-5-1-thinking": { source: "claude-fable-5-1", order: "thinking-then-effort" },
+  "claude-4.6-opus-thinking": { source: "claude-4.6-opus", order: "effort-then-thinking" },
+  "claude-4.5-opus-thinking": { source: "claude-4.5-opus", order: "effort-then-thinking" },
+  "claude-4.6-sonnet-thinking": { source: "claude-4.6-sonnet", order: "effort-then-thinking" },
+  "claude-4.5-sonnet-thinking": { source: "claude-4.5-sonnet", order: "bare" },
+  "claude-4-sonnet-thinking": { source: "claude-4-sonnet", order: "bare" },
+};
+
+/** Codex-facing ids for Cursor's explicit-thinking variants. */
+export const CURSOR_THINKING_MODEL_IDS = Object.keys(CURSOR_THINKING_FAMILIES);
+
+/**
+ * Picker order, which is the canonical ladder plus the declared sentinels that rank below `low`.
+ *
+ * `cursorModelEffortLadder` filters against this, so a tier absent from it is silently dropped
+ * from the Codex picker even though `cursorEffortSuffix` would happily send it. That is what
+ * hid `gemini-3.6-flash-minimal`, the one Cursor model with a `minimal` rung.
+ */
+const CURSOR_PICKER_EFFORT_ORDER = ["minimal", ...CANONICAL_CODEX_EFFORT_ORDER] as const;
+
 function normalizeRequestedEffort(reasoning: string | undefined): string | undefined {
   const normalized = reasoning?.toLowerCase();
   return normalized === "ultra" ? "max" : normalized;
+}
+
+function cursorEffortLookupId(modelId: string): string {
+  const claude = normalizeCursorClaudeId(modelId);
+  if (!claude) return modelId;
+  return `${claude.canonicalBaseId}${claude.thinking ? "-thinking" : ""}${claude.fast ? "-fast" : ""}`;
 }
 
 /** Collapse a Codex reasoning-effort label to a low/medium/high rank for clamping onto a model's tiers. */
@@ -94,7 +177,7 @@ function codexEffortRank(reasoning: string | undefined): "low" | "medium" | "hig
  * the model takes no suffix (bare). Literal model tiers pass through; unknown efforts clamp by rank.
  */
 export function cursorEffortSuffix(baseModelId: string, reasoning: string | undefined): string | undefined {
-  const tiers = CURSOR_MODEL_EFFORT_TIERS[baseModelId];
+  const tiers = CURSOR_MODEL_EFFORT_TIERS[cursorEffortLookupId(baseModelId)];
   if (!tiers || tiers.length === 0) return undefined;
   const requested = normalizeRequestedEffort(reasoning);
   if (requested && tiers.includes(requested)) return requested;
@@ -110,15 +193,15 @@ export function cursorEffortSuffix(baseModelId: string, reasoning: string | unde
 
 /** The Codex-facing picker ladder for a Cursor model, sorted in canonical Codex effort order. */
 export function cursorModelEffortLadder(baseModelId: string): string[] | undefined {
-  const tiers = CURSOR_MODEL_EFFORT_TIERS[baseModelId];
+  const tiers = CURSOR_MODEL_EFFORT_TIERS[cursorEffortLookupId(baseModelId)];
   if (!tiers || tiers.length === 0) return undefined;
   const tierSet = new Set(tiers);
-  return CANONICAL_CODEX_EFFORT_ORDER.filter(effort => tierSet.has(effort));
+  return CURSOR_PICKER_EFFORT_ORDER.filter(effort => tierSet.has(effort));
 }
 
 /** Base models known to carry a reasoning-effort suffix (everything else is sent bare). */
 export function cursorModelHasEffortTiers(baseModelId: string): boolean {
-  return (CURSOR_MODEL_EFFORT_TIERS[baseModelId]?.length ?? 0) > 0;
+  return (CURSOR_MODEL_EFFORT_TIERS[cursorEffortLookupId(baseModelId)]?.length ?? 0) > 0;
 }
 
 /**
@@ -127,6 +210,33 @@ export function cursorModelHasEffortTiers(baseModelId: string): boolean {
  * and send the base model plus requested_model parameters instead.
  */
 export function cursorWireModelIdWithEffort(baseModelId: string, effortSuffix: string): string {
+  const lookupId = cursorEffortLookupId(baseModelId);
+  const thinking = CURSOR_THINKING_FAMILIES[lookupId];
+  const claude = normalizeCursorClaudeId(baseModelId);
+  if (claude) {
+    return composeCursorClaudeWireId(claude, {
+      thinking: claude.thinking,
+      fast: claude.fast,
+      effort: effortSuffix,
+      bareThinking: thinking?.order === "bare",
+    });
+  }
+  if (thinking) {
+    const { source, order } = thinking;
+    // Cursor writes the thinking marker on either side of the effort depending on family
+    // (measured against GetUsableModels, 260825):
+    //   thinking-then-effort  claude-opus-5-thinking-high, ...-thinking-high-fast
+    //   effort-then-thinking  claude-4.6-opus-high-thinking
+    //   bare                  claude-4.5-sonnet-thinking (no effort rung at all)
+    // Sending the wrong order returns ERROR_BAD_MODEL_NAME, so this is not cosmetic.
+    if (order === "bare") return `${source}-thinking`;
+    if (order === "effort-then-thinking") return `${source}-${effortSuffix}-thinking`;
+    if (source.endsWith("-fast")) {
+      const stem = source.slice(0, -"-fast".length);
+      return `${stem}-thinking-${effortSuffix}-fast`;
+    }
+    return `${source}-thinking-${effortSuffix}`;
+  }
   if (baseModelId.endsWith("-fast")) {
     return `${baseModelId.slice(0, -"-fast".length)}-${effortSuffix}-fast`;
   }

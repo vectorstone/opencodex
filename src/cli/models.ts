@@ -5,13 +5,19 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { syncModelsToCodex } from "../codex/sync";
 import { hasOwnProvider, isValidProviderName, loadConfig, saveConfig } from "../config";
-import { canonicalizeReasoningEfforts, isDeclaredReasoningEffort, modelRecordValue } from "../reasoning-effort";
-import { encodedModelIdCollides, routedSlug, slugEquals } from "../providers/slug-codec";
+import {
+  canonicalizeReasoningEfforts,
+  configuredReasoningEfforts,
+  isDeclaredReasoningEffort,
+  modelRecordValue,
+} from "../reasoning-effort";
+import { encodedModelIdCollides, resolveSlugSelection, routedSlug } from "../providers/slug-codec";
+import { isModelsRuntimeSubcommand } from "./models-runtime-subcommands";
 import { knownModelIdsForProvider } from "../router";
 import { findLiveProxy } from "../server/proxy-liveness";
 import { modelInList, type OcxConfig, type OcxCustomModel } from "../types";
 
-const ADD_USAGE = "Usage: ocx models add <provider> <modelId> [--display-name <name>] [--context-window <tokens>] [--modalities text,image,audio] [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra>] [--default-reasoning-effort <level>]";
+const ADD_USAGE = "Usage: ocx models add <provider> <modelId> [--display-name <name>] [--context-window <tokens>] [--max-output-tokens <tokens>] [--modalities text,image,audio] [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra>] [--default-reasoning-effort <level>]";
 const REMOVE_USAGE = "Usage: ocx models remove <customId|provider/modelId> [--yes]";
 const LIST_CUSTOM_USAGE = "Usage: ocx models list-custom [--json]";
 const ALLOWED_MODALITIES = new Set(["text", "image", "audio"]);
@@ -91,7 +97,6 @@ function collectModels(config: OcxConfig, providerFilter?: string): ModelEntry[]
     const seen = new Set<string>();
     const contextWindows = prov.modelContextWindows ?? {};
     const inputModalities = prov.modelInputModalities ?? {};
-    const reasoningEfforts = prov.modelReasoningEfforts ?? {};
     const globalContext = prov.contextWindow ?? null;
 
     const addModel = (model: string, isDefault: boolean) => {
@@ -107,7 +112,13 @@ function collectModels(config: OcxConfig, providerFilter?: string): ModelEntry[]
       // an exact `gpt-oss:120b` entry that lists "image", and the proxy rejects the image.
       const noVision = modelInList(prov.noVisionModels, model);
       const modalities = noVision ? ["text"] : (modelRecordValue(inputModalities, model) ?? null);
-      const efforts = modelRecordValue(reasoningEfforts, model) ?? prov.reasoningEfforts ?? null;
+      // Same reason, for the ladder: `configuredReasoningEfforts` is what the catalog
+      // (`provider-fetch`) and the effort cap (`effort-policy`) resolve through, and it
+      // does three things this expression did not — it returns [] for a noReasoningModels
+      // match, drops levels Codex does not declare, and re-adds tiers the wire map proves
+      // the model emits. Restating two of its five lines here reported a ladder the proxy
+      // strips, and unsanitized junk as a supported level.
+      const efforts = configuredReasoningEfforts(prov, model) ?? null;
 
       entries.push({
         provider: provName,
@@ -181,6 +192,7 @@ async function handleCustomAdd(args: string[]): Promise<void> {
   const modelId = rest.shift()?.trim() ?? "";
   const displayNameValue = consumeFlagValue(rest, "--display-name");
   const contextWindowValue = consumeFlagValue(rest, "--context-window");
+  const maxOutputTokensValue = consumeFlagValue(rest, "--max-output-tokens");
   const modalitiesValue = consumeFlagValue(rest, "--modalities");
   const reasoningEffortsValue = consumeFlagValue(rest, "--reasoning-efforts");
   const defaultEffortValue = consumeFlagValue(rest, "--default-reasoning-effort");
@@ -202,6 +214,14 @@ async function handleCustomAdd(args: string[]): Promise<void> {
     contextWindow = Number(contextWindowValue);
     if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
       fail("context window must be a positive integer");
+    }
+  }
+
+  let maxOutputTokens: number | undefined;
+  if (maxOutputTokensValue !== undefined) {
+    maxOutputTokens = Number(maxOutputTokensValue);
+    if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+      fail("maximum output tokens must be a positive safe integer");
     }
   }
 
@@ -234,6 +254,7 @@ async function handleCustomAdd(args: string[]): Promise<void> {
     modelId,
     ...(displayName ? { displayName } : {}),
     ...(contextWindow ? { contextWindow } : {}),
+    ...(maxOutputTokens ? { maxOutputTokens } : {}),
     ...(inputModalities ? { inputModalities } : {}),
     ...(parsed.reasoningEfforts ? { reasoningEfforts: parsed.reasoningEfforts } : {}),
     ...(parsed.defaultReasoningEffort ? { defaultReasoningEffort: parsed.defaultReasoningEffort } : {}),
@@ -267,11 +288,34 @@ async function handleCustomRemove(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const existing = config.customModels ?? [];
-  const matchingIndexes = existing.flatMap((model, index) => (
-    target.includes("/")
-      ? slugEquals(target, model.provider, model.modelId)
-      : model.id === target
-  ) ? [index] : []);
+  // Slug matching goes through the shared resolver so this command sees the same collision
+  // class catalog filtering and persisted sync see (#2491). `slugEquals` compares the raw and
+  // encoded spellings of ONE id, so a selector written in the native slash form matched only
+  // that row while the dash form matched both — the two relations disagreed on the same
+  // config. Removal stays exact-or-refuse: an ambiguous selector still aborts below, which is
+  // the right default for a destructive command.
+  const separator = target.indexOf("/");
+  const selectedProvider = separator >= 0 ? target.slice(0, separator) : undefined;
+  // Resolve ONCE against the provider's whole roster, then map the decision back onto rows.
+  // Calling the resolver per row with a singleton roster hid every cross-row fact it needs:
+  // a self-namespaced `acme/turbo` and a sibling `turbo` each matched their own singleton,
+  // so the command saw two matches and aborted as ambiguous even though the selector names
+  // one row exactly.
+  const rosterMatched = selectedProvider === undefined
+    ? undefined
+    : resolveSlugSelection(
+      selectedProvider,
+      target,
+      existing.filter(model => model.provider === selectedProvider).map(model => model.modelId),
+    );
+  // Deliberately admit the whole matched set rather than narrowing to `exact`: an encoded
+  // selector that spans a real collision must still abort below. Removal stays exact-or-refuse.
+  const admitted = new Set(rosterMatched?.matched ?? []);
+  const matchingIndexes = existing.flatMap((model, index) => {
+    if (selectedProvider === undefined) return model.id === target ? [index] : [];
+    if (model.provider !== selectedProvider) return [];
+    return admitted.has(model.modelId) ? [index] : [];
+  });
   if (matchingIndexes.length === 0) fail(`custom model "${target}" not found`);
   if (matchingIndexes.length > 1) {
     fail(`custom model selector "${target}" is ambiguous; use the custom model id`);
@@ -297,6 +341,7 @@ function customModelCells(model: OcxCustomModel): string[] {
     model.modelId,
     model.displayName ?? "-",
     model.contextWindow ? `${Math.round(model.contextWindow / 1000)}k` : "-",
+    model.maxOutputTokens ? `${Math.round(model.maxOutputTokens / 1000)}k` : "-",
     model.inputModalities?.join(",") ?? "-",
     model.reasoningEfforts?.join(",") ?? "-",
     model.defaultReasoningEffort ?? "-",
@@ -305,7 +350,7 @@ function customModelCells(model: OcxCustomModel): string[] {
 
 function printCustomModelGroup(provider: string, models: OcxCustomModel[]): void {
   const rows = models.map(customModelCells);
-  const headers = ["ID", "MODEL", "DISPLAY NAME", "CONTEXT", "MODALITIES", "EFFORTS", "DEFAULT EFFORT"];
+  const headers = ["ID", "MODEL", "DISPLAY NAME", "CONTEXT", "MAX OUTPUT", "MODALITIES", "EFFORTS", "DEFAULT EFFORT"];
   const widths = headers.map((header, column) => Math.max(header.length, ...rows.map(row => row[column].length)));
   const line = (cells: string[]) => cells.map((cell, column) => cell.padEnd(widths[column])).join("  ");
   console.log(`${provider}:`);
@@ -412,7 +457,7 @@ export async function handleModels(args: string[]): Promise<void> {
     handleCustomList(rest);
     return;
   }
-  if (["live", "edit", "enable", "disable", "provider", "selected", "context", "shadow"].includes(subcommand ?? "")) {
+  if (isModelsRuntimeSubcommand(subcommand)) {
     const { handleModelsRuntimeCommand } = await import("./models-runtime");
     const code = await handleModelsRuntimeCommand(subcommand!, rest);
     if (code !== null) process.exitCode = code;

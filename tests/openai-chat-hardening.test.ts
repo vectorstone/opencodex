@@ -19,6 +19,129 @@ afterEach(() => {
   else process.env.OCX_DEBUG = previousDebug;
 });
 
+describe("AgentRouter openai-chat compatibility", () => {
+  const preamble = "[Instruction: Process the user request below and respond in the appropriate language.]";
+
+  describe("omitReasoningEffortWithToolsModels", () => {
+    const toolBearing = (modelId: string): OcxParsedRequest => ({
+      modelId,
+      context: {
+        messages: [{ role: "user", content: "hi", timestamp: 0 }],
+        tools: [{
+          name: "read_file",
+          description: "Read a file",
+          parameters: { type: "object", properties: { path: { type: "string" } } },
+        }],
+      },
+      stream: false,
+      options: { reasoning: "high" },
+    });
+    const plain = (modelId: string): OcxParsedRequest => ({
+      modelId,
+      context: { messages: [{ role: "user", content: "hi", timestamp: 0 }] },
+      stream: false,
+      options: { reasoning: "high" },
+    });
+    const gated = provider({ omitReasoningEffortWithToolsModels: ["picky-model"] });
+
+    test("drops the wire effort only when tools are present", () => {
+      const withTools = JSON.parse(
+        createOpenAIChatAdapter(gated).buildRequest(toolBearing("picky-model")).body,
+      ) as Record<string, unknown>;
+      expect(withTools.reasoning_effort).toBeUndefined();
+      // The tools themselves must still be sent — this is an effort opt-out, not a tool opt-out.
+      expect(Array.isArray(withTools.tools)).toBe(true);
+
+      const withoutTools = JSON.parse(
+        createOpenAIChatAdapter(gated).buildRequest(plain("picky-model")).body,
+      ) as Record<string, unknown>;
+      expect(withoutTools.reasoning_effort).toBe("high");
+    });
+
+    test("leaves an unlisted sibling model untouched", () => {
+      const sibling = JSON.parse(
+        createOpenAIChatAdapter(gated).buildRequest(toolBearing("other-model")).body,
+      ) as Record<string, unknown>;
+      expect(sibling.reasoning_effort).toBe("high");
+    });
+
+    test("an unset provider list changes nothing", () => {
+      const body = JSON.parse(
+        createOpenAIChatAdapter(provider()).buildRequest(toolBearing("picky-model")).body,
+      ) as Record<string, unknown>;
+      expect(body.reasoning_effort).toBe("high");
+    });
+
+    test("suppresses the gateway-object reasoning block for tool-bearing requests", () => {
+      // The gateway-object branch writes its own reasoning field, so it needs the same
+      // guard; without it the wire effort returns through a second path.
+      const gatewayProvider = provider({
+        reasoningWireFormat: "gateway-object",
+        omitReasoningEffortWithToolsModels: ["picky-model"],
+      });
+      const none = (modelId: string): OcxParsedRequest => ({
+        ...toolBearing(modelId),
+        options: { reasoning: "none" },
+      });
+
+      const suppressed = JSON.parse(
+        createOpenAIChatAdapter(gatewayProvider).buildRequest(none("picky-model")).body,
+      ) as Record<string, unknown>;
+      expect(suppressed.reasoning).toBeUndefined();
+      expect(suppressed.reasoning_effort).toBeUndefined();
+
+      // An unlisted model still takes the gateway-object path.
+      const untouched = JSON.parse(
+        createOpenAIChatAdapter(gatewayProvider).buildRequest(none("other-model")).body,
+      ) as Record<string, unknown>;
+      expect(untouched.reasoning ?? untouched.reasoning_effort).toBeDefined();
+    });
+  });
+
+  test("adds a stable Codex originator while preserving operator header precedence", () => {
+    const automatic = createOpenAIChatAdapter(provider({ baseUrl: "https://agentrouter.org/v1" })).buildRequest(parsed());
+    expect(automatic.headers.originator).toBe("codex_cli_rs");
+
+    const overridden = createOpenAIChatAdapter(provider({
+      baseUrl: "https://agentrouter.org/v1",
+      headers: { Originator: "operator-client" },
+    })).buildRequest(parsed());
+    expect(overridden.headers.Originator).toBe("operator-client");
+    expect(overridden.headers.originator).toBeUndefined();
+  });
+
+  test.each([
+    "https://notagentrouter.example/v1",
+    "https://agentrouter.org.attacker.example/v1",
+  ])("does not add compatibility behavior to a lookalike host: %s", baseUrl => {
+    const request = createOpenAIChatAdapter(provider({ baseUrl })).buildRequest(parsed());
+    expect(request.headers.originator).toBeUndefined();
+    expect(request.body).not.toContain(preamble);
+  });
+
+  test("frames translated chat without changing the original parsed request", () => {
+    const source = parsed();
+    source.context.messages[0]!.content = "responda somente: OK";
+    const request = createOpenAIChatAdapter(provider({ baseUrl: "https://agentrouter.org/v1" })).buildRequest(source);
+    const body = JSON.parse(request.body as string) as { messages: { content: { text: string }[] }[] };
+    expect(body.messages[0]?.content.map(part => part.text)).toEqual([preamble, "responda somente: OK"]);
+    expect(source.context.messages[0]?.content).toBe("responda somente: OK");
+  });
+
+  test("frames passthrough chat without mutating the caller body", () => {
+    const rawBody = { messages: [{ role: "user", content: "responda somente: OK" }] };
+    const request = buildOpenAIChatPassthroughRequest(
+      provider({ baseUrl: "https://agentrouter.org/v1" }),
+      rawBody,
+      "test-model",
+      false,
+    );
+    const body = JSON.parse(request.body as string) as { messages: { content: { text: string }[] }[] };
+    expect(body.messages[0]?.content.map(part => part.text)).toEqual([preamble, "responda somente: OK"]);
+    expect(rawBody.messages[0]?.content).toBe("responda somente: OK");
+  });
+});
+
 function parsed(): OcxParsedRequest {
   return {
     modelId: "test-model",
@@ -40,7 +163,10 @@ function provider(overrides: Partial<OcxProviderConfig> = {}): OcxProviderConfig
 
 async function collect(stream: AsyncGenerator<AdapterEvent>): Promise<AdapterEvent[]> {
   const events: AdapterEvent[] = [];
-  for await (const event of stream) events.push(event);
+  // Heartbeats are invisible downstream: the bridge consumes them to re-arm its stall
+  // watchdog and emits nothing. Dropping them here keeps these assertions about the wire
+  // the client actually sees.
+  for await (const event of stream) if (event.type !== "heartbeat") events.push(event);
   return events;
 }
 
@@ -476,6 +602,102 @@ describe("openai-chat stream response hardening", () => {
     expect(lines).toContain('"callIndex":1');
     expect(lines).not.toContain('"tool_call_function_name_invalid"');
   });
+
+  // Some OpenAI-compatible streamers repeat an already-sent field as a non-string placeholder
+  // instead of null. Before #2155 that killed the whole turn with a 502 even though the value
+  // being repeated was already held in canonical form, so the tool never ran.
+  test("a non-string repeat is padding once that field has string provenance (#2155)", async () => {
+    const adapter = createOpenAIChatAdapter(provider());
+    const response = new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, id: "call_a", function: { name: "shell", arguments: "" } },
+      ] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, id: { padding: true }, function: { name: { padding: true }, arguments: { padding: true } } },
+      ] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, function: { arguments: "{}" } },
+      ] } }] })}\n\n`,
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      "data: [DONE]\n\n",
+    ].join(""));
+
+    const events = await collect(adapter.parseStream(response));
+    expect(events.some(event => event.type === "error")).toBe(false);
+    expect(events).toContainEqual({ type: "tool_call_start", id: "call_a", name: "shell" });
+    expect(events).toContainEqual({ type: "tool_call_delta", arguments: "{}" });
+  });
+
+  // Tolerance is per field. A canonical NAME is not evidence that `arguments` was ever sent
+  // as a string, and accepting a malformed object here would silently discard an argument
+  // payload the model meant to send.
+  test("a canonical name does not authorize a malformed arguments value (#2155)", async () => {
+    const adapter = createOpenAIChatAdapter(provider());
+    const response = new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, id: "call_a", function: { name: "shell" } },
+      ] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, function: { arguments: { bad: true } } },
+      ] } }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""));
+
+    expect(await collect(adapter.parseStream(response))).toEqual([{
+      type: "error",
+      status: 502,
+      errorType: "upstream_error",
+      message: "upstream response contained invalid tool calls (tool_call_function_arguments_invalid; callIndex=0; valueType=object)",
+    }]);
+  });
+
+  test("a malformed id stays terminal until that call has a canonical id (#2155)", async () => {
+    const adapter = createOpenAIChatAdapter(provider());
+    const response = new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, function: { name: "shell", arguments: "{}" } },
+      ] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, id: { bad: true } },
+      ] } }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""));
+
+    expect(await collect(adapter.parseStream(response))).toEqual([{
+      type: "error",
+      status: 502,
+      errorType: "upstream_error",
+      message: "upstream response contained invalid tool calls (tool_call_id_invalid; callIndex=0; valueType=object)",
+    }]);
+  });
+
+  // The reason the diagnostic is passed from the rejection site rather than rescanned: a
+  // stateless rescan stops at the first structurally odd value, which here is the ACCEPTED
+  // padding on call 0, and would blame the wrong call for the real defect on call 1.
+  test("parallel calls blame the unresolved call, not the accepted padding (#2155)", async () => {
+    process.env.OCX_DEBUG = "1";
+    const adapter = createOpenAIChatAdapter(provider());
+    const response = new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, id: "call_a", function: { name: "alpha", arguments: "" } },
+        { index: 1, id: "call_b", function: { name: "beta" } },
+      ] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [
+        { index: 0, function: { arguments: { padding: true } } },
+        { index: 1, function: { arguments: { bad: true } } },
+      ] } }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""));
+
+    expect(await collect(adapter.parseStream(response))).toEqual([{
+      type: "error",
+      status: 502,
+      errorType: "upstream_error",
+      message: "upstream response contained invalid tool calls (tool_call_function_arguments_invalid; callIndex=1; valueType=object)",
+    }]);
+    const lines = getDebugLogEntries().map(entry => entry.line).join("\n");
+    expect(lines).toContain('"callIndex":1');
+  });
 });
 
 describe("openai-chat credential hardening", () => {
@@ -824,4 +1046,33 @@ describe("openai-chat response_format emission", () => {
         .toEqual({ type: "json_object" });
     });
   });
+
+// Tool-call deltas are BUFFERED until a terminal signal, so this adapter can consume upstream
+// frames for a long time while yielding nothing downstream. The Responses bridge arms its
+// stall watchdog on ADAPTER activity, not socket activity, so a model streaming a large
+// argument payload was indistinguishable from a hung upstream.
+//
+// Found while investigating #2156 but deliberately NOT claimed as its fix: a stall abort
+// emits `response.incomplete` with `upstream_stall_timeout`, while that report shows the
+// adapter's own EOF error with tool calls still pending. This pins the mechanism only.
+test("tool-call deltas emit heartbeats so a long buffering phase is not read as a stall", async () => {
+  const adapter = createOpenAIChatAdapter(provider());
+  const frames = ['data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_a", function: { name: "shell", arguments: "" } }] } }] }) + '\n\n'];
+  // Many argument chunks and nothing else: exactly the shape that looked like silence.
+  for (let i = 0; i < 12; i += 1) {
+    frames.push('data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"x"' } }] } }] }) + '\n\n');
+  }
+  frames.push('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n', "data: [DONE]\n\n");
+
+  const raw: AdapterEvent[] = [];
+  for await (const event of adapter.parseStream(new Response(frames.join("")))) raw.push(event);
+
+  // One per consumed tool-call delta: the watchdog sees activity for the whole phase.
+  expect(raw.filter(e => e.type === "heartbeat").length).toBeGreaterThanOrEqual(12);
+  // And the client-visible wire is unchanged -- a heartbeat is consumed by the bridge.
+  const visible = raw.filter(e => e.type !== "heartbeat");
+  expect(visible.some(e => e.type === "error")).toBe(false);
+  expect(visible).toContainEqual({ type: "tool_call_start", id: "call_a", name: "shell" });
+  expect(visible.at(-1)).toMatchObject({ type: "done" });
+});
 });

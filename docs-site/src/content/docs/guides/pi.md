@@ -32,8 +32,8 @@ export line, and how many models carry authoritative context limits.
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
-          "contextWindow": 200000,
-          "maxTokens": 32000
+          "contextWindow": 1000000,
+          "maxTokens": 128000
         }
       ]
     }
@@ -94,13 +94,12 @@ refuses to start without a token — see [Remote access](/reference/configuratio
 
 ## Model metadata
 
-`contextWindow` and `maxTokens` are emitted only when the catalog reports an authoritative context
-window. When it does not, both fields are omitted for that model and Pi applies its own defaults;
-`ocx export` prints how many rows fell into that case.
+`contextWindow` and `maxTokens` are independent authoritative capabilities. Each field is emitted
+only when that value is known; otherwise Pi applies its own default for the missing value.
+`ocx export` reports how many rows lack a complete supported limit pair.
 
-`maxTokens` is a schema-satisfying budget of `32000`, clamped down to the context window so a
-small-context model is never given more output than context. It is not a claim about any specific
-model's true maximum.
+`maxTokens` comes from exact provider metadata or an explicit custom-model value. It is clamped to
+the context window when both are known. OpenCodex never substitutes the old `32000` placeholder.
 
 Two fields are deliberately absent. `cost` requires all four price fields and opencodex has no
 price data for routed models — emitting zeros would assert that every model is free.

@@ -104,7 +104,7 @@ ocx logout <provider>
 
 | 프로바이더 | 어댑터 | 베이스 URL | 비고 |
 | --- | --- | --- | --- |
-| `xai` | `openai-chat` | `https://api.x.ai/v1` | 실시간 목록을 우선 사용하며, 폴백 기본 모델은 `grok-4.5`입니다. |
+| `xai` | `openai-chat` | `https://cli-chat-proxy.grok.com/v1` | OAuth는 별도의 Grok CLI 구독 게이트웨이를 사용합니다. API 키 오버라이드는 `https://api.x.ai/v1`을 사용하며 Priority Processing을 주입할 수 있습니다. 실시간 목록을 우선 사용하며, 폴백 기본 모델은 `grok-4.5`입니다. |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | Claude 모델; 실시간 모델 목록은 `/v1/models`에서 가져옵니다. |
 | `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi K2.7/K2.6/K2.5 코딩 모델. |
 | `nous` | `openai-chat` | `https://inference-api.nousresearch.com/v1` | Nous Research 구독 게이트웨이(Hermes Agent와 동일한 백엔드). `portal.nousresearch.com`에 대한 디바이스 그랜트 로그인; access 토큰은 요청별 inference JWT. 유료 + `:free` 모델 혼합 카탈로그(`tencent/hy3:free`, `stepfun/step-3.7-flash:free` 등)는 로그인한 계정에서 실시간으로 발견됩니다. Refresh 토큰은 단회 사용이며, 갱신할 때마다 회전됩니다. |
@@ -403,13 +403,20 @@ model discovery는 이 실험적 어댑터에서 활성화되어 있으며, Curs
 
 ### Ollama Cloud
 
-Ollama Cloud는 호스팅형(로컬이 아님) Ollama로, `https://ollama.com/v1`에서 OpenAI 호환이며 키는
-[ollama.com/settings/keys](https://ollama.com/settings/keys)에서 발급받습니다. opencodex는 클라우드
+Ollama Cloud는 호스팅형(로컬이 아님) Ollama입니다. `https://ollama.com/v1`으로 설정하고 키는
+[ollama.com/settings/keys](https://ollama.com/settings/keys)에서 발급받습니다. opencodex는 OpenAI 호환
+표면이 아니라 Ollama 자체 REST API(`POST /api/chat`)로 연결하며, 모델 목록을 공급자에서 직접
+발견하므로 새 Ollama Cloud 모델이 설정 변경 없이 나타납니다. opencodex는 클라우드
 라인업을 비전 기능에 따라 분류하여 [비전 사이드카](/ko/guides/sidecars/)가 텍스트 전용 모델에만
 작동하도록 합니다. 텍스트 전용 모델(예: `glm-5.2`, `deepseek-v4-pro`, `gpt-oss`, `qwen3-coder`,
 `minimax-m2.x`, `nemotron-3-*`)은 `noVisionModels`에 나열되며, 비전 네이티브 모델(예:
 `kimi-k2.6`, `minimax-m3`, `gemma4`, `qwen3.5`, `gemini-3-flash-preview`)은 포함되지 않습니다. 매칭은
 Ollama의 `:size` 태그에 관대하므로 `gpt-oss`는 `gpt-oss:120b`와 `gpt-oss:20b`를 모두 포괄합니다.
+
+Ollama는 현재 구조화 출력이 Ollama Cloud에서 지원되지 않는다고 문서화하고 있습니다. 정식
+`ollama-cloud`에 대한 구조화 출력 요청(`text.format`)은 opencodex가 자유 서술을 조용히 돌려주는
+대신 명확한 오류로 거부합니다. 로컬 / 커스텀 `ollama-native` 엔드포인트는 Ollama의 네이티브
+`format` 동작을 유지합니다.
 
 ## 4. 로컬 프로바이더
 

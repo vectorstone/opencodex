@@ -6,14 +6,13 @@ description: Yerel ChatGPT sidecar'ları aracılığıyla yönlendirilen modelle
 Yönlendirilen modellerin tümü barındırılan **web araması** veya yerel **görsel
 girişi** sunmaz. opencodex bu yetenekleri iki sidecar ile doldurur. Her biri bir
 ChatGPT girişi (`forward`) sağlayıcısı veya saklanan bir Anthropic OAuth
-sağlayıcısı aracılığıyla çalışabilir. Sidecar hataları tüm turu başarısız kılmak
+sağlayıcısı aracılığıyla çalışabilir; web araması açık `xai` arka ucuyla saklanan Grok OAuth'ı da kullanabilir. Sidecar hataları tüm turu başarısız kılmak
 yerine sınırlı araç sonuçları veya görsel işaretçileri haline gelir.
 
 :::note[Otomatik arka uç seçimi]
-Açık `backend` yapılandırması kazanır. Ayarlanmadığında opencodex,
-etkinleştirilmiş bir Anthropic OAuth sağlayıcısının `needsReauth` olarak
-işaretlenmemiş etkin bir hesabı varsa `anthropic`'i kullanır; aksi takdirde
-`openai`'yi kullanır. Bu kimlik bilgisi olmadan açık `anthropic` kapalı olarak
+Açık `backend` yapılandırması kazanır. Web araması ayarlanmadığında her zaman `openai` kullanır;
+Vision kullanılabilir bir Anthropic OAuth hesabı varsa `anthropic`, yoksa `openai` kullanır.
+Kullanılabilir kimlik bilgisi olmadan açık `anthropic` veya `xai` geri dönüş yapmadan
 başarısız olur. `openai`, hem ChatGPT girişi kimlik doğrulamasını hem de
 etkinleştirilmiş bir `forward` sağlayıcısını gerektirir.
 :::
@@ -30,8 +29,9 @@ Codex, doğrudan geçiş olmayan bir yönlendirilmiş model için barındırıla
    `web_search`'i çağırdığında opencodex seçilen sidecar arka ucunu kullanır:
    OpenAI varsayılan olarak `gpt-5.6-luna` ile barındırılan `web_search`'i
    çalıştırır; Anthropic varsayılan olarak `claude-sonnet-5` ile
-   `web_search_20250305`'i çalıştırır. Akışlı yanıt ve alıntılar bir araç sonucu
-   haline gelir.
+   `web_search_20250305`'i çalıştırır. xAI varsayılan olarak `grok-4.6` ile hosted
+   `web_search` çalıştırır ve `xSearch.enabled` true olduğunda aynı isteğe `x_search` ekler.
+   Akışlı yanıt ve alıntılar bir araç sonucu haline gelir.
 3. Model yanıt verene veya toplam gerçek sorgu bütçesi `maxSearchesPerTurn`'e
    (varsayılan 3) ulaşana kadar **döngüye girer**, ardından arama aracını
    kaldırır ve nihai bir yanıta zorlar. `apply_patch` veya kabuk gibi gerçek
@@ -103,9 +103,16 @@ durma, toplam bir üretim zaman aşımı değildir. SSE başlamadan önceki arı
 
 ## Vizyon sidecar'ı
 
-Yönlendirilen model sağlayıcısının `noVisionModels` listesinde yer aldığında ve
-bir istek görsel taşıdığında, opencodex ana çağrıdan **önce** her görseli
-açıklar ve onu metinle değiştirir. `visionSidecar.model` olmadığında veya boş
+Yönlendirilen model sağlayıcısının `noVisionModels` listesinde yer aldığında ya da
+bu model için `modelInputModalities` ile salt metin olarak bildirildiğinde ve bir
+istek görsel taşıdığında, opencodex kullanılabilir bir vision sidecar planı varsa
+ana çağrıdan **önce** her görseli açıklar ve onu metinle değiştirir. Kullanılabilir
+bir plan yoksa ham görsel salt metin arka ucuna iletilmek yerine kaldırılır. Model
+kataloğu sidecar kapsamında olan her model için görsel girdisini bildirir. Kombolar,
+her üye görselleri yerel olarak veya bir sidecar üzerinden kabul ettiğinde ve kombonun
+`imageInput` ayarı devre dışı olmadığında görsel girdisini bildirir; böylece Codex
+uygulaması gibi istemciler, sidecar çalışmadan önce ekleri engellemek yerine kabul eder.
+`visionSidecar.model` olmadığında veya boş
 olduğunda, OpenAI yürütme yolu, Kontrol Paneli ve yönetim API'si `gpt-5.4-mini`
 geri dönüşünü kullanır. Başlangıç hala açıkça kalıcı hale getirilmiş eski bir
 `gpt-5.4-mini` değerini `gpt-5.6-luna`'ya geçirir; bu geçiş, bulunmayan bir
@@ -135,9 +142,8 @@ model alanına değil, saklanan bir değere uygulanır.
   görselleri proxy tarafından değil, OpenAI arka ucu tarafından getirilir.
 - `noVisionModels` eşleştirmesi Ollama tarzı bir `:size` sonekini yok sayar, bu
   nedenle bir `gpt-oss` girdisi `gpt-oss:120b`'yi de kapsar.
-- Açıklama başarısız olursa model kısa bir işleme hatası işaretçisi alır.
-  Kullanılabilir hiçbir sidecar planı yoksa ham görsel salt metin bir arka uca
-  iletilmek yerine kaldırılır.
+- Açıklama başarısız olursa model kısa bir işleme hatası işaretçisi alır. (Kullanılabilir bir
+  sidecar planı yoksa açıklama denenmez; ham görsel yukarıda belirtildiği gibi kaldırılır.)
 - `maxDescriptionsPerTurn` (varsayılan 8), ana model turu başına yeni
   açıklamaları sınırlar. Önbellek isabetleri ve aynı turdaki kopyalar bunu
   tüketmez. Başarılı `data:` görsel açıklamaları arka uç, model, ayrıntı, görsel
@@ -171,7 +177,6 @@ Bir model, sağlayıcı başına salt metin olarak işaretlenir:
 {
   "providers": {
     "ollama-cloud": {
-      "adapter": "openai-chat",
       "baseUrl": "https://ollama.com/v1",
       "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
     }
@@ -198,5 +203,3 @@ hedeflenen hesap ve iş yükü ile kapsamlı bir şekilde test edilmelidir.
 
 Her alan için [Yapılandırma referansı](/tr/reference/configuration/#sidecars)
 bölümüne bakın.
-
-

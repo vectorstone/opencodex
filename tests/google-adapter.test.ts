@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createGoogleAdapter } from "../src/adapters/google";
+import { chatCompletionsToResponsesBody } from "../src/chat/inbound";
+import { parseRequest } from "../src/responses/parser";
 import type { OcxParsedRequest } from "../src/types";
 
 const provider = { adapter: "google", baseUrl: "https://generativelanguage.googleapis.com", apiKey: "key" };
@@ -18,6 +20,14 @@ async function geminiBody(parsed: OcxParsedRequest): Promise<Record<string, unkn
   const { body } = await createGoogleAdapter(provider).buildRequest(parsed);
   return JSON.parse(body);
 }
+
+function systemInstructionText(body: Record<string, unknown>): string {
+  const instruction = body.systemInstruction as { parts?: Array<{ text?: string }> } | undefined;
+  return instruction?.parts?.[0]?.text ?? "";
+}
+
+const REJECTED_CLAUDE_SDK_PARAGRAPH =
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 describe("google adapter — tool result images", () => {
   test("tool-result screenshots ride along as inline_data beside the functionResponse", async () => {
@@ -79,6 +89,53 @@ describe("google adapter — tool result images", () => {
 
     const toolTurn = contents.find(c => c.parts.some(p => "functionResponse" in p));
     expect(toolTurn!.parts.some(p => "inline_data" in p)).toBe(false);
+  });
+});
+
+describe("google adapter — Chat Completions video input", () => {
+  test("carries an inline video through Chat translation onto Gemini inline_data", async () => {
+    const responsesBody = chatCompletionsToResponsesBody({
+      model: "google-antigravity/gemini-3.7-flash",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Summarize this video" },
+          { type: "video_url", video_url: { url: "data:video/mp4;base64,aGVsbG8=" } },
+        ],
+      }],
+    });
+    const parsed = parseRequest(responsesBody);
+    parsed.modelId = "gemini-3.7-flash";
+
+    const contents = await geminiContents(parsed);
+
+    expect(contents).toContainEqual({
+      role: "user",
+      parts: [
+        { text: "Summarize this video" },
+        { inline_data: { mime_type: "video/mp4", data: "aGVsbG8=" } },
+      ],
+    });
+  });
+
+  test("does not mislabel an arbitrary remote video URL as Gemini file_data", async () => {
+    const responsesBody = chatCompletionsToResponsesBody({
+      model: "google-antigravity/gemini-3.7-flash",
+      messages: [{
+        role: "user",
+        content: [{ type: "video_url", video_url: { url: "https://example.test/video.mp4" } }],
+      }],
+    });
+    const parsed = parseRequest(responsesBody);
+    parsed.modelId = "gemini-3.7-flash";
+
+    const contents = await geminiContents(parsed);
+
+    expect(contents).toContainEqual({
+      role: "user",
+      parts: [{ text: "[video: https://example.test/video.mp4]" }],
+    });
+    expect(JSON.stringify(contents)).not.toContain("file_data");
   });
 });
 
@@ -187,6 +244,99 @@ describe("google adapter — tool-call ids on the wire", () => {
     const contents = envelope.request.contents as { role: string; parts: Record<string, unknown>[] }[];
     const fc = (contents.find(c => c.role === "model")!.parts.find(p => "functionCall" in p) as { functionCall: { id?: string } }).functionCall.id;
     expect(fc).toBe("call_xyz");
+  });
+});
+
+describe("google adapter — Antigravity system prompt compatibility", () => {
+  const ccaProvider = {
+    ...provider,
+    googleMode: "cloud-code-assist",
+    baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+    project: "proj-123",
+  } as const;
+
+  function systemPromptParsed(modelId: string): OcxParsedRequest {
+    return {
+      modelId,
+      stream: false,
+      options: {},
+      context: {
+        systemPrompt: [`prefix\n\n${REJECTED_CLAUDE_SDK_PARAGRAPH}\n\nsuffix`],
+        messages: [{ role: "user", content: "hi" }],
+        tools: [],
+      },
+    } as unknown as OcxParsedRequest;
+  }
+
+  test("removes only the rejected standalone paragraph for CCA Gemini 3.7 Flash", async () => {
+    const parsed = systemPromptParsed("gemini-3.7-flash");
+    const ccaEnvelope = JSON.parse((await createGoogleAdapter(ccaProvider).buildRequest(parsed)).body) as {
+      request: Record<string, unknown>;
+    };
+    const directBody = await geminiBody(parsed);
+    const directText = systemInstructionText(directBody);
+
+    expect(systemInstructionText(ccaEnvelope.request)).toBe(
+      directText.replace(`${REJECTED_CLAUDE_SDK_PARAGRAPH}\n\n`, ""),
+    );
+    expect(systemInstructionText(ccaEnvelope.request)).not.toContain(REJECTED_CLAUDE_SDK_PARAGRAPH);
+  });
+
+  test("removes the rejected paragraph for CCA Gemini 3.8 Flash too", async () => {
+    // Probed 2026-09-03: 3.8 answers 429 RESOURCE_EXHAUSTED while this paragraph survives
+    // into systemInstruction, and 200 once stripped. Since 3.8 is now the default, a
+    // 3.7-only guard would 429 every Claude-Agent-shaped request and report it as quota.
+    const parsed = systemPromptParsed("gemini-3.8-flash");
+    const envelope = JSON.parse((await createGoogleAdapter(ccaProvider).buildRequest(parsed)).body) as {
+      request: Record<string, unknown>;
+    };
+
+    expect(systemInstructionText(envelope.request)).not.toContain(REJECTED_CLAUDE_SDK_PARAGRAPH);
+  });
+
+  test("removes it for a raw 3.8 suffix selector published by a partial ladder", async () => {
+    // When CCA returns an incomplete tier set the picker publishes raw suffix ids, so
+    // parsed.modelId can be the wire id rather than the collapsed base — exactly the ids the
+    // 429 probe used. A base-only membership test would lose the guard precisely when CCA is
+    // already degraded.
+    for (const suffixId of ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high"]) {
+      const built = await createGoogleAdapter(ccaProvider).buildRequest(systemPromptParsed(suffixId));
+      const envelope = JSON.parse(built.body) as { request: Record<string, unknown> };
+
+      expect(systemInstructionText(envelope.request)).not.toContain(REJECTED_CLAUDE_SDK_PARAGRAPH);
+    }
+  });
+
+  test("removes it for a RETIRED id that rule 0 redirects onto the rejecting generation", async () => {
+    // A saved gemini-3.6-flash selection does not call 3.6 — rule 0 routes it to
+    // gemini-3.7-flash-tiered, which rejects the paragraph (probed at 429 with it intact).
+    // Retired ids deliberately keep their own identity for usage accounting, so they never
+    // canonicalize into the generation they actually reach; judging the SELECTOR would leave
+    // every saved 3.6/3.5 config broken. This is why the guard reads the routed wire id.
+    const parsed = systemPromptParsed("gemini-3.6-flash");
+    const envelope = JSON.parse((await createGoogleAdapter(ccaProvider).buildRequest(parsed)).body) as {
+      request: Record<string, unknown>;
+    };
+
+    expect(systemInstructionText(envelope.request)).not.toContain(REJECTED_CLAUDE_SDK_PARAGRAPH);
+  });
+
+  test("preserves the paragraph for a Cloud Code Assist model that does not reject it", async () => {
+    // Membership is probe-established per generation, so a model with no recorded rejection
+    // keeps its system prompt byte-identical. Claude-on-Antigravity is the natural control:
+    // the paragraph is literally true for it.
+    const parsed = systemPromptParsed("claude-sonnet-4-6");
+    const envelope = JSON.parse((await createGoogleAdapter(ccaProvider).buildRequest(parsed)).body) as {
+      request: Record<string, unknown>;
+    };
+
+    expect(systemInstructionText(envelope.request)).toContain(REJECTED_CLAUDE_SDK_PARAGRAPH);
+  });
+
+  test("preserves the paragraph outside Cloud Code Assist", async () => {
+    const body = await geminiBody(systemPromptParsed("gemini-3.7-flash"));
+
+    expect(systemInstructionText(body)).toContain(REJECTED_CLAUDE_SDK_PARAGRAPH);
   });
 });
 

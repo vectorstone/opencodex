@@ -3,7 +3,7 @@
  * so the proxy must relay it to an OpenAI upstream instead of the /v1/* JSON-404 guard.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../src/codex/account-store";
 import { clearAccountNeedsReauth, clearAccountQuota } from "../src/codex/auth-api";
@@ -25,6 +25,7 @@ import { beginShutdownDrain, isDraining, resetLifecycleDrainStateForTests } from
 import type { OcxConfig } from "../src/types";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
 const previousOpencodexHome = process.env.OPENCODEX_HOME;
@@ -34,7 +35,7 @@ let isolatedCodexHome: IsolatedCodexHome | null = null;
 const DIRECT_CHATGPT_TOKEN = fakeChatGptJwt({ chatgpt_account_id: "acct-123" });
 
 beforeEach(() => {
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
   mkdirSync(TEST_DIR, { recursive: true });
   process.env.OPENCODEX_HOME = TEST_DIR;
   delete process.env.OPENCODEX_API_AUTH_TOKEN;
@@ -58,7 +59,7 @@ afterEach(() => {
   clearThreadAccountMap();
   clearAccountNeedsReauth("pool-a");
   clearAccountQuota();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
 });
 
 interface CapturedRequest {
@@ -119,6 +120,14 @@ function forwardConfig(): OcxConfig {
       },
     },
   } as OcxConfig;
+}
+
+function expectReadyProtocolMetadata(body: Record<string, unknown>, managementUrl: string): void {
+  expect(body).toMatchObject({
+    protocol: 1,
+    minimumClientProtocol: 1,
+    managementUrl,
+  });
 }
 
 function multipartLiveBody(
@@ -482,6 +491,113 @@ test("a routed pool account's token overrides the caller bearer on the live rela
     await upstream.stop(true);
   }
 });
+
+test("call-create and its sideband join bind to the same pool account (openai/codex #35830)", async () => {
+  // Desktop v3 voice: POST /v1/live creates the WebRTC call under the proxy-selected Pool
+  // account; the sideband join must reach OpenAI under that SAME account or the call is not
+  // found (404). Both legs carry codex-rs build_session_headers (session-id + thread-id), so
+  // the pool affinity key is identical — a round-robin pool with two accounts must not hand
+  // the join to the other account.
+  const captured: CapturedRequest[] = [];
+  const upstream = fakeLiveUpstream(captured);
+  const seenUpgradeHeaders: Headers[] = [];
+  const wsUpstream = Bun.serve({
+    port: 0,
+    fetch(req, server) {
+      if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+        seenUpgradeHeaders.push(req.headers);
+        if (server.upgrade(req, { data: {} })) return undefined as unknown as Response;
+      }
+      return new Response("not found", { status: 404 });
+    },
+    websocket: { message(ws, message) { ws.send(String(message)); } },
+  });
+  saveConfig({
+    ...forwardConfig(),
+    accountPoolStrategy: "round-robin",
+    providers: {
+      openai: {
+        adapter: "openai-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authMode: "forward",
+        codexAccountMode: "pool",
+      },
+    },
+    codexAccounts: [
+      { id: "pool-a", email: "a@example.test", isMain: false, chatgptAccountId: "acct-pool-a" },
+      { id: "pool-b", email: "b@example.test", isMain: false, chatgptAccountId: "acct-pool-b" },
+    ],
+  } as OcxConfig);
+  for (const [id, acct] of [["pool-a", "acct-pool-a"], ["pool-b", "acct-pool-b"]] as const) {
+    saveCodexAccountCredential(id, {
+      accessToken: fakeChatGptJwt({ chatgpt_account_id: acct, email: `${id}@example.test` }),
+      refreshToken: `${id}-refresh`,
+      expiresAt: Date.now() + 3_600_000,
+      chatgptAccountId: acct,
+    });
+  }
+  const RealWebSocket = globalThis.WebSocket;
+  const wsPort = wsUpstream.port;
+  globalThis.WebSocket = class extends RealWebSocket {
+    constructor(url: string | URL, protocols?: string | string[] | Record<string, unknown>) {
+      const parsed = new URL(String(url));
+      const target = parsed.hostname === "api.openai.com" && parsed.pathname.startsWith("/v1/live/")
+        ? `ws://127.0.0.1:${wsPort}${parsed.pathname}${parsed.search}`
+        : String(url);
+      super(target, protocols as string[]);
+    }
+  } as typeof WebSocket;
+
+  const server = startServer(0);
+  try {
+    const voiceHeaders = {
+      authorization: `Bearer ${DIRECT_CHATGPT_TOKEN}`,
+      "chatgpt-account-id": "acct-123",
+      "session-id": "sess_voice_1",
+      "thread-id": "thread_voice_1",
+    };
+    const { body, contentType } = multipartLiveBody();
+    const created = await fetch(new URL("/v1/live", server.url), {
+      method: "POST",
+      headers: { ...voiceHeaders, "content-type": contentType },
+      body,
+    });
+    expect(created.status).toBe(201);
+    expect(captured).toHaveLength(1);
+    const createAccount = captured[0].headers.get("chatgpt-account-id");
+    expect(["acct-pool-a", "acct-pool-b"]).toContain(createAccount);
+
+    // Unrelated traffic on a different thread advances round-robin in between.
+    const other = await fetch(new URL("/v1/live", server.url), {
+      method: "POST",
+      headers: { ...voiceHeaders, "session-id": "sess_other", "thread-id": "thread_other", "content-type": contentType },
+      body,
+    });
+    expect(other.status).toBe(201);
+    expect(captured[1].headers.get("chatgpt-account-id")).not.toBe(createAccount);
+
+    const wsUrl = new URL("/v1/live/rtc_test", server.url);
+    wsUrl.protocol = "ws:";
+    const client = new RealWebSocket(wsUrl.toString(), { headers: voiceHeaders } as unknown as string[]);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("sideband timeout")), 15_000);
+      client.addEventListener("open", () => client.send("hello"));
+      client.addEventListener("message", () => { clearTimeout(timer); resolve(); });
+      client.addEventListener("error", () => { clearTimeout(timer); reject(new Error("client websocket error")); });
+    });
+    client.close();
+    expect(seenUpgradeHeaders).toHaveLength(1);
+    expect(seenUpgradeHeaders[0].get("chatgpt-account-id")).toBe(createAccount);
+    expect(seenUpgradeHeaders[0].get("authorization")).toBe(captured[0].headers.get("authorization"));
+    expect(seenUpgradeHeaders[0].get("session-id")).toBe("sess_voice_1");
+    expect(seenUpgradeHeaders[0].get("thread-id")).toBe("thread_voice_1");
+  } finally {
+    globalThis.WebSocket = RealWebSocket;
+    await server.stop(true);
+    await upstream.stop(true);
+    await wsUpstream.stop(true);
+  }
+}, { timeout: 20_000 });
 
 test("sideband GET /v1/live/{callId} relays the exact frame ceiling bidirectionally", async () => {
   const seenPaths: string[] = [];
@@ -890,6 +1006,14 @@ test("parseLiveSidebandTarget recognizes standalone realtime sessions", async ()
   ).toBeNull();
   // Bare /v1/realtime/calls is the call-create HTTP path, not a WS target.
   expect(parseLiveSidebandTarget("/v1/realtime/calls", new URLSearchParams(), "")).toBeNull();
+  // A malformed percent escape in a keyed join must read as "no target" (JSON 404), never
+  // let decodeURIComponent throw out of the router as a 500.
+  expect(parseLiveSidebandTarget("/v1/live/%ZZ", new URLSearchParams(), "")).toBeNull();
+  expect(parseLiveSidebandTarget("/v1/realtime/calls/%ZZ", new URLSearchParams(), "")).toBeNull();
+  expect(parseLiveSidebandTarget("/v1/live/rtc%5Fok", new URLSearchParams(), "")).toEqual({
+    style: "frameless-path",
+    callId: "rtc_ok",
+  });
   // Valid join shapes keep working.
   expect(
     parseLiveSidebandTarget("/v1/realtime", new URLSearchParams("call_id=rtc_2"), "call_id=rtc_2"),
@@ -1231,13 +1355,17 @@ describe("GET /readyz", () => {
       try {
         const pending = await fetch(new URL("/readyz", server.url));
         expect(pending.status).toBe(503);
-        expect(((await pending.json()) as { status: string }).status).toBe("pending");
+        const pendingBody = (await pending.json()) as Record<string, unknown>;
+        expect(pendingBody.status).toBe("pending");
+        expectReadyProtocolMetadata(pendingBody, new URL(server.url).origin);
 
         await runStartupReadinessSync(gate, async () => outcome);
 
         const settled = await fetch(new URL("/readyz", server.url));
         expect(settled.status).toBe(expectedHttp);
-        expect(((await settled.json()) as { status: string }).status).toBe(expectedStatus);
+        const settledBody = (await settled.json()) as Record<string, unknown>;
+        expect(settledBody.status).toBe(expectedStatus);
+        expectReadyProtocolMetadata(settledBody, new URL(server.url).origin);
       } finally {
         await server.stop(true);
       }
@@ -1268,10 +1396,41 @@ describe("GET /readyz", () => {
       expect(typeof readyzBody.uptime).toBe("number");
       expect(typeof readyzBody.pid).toBe("number");
       expect(typeof readyzBody.port).toBe("number");
+      expectReadyProtocolMetadata(readyzBody, new URL(base).origin);
       // Sanitization: the body must never carry sync diagnostics, paths, or warnings.
-      expect(Object.keys(readyzBody).sort()).toEqual(["pid", "port", "service", "status", "uptime", "version"]);
+      expect(Object.keys(readyzBody).sort()).toEqual([
+        "managementUrl", "minimumClientProtocol", "pid", "port", "protocol", "service", "status", "uptime", "version",
+      ]);
       expect(JSON.stringify(readyzBody)).not.toContain("warning");
       expect(JSON.stringify(readyzBody)).not.toContain("path");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("hub readiness prefers the configured public management origin over the observed listener", async () => {
+    saveConfig({
+      ...forwardConfig(),
+      runtimeRole: "hub",
+      hub: { managementPublicOrigin: "https://hub.example.test" },
+    });
+    const server = startServer(0);
+    try {
+      const ready = await fetch(new URL("/readyz", server.url), {
+        headers: {
+          Host: "observed.example.test:8443",
+          "X-Forwarded-Host": "attacker.example.test",
+          "X-Forwarded-Proto": "http",
+        },
+      });
+      const body = await ready.json() as Record<string, unknown>;
+      expectReadyProtocolMetadata(body, "https://hub.example.test");
+
+      const health = await fetch(new URL("/healthz", server.url));
+      const healthBody = await health.json() as Record<string, unknown>;
+      expect(healthBody.guiPairCapability).toBe("v1");
+      expect(JSON.stringify(healthBody)).not.toContain("ocx_session_");
+      expect(JSON.stringify(healthBody)).not.toContain("csrf");
     } finally {
       await server.stop(true);
     }
@@ -1517,7 +1676,9 @@ describe("GET /readyz while draining", () => {
       const drainRes = await fetch(new URL("/readyz", base));
       expect(drainRes.status).toBe(503);
       expect(drainRes.headers.get("retry-after")).toBe("1");
-      expect(((await drainRes.json()) as { status: string }).status).toBe("pending");
+      const drainBody = (await drainRes.json()) as Record<string, unknown>;
+      expect(drainBody.status).toBe("pending");
+      expectReadyProtocolMetadata(drainBody, new URL(base).origin);
 
       // The gate itself is untouched — draining is a listener state, not a gate
       // transition, so the startup-sync ownership contract is preserved.

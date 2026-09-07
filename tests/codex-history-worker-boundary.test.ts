@@ -7,11 +7,12 @@
  * valid success would report every completed job as a death.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runCodexHistoryJob } from "../src/codex/history-job";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let root = "";
 let previousCodexHome: string | undefined;
@@ -36,7 +37,7 @@ afterEach(() => {
   else process.env.CODEX_HOME = previousCodexHome;
   if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
-  while (cleanup.length) rmSync(cleanup.pop()!, { recursive: true, force: true });
+  while (cleanup.length) removeTreeWithRetry(cleanup.pop()!);
 });
 
 describe("a dead worker is not a slow one", () => {
@@ -74,6 +75,26 @@ describe("the result validator", () => {
     // A reply for a different job is not this job's answer.
     expect(isPlausibleWorkerResultForTests(
       { requestId: "r", jobId: "OTHER", type: "done", outcome: "converged", rows: 3, files: 1 }, "r", "j",
+    )).toBe(false);
+    expect(isPlausibleWorkerResultForTests(
+      { requestId: "r", jobId: "j", type: "error", message: "history_transition_failed", reason: "integrity" },
+      "r", "j",
+    )).toBe(true);
+    expect(isPlausibleWorkerResultForTests(
+      { requestId: "r", jobId: "j", type: "error", message: "history_transition_failed", reason: "integrity", rows: 1, files: 2 },
+      "r", "j",
+    )).toBe(true);
+    expect(isPlausibleWorkerResultForTests(
+      { requestId: "r", jobId: "j", type: "error", message: "history_transition_failed", reason: "integrity", rows: 1 },
+      "r", "j",
+    )).toBe(false);
+    expect(isPlausibleWorkerResultForTests(
+      { requestId: "r", jobId: "j", type: "error", message: "history_transition_failed", reason: "integrity", rows: -1, files: 0 },
+      "r", "j",
+    )).toBe(false);
+    expect(isPlausibleWorkerResultForTests(
+      { requestId: "r", jobId: "j", type: "error", message: "history_transition_failed", reason: "invented" },
+      "r", "j",
     )).toBe(false);
     const target = {
       canonicalStateDbPath: "/state/state_5.sqlite",
@@ -119,5 +140,25 @@ describe("the result validator", () => {
     expect(isPlausibleWorkerResultForTests(
       { requestId: "r", jobId: "j", type: "blocked", reason: "invented" }, "r", "j",
     )).toBe(false);
+  });
+
+  test("the parent preserves partial progress from a valid worker error", async () => {
+    const { classifyWorkerResultForTests } = await import("../src/codex/history-job");
+    expect(classifyWorkerResultForTests({
+      requestId: "r",
+      jobId: "j",
+      type: "error",
+      message: "history_transition_failed",
+      reason: "integrity",
+      rows: 1,
+      files: 2,
+    })).toEqual({
+      kind: "failed",
+      reason: "worker-error",
+      message: "history_transition_failed",
+      historyFailureReason: "integrity",
+      rows: 1,
+      files: 2,
+    });
   });
 });

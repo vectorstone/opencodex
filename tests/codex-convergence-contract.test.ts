@@ -40,6 +40,7 @@ import { saveConfig } from "../src/config";
 import { handleManagementAPI } from "../src/server/management-api";
 import type { OcxConfig } from "../src/types";
 import { ManagementRequest } from "./helpers/management-auth";
+import { removeTreeWithRetry } from "./helpers/remove-tree";
 
 let root = "";
 let codexHome = "";
@@ -116,7 +117,7 @@ afterEach(() => {
   else process.env.CODEX_HOME = previousCodexHome;
   if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousOpencodexHome;
-  rmSync(root, { recursive: true, force: true });
+  removeTreeWithRetry(root);
 });
 
 test("T1 gather performs no filesystem write and does not materialize a runtime probe home", async () => {
@@ -372,10 +373,10 @@ test("a failure cause never carries message text, paths or identifiers (#1784)",
   expect(body).not.toContain("failed writing");
 });
 
-test("the route inventory contains exactly the specified 7 + 6 + 2 + 2 convergence calls", () => {
+test("the route inventory contains exactly the specified 8 + 14 + 2 + 2 convergence calls", () => {
   const counts = Object.fromEntries([
-    ["provider-routes.ts", 7],
-    ["model-routes.ts", 6],
+    ["provider-routes.ts", 8],
+    ["model-routes.ts", 14],
     ["combo-routes.ts", 2],
     ["agent-settings-routes.ts", 2],
   ].map(([file, expected]) => {
@@ -386,11 +387,54 @@ test("the route inventory contains exactly the specified 7 + 6 + 2 + 2 convergen
     return [file, count];
   }));
   expect(counts).toEqual({
-    "provider-routes.ts": 7,
-    "model-routes.ts": 6,
+    "provider-routes.ts": 8,
+    "model-routes.ts": 14,
     "combo-routes.ts": 2,
     "agent-settings-routes.ts": 2,
   });
+});
+
+test("both model-discovery write paths converge the Codex catalog", () => {
+  const source = readFileSync(join(import.meta.dir, "..", "src", "server", "management", "model-routes.ts"), "utf8");
+  const settings = source.slice(source.indexOf('url.pathname === "/api/model-discovery" && req.method === "PUT"'), source.indexOf('url.pathname === "/api/model-discovery/acknowledge"'));
+  // Sliced to the NEXT route rather than to /api/catalog: the alias routes (#2463) landed
+  // between them, so a fixed far boundary would swallow their convergence calls and count
+  // them as this route's.
+  const acknowledge = source.slice(source.indexOf('url.pathname === "/api/model-discovery/acknowledge"'), source.indexOf('url.pathname === "/api/aliases"'));
+  expect(settings.match(/await convergeCodexCatalog\(\)/g)?.length).toBe(1);
+  expect(acknowledge.match(/await convergeCodexCatalog\(\)/g)?.length).toBe(1);
+});
+
+test("all three alias write routes converge the Codex catalog", () => {
+  const source = readFileSync(join(import.meta.dir, "..", "src", "server", "management", "model-routes.ts"), "utf8");
+  for (const marker of ["providerAliasMatch && req.method", "modelAliasMatch && req.method", 'url.pathname === "/api/default-aliases"']) {
+    const start = source.indexOf(marker);
+    expect(start).toBeGreaterThan(-1);
+    expect(source.slice(start, source.indexOf("\n  if (", start + 1))).toContain("await convergeCodexCatalog()");
+  }
+});
+
+/**
+ * Same discipline as the reload-route assertion below: the count above went 6 -> 8 for the
+ * model-preset routes (#2465), and a bare count that only ever rises stops being a contract.
+ * Assert those two calls specifically, so a later bump cannot pass while some OTHER route
+ * quietly gained one, or while a preset route lost its own convergence.
+ *
+ * Both are write paths that change which models ship to the catalog — applying a preset
+ * narrows it, clearing back to "all" widens it — so each must converge for exactly the same
+ * reason `PUT /api/selected-models` does.
+ */
+test("both model-preset write paths converge the Codex catalog", () => {
+  const source = readFileSync(
+    join(import.meta.dir, "..", "src", "server", "management", "model-routes.ts"),
+    "utf8",
+  );
+  const handlerStart = source.indexOf('url.pathname === "/api/model-presets" && req.method === "PUT"');
+  expect(handlerStart).toBeGreaterThan(-1);
+  const handlerBody = source.slice(handlerStart, source.indexOf("url.pathname ===", handlerStart + 1));
+  // The "all" branch and the materialize branch each converge; "custom" only moves the marker,
+  // so it deliberately does not.
+  expect(handlerBody.match(/await convergeCodexCatalog\(\)/g)?.length).toBe(2);
 });
 
 /**
@@ -411,4 +455,24 @@ test("the attested reload route converges the Codex catalog like the other write
   // The reload handler returns before the next route check; scope the search to its body.
   const handlerBody = source.slice(handlerStart, source.indexOf("url.pathname ===", handlerStart + 1));
   expect(handlerBody).toContain("await convergeCodexCatalog()");
+});
+
+/**
+ * The eighth provider-route call belongs to the atomic provider batch PUT: one commit can
+ * add, edit, or remove several routed rows, so the post-commit live state must converge once.
+ * Keep this route-specific assertion beside the total so the inventory cannot be satisfied
+ * by an unrelated extra call while the batch route loses its own convergence.
+ */
+test("the atomic provider batch route converges the Codex catalog once", () => {
+  const source = readFileSync(
+    join(import.meta.dir, "..", "src", "server", "management", "provider-routes.ts"),
+    "utf8",
+  );
+  const handlerStart = source.indexOf('url.pathname === "/api/providers" && req.method === "PUT"');
+  expect(handlerStart).toBeGreaterThan(-1);
+  const handlerBody = source.slice(handlerStart, source.indexOf(
+    'url.pathname === "/api/providers" && req.method === "POST"',
+    handlerStart + 1,
+  ));
+  expect(handlerBody.match(/await convergeCodexCatalog\(\)/g)?.length).toBe(1);
 });

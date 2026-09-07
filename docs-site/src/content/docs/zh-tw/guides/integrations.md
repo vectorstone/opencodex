@@ -26,7 +26,9 @@ loopback，而且絕不會寫入真實憑證。
 MiniMax Code 依序遵循 `MINIMAX_DATA_DIR`、`MAVIS_DATA_DIR`，最後才回退到
 `~/.minimax`。其受管理區塊只擁有 `custom_provider.opencodex`，不會變更
 `defaultModel`、MiniMax 憑證來源或使用者的 MiniMax 登入。連接後請在 MCode
-中選擇 `custom_provider:opencodex/<provider/model>`。
+中選擇 `custom_provider:opencodex/<provider/model>`。重新整理整合也會更新有可靠來源的
+逐模型 context window 與 reasoning-effort 選項；未知能力會省略，而 MCode session
+目前選取的 effort 不會被覆寫。
 
 路徑遵循客戶端自己的環境覆寫（environment override）。對 OMP 而言，`OMP_PROFILE` 以存在與否優先於 `PI_PROFILE`，即使明確為空也一樣。具名 profile 會把 `PI_CONFIG_DIR` 當作相對於使用者家目錄的目錄名稱，並忽略 `PI_CODING_AGENT_DIR`；沒有具名 profile 時，`PI_CODING_AGENT_DIR` 勝出。OMP 支援 provider 層級的 headers，但這個最初的整合刻意只支援 loopback；遠端 `x-opencodex-api-key` 的連線設定被延後。搬移過的 `HERMES_HOME`、`KIMI_CODE_HOME` 與 `XDG_CONFIG_HOME` 路徑同樣會被遵循，而非猜測。表格列出每個客戶端的預設值。
 
@@ -38,9 +40,9 @@ OpenClaw 有數個環境變數，各自負責不同的工作。`OPENCLAW_CONFIG_
 
 opencodex 從自己的環境讀取這些變數。如果你的 gateway 以 profile 或搬移過的家目錄執行，請以相同的變數啟動 opencodex，否則它會正確地遵循另一個安裝。
 
-## 其他四個介面不是開關
+## 其他五個介面不是開關
 
-**API Keys** 管理 opencodex 自己的憑證，根本不是客戶端。**Codex CLI** 由 proxy 服務本身連接——啟動 opencodex 即套用，停止即回復原生路由——所以沒有什麼需要逐檔切換。**Claude** 保留自己的啟用旗標與 Desktop 的 Save/Apply 流程，**Grok Build** 保留其先選後套用的模型圍欄（model fence）。那些語意早於這項功能，且維持不變。
+**API Keys** 管理 opencodex 自己的憑證，根本不是客戶端。**Codex CLI** 由 proxy 服務本身連接——啟動 opencodex 即套用，停止即回復原生路由——所以沒有什麼需要逐檔切換。**Claude** 保留自己的啟用旗標與 Desktop 的 Save/Apply 流程，**Grok Build** 保留其先選後套用的模型圍欄（model fence）。那些語意早於這項功能，且維持不變。**Cursor** 完全不會寫入任何內容：其分頁會顯示偵測結果、gateway 值，以及最近一次看到的請求，其餘則在 Cursor Private Inference 內部進行。
 
 ## 回復（Rollback）
 
@@ -78,12 +80,25 @@ ocx integration client history --client hermes
 ocx integration client restore --op <opId> [--confirm-drift]
 ```
 
+`--overwrite-conflict` 是 **Replace** 的終端形式：
+
+```bash
+ocx integration client enable --client zcode --overwrite-conflict
+```
+
+和 `--confirm-drift` 一樣，它永遠不會被預設：沒有這個旗標，衝突仍然會被拒絕。
+它只適用於 `enable`；對衝突強制 *disable* 會刪除我們從未寫入的區塊，因此這個組合會被拒絕。
+
 MiniMax Code 先連接一次 provider，再透過會檢查設定的 launcher 啟動：
 
 ```bash
 ocx integration client enable --client mcode
 ocx mcode
 ```
+
+完成一次連接後，`ocx sync` 也會以目前的 context window 與 reasoning-effort 階梯更新
+OpenCodex 已擁有的 MCode 區塊。若區塊已刪除、遭外部修改、不安全或從未由 OpenCodex
+建立，sync 會保持原檔不動；只有在你確定要重新連接時才再次執行 enable。
 
 另一個 MiniMax 平台 CLI（`mmx`）不是檔案開關整合。其文字命令使用 MiniMax 的
 Anthropic 相容端點，因此 OpenCodex 提供憑證隔離、僅限 loopback 的 launcher：

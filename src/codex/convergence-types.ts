@@ -34,7 +34,7 @@ export interface CodexIntegrationRecord {
 }
 
 export interface CodexHistoryState {
-  status: "converged" | "pending" | "running" | "blocked" | "unknown" | "not-evaluated";
+  status: "adoption-pending" | "converged" | "pending" | "running" | "blocked" | "unknown" | "not-evaluated";
   /**
    * Why it is not converged, when it is not. These are terminal observations
    * for one attempt, not reasons to collapse the durable retry schedule.
@@ -429,6 +429,7 @@ export interface CatalogTrustedOpenAiApiPolicySnapshot {
   readonly models?: readonly string[];
   readonly modelContextWindows?: Readonly<Record<string, number>>;
   readonly modelMaxInputTokens?: Readonly<Record<string, number>>;
+  readonly virtualModels?: Readonly<Record<string, Readonly<{ wireModelId: string; reasoningMode: "pro" }>>>;
   readonly modelInputModalities?: Readonly<Record<string, readonly string[]>>;
   readonly modelReasoningEfforts?: Readonly<Record<string, readonly string[]>>;
 }

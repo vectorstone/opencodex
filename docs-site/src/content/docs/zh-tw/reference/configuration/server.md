@@ -24,12 +24,13 @@ description: 監聽器、遠端存取、許可金鑰、逾時、儲存、sidecar
 | `codexAutoStart?` | `boolean` | `true` | 讓 Codex shim 在啟動 Codex 前執行 `ocx ensure`。False 使 ensure 為 no-op。 |
 | `codexShimAutoRestore?` | `boolean` | `true` | 在完成的外部 Codex 更新取代已安裝的 shim 後還原它。環境退出：`OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`。 |
 | `syncResumeHistory?` | `boolean` | `true` | 可逆的 Codex App 歷史相容性。原始中繼資料由 `ocx stop` / `ocx restore` 備份並還原。 |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 將識別的 Codex helper/shadow call 重定向到所選模型，以低 effort 執行。預設來源前綴為 `gpt-5.4-mini` 與 `gpt-5.6-luna`。 |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 將識別的 Codex helper/shadow call 重定向到所選模型，並保留為請求設定的 reasoning effort。預設來源前綴為 `gpt-5.6-luna`；0.144.x 及更舊的客戶端使用 `gpt-5.4-mini`，可透過 `sourceModels` 恢復。 |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | 可用時開啟 | 網頁搜尋 sidecar 選項。 |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | 可用時開啟 | 圖片描述 sidecar 選項。 |
 | `images?` | `OcxImagesConfig` | 自動 OpenAI 選擇 | Codex `image_gen` 的獨立 Images 中繼選項。 |
 
-若較舊的開發組建在備份支援存在前變更了 resume-history 中繼資料，請執行 `ocx recover-history --legacy-openai` 以強制原生供應商復原。
+若較舊的開發組建在備份支援存在前變更了 resume-history 中繼資料，請執行 `ocx recover-history --legacy-openai --yes` 以強制原生供應商復原。
+此命令會重新標記所有含有使用者訊息的 `opencodex` row，其中也包含正常的專用 provider 歷史；執行前請查看 lifecycle reference 中的完整範圍警告。
 
 ## 遠端存取
 
@@ -88,8 +89,9 @@ stream 開啟前以 `401` 失敗。
 該 port 是必填的，且必須與 proxy port 不同。它絕不會由 OS 指派：臨時 port 會在重啟時改變，而
 已執行的 app-server 仍保留先前的 `base_url`。
 
-該 listener 只服務 `POST /v1/responses`、其 WebSocket upgrade、`POST /v1/responses/compact` 與
-`GET /v1/models`。其他一切，包括 `/api/*` 與儀表板，都會回傳 `404`。
+該 listener 只服務 `POST /v1/responses`、其 WebSocket upgrade、`POST /v1/responses/compact`、
+`POST /v1/alpha/search`（Codex 原生網頁搜尋中繼）、`GET /v1/models`，以及獨立語音 WebSocket upgrade。
+其他一切，包括 `/api/*` 與儀表板，都會回傳 `404`。
 
 :::danger[這是一個未認證的介面]
 機器上的每個 process 都可以使用此 listener。它會耗用帳號配額與付費 provider 憑證，也可能耗盡
@@ -139,14 +141,14 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 
 ## Shadow call
 
-Codex 使用小型 helper 模型處理如標題與 commit 訊息等任務。啟用 `shadowCallIntercept` 以將識別的來源模型前綴重定向到另一個已設定的模型。替換以低 effort 執行。僅在客戶端使用不同的 helper id 時設定 `sourceModels`。
+Codex 使用小型 helper 模型處理如標題與 commit 訊息等任務。啟用 `shadowCallIntercept` 以將識別的來源模型前綴重定向到另一個已設定的模型。替換後仍會保留為請求設定的 reasoning effort。僅在客戶端使用不同的 helper id 時設定 `sourceModels`。
 
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.4-mini", "gpt-5.6-luna"]
+    "sourceModels": ["gpt-5.6-luna"]
   }
 }
 ```
@@ -167,14 +169,16 @@ Codex 使用小型 helper 模型處理如標題與 commit 訊息等任務。啟�
 | 欄位 | 型別 | 預設值 | 意義 |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | 可用時開啟 | 主開關。 |
-| `backend?` | `"openai" \| "anthropic"` | 自動 | 明確勝出；否則可用的已儲存 Anthropic OAuth 選擇 `anthropic`，然後 `openai`。 |
-| `model?` | `string` | 視 backend 而定 | OpenAI 為 `gpt-5.6-luna` 或 Anthropic 為 `claude-sonnet-5`。舊版明確 `gpt-5.4-mini` 在啟動時遷移。 |
+| `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | 明確設定優先；省略時一律使用 `openai`。`anthropic` 與 `xai` 僅在明確設定時執行；`gemini` 與 `exa` 在 executor 推出前仍為保留值。 |
+| `model?` | `string` | 視 backend 而定 | OpenAI 為 `gpt-5.6-luna`、Anthropic 為 `claude-sonnet-5`、xAI 為 `grok-4.6`。舊版明確 `gpt-5.4-mini` 在啟動時遷移。 |
+| `exaApiKey?` | `string` | 無 | `exa` backend 的操作員金鑰。僅可寫入：管理讀取永遠不會傳回已儲存的值。 |
+| `xSearch?` | `object` | 省略 | xAI 專用的託管 `x_search` opt-in：`enabled`、互斥的 `allowedXHandles` / `excludedXHandles` 陣列（最多 20 項），以及 ISO `fromDate` / `toDate`（`YYYY-MM-DD`）。 |
 | `reasoning?` | `string` | `low` | Sidecar effort。`minimal` 在網頁搜尋時被拒絕。 |
 | `maxSearchesPerTurn?` | `number` | `3` | 每個主模型回合允許的實際搜尋。 |
 | `routedModelStallTimeoutMs?` | `number` | `200000` | 僅設定檔的路由模型原始 body 不活動截止時間。整數 1–2147483647；每個非空 chunk 重置它。 |
 | `timeoutMs?` | `number` | `60000` | 一個代管搜尋的截止時間。 |
 
-OpenAI backend 需要 ChatGPT 登入與啟用的 ChatGPT `forward` 供應商。Claude-inbound 路由重播將主 ChatGPT 認證注入內部請求。Anthropic backend 使用來自已啟用 Anthropic OAuth 供應商的現用已儲存憑證。明確選擇的 Anthropic backend 在無可用帳號時 fail closed 而非後退。Anthropic 執行器使用其原生 `web_search_20250305` 工具。
+OpenAI backend 需要 ChatGPT 登入與啟用的 ChatGPT `forward` 供應商。Claude-inbound 路由重播將主 ChatGPT 認證注入內部請求。Anthropic backend 使用來自已啟用 Anthropic OAuth 供應商的現用已儲存憑證。明確選擇的 Anthropic backend 在無可用帳號時 fail closed 而非後退。Anthropic 執行器使用其原生 `web_search_20250305` 工具。xAI backend 需要可用的已儲存 Grok OAuth 帳號，使用託管 `web_search`，並在 `xSearch.enabled` 為 true 時加入託管 `x_search`。格式錯誤的 `xSearch` 管理輸入會傳回 `400`；格式錯誤的持久化區塊會在規劃期間 fail closed。`gemini` 與 `exa` 通道絕不會因憑證探索或 fallback 而啟用；操作員必須明確選擇它們。`exaApiKey` 可在寫入時接受，但會從管理回應中省略。
 
 四個時鐘治理搜尋：基礎 `stallTimeoutSec`、`connectTimeoutMs`、路由模型不活動與代管搜尋逾時。有效的橋接看門狗為最大值加 30 秒。路由停滯是不活動防護，而非總生成截止時間。
 
@@ -183,7 +187,7 @@ OpenAI backend 需要 ChatGPT 登入與啟用的 ChatGPT `forward` 供應商。C
 | 欄位 | 型別 | 預設值 | 意義 |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | 可用時開啟 | 主圖片描述開關。 |
-| `backend?` | `"openai" \| "anthropic"` | 自動 | 與網頁搜尋相同的明確優先、Anthropic 憑證感知選擇。 |
+| `backend?` | `"openai" \| "anthropic"` | 自動 | 明確值優先；未設定時優先使用可用的已儲存 Anthropic OAuth 憑證，否則使用 `openai`。 |
 | `model?` | `string` | 視 backend 而定 | OpenAI 為 `gpt-5.4-mini` 或 Anthropic 為 `claude-sonnet-5`。 |
 | `maxDescriptionsPerTurn?` | `number` | `8` | 每個主回合允許的新描述快取未命中。`0` 停用呼叫；無效值使用預設。 |
 | `timeoutMs?` | `number` | `45000` | Sidecar 擷取逾時。整數 1–2147483647。 |
@@ -191,3 +195,9 @@ OpenAI backend 需要 ChatGPT 登入與啟用的 ChatGPT `forward` 供應商。C
 視覺僅對發送到其供應商 `noVisionModels` 中模型的圖片啟用。OpenAI 的登入／forward 需求與搜尋相同；明確選擇的 Anthropic 在無可用憑證時 fail closed。成功的 `data:` 描述使用以 backend、模型、細節、圖片位元組與正規化訊息 context 為 key 的有界快取。命中與同回合重複不消耗限制。遠端 `https:` 圖片與失敗或空的描述不被快取。
 
 Anthropic OAuth sidecar 重用 opencodex 既有的 Claude Code OAuth 指紋。請對預期帳號與工作負載進行浸泡測試。
+
+## Remote Hub 金鑰與預設值
+
+`runtimeRole` 預設為 `standalone`。Hub 使用 `hub.managementPublicOrigin`、僅限迴路的 `hub.managementIngress`（缺省為 `enabled:false`）與正確的 `remoteGui.allowedTailscaleUsers`（缺省為空）。用戶端金鑰保存在 `service-api-token` 而不是 `config.json`；輪替期間可能暫時存在 `service-api-token.prev`。用量不會鏡像。
+
+`remoteGui.allowInsecureHttp` 是已棄用的 no-op，只為讓舊的 strict-schema 設定繼續載入而保留。請從設定移除：pairing grant 僅接受 loopback 或已驗證的 HTTPS；設為 `true` 也不會重新開放明文 HTTP pairing。

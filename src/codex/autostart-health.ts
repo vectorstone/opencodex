@@ -90,9 +90,9 @@ export function deriveStartupHealth(inputs: StartupHealthInputs): StartupHealth 
     : inputs.routingKind === "custom-local" || inputs.routingKind === "unknown"
       ? COMMANDS.restoreNative
     : inputs.serviceSupported
-      // An already-registered service is refreshed in place: `repair` rewrites its assets
-      // and restarts it without re-registering, so it needs no elevation on Windows and
-      // cannot switch a WinSW install to Task Scheduler the way `install` would. Only a
+      // An already-registered service is refreshed in place: `repair` reuses healthy Windows
+      // scheduler definitions, while stale ones may be re-registered and require elevation.
+      // It still cannot switch a WinSW install to Task Scheduler the way `install` would. Only a
       // genuinely absent (or conflicting, which needs uninstall-then-install) service
       // gets the registering command.
       ? (inputs.serviceInstalled && !inputs.serviceConflict ? COMMANDS.repairService : COMMANDS.installService)
@@ -153,4 +153,20 @@ export function startupHealthSummary(health: StartupHealth): string {
   if (health.serviceStale) return `AT RISK after restart (background service files are stale; run '${command}')`;
   if (health.serviceInstalled && !health.serviceViable) return `AT RISK after restart (installed service is disabled, stopped, or unhealthy; run '${command}')`;
   return `AT RISK after restart (no viable background service; run '${command}')`;
+}
+
+/**
+ * The routing/service/shim token `ocx doctor` prints under restart safety.
+ * Extracted so `ocx status` can show the same string rather than growing a
+ * second copy that drifts (#2411). Two management routes computing the same
+ * thing separately is exactly how #2457 happened.
+ */
+export function formatStartupRoutingDetail(health: StartupHealth): string {
+  const service = health.serviceViable
+    ? "viable"
+    : health.serviceInstalled ? "installed-but-unhealthy" : "absent";
+  const shim = health.shimHealthy
+    ? "healthy"
+    : health.shimInstalled ? "stale" : "absent";
+  return `routing=${health.routingKind}, service=${service}, shim=${shim}`;
 }

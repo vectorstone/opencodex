@@ -67,7 +67,7 @@ API key，且绝不会回退到 native alias。启用这组兼容选项前，请
 | 别名 | 对应资源 |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
@@ -124,7 +124,7 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 ### `ocx opencode [opencode args...]`
 
-确保代理正在运行，然后在 OpenCode 的内联运行时层（`OPENCODE_CONFIG_CONTENT`）中启动 opencode，并注入生成的 `provider.opencodex` 块。现有的内联配置会被保留，仅本次启动会替换 `provider.opencodex`。可能会读取全局或项目级 `opencode.json` 文件以警告已有覆盖，但不会修改磁盘上的文件。路由后的模型会显示为 `opencodex/<provider>/<model>`。稍后再次启动普通 `opencode` 时，行为与之前完全一致。
+确保代理正在运行，然后在 OpenCode 的内联运行时层（`OPENCODE_CONFIG_CONTENT`）中启动 opencode，并注入生成的 `provider.opencodex` 和 `providers.opencodex` 块。现有的内联配置会被保留，仅本次启动会替换这两个键。可能会读取全局或项目级 `opencode.json` 文件以警告已有覆盖，但不会修改磁盘上的文件。路由后的模型会显示为 `opencodex/<provider>/<model>`。稍后再次启动普通 `opencode` 时，行为与之前完全一致。
 
 ### `ocx grok <status|exclude|include|set|clear|apply> ...`
 
@@ -132,7 +132,7 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 ## Client config export
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime>`
 
 输出连接到正在运行代理的客户端配置。此命令会以所选客户端的原生格式序列化 `opencodex` provider 块，其中包含基础 URL、模型列表，以及该客户端适用的凭据引用或 `opencodex-loopback` 占位值。
 
@@ -140,7 +140,7 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 | 标志 | 动作 |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | 必需。选择客户端配置格式。 |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime>` | 必需。选择客户端配置格式。 |
 | `--json` | 仅在 stdout 打印配置 JSON，这样重定向即可捕获字节级精确输出。包括 `--out` 写入提示在内的所有诊断信息都会输出到 stderr。 |
 | `--out <path>` | 将配置写入 `<path>`。拒绝替换已存在的文件。 |
 | `--force` | 允许 `--out` 替换已存在的文件。 |
@@ -157,13 +157,16 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 | 客户端 | 规范目标路径 | 下载文件名 | 环境变量 |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json`（设置了 `XDG_CONFIG_HOME` 时以其为准） | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | 无 - 块中携带字面值 `opencodex-loopback` |
+| `pi` | `~/.pi/agent/models.json` (设置后 `PI_CODING_AGENT_DIR` 优先；相对路径会被拒绝) | `pi-models.json` | 无 - 块中携带字面值 `opencodex-loopback` |
 | `omp` | `~/.omp/agent/models.yml`（默认路径；即使为空，`OMP_PROFILE` 也优先于 `PI_PROFILE`） | `omp-models.yaml` | 无 - 字面值 `opencodex-loopback` |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | 无 - loopback placeholder |
 | `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
 | `dsh` | `$DSH_HOME/settings.yaml`（默认 `~/.dsh/settings.yaml`） | `settings.yaml` | 无 — 非秘密环回 bearer 占位值 |
+| `mcode` | `~/.minimax/config.yaml` (设置后 `MINIMAX_DATA_DIR` 优先，其次是旧的 `MAVIS_DATA_DIR`；相对路径会被拒绝) | `mcode-config.yaml` | 无 — loopback placeholder |
+| `zcode` | `~/.zcode/v2/config.json` (设置后 `ZCODE_DATA_DIR` 优先；相对路径会被拒绝) | `config.json` | 无 — loopback placeholder |
+| `prime` | `~/.prime/agent/models.json` (设置后 `PRIME_AGENT_CODING_AGENT_DIR` 优先；相对路径会被拒绝) | `prime-models.json` | 无 — loopback placeholder |
 
 opencode 会插值 `{env:OPENCODEX_OPENCODE_API_KEY}`。opencodex 生成的 Pi 导出不需要环境变量，而是携带字面占位值 `opencodex-loopback`。这个值是必需的：Pi 在构建模型列表时会解析 `apiKey`，如果已有配置包含未设置的环境变量引用，它就会隐藏整个 provider。回环上的代理从不校验生成的占位值。
 
@@ -171,19 +174,27 @@ opencode 会插值 `{env:OPENCODEX_OPENCODE_API_KEY}`。opencodex 生成的 Pi �
 `ocx export` 从不写入你的真实客户端配置。该命令只会打印目标路径供你手动合并，而 `--out` 在没有 `--force` 的情况下拒绝覆盖已有文件，因为替换配置会破坏其中已有的其他 providers、agents 和 MCP 条目。
 :::
 
-任何密钥都不会被序列化。opencode、Hermes、OpenClaw 和 Gajae 配置里只包含环境引用，因此密钥仍保留在你的环境中；Pi、OMP、Kimi 和 DSH 配置里携带的是环回占位值而不是任何凭据。环回代理（`127.0.0.1`，默认值）根本不需要准入密钥。当代理绑定到环回地址之外时，请设置对应的 `OPENCODEX_OPENCODE_API_KEY`、`OPENCODEX_HERMES_API_KEY` 或 `OPENCODEX_OPENCLAW_API_KEY`。`OPENCODEX_GAJAE_API_KEY` 只会从环境中提供 Gajae provider 凭据，不能发送远程准入 header，因此生成的 Gajae 集成仍与 Pi、OMP、Kimi 和 DSH 一样仅支持环回。关于准入密钥如何签发，请参见 [远程访问](/reference/configuration/#remote-access)。上游 providers 自身的密钥则完全是另一回事，需要按 [Providers](/guides/providers/) 单独配置。
+任何密钥都不会被序列化。生成的配置里携带的要么是有文档记录的环境引用，要么是非机密的环回占位值。环回代理（`127.0.0.1`，默认值）根本不需要准入密钥。当代理绑定到环回地址之外时，请设置对应的 `OPENCODEX_OPENCODE_API_KEY`、`OPENCODEX_HERMES_API_KEY` 或 `OPENCODEX_OPENCLAW_API_KEY`。`OPENCODEX_GAJAE_API_KEY` 只会从环境中提供 Gajae provider 凭据，不能发送远程准入 header，因此生成的 Gajae 集成仍仅支持环回。关于准入密钥如何签发，请参见 [远程访问](/reference/configuration/#remote-access)。上游 providers 自身的密钥则完全是另一回事，需要按 [Providers](/guides/providers/) 单独配置。
 
 同一份负载会通过 `GET /api/client-config` 提供，并在仪表盘的 API 选项卡中渲染，因此 CLI、API 和 GUI 使用的是同一字节内容。
 
 ## Runtime and configuration
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 管理无头运行时设置、启动、同步、诊断和更新。
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update` 更新 OpenCodex 本身。Codex CLI 使用以下独立的只读检查命令：
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` 不会向软件包注册表发起请求，只会在限定范围内检查已配置候选项的来源证据，包括经过脱敏的可执行文件位置和所有权证据。受信任的已发布启动器上下文只能验证该候选项快照，并不证明 Codex 已成功运行。由于这条一次性命令绝不会运行 Codex，来自环境变量和持久化记录的候选项仅用于报告（`managed: false`，通常为 `selection_unattested`）；JSON 输出包含 `candidateAvailable`、`candidateVersion` 和 `candidateSource`，且 `selectionAttested` 始终为 `false`。检查已配置候选项需要受信任的已发布启动器上下文；直接使用 Bun 启动或从源码运行时没有这项证明，因此会忽略环境变量和持久化记录中的候选项状态，并可能报告 `candidate_unavailable`。在 Windows 上，这个首个切片不会对候选路径或配置路径执行任何文件系统 I/O。只有由受信任启动器捕获的绝对环境候选项可以获得应用捆绑或版本管理器的纯词法标签；其他所有 Windows 候选项都会以失败关闭方式处理。该命令不会运行 Codex 或软件包管理器，不会修复 shim，不会写入配置或缓存，不会停止进程，也不会安装任何内容。随应用捆绑的候选项、位于已识别版本管理器路径中的候选项、未经验证的独立候选项以及 shim 状态不明确的候选项，都会报告为 `unmanaged` 或 `unknown`，绝不会归类为 `managed`。
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

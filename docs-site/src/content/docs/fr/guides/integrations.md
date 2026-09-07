@@ -29,6 +29,9 @@ MiniMax Code recherche d’abord `MINIMAX_DATA_DIR`, puis `MAVIS_DATA_DIR`, avan
 `~/.minimax`. Son bloc géré ne possède que `custom_provider.opencodex`. Il ne modifie ni `defaultModel`, ni
 la source d’identification MiniMax sélectionnée, ni la connexion MiniMax de l’utilisateur. Après l’avoir
 connecté, choisissez dans MCode une entrée `custom_provider:opencodex/<provider/model>`.
+L’actualisation de l’intégration met également à jour les fenêtres de contexte par modèle et les choix
+d’effort de raisonnement faisant autorité ; les capacités inconnues sont omises et l’effort courant,
+qui appartient à la session MCode, est préservé.
 
 Les chemins respectent les variables de remplacement propres à chaque client, lorsqu'elles existent. Pour
 OMP, la présence de `OMP_PROFILE` l'emporte sur `PI_PROFILE`, même si sa valeur est explicitement vide. Un
@@ -58,14 +61,16 @@ opencodex lit ces variables dans son propre environnement. Si votre passerelle u
 dossier personnel déplacé, lancez opencodex avec les mêmes variables ; sinon, il suivra correctement une
 autre installation.
 
-## Les quatre autres surfaces ne sont pas des commutateurs
+## Les cinq autres surfaces ne sont pas des commutateurs
 
 **Clés API** gère les propres identifiants d'opencodex et n'est donc pas un client. **Codex CLI** est relié
 par le service du proxy lui-même : démarrer opencodex applique ce routage et l'arrêter restaure le routage
 natif ; aucun fichier ne doit donc être activé ou désactivé séparément. **Claude** conserve son propre
 indicateur d'activation et le flux **Enregistrer/Appliquer** de Desktop, tandis que **Grok Build** conserve
 sa barrière « sélectionner, puis appliquer » pour les modèles. Ces règles sont antérieures à cette
-fonctionnalité et restent inchangées.
+fonctionnalité et restent inchangées. **Cursor** n'écrit absolument rien : son onglet affiche la détection,
+les valeurs de la passerelle et la dernière requête observée, et tout le reste se passe dans Cursor Private
+Inference.
 
 ## Restauration
 
@@ -142,12 +147,26 @@ ocx integration client history --client hermes
 ocx integration client restore --op <opId> [--confirm-drift]
 ```
 
+`--overwrite-conflict` est la forme terminale de **Replace** :
+
+```bash
+ocx integration client enable --client zcode --overwrite-conflict
+```
+
+Comme `--confirm-drift`, il n'est jamais supposé : sans lui, un conflit reste refusé.
+Il ne s'applique qu'à `enable` ; forcer un *disable* sur un conflit supprimerait un bloc
+que nous n'avons jamais écrit, donc cette combinaison est rejetée.
+
 Pour MiniMax Code, connectez une fois le fournisseur puis utilisez l’enveloppe qui vérifie la connexion :
 
 ```bash
 ocx integration client enable --client mcode
 ocx mcode
 ```
+
+Une fois l’intégration connectée, `ocx sync` actualise également le bloc MCode géré avec les fenêtres de
+contexte et les niveaux d’effort de raisonnement actuels. Les blocs absents, modifiés par un tiers, non sûrs
+ou jamais gérés restent intacts ; réactivez explicitement l’intégration lorsque vous souhaitez la reconnecter.
 
 Le CLI distinct de la plateforme MiniMax (`mmx`) n’est pas une intégration à commutateur de fichier. Ses
 commandes textuelles utilisent le point de terminaison compatible avec Anthropic de MiniMax ; OpenCodex

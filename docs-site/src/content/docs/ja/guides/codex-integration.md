@@ -40,6 +40,7 @@ Codex の組み込み `image_gen` ツールは、`/v1/responses` を経由しま
 失敗。壊れた/期限切れのプール認証情報が、別途請求される API 使用量の背後に隠れることはありません。
 - **明示的なカスタム プロバイダー:** `images.provider` をカスタム API キーの ID に設定します。
 `openai-responses` プロバイダー。そのエンドポイントは OpenAI Images API を実装します。明示的な選択はクローズに失敗し、別の有料アップストリームにフォールバックすることはありません。レジストリで管理されているプロバイダー ID はここでは受け入れられません。組み込みの OpenAI 層を使用するには、`images.provider` を省略します。
+- **xAI Imagine (Grok OAuth) リレー:** `images.bridgeEnabled` が `true` で、`images.provider` が未設定、かつ `xai` プロバイダーが設定されている場合、`/v1/images/generations` と `/v1/images/edits` は `https://api.x.ai/v1` に送られます。使われる資格情報はプロバイダーの `authMode` で決まります。`"oauth"` なら `ocx login xai` の Grok CLI グラントを再利用し、それ以外ならプロバイダーの API キーを使います。OAuth ログインがキー方式のプロバイダーを有効にすることはなく、その逆もありません。ChatGPT の資格情報は転送されません。資格情報が無い場合、プロキシは ChatGPT に課金せず 400 を返します。`images.provider` を明示すると `/v1/images` はそのプロバイダーが受け持ち、その検証エラーがそのまま返され、xAI リレーは試行されません。リレーは Codex の `size` / `aspect_ratio` を xAI Imagine のボディに写し、同じ `{created, data:[{b64_json}]}` 形を返します。バッチ全体（インライン `b64_json` とダウンロードした URL）のデコード済みバイトと base64 エンコード出力は合わせて 100 MiB 未満です。上限を超えるバッチは 502 を返します。xAI がインラインのバイト列ではなく画像 URL を返した場合、プロキシは資格情報なしで自ら取得します。URL は公開 HTTPS でなければならず（リダイレクト、`file:`、ループバックやプライベートアドレスは不可）、1 ファイルあたり 50 MiB が上限で、結果はローカルのアーティファクトとして保存され、認証済みの管理エンドポイント経由でのみ配信されます。これは API キー専用の Responses Image Bridge ループとは独立です。
 - **Google Antigravity (CCA) フォールバック:** OpenAI 前方候補でもキー付きでもない場合
 プロバイダーが構成されている場合、`/v1/images/generations` (`/images/edits` ではありません) は、`gemini-3.1-flash-image` モデルを使用して Antigravity **Cloud Code Assist** エンドポイントにフォールバックします。フォールバックは、OpenAI 候補が構成されていない場合だけでなく、OpenAI 認証の解決が失敗した後 (ChatGPT 資格情報の期限切れまたは欠落など) にも起動されます。これには `ocx login google-antigravity` が必要です。 OAuth トークンは、固定された CCA レジストリ ホストにのみ送信され、構成レベルの `baseUrl` オーバーライドには送信されません。応答は、Codex が期待するのと同じ `{created, data:[{b64_json}]}` 形状で返されます。
 - **どちらでもない:** プロキシは一般的な 404 ではなく明確なエラーを返します。 ルーティングされたプロバイダー
@@ -116,7 +117,7 @@ Windows では、ChatGPT/Codex アプリが `%USERPROFILE%\\.codex` を読み取
 
 ## スレッドのアイデンティティと履歴
 
-デフォルトのループバック形式では、Codex のネイティブ `openai` プロバイダーでタグ付けされた新しいスレッドが維持されるため、通常の再開履歴には再マッピングが必要ありません。最初の同期時に、古い opencodex ビルドでタグ付けされたスレッドも `openai` に移行されます。非ループバック専用プロバイダー モードでは、アクティブな間は `opencodex` プロバイダーの下で履歴がミラーリングされ、終了時にバックアップされたメタデータが復元されます。履歴を残さないように `syncResumeHistory: false` を設定します。
+デフォルトのループバック形式では、Codex のネイティブ `openai` プロバイダーでタグ付けされた新しいスレッドが維持されるため、通常の再開履歴には再マッピングが必要ありません。同期と復元は、一致するバックアップマニフェストだけを適用し、各スレッドの元のプロバイダー、ソース、イベントマーカーを正確に復元します。マニフェストのない `opencodex` 行は変更されません。従来の再ラベル付けを明示的に強制する場合にだけ `ocx recover-history --legacy-openai --yes` を使用してください。このコマンドは意図的に広範囲です。ユーザーメッセージを持ち、現在 `opencodex` とタグ付けされているすべてのスレッドを `openai` に変更し、`exec` を `cli` に正規化してイベントマーカーを設定します。正当な専用プロバイダー履歴も対象です。状態をバックアップし、この全範囲を意図する場合にのみ使用してください。非ループバック専用プロバイダー モードでは、アクティブな間は `opencodex` プロバイダーの下で履歴がミラーリングされ、終了時にバックアップされたメタデータが復元されます。履歴を変更しないように `syncResumeHistory: false` を設定します。
 
 ## モデルカタログの同期
 
@@ -163,13 +164,13 @@ CLI から表示名を追加します (プロキシは、ライブ時にカタ�
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
-リモート Codex クライアントは、管理 API 経由で同じ生成されたカタログをフェッチできます (他の `/api/*` ルートと同じアドミッション トークン)。
+リモート Codex クライアントは、通常のデータプレーン キー（管理者トークンではなく、`/v1/responses` で既に使用しているものと同じ資格情報）で同じ生成済みカタログを取得できます。
 
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/opencodex-catalog.json"
 tmp="$(mktemp "${dest}.XXXXXX")"
-curl -fsS -H "x-opencodex-api-key: $OPENCODEX_ADMIN_AUTH_TOKEN" \
-  "https://proxy.example.com/api/catalog" > "$tmp" \
+curl -fsS -H "x-opencodex-api-key: $OPENCODEX_API_AUTH_TOKEN" \
+  "https://proxy.example.com/v1/catalog" > "$tmp" \
   && mv "$tmp" "$dest"
 ocx sync-cache
 ```
@@ -178,11 +179,13 @@ ocx sync-cache
 
 管理 API (`POST /api/custom-models`、`PUT /api/custom-models/<id>` と `displayName` 文字列) および Web ダッシュボードを通じて設定または編集することもできます。 `/` は、配線済みスラグ セパレータと衝突する可能性があるため拒否されます。
 
+`GET /v1/catalog` は、モデル一覧の読み取りに管理トークンを必要としないために存在します。読み取り専用（`GET` と `HEAD`）で、`x-opencodex-api-key`、bearer トークン、`x-api-key` を受け付け、管理ルートとまったく同じバイト列を返します。レスポンスには強い `ETag` が付き、`If-None-Match` で送り返すと全文ではなく `304` が返ります。また `Cache-Control: private, no-cache` が設定されます。ここで許可されたデータプレーンキーは、管理プレーンでは**何も**得られません。`/api/catalog` を含むすべての `/api/*` ルートは、引き続き管理トークンまたはダッシュボードセッションを要求します。
+
 表示名は **表示専用であり、再生成しても安定しています**。 `ocx sync` およびカタログが更新されるたびに、`config.json` (`customModels` を含む) からルーティングされたエントリが再取得されるため、設定された名前はルーティングされたスラッグに戻るのではなく、再適用されます。管理対象サービスの再起動でも、プロキシのバインド直後にこの同期が試行されます。オフライン ログイン中など、ベストエフォート型ブート同期が失敗した場合、以前に永続化されたカタログが保持され、次に成功した `ocx sync` が構成された名前を再適用します。本物のアップストリーム ネイティブ名 (例: `gpt-5.6-sol` → "GPT-5.6-Sol") は、固定されたアップストリーム スナップショットから取得され、カスタム表示名によって上書きされることはありません。
 
 ### 外部プロバイダーマネージャー
 
-デフォルトの `full` モードで `config.toml` がすでに `openai` または `opencodex` 以外のプロバイダーを選択している場合、OpenCodex はファイルを変更しないままにし、プロファイルの書き込み、カタログ/キャッシュの更新、および即時およびバックグラウンドの両方の Codex 履歴の移行をスキップします。カスタム プロバイダーを管理するツールは、多くの場合、既存のセッションにそのプロバイダー ID をタグ付けします。アクティブな ID を置き換えると、それらの無傷のセッションが Codex の履歴ビューから消える可能性があります。同じ保護が、レガシー ルート プロファイルによって選択された外部プロバイダーにも適用されます。
+デフォルトの `full` モードで `config.toml` がすでに `openai` または `opencodex` 以外のプロバイダーを選択している場合、OpenCodex はファイルを変更しないままにし、プロファイルの書き込み、カタログ/キャッシュの更新、および即時およびバックグラウンドの両方の Codex 履歴メタデータの復元をスキップします。カスタム プロバイダーを管理するツールは、多くの場合、既存のセッションにそのプロバイダー ID をタグ付けします。アクティブな ID を置き換えると、それらの無傷のセッションが Codex の履歴ビューから消える可能性があります。同じ保護が、レガシー ルート プロファイルによって選択された外部プロバイダーにも適用されます。
 
 外部 provider id を維持しながら標準モデル選択を更新するには、`ocx config set clientIntegrations.codex catalog-only` を実行してから `ocx sync` を実行します。このモードは `model_catalog_json` のカタログと `models_cache.json` だけを更新し、`config.toml`、`opencodex.config.toml`、journal、履歴データベース、session JSONL を変更しません。外部 provider は Responses passthrough (`wire_api = "responses"`) でローカルプロキシを参照させてください。
 

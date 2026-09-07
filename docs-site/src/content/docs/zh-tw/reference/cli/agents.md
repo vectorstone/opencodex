@@ -62,7 +62,7 @@ ocx route combo set reliable --targets ark/model-a:2,openai/gpt-5.5
 | 別名 | 等效資源 |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
@@ -121,7 +121,7 @@ ocx claude desktop import <path> [--apply]         驗證並匯入 JSON
 
 ### `ocx opencode [opencode args...]`
 
-確保代理正在執行，然後在 OpenCode 的內嵌執行階段層（`OPENCODE_CONFIG_CONTENT`）中以生成的 `provider.opencodex` 區塊啟動 opencode。既有的內嵌設定會被保留，本次啟動僅替換 `provider.opencodex`。全域或專案的 `opencode.json` 檔案可能被讀取以警告既有的覆寫，但磁碟上的檔案永不修改。路由模型以
+確保代理正在執行，然後在 OpenCode 的內嵌執行階段層（`OPENCODE_CONFIG_CONTENT`）中以生成的 `provider.opencodex` 與 `providers.opencodex` 區塊啟動 opencode。既有的內嵌設定會被保留，本次啟動僅替換這兩個鍵。全域或專案的 `opencode.json` 檔案可能被讀取以警告既有的覆寫，但磁碟上的檔案永不修改。路由模型以
 `opencodex/<provider>/<model>` 出現。之後啟動普通 `opencode` 的行為與之前完全相同。
 
 ### `ocx grok <status|exclude|include|set|clear|apply> ...`
@@ -130,7 +130,7 @@ ocx claude desktop import <path> [--apply]         驗證並匯入 JSON
 
 ## 客戶端設定匯出
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime>`
 
 印出連接到執行中代理的客戶端設定。此指令會用所選客戶端的原生格式，序列化含有 base URL、模型清單，以及適用的環境變數參考或 loopback 佔位符的 `opencodex` provider 區塊。
 
@@ -138,7 +138,7 @@ ocx claude desktop import <path> [--apply]         驗證並匯入 JSON
 
 | 旗標 | 動作 |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | 必填。選擇客戶端設定格式。 |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime>` | 必填。選擇客戶端設定格式。 |
 | `--json` | 僅在 stdout 印出設定 JSON，使重導向能擷取逐位元組輸出。所有診斷訊息（含 `--out` 寫入提示）皆送至 stderr。 |
 | `--out <path>` | 將設定寫入 `<path>`。拒絕覆寫既有檔案。 |
 | `--force` | 允許 `--out` 覆寫既有檔案。 |
@@ -155,13 +155,16 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 | 客戶端 | 標準目的地 | 下載檔名 | 環境變數 |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json`（`XDG_CONFIG_HOME` 設定時優先） | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | 無——區塊帶有字面值 `opencodex-loopback` |
+| `pi` | `~/.pi/agent/models.json` (設定後 `PI_CODING_AGENT_DIR` 優先；相對路徑會被拒絕) | `pi-models.json` | 無——區塊帶有字面值 `opencodex-loopback` |
 | `omp` | `~/.omp/agent/models.yml`（即使是空值，`OMP_PROFILE` 仍優先於 `PI_PROFILE`） | `omp-models.yaml` | 無——loopback 佔位符 |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | 無——loopback 佔位符 |
 | `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
 | `dsh` | `$DSH_HOME/settings.yaml`（預設 `~/.dsh/settings.yaml`） | `settings.yaml` | 無——非秘密的 loopback bearer 佔位符 |
+| `mcode` | `~/.minimax/config.yaml` (設定後 `MINIMAX_DATA_DIR` 優先，其次為舊的 `MAVIS_DATA_DIR`；相對路徑會被拒絕) | `mcode-config.yaml` | 無——loopback 佔位符 |
+| `zcode` | `~/.zcode/v2/config.json` (設定後 `ZCODE_DATA_DIR` 優先；相對路徑會被拒絕) | `config.json` | 無——loopback 佔位符 |
+| `prime` | `~/.prime/agent/models.json` (設定後 `PRIME_AGENT_CODING_AGENT_DIR` 優先；相對路徑會被拒絕) | `prime-models.json` | 無——loopback 佔位符 |
 
 opencode 會插值 `{env:OPENCODEX_OPENCODE_API_KEY}`。Pi 與 OMP 的匯出不需要環境變數，
 而是帶有字面值 `opencodex-loopback`。DSH 匯出需要 DSH 0.1.0-rc.6 或更新版本，且只擁有
@@ -180,13 +183,21 @@ Gajae 是例外：`OPENCODEX_GAJAE_API_KEY` 只會從環境提供 provider 憑�
 
 ## 執行階段與設定
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 管理無頭執行階段設定、啟動、同步、診斷與更新。
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update` 更新 OpenCodex 本身。Codex CLI 使用以下獨立唯讀檢查指令：
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` 不會向套件 registry 發出請求，只會在限定範圍內檢查設定中的安裝候選項來源證據，包括經過遮罩的可執行檔位置與所有權證據。正式發布的 launcher 所提供的可信內容只會驗證該候選項快照，並不證明 Codex 已成功執行。由於這個單次命令絕不會執行 Codex，來自環境變數與持久化記錄的候選項只供報告（`managed: false`，通常為 `selection_unattested`）；JSON 輸出包含 `candidateAvailable`、`candidateVersion` 與 `candidateSource`，而 `selectionAttested` 維持 `false`。檢查設定中的安裝候選項時，必須有正式發布的 launcher 所提供的可信內容；直接使用 Bun 啟動或從原始碼執行時不具備這項證明，因此會忽略來自環境與持久化記錄的候選項狀態，並可能報告 `candidate_unavailable`。在 Windows 上，這個首個切片不會對候選路徑或設定路徑執行任何檔案系統 I/O。只有由可信 launcher 擷取的絕對環境候選項可以取得應用程式封裝或版本管理工具的純詞彙標籤；其他所有 Windows 候選項都會以失敗關閉方式處理。此命令不會執行 Codex 或套件管理工具、不會修復 shim、不會寫入設定或快取、不會停止程序，也不會安裝任何內容。隨應用程式封裝的候選項、位於已識別版本管理工具路徑中的候選項、未經驗證的獨立候選項，以及 shim 狀態不明確的候選項，都會報告為 `unmanaged` 或 `unknown`，絕不會歸類為 `managed`。
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

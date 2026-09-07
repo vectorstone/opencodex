@@ -31,6 +31,9 @@ son olarak `~/.minimax` dizinine geri döner. Yönetilen blok yalnızca
 `custom_provider.opencodex` alanına sahiptir; `defaultModel` değerini, seçilen
 MiniMax kimlik bilgisi kaynağını veya kullanıcının MiniMax oturumunu değiştirmez.
 Bağladıktan sonra MCode içinde bir `custom_provider:opencodex/<provider/model>` girdisi seçin.
+Entegrasyon yenilendiğinde model başına doğrulanmış bağlam pencereleri ve akıl yürütme
+çabası seçenekleri de yenilenir; bilinmeyen yetenekler atlanır ve MCode oturumunun
+yönettiği geçerli çaba seçimi korunur.
 
 Yollar, varsa her istemcinin kendi ortam geçersiz kılmalarını dikkate alır. OMP
 için `OMP_PROFILE`, açıkça boş olduğunda bile varlığıyla `PI_PROFILE`'a üstün
@@ -65,7 +68,7 @@ opencodex bunları kendi ortamından okur. Ağ geçidiniz bir profil veya taşı
 bir ev dizini ile çalışıyorsa, opencodex'i aynı değişkenler ayarlanmış olarak
 başlatın; aksi takdirde doğru şekilde farklı bir kurulumu takip eder.
 
-## Diğer dört yüzey anahtar değildir
+## Diğer beş yüzey anahtar değildir
 
 **API Anahtarları (API Keys)** opencodex'in kendi kimlik bilgilerini yönetir ve
 hiçbir şekilde bir istemci değildir. **Codex CLI**, proxy servisinin kendisi
@@ -73,7 +76,9 @@ tarafından bağlanır — opencodex'i başlatmak uygular, durdurmak yerel
 yönlendirmeyi geri yükler — bu nedenle dosya başına değiştirilecek bir şey
 yoktur. **Claude** kendi etkinleştirme bayrağını ve Desktop'ın Kaydet/Uygula
 akışını korur; **Grok Build** ise seç ve uygula model çitini korur. Bu
-anlambilimler bu özellikten öncedir ve değişmemiştir.
+anlambilimler bu özellikten öncedir ve değişmemiştir. **Cursor** hiçbir şey
+yazmaz: sekmesi algılama durumunu, ağ geçidi değerlerini ve görülen son isteği
+gösterir; geri kalanı Cursor Private Inference içinde gerçekleşir.
 
 ## Geri Alma (Rollback)
 
@@ -165,12 +170,27 @@ ocx integration client history --client hermes
 ocx integration client restore --op <opId> [--confirm-drift]
 ```
 
+`--overwrite-conflict`, **Replace** eyleminin terminal karsiligidir:
+
+```bash
+ocx integration client enable --client zcode --overwrite-conflict
+```
+
+`--confirm-drift` gibi asla varsayilmaz: bayrak yazilmadan catisma yine reddedilir.
+Yalnizca `enable` icin gecerlidir; bir catismanin uzerine *disable* zorlamak hic
+yazmadigimiz bir blogu silecegi icin bu birlesim reddedilir.
+
 MiniMax Code için sağlayıcıyı bir kez bağlayın ve denetimli başlatıcı üzerinden çalıştırın:
 
 ```bash
 ocx integration client enable --client mcode
 ocx mcode
 ```
+
+Bağlandıktan sonra `ocx sync`, yönetilen MCode bloğunu güncel bağlam pencereleri ve
+akıl yürütme çabası seçenekleriyle de yeniler. Eksik, dışarıdan düzenlenmiş, güvenli
+olmayan veya hiç sahiplenilmemiş bloklara dokunmaz; yeniden bağlamak istediğinizde
+entegrasyonu açıkça yeniden etkinleştirin.
 
 Ayrı MiniMax platform CLI'si (`mmx`) bir dosya anahtarı entegrasyonu değildir.
 Metin komutları MiniMax'ın Anthropic uyumlu uç noktasını kullandığı için OpenCodex,
