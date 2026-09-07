@@ -19,7 +19,16 @@ describe("Responses namespace tool compatibility", () => {
         {
           type: "namespace",
           name: "collaboration",
-          tools: [{ type: "function", name: "spawn_agent", parameters: {} }],
+          tools: [{
+            type: "function",
+            name: "spawn_agent",
+            parameters: {
+              type: "object",
+              properties: {
+                message: { type: "string", description: "Initial task", encrypted: true },
+              },
+            },
+          }],
         },
       ],
       input: [
@@ -29,6 +38,7 @@ describe("Responses namespace tool compatibility", () => {
           name: "spawn_agent",
           call_id: "call_spawn",
           arguments: "{}",
+          encrypted_function_args: [],
         },
         {
           type: "custom_tool_call",
@@ -55,10 +65,18 @@ describe("Responses namespace tool compatibility", () => {
 
     expect(body.tools).toEqual([
       { type: "custom", name: "exec", description: "run" },
-      { type: "function", name: "collaboration__spawn_agent", parameters: {} },
+      {
+        type: "function",
+        name: "collaboration__spawn_agent",
+        parameters: {
+          type: "object",
+          properties: { message: { type: "string", description: "Initial task" } },
+        },
+      },
     ]);
     expect(body.input[0]).toMatchObject({ name: "collaboration__spawn_agent", call_id: "call_spawn" });
     expect(body.input[0]).not.toHaveProperty("namespace");
+    expect(body.input[0]).not.toHaveProperty("encrypted_function_args");
     expect(body.input[1]).toMatchObject({ name: "exec", call_id: "call_exec" });
     expect(body.input[1]).not.toHaveProperty("namespace");
     expect(body.tool_choice.tools).toEqual([
@@ -102,6 +120,54 @@ describe("Responses namespace tool compatibility", () => {
     };
     expect(directCollision.tools.map(tool => tool.name)).toEqual(["read", "workspace__read"]);
     expect(directCollision.tool_choice.name).toBe("read");
+  });
+
+  test("strips only routed collaboration message encryption schema markers", () => {
+    const encryptedMessageParameters = {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "message", encrypted: true },
+      },
+    };
+    const body = rewriteRoutedNamespaceToolsForUpstream({
+      tools: [
+        {
+          type: "namespace",
+          name: "collaboration",
+          tools: [
+            { type: "function", name: "spawn_agent", parameters: encryptedMessageParameters },
+            { type: "function", name: "send_message", parameters: encryptedMessageParameters },
+            { type: "function", name: "followup_task", parameters: encryptedMessageParameters },
+            { type: "function", name: "interrupt_agent", parameters: encryptedMessageParameters },
+          ],
+        },
+        {
+          type: "namespace",
+          name: "other",
+          tools: [{ type: "function", name: "spawn_agent", parameters: encryptedMessageParameters }],
+        },
+      ],
+    }).body as {
+      tools: Array<{ name: string; parameters: { properties: { message: Record<string, unknown> } } }>;
+    };
+
+    for (const name of [
+      "collaboration__spawn_agent",
+      "collaboration__send_message",
+      "collaboration__followup_task",
+    ]) {
+      const message = body.tools.find(tool => tool.name === name)?.parameters.properties.message;
+      expect(message).toEqual({ type: "string", description: "message" });
+    }
+    expect(
+      body.tools.find(tool => tool.name === "collaboration__interrupt_agent")
+        ?.parameters.properties.message.encrypted,
+    ).toBe(true);
+    expect(
+      body.tools.find(tool => tool.name === "other__spawn_agent")
+        ?.parameters.properties.message.encrypted,
+    ).toBe(true);
+    expect(encryptedMessageParameters.properties.message.encrypted).toBe(true);
   });
 
   test("only arms response aliases authorized by tool_choice", () => {
@@ -515,5 +581,57 @@ describe("Responses namespace tool compatibility", () => {
       ] },
     });
     expect(restoreRoutedNamespaceCallsInJson("not-json", aliases)).toBe("not-json");
+  });
+
+  test("marks routed collaboration message calls for plaintext v2 delivery", () => {
+    const aliases = new Map([
+      ["collaboration__spawn_agent", { namespace: "collaboration", name: "spawn_agent", kind: "function" as const }],
+      ["collaboration__send_message", { namespace: "collaboration", name: "send_message", kind: "function" as const }],
+      ["collaboration__followup_task", { namespace: "collaboration", name: "followup_task", kind: "function" as const }],
+      ["collaboration__interrupt_agent", { namespace: "collaboration", name: "interrupt_agent", kind: "function" as const }],
+    ]);
+    const restored = restoreRoutedNamespaceCalls({
+      output: [
+        { type: "function_call", name: "collaboration__spawn_agent", arguments: "{}" },
+        { type: "function_call", name: "collaboration__send_message", arguments: "{}", encrypted_function_args: null },
+        { type: "function_call", name: "collaboration__followup_task", arguments: "{}", encrypted_function_args: [] },
+        { type: "function_call", name: "collaboration__interrupt_agent", arguments: "{}" },
+      ],
+    }, aliases).value as { output: Array<Record<string, unknown>> };
+
+    expect(restored.output[0]).toMatchObject({
+      namespace: "collaboration",
+      name: "spawn_agent",
+      encrypted_function_args: [],
+    });
+    expect(restored.output[1]).toMatchObject({
+      namespace: "collaboration",
+      name: "send_message",
+      encrypted_function_args: [],
+    });
+    expect(restored.output[2]).toMatchObject({
+      namespace: "collaboration",
+      name: "followup_task",
+      encrypted_function_args: [],
+    });
+    expect(restored.output[3]).not.toHaveProperty("encrypted_function_args");
+  });
+
+  test("preserves non-empty encrypted collaboration metadata", () => {
+    const aliases = new Map([
+      ["collaboration__spawn_agent", { namespace: "collaboration", name: "spawn_agent", kind: "function" as const }],
+    ]);
+    const restored = restoreRoutedNamespaceCalls({
+      type: "function_call",
+      name: "collaboration__spawn_agent",
+      arguments: "{}",
+      encrypted_function_args: ["message"],
+    }, aliases).value;
+
+    expect(restored).toMatchObject({
+      namespace: "collaboration",
+      name: "spawn_agent",
+      encrypted_function_args: ["message"],
+    });
   });
 });

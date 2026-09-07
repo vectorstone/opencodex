@@ -303,7 +303,15 @@ describe("xAI OAuth Responses streaming opt-in", () => {
                 {
                   type: "namespace",
                   name: "collaboration",
-                  tools: [{ type: "function", name: "spawn_agent", description: "spawn", parameters: {} }],
+                  tools: [{
+                    type: "function",
+                    name: "spawn_agent",
+                    description: "spawn",
+                    parameters: {
+                      type: "object",
+                      properties: { message: { type: "string", encrypted: true } },
+                    },
+                  }],
                 },
               ],
             },
@@ -321,7 +329,11 @@ describe("xAI OAuth Responses streaming opt-in", () => {
       const outboundTools = outboundInput?.find(item => item.type === "additional_tools")?.tools;
       expect(outboundTools?.some(tool => tool.type === "namespace")).toBe(false);
       expect(outboundTools?.find(tool => tool.name === "exec")?.type).toBe("function");
-      expect(outboundTools?.find(tool => tool.name === "collaboration__spawn_agent")?.type).toBe("function");
+      const outboundSpawn = outboundTools?.find(tool => tool.name === "collaboration__spawn_agent") as
+        | { type: string; parameters?: { properties?: { message?: Record<string, unknown> } } }
+        | undefined;
+      expect(outboundSpawn?.type).toBe("function");
+      expect(outboundSpawn?.parameters?.properties?.message).toEqual({ type: "string" });
       expect(outboundBody?.tools).toEqual([{ type: "web_search" }]);
 
       const payloads = clientText
@@ -336,6 +348,7 @@ describe("xAI OAuth Responses streaming opt-in", () => {
         namespace: "collaboration",
         name: "spawn_agent",
         call_id: "call_spawn",
+        encrypted_function_args: [],
       });
       const completed = payloads.find(payload => payload.type === "response.completed") as {
         response?: { output?: Array<Record<string, unknown>> };
@@ -343,6 +356,7 @@ describe("xAI OAuth Responses streaming opt-in", () => {
       expect(completed?.response?.output?.[0]).toMatchObject({
         namespace: "collaboration",
         name: "spawn_agent",
+        encrypted_function_args: [],
       });
     } finally {
       await server.stop(true);
@@ -405,6 +419,7 @@ describe("xAI OAuth Responses streaming opt-in", () => {
         namespace: "collaboration",
         name: "spawn_agent",
         call_id: "call_spawn_json",
+        encrypted_function_args: [],
       });
     } finally {
       await server.stop(true);

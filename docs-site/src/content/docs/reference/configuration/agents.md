@@ -69,6 +69,16 @@ Surface detection uses tool shape. A namespaced `spawn_agent` with `send_input`,
 `close_agent` is v1. A flat `spawn_agent` with `send_message`, `followup_task`, `interrupt_agent`, or
 `list_agents` is v2.
 
+For routed Responses providers, OpenCodex flattens private namespace tools before dispatch. It
+removes the nested `message.encrypted` schema marker only from `collaboration.spawn_agent`,
+`send_message`, and `followup_task`, preventing a compatible third-party gateway from replacing the
+message with ChatGPT-only ciphertext. Restored authorized calls with ordinary JSON arguments receive
+`encrypted_function_args: []`, which Codex 0.151+ uses for plaintext inter-agent delivery. Other
+encrypted schema fields remain intact, and existing non-empty encrypted metadata is never
+overwritten; those payloads remain subject to the fail-closed encrypted-task rules below. OpenCodex
+removes its empty marker from later history replay before dispatching that replay to the routed
+provider.
+
 V1 guidance is proactive text only at `max` or `ultra`. V2 receives a proxy-authored developer
 message only when a preferred model, eligible roster, or fallback chain exists. Built-in v2 guidance
 has a 700-character budget and drops the roster first if necessary. Guidance is deduplicated across

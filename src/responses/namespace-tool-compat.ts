@@ -17,6 +17,11 @@ export interface RoutedNamespaceToolIdentity {
 export type RoutedNamespaceToolAliases = ReadonlyMap<string, RoutedNamespaceToolIdentity>;
 
 const BUILTIN_FUNCTIONS_NAMESPACE = "functions";
+const PLAINTEXT_COLLABORATION_MESSAGE_TOOLS = new Set([
+  "spawn_agent",
+  "send_message",
+  "followup_task",
+]);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -84,6 +89,34 @@ function loweredIdentity(namespace: string, name: string): string {
 
 function loweredWireName(namespace: string, name: string): string {
   return namespace === BUILTIN_FUNCTIONS_NAMESPACE ? name : namespacedToolName(namespace, name);
+}
+
+function stripRoutedCollaborationMessageEncryption(
+  namespace: string,
+  tool: Record<string, unknown>,
+): Record<string, unknown> {
+  if (
+    namespace !== "collaboration"
+    || tool.type !== "function"
+    || typeof tool.name !== "string"
+    || !PLAINTEXT_COLLABORATION_MESSAGE_TOOLS.has(tool.name)
+    || !isPlainObject(tool.parameters)
+    || !isPlainObject(tool.parameters.properties)
+    || !isPlainObject(tool.parameters.properties.message)
+    || tool.parameters.properties.message.encrypted !== true
+  ) return tool;
+
+  const { encrypted: _encrypted, ...message } = tool.parameters.properties.message;
+  return {
+    ...tool,
+    parameters: {
+      ...tool.parameters,
+      properties: {
+        ...tool.parameters.properties,
+        message,
+      },
+    },
+  };
 }
 
 function addSelector(
@@ -187,7 +220,8 @@ function rewriteToolList(
           || emitted.has(wireName)
         ) continue;
         emitted.add(wireName);
-        rewritten.push(wireName === child.name ? child : { ...child, name: wireName });
+        const publicChild = stripRoutedCollaborationMessageEncryption(parsed.namespace, child);
+        rewritten.push(wireName === child.name ? publicChild : { ...publicChild, name: wireName });
       }
       continue;
     }
@@ -328,7 +362,23 @@ function rewriteInputItem(item: unknown, plan: NamespaceRewritePlan, emitted: Se
   if (
     (item.type === "function_call" || item.type === "custom_tool_call")
     && typeof item.name === "string"
-  ) return rewriteNamedSelector(item, plan, false);
+  ) {
+    const rewritten = rewriteNamedSelector(item, plan, false);
+    if (
+      item.type === "function_call"
+      && item.namespace === "collaboration"
+      && PLAINTEXT_COLLABORATION_MESSAGE_TOOLS.has(item.name)
+      && Array.isArray(item.encrypted_function_args)
+      && item.encrypted_function_args.length === 0
+      && isPlainObject(rewritten)
+    ) {
+      // The empty marker is for Codex's local dispatch choice. A routed upstream needs the
+      // ordinary function arguments, not the private replay metadata that strict gateways reject.
+      const { encrypted_function_args: _dropped, ...rest } = rewritten;
+      return rest;
+    }
+    return rewritten;
+  }
   return item;
 }
 
@@ -407,6 +457,21 @@ export function restoreRoutedNamespaceCalls(
     if (identity) {
       restored.name = identity.name;
       restored.namespace = identity.namespace;
+      // Codex 0.151+ interprets an explicitly empty encrypted-function-argument list on these
+      // collaboration calls as a direct plaintext inter-agent message. Routed providers return
+      // ordinary JSON arguments and cannot mint ChatGPT backend ciphertext, so add the marker
+      // only when no non-empty encrypted metadata exists. Preserve any actual ciphertext claim
+      // unchanged so the downstream unreadable-task guard can continue to fail closed.
+      if (
+        value.type === "function_call"
+        && identity.kind === "function"
+        && identity.namespace === "collaboration"
+        && PLAINTEXT_COLLABORATION_MESSAGE_TOOLS.has(identity.name)
+        && typeof value.arguments === "string"
+        && (value.encrypted_function_args === undefined || value.encrypted_function_args === null)
+      ) {
+        restored.encrypted_function_args = [];
+      }
       changed = true;
     }
   }

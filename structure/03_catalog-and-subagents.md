@@ -179,6 +179,18 @@ the flag and thread count decide what the native runtime allows.
 `multi_agent_version`. Native ChatGPT rows then select v1 from the catalog and routed rows select
 v2. An explicit attempt to enable the global flag while the hybrid pin is active is rejected.
 
+Routed V2 collaboration calls use a separate wire-level plaintext contract. Codex marks the
+`message` schema on `collaboration.spawn_agent`, `send_message`, and `followup_task` as encrypted;
+when those namespace children are flattened for a third-party Responses provider,
+`src/responses/namespace-tool-compat.ts` removes only that nested marker so the provider returns
+ordinary JSON arguments. During authorized alias restoration it attaches
+`encrypted_function_args: []` to the same three calls. Codex 0.151+ interprets that exact marker as
+`DirectPlaintextMessage`, so child and peer `agent_message` items contain `input_text` rather than
+ChatGPT-only ciphertext. The marker is stripped from replay before the history is sent back to a
+third-party gateway; the ordinary JSON arguments remain. Other encrypted schema fields, non-empty
+encrypted metadata, and other tools are preserved, and the routed unreadable-task guard remains the
+fail-closed boundary.
+
 ### What the five-model `spawn_agent` window is, and how V1 differs from V2
 
 `MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5` (mirrored in `src/codex/catalog/sync.ts`) is **not** a

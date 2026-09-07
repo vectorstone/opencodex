@@ -22,10 +22,12 @@ Choose the mode for **new sessions**. Existing sessions keep the surface they st
 
 On **v2**, an optional **Keep ChatGPT on v1** switch (`keepNativeChatGptOnV1`) leaves Sol/Terra
 on the v1 surface so they can still spawn Grok or Claude. ChatGPT-native parents encrypt v2
-`NEW_TASK` bodies; routed models cannot read them. Routed parents stay on v2, where child tasks
-are plaintext. OpenCodex disables the global `multi_agent_v2` override for this hybrid because
-Codex applies that override before per-model catalog pins. This is a switch *inside* v2, not a
-fourth catalog mode.
+`NEW_TASK` bodies; routed models cannot read them. Routed parents stay on v2. OpenCodex removes the
+ChatGPT-only encrypted-message schema marker before sending their `spawn_agent`, `send_message`, and
+`followup_task` calls to a third-party Responses provider, then marks the restored calls for Codex's
+plaintext delivery path. OpenCodex disables the global `multi_agent_v2` override for this hybrid
+because Codex applies that override before per-model catalog pins. This is a switch *inside* v2, not
+a fourth catalog mode.
 
 :::tip[Not sure?]
 Start with **base**. Choose **v1** when cross-provider delegation must work predictably. Force **v2**
@@ -125,6 +127,14 @@ appears earlier in the chain.
 Codex may send a v2 native-to-routed child task only as backend-encrypted `encrypted_content`. That
 payload can be read by the native ChatGPT backend, but not by an external provider. This is the
 known [#92 limitation](https://github.com/lidge-jun/opencodex/issues/92).
+
+For a routed parent, OpenCodex lowers private namespace tools for the third-party Responses API. On
+`collaboration.spawn_agent`, `send_message`, and `followup_task`, it removes the nested
+`message.encrypted` schema marker that would otherwise ask a compatible gateway to replace the
+message with ChatGPT-only ciphertext. After restoring an authorized plaintext call, OpenCodex adds
+`encrypted_function_args: []`; Codex 0.151+ interprets that marker as direct plaintext inter-agent
+delivery. Other encrypted schema fields remain intact. If an upstream response carries non-empty
+encrypted-function metadata, OpenCodex preserves it and does not claim that the payload is plaintext.
 
 opencodex fails safely instead of forwarding an empty or unreadable task:
 

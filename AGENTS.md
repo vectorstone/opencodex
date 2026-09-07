@@ -278,6 +278,28 @@ fork-maintained behavior, and do not belong in this register.
 - Original fork implementation: `2780fc291`. Upstream disposition:
   fork-only as of upstream v2.33.0 (`ec51e42d`).
 
+#### F-006 — Routed V2 collaboration plaintext delivery
+
+- Codex marks the `message` parameter on v2 collaboration tools as encrypted. Before sending
+  flattened namespace tools to a routed Responses provider, OpenCodex must remove that marker only
+  from `collaboration.spawn_agent`, `collaboration.send_message`, and
+  `collaboration.followup_task`; otherwise a compatible gateway replaces the message with ChatGPT
+  backend ciphertext. When OpenCodex restores an authorized routed call to
+  `collaboration.spawn_agent`, `collaboration.send_message`, or
+  `collaboration.followup_task`, it must attach `encrypted_function_args: []`. Codex 0.151+ uses
+  that exact marker to deliver the inter-agent payload as plaintext instead of producing a
+  ChatGPT-backend-encrypted child task that the routed provider cannot read.
+- The marker is scoped to request-authorized function aliases and those three message-bearing
+  collaboration calls. Never remove encrypted schema markers from other tools, add the delivery
+  marker to other collaboration tools or custom calls, or overwrite non-empty encrypted-function
+  metadata. Genuine ciphertext remains opaque and the `unreadable_encrypted_agent_task` guard must
+  continue to fail closed.
+- The key path is `src/responses/namespace-tool-compat.ts`; regression sentinels are
+  `tests/namespace-tool-compat.test.ts` and `tests/server-xai-responses-streaming.test.ts`, covering
+  both streaming and JSON Responses output.
+- Original fork implementation: current change set (commit pending). Upstream disposition:
+  fork-only as of upstream v2.42.0 (`48f818664`).
+
 ### Registering future fork-only changes
 
 Any change that intentionally differs from upstream behavior must update this
