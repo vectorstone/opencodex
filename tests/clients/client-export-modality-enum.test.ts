@@ -64,6 +64,9 @@ const MIXED: ExportModel = {
   provider: "zenmux",
   id: "meta-muse-spark-1.1",
   contextWindow: 1_048_576,
+  // Fork F-004: opencode's `limit` needs an authoritative OUTPUT capability too, so this fixture
+  // declares one; without it the paired block is correctly omitted instead of stood in.
+  maxOutputTokens: 32_000,
   inputModalities: ["text", "image", "audio"],
 };
 

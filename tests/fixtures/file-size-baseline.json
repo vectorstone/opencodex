@@ -15,7 +15,7 @@
   ],
   "files": {
     ".github/scripts/issue-quality.test.cjs": 2143,
-    "gui/src/pages/Models.tsx": 2792,
+    "gui/src/pages/Models.tsx": 2823,
     "gui/src/styles.css": 2958,
     "src/adapters/openai-chat.ts": 822,
     "src/adapters/openai-responses.ts": 6,
@@ -36,7 +36,7 @@
     "tests/cli/cli-account.test.ts": 2313,
     "tests/codex-integration/codex-auth-api.test.ts": 6549,
     "tests/codex-integration/codex-auth-context.test.ts": 2496,
-    "tests/codex-integration/codex-catalog.test.ts": 7985,
+    "tests/codex-integration/codex-catalog.test.ts": 8041,
     "tests/codex-integration/codex-reset-credit-recovery.test.ts": 2135,
     "tests/codex-integration/codex-routing.test.ts": 3443,
     "tests/codex-integration/codex-shim.test.ts": 2388,

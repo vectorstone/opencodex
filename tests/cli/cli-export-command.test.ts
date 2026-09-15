@@ -43,11 +43,14 @@ const ROWS = [
     native: true,
     disabled: false,
     contextWindow: 272_000,
+    // Fork F-004: an output limit is exported only from authoritative capability, so these two
+    // rows declare one; `custom/no-context` deliberately declares nothing.
+    maxOutputTokens: 128_000,
     inputModalities: ["text", "image"],
     reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     defaultReasoningEffort: "high",
   },
-  { provider: "anthropic", id: "claude-opus-5", namespaced: "anthropic/claude-opus-5", disabled: false, contextWindow: 200_000, displayName: "Claude Opus 5", inputModalities: ["text"] },
+  { provider: "anthropic", id: "claude-opus-5", namespaced: "anthropic/claude-opus-5", disabled: false, contextWindow: 200_000, maxOutputTokens: 64_000, displayName: "Claude Opus 5", inputModalities: ["text"] },
   { provider: "custom", id: "no-context", namespaced: "custom/no-context", disabled: false },
   { provider: "banned", id: "hidden", namespaced: "banned/hidden", disabled: true, contextWindow: 100_000 },
 ];
