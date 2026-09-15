@@ -1,4 +1,6 @@
+import { parseResetCooldownMs } from "../codex/routing";
 import { classifyError, isCyberPolicyCode } from "../lib/errors";
+import { isNonReplayableUpstreamCode } from "../lib/upstream-retry";
 import type { OcxComboTarget } from "../types";
 import { targetKey } from "./types";
 import {
@@ -197,6 +199,7 @@ export function coolComboTarget(
   target: Pick<OcxComboTarget, "provider" | "model">,
   options?: {
     retryAfter?: string | null;
+    resetAt?: unknown | unknown[];
     now?: number;
     cooldownMs?: number;
     writerGeneration?: number;
@@ -209,8 +212,12 @@ export function coolComboTarget(
   const writerGeneration = options?.writerGeneration ?? captureConfigGeneration();
   const ownerKey = `${comboId}::${targetKey(target)}`;
   if (writerGeneration < lastReconciledGeneration && !liveComboTargets.has(ownerKey)) return;
-  const cooldownMs = options?.cooldownMs
-    ?? parseRetryAfterMs(options?.retryAfter, now)
+  // A server-provided Retry-After is authoritative, including an immediate `0` directive.
+  // A quota reset is the next-most-specific signal (#3256); configured and default cooldowns
+  // are only fallbacks when upstream supplied neither usable value.
+  const cooldownMs = parseRetryAfterMs(options?.retryAfter, now, { preserveImmediate: true })
+    ?? parseResetCooldownMs(options?.resetAt, now)
+    ?? options?.cooldownMs
     ?? (isTransientRequestRateLimit({
       status: options?.status,
       code: options?.code,
@@ -220,6 +227,32 @@ export function coolComboTarget(
     cooldownUntil: now + Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS),
   });
   sweepExpiredOnWrite(now);
+}
+
+export function earliestComboCooldown(
+  comboId: string,
+  targets: Iterable<Pick<OcxComboTarget, "provider" | "model">>,
+  now = Date.now(),
+): { expiry: number; target: Pick<OcxComboTarget, "provider" | "model"> } | undefined {
+  let earliest: { expiry: number; target: Pick<OcxComboTarget, "provider" | "model"> } | undefined;
+  for (const target of targets) {
+    const key = cooldownMapKey(comboId, target);
+    const entry = targetCooldowns.get(key);
+    if (!entry || entry.cooldownUntil <= now) continue;
+    if (earliest === undefined || entry.cooldownUntil < earliest.expiry) {
+      earliest = { expiry: entry.cooldownUntil, target };
+    }
+  }
+  return earliest;
+}
+
+/** Public convenience wrapper returning only the earliest cooldown expiry. */
+export function earliestComboCooldownExpiry(
+  comboId: string,
+  targets: Iterable<Pick<OcxComboTarget, "provider" | "model">>,
+  now = Date.now(),
+): number | undefined {
+  return earliestComboCooldown(comboId, targets, now)?.expiry;
 }
 
 export function reconcileComboTargetCooldowns(context: GenerationContext): number {
@@ -253,7 +286,7 @@ export function clearComboTargetCooldowns(comboId?: string): void {
 }
 
 export type ComboFailureDecision = "hop" | "stop";
-export type ComboFailureCooldownScope = "target" | "provider";
+export type ComboFailureCooldownScope = "none" | "target" | "provider";
 
 function normalizedFailureCode(code?: string | null): string {
   return code?.trim().toLowerCase().replaceAll("-", "_") ?? "";
@@ -272,9 +305,93 @@ function isProviderScopedQuotaCap(
   ) {
     return true;
   }
-  return normalizedCode === "free_rate_limited"
-    || text.includes("err_free_prompt_cap")
+  return text.includes("err_free_prompt_cap")
     || (text.includes("free tier") && text.includes("single request"));
+}
+
+/**
+ * A free-tier cap the upstream evaluates PER REQUEST rather than per account window. These
+ * needles used to reach only `isProviderScopedQuotaCap`, so a single oversized free-tier prompt
+ * cooled the whole provider for every other combo — including the shorter requests that same
+ * provider would still have served. `free_rate_limited` also left the provider-scoped predicate
+ * for the same reason; it stays a hop signal, but stops recording provider-wide evidence.
+ */
+function isRequestLocalFreePromptCap(
+  status: number | undefined,
+  message: string,
+  code?: string | null,
+): boolean {
+  if (status !== 400) return false;
+  const text = message.toLowerCase();
+  if (normalizedFailureCode(code) === "free_rate_limited") return true;
+  if (text.includes("err_free_prompt_cap")) return true;
+  return text.includes("free tier") && (text.includes("single request") || text.includes("prompt"));
+}
+
+/**
+ * Failures that describe the SHAPE of this request rather than the health of the target.
+ * Cooling anything for these is wrong twice over: the target is fine, and the next request
+ * (shorter prompt, smaller tool catalog) would have succeeded against it.
+ */
+const REQUEST_SHAPE_FAILURE_CODES = new Set([
+  "input_admission_refused",
+  "context_length_exceeded",
+  "tool_catalog_too_large",
+  "cursor_root_envelope_limit",
+  "target_incompatible",
+]);
+
+/** Credential/billing failures that every target sharing the provider inherits. */
+const PROVIDER_SCOPED_FAILURE_CODES = new Set([
+  "invalid_api_key",
+  "insufficient_quota",
+  "subscription_required",
+  "payment_required",
+  "billing_error",
+  "insufficient_balance",
+]);
+
+/**
+ * Precise target-local request incompatibilities are request-local, not terminal for a combo.
+ * Require a bounded, intact provider envelope; never infer compatibility from echoed prompt text.
+ * Only OpenCodex's exact error wrapper may be unwrapped, with a fixed depth budget. Unknown or
+ * conflicting codes fail closed. No fields are removed here and no same-target replay is added.
+ * Image rejection requires `param: input` and an exact model-scoped prefix.
+ */
+function isRequestLocalTargetIncompatibility(status: number, message: string, code?: string | null): boolean {
+  if (status !== 400 || message.length > 16_384) return false;
+  const genericCodes = new Set(["", "invalid_request_error", "unsupported_parameter", "unsupported_value"]);
+  if (!genericCodes.has(normalizedFailureCode(code))) return false;
+  let text = message.trim();
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (text.startsWith("Provider error 400: ")) text = text.slice("Provider error 400: ".length);
+    let payload: unknown;
+    try { payload = JSON.parse(text); } catch { return false; }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+    const error = (payload as Record<string, unknown>).error;
+    if (!error || typeof error !== "object" || Array.isArray(error)) return false;
+    const e = error as Record<string, unknown>;
+    if (e.code !== undefined && e.code !== null && typeof e.code !== "string") return false;
+    const errorCode = normalizedFailureCode(typeof e.code === "string" ? e.code : undefined);
+    if (!genericCodes.has(errorCode) || typeof e.message !== "string") return false;
+    if (e.type !== "invalid_request_error" && e.type !== "upstream_error") return false;
+    if (e.message.startsWith("Provider error 400: ") && e.param === undefined
+      && (errorCode === "" || errorCode === "invalid_request_error")) {
+      text = e.message;
+      continue;
+    }
+    if (e.type !== "invalid_request_error") return false;
+    if (e.message === "Unsupported parameter: user") {
+      return (e.param === undefined || e.param === "user") && errorCode !== "unsupported_value";
+    }
+    if (errorCode === "unsupported_value"
+      && (e.param === "reasoning.effort" || e.param === "reasoning_effort")
+      && e.message.startsWith("Unsupported value:") && e.message.includes("not supported")) return true;
+    return e.param === "input"
+      && (errorCode === "" || errorCode === "invalid_request_error")
+      && /^Model '[^']{1,256}' does not support image inputs\./.test(e.message);
+  }
+  return false;
 }
 
 export function comboFailureCooldownScope(
@@ -282,7 +399,21 @@ export function comboFailureCooldownScope(
   message: string,
   options?: { code?: string | null },
 ): ComboFailureCooldownScope {
-  return isProviderScopedQuotaCap(status, message, options?.code) ? "provider" : "target";
+  const code = normalizedFailureCode(options?.code);
+  // Request-shape refusals first: an oversized request must not cool a healthy target.
+  if (
+    status === 413
+    || REQUEST_SHAPE_FAILURE_CODES.has(code)
+    || isRequestLocalFreePromptCap(status, message, options?.code)
+    || isProviderTargetContextOverflow(status, message, options?.code)
+    || isRequestLocalTargetIncompatibility(status, message, options?.code)
+  ) return "none";
+  if (isProviderScopedQuotaCap(status, message, options?.code)) return "provider";
+  // A rejected or unpaid credential is provider-wide evidence: every target that routes
+  // through the same provider row carries the same key and will fail identically.
+  if (status === 401 || status === 402 || status === 403) return "provider";
+  if (PROVIDER_SCOPED_FAILURE_CODES.has(code)) return "provider";
+  return "target";
 }
 
 function isModelLifecycleGone(
@@ -307,6 +438,19 @@ function isModelLifecycleGone(
   );
 }
 
+function isProviderTargetContextOverflow(
+  status: number,
+  message: string,
+  code?: string | null,
+): boolean {
+  if (status !== 400) return false;
+  const normalizedCode = normalizedFailureCode(code);
+  const text = message.toLowerCase();
+  if (text.includes("invalid_request_prompt_too_long")) return true;
+  return normalizedCode === "5059"
+    && /\bprompt\s+\d+\s*>\s*\d+\s+maximum context length\b/i.test(message);
+}
+
 export function comboFailureDecision(
   status: number,
   message: string,
@@ -314,6 +458,10 @@ export function comboFailureDecision(
 ): ComboFailureDecision {
   if (status === 499) return "stop";
   if (message.toLowerCase().includes("origin_rejected")) return "stop";
+  // The origin may already be executing this turn (the Codex WebSocket relay sent the create
+  // frame and never saw a response event). Hopping would send the same request to a second
+  // target while the first may still be generating; the honest status goes to the client.
+  if (isNonReplayableUpstreamCode(options?.code)) return "stop";
   // Cyber policy is a hard non-retryable refusal — honor structured code even when
   // classificationText was truncated before the JSON code field.
   if (isCyberPolicyCode(options?.code)) return "stop";
@@ -324,6 +472,10 @@ export function comboFailureDecision(
   if (isModelLifecycleGone(status, message, options?.code)) return "hop";
   const error = classifyError(status, "upstream_error", message);
   if (isCyberPolicyCode(error.code)) return "stop";
+  // A provider can expose its own target hard cap with a non-semantic vendor code
+  // (for example 5059 + invalid_request_prompt_too_long). That is evidence that this
+  // target is too small, not that every later combo target is incapable of serving it.
+  if (isProviderTargetContextOverflow(status, message, options?.code)) return "hop";
   // A local input-admission refusal (#1524) says "this candidate cannot fit the request",
   // not "the request is impossible": the next candidate may have a larger context window.
   //
@@ -347,15 +499,31 @@ export function comboFailureDecision(
   if (isProviderScopedQuotaCap(status, message, options?.code || error.code)) {
     return "hop";
   }
+  // A model-scoped rejection is target-local: this provider does not serve THIS model, which
+  // says nothing about the next combo target. Structured code only, plus the explicit prose
+  // form upstreams emit when they carry no code, so an unrelated 400 stays terminal.
+  const failureCode = normalizedFailureCode(options?.code || error.code);
+  if (["model_not_found", "model_unavailable", "unsupported_model"].includes(failureCode)) {
+    return "hop";
+  }
+  // `free_rate_limited` no longer routes through `isProviderScopedQuotaCap` (it is a
+  // per-request cap, not provider-wide evidence), so keep its hop verdict explicit here.
+  if (failureCode === "free_rate_limited") return "hop";
+  if (isRequestLocalTargetIncompatibility(status, message, options?.code)) return "hop";
   if (["origin_rejected", "context_length_exceeded", "invalid_request_error"].includes(error.code ?? "")) {
     return "stop";
   }
-  if ([401, 403, 404, 408, 429].includes(status) || status >= 500) return "hop";
+  // 402 (payment required) and 425 (too early) are provider-state signals, not verdicts about
+  // the request: another combo target can still serve it.
+  if ([401, 402, 403, 404, 408, 425, 429].includes(status) || status >= 500) return "hop";
   if ([
     "permission_denied",
     "subscription_required",
     "invalid_api_key",
     "insufficient_quota",
+    "payment_required",
+    "billing_error",
+    "insufficient_balance",
     "rate_limit_exceeded",
     "server_is_overloaded",
     "upstream_server_error",

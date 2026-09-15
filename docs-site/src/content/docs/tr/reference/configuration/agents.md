@@ -12,7 +12,7 @@ kontrol eder.
 | Alan | Tip | Varsayılan | Anlamı |
 | --- | --- | --- | --- |
 | `multiAgentMode?` | `"v1" \| "default" \| "v2"` | `"default"` | `v1` her katalog modelini v1 olarak damgalar; `v2` her modeli v2 olarak damgalar. `default` yukarı akış sabitlemelerini geri yükler (Sol/Terra v2, Luna v1) ve aksi takdirde yerel `multi_agent_v2` bayrağını takip eder. Yeni oturumlara uygulanır. |
-| `subagentModels?` | `string[]` | `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` | Alt ajan seçicisinde ilk olarak öne çıkan en fazla beş yalın yerel, hesap nitelikli `<secici>/<yerel-openai-modeli>` veya yönlendirilen `saglayici/model` kimliği. Kontrol paneli yalnızca yalın yerel ve yönlendirilen kimlikleri sunar ve kaydederken tam hesap nitelikli seçimleri atlar; tam seçimler için `ocx agent subagents set` kullanın veya yapılandırmayı düzenleyin. Açık bir boş liste korunur. |
+| `subagentModels?` | `string[]` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5` | Alt ajan seçicisinde ilk olarak öne çıkan en fazla beş yalın yerel, hesap nitelikli `<secici>/<yerel-openai-modeli>` veya yönlendirilen `saglayici/model` kimliği. Kontrol paneli yalnızca yalın yerel ve yönlendirilen kimlikleri sunar ve kaydederken tam hesap nitelikli seçimleri atlar; tam seçimler için `ocx agent subagents set` kullanın veya yapılandırmayı düzenleyin. [Tek seferlik Astra yükseltmesinden](/reference/configuration/agents/#astra-roster-upgrade) sonra açık bir boş liste korunur. |
 | `injectionModel?` | `string` | — | Proxy kaynaklı v2 yetkilendirme rehberliğinde kullanılan tercih edilen yerel veya yönlendirilen alt ajan modeli. |
 | `injectionEffort?` | `string` | — | Yalnızca `injectionModel` ile anlamlı olan tercih edilen çaba (`low` ile `ultra` arası). |
 | `injectionPrompt?` | `string` | — | Yerleşik v2 rehberlik gövdesinin yerini alır. `{{model}}`, `{{effort}}`, `{{roster}}` ve `{{fallback}}` destekler. Yapılandırılmış bir `injectionModel`, özel istemi oluşturmak için yeterlidir. |
@@ -118,9 +118,16 @@ için hala okunur, ancak `ocx doctor` bunu bayraklar.
 opencodex devre dışı bırakılmış, yönlendirilemez, sağlıksız, soğumada olan veya
 kota eşiği adaylarını atlar. Kullanılabilirlik anlık görüntüsü
 `subagentModelFallbackPollMs` boyunca önbelleğe alınır. Şifrelenmiş çocuk
-görevleri zinciri kurallı yerel ChatGPT hedefleriyle kısıtlayabilir; hiçbiri
-şifrelenmiş yükü okuyamazsa istek okunamayan şifreli metni başka bir yere
-yönlendirmek yerine başarısız olur.
+görevlerinde zincir, kurallı yerel ChatGPT hedefleriyle ve
+`allowEncryptedV2AgentTasks: true` kullanılarak açıkça güvenilen doğrudan anahtar
+kimlik doğrulamalı Responses rotalarıyla sınırlıdır. Hiçbiri şifrelenmiş yükü
+işleyemezse istek, okunamayan şifreli metni başka bir yere yönlendirmek yerine
+başarısız olur. Kombo önce kullanılabilir kurallı yerel hedefi dener; seçilebilir
+yerel hedef kalmazsa ya da yerel denemeler tükenirse ve `agentTaskRecovery` etkinse,
+şifrelenmiş `NEW_TASK` yönlendirilen
+kombo gönderiminden önce bir kez kurtarılır. Kombo kurtarma yalnızca spawn edilen çocuk
+turlarında çalışır; doğrudan yönlendirilen yol, konuşma ortasındaki bir model değişimini de
+kurtarır.
 
 ```json
 {
@@ -129,9 +136,9 @@ yönlendirmek yerine başarısız olur.
   "injectionModel": "gpt-5.5",
   "injectionEffort": "high",
   "syncCodexSubagentDefaults": true,
-  "subagentModelFallback": ["gpt-5.4-mini"],
+  "subagentModelFallback": ["gpt-5.6-luna"],
   "subagentModelFallbackByModel": {
-    "gpt-5.5": ["gpt-5.4-mini"]
+    "gpt-5.5": ["gpt-5.6-luna"]
   },
   "subagentModelFallbackPollMs": 60000,
   "subagentEffortCap": "high"
@@ -140,9 +147,14 @@ yönlendirmek yerine başarısız olur.
 
 ## Şifrelenmiş v2 görev kurtarma
 
-`agentTaskRecovery`, yönlendirilen bir v2 çocuğu oluşturan yerel bir ChatGPT
-ebeveyni için deneysel bir uyumluluk yoludur. Varsayılan olarak devre dışıdır.
-Açıkça etkinleştirildiğinde ve nihai yönlendirilen çocuk görevi aksi takdirde
+`agentTaskRecovery`, yönlendirilen bir sağlayıcıya ulaşan arka uçta şifrelenmiş
+v2 görevleri için deneysel bir uyumluluk yoludur. İki istek biçimi kapsanır:
+yönlendirilen bir v2 çocuğu oluşturan yerel bir ChatGPT ebeveyni ve yerel bir
+ChatGPT modelinden yönlendirilen bir modele geçirilen canlı bir konuşma —
+geçmişi, sonraki her turda arka uçta üretilmiş şifreli bir ajan mesajını yeniden
+oynatır ([#4089](https://github.com/lidge-jun/opencodex/issues/4089)).
+Varsayılan olarak devre dışıdır.
+Açıkça etkinleştirildiğinde ve nihai yönlendirilen görev aksi takdirde
 okunamayan bir Fernet yükü içerdiğinde, opencodex iletme modu kimlik
 doğrulamasıyla sabit `https://chatgpt.com/backend-api/codex/responses` uç
 noktasına ham bir Responses doğrudan geçiş isteği kullanır. ChatGPT düz metin
@@ -224,10 +236,13 @@ sınırı ve özel arka uç bağımlılığı kabul edilebilir olduğunda etkinl
 Olmadıklarında yerel bir ChatGPT çocuğunu veya v1 heterojen yetkilendirmesini
 tercih edin.
 
-Bu kurtarma yolu doğrudan yönlendirilen çocuklara uygulanır. Aynı anda en fazla
-32 kurtarma isteği etkin olabilir; ek ıskalamalar kapalı olarak başarısız olur.
-Kombo yönlendirmesi şifrelenmiş görevler için mevcut yalnızca yerel filtresini
-korur ve kurtarmayı çağırmaz.
+Bu kurtarma yolu doğrudan yönlendirilen çocuklara ve bir kombodaki şifrelenmiş
+`NEW_TASK` oluşturma isteklerine uygulanır. Aynı anda en fazla 32 kurtarma isteği
+etkin olabilir; ek ıskalamalar kapalı olarak başarısız olur. Kullanılabilir kanonik
+yerel hedefi olan bir kombo şifreli metni yine doğrudan gönderir; kurtarma yalnızca
+seçilebilir yerel hedef kalmadığında çalışır. Kurtarma hatası, tükenen hedefler veya
+kullanılamayan hedefler, şifreli metin yönlendirilen sağlayıcıya gönderilmeden yine
+kapalı biçimde başarısız olur.
 
 ## Çaba sınırları
 
@@ -244,7 +259,7 @@ hiçbir basamak uymuyorsa opencodex çabayı kaldırır ve sağlayıcı varsayı
 uygulanmasına izin verir. `max` ve `ultra` kabul edilirken kontrol paneli `low`
 ile `xhigh` arasını sunar.
 
+Yapılandırılmış sınırlar, model effort sabitlemesi olmayan uygun yerel Chat Completions turlarına da uygulanır. Sağlayıcının iletim değerine eşleme yalnızca sabitleme uygulandığında veya sınır değeri değiştirdiğinde yapılır; aksi hâlde yerel çağıran değeri özgün yazımını korur.
+
 v1, varsayılan ve v2 davranışının yeni başlayanlara yönelik açıklaması için [Alt
 ajan yüzeyleri](/tr/guides/sub-agent-surface/) sayfasına bakın.
-
-

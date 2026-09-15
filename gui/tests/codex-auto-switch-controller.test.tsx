@@ -139,7 +139,7 @@ async function mountHarness(): Promise<Harness> {
   const fetchRouter = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-    if (url.endsWith("/api/codex-auth/accounts") && method === "GET") {
+    if (url.endsWith("/api/settings") && method === "GET") return Response.json({ codexQuotaAutoRefresh: {} });    if (url.endsWith("/api/codex-auth/accounts") && method === "GET") {
       return Response.json({ accounts: [] });
     }
     // Pool controller + strategy card both GET /active; prefer queued responses for
@@ -156,9 +156,11 @@ async function mountHarness(): Promise<Harness> {
         accountPoolStickyLimit: 1,
       });
     }
-    if (url.endsWith("/api/codex-auth/auto-switch") && method === "PUT") {
-      const body = JSON.parse(String(init?.body)) as { threshold: number };
-      writes.push(body.threshold);
+    if (url.endsWith("/api/pool/settings") && method === "PUT") {
+      // The unified contract field, not the GUI one: the client maps it, and a harness
+      // still reading `threshold` would record undefined for every save.
+      const body = JSON.parse(String(init?.body)) as { autoSwitchThreshold: number };
+      writes.push(body.autoSwitchThreshold);
       const response = putResponses.shift();
       if (!response) throw new Error("unexpected auto-switch write");
       return await response;
@@ -198,7 +200,7 @@ async function mountHarness(): Promise<Harness> {
     container.querySelector<HTMLInputElement>('input[aria-label="Usage threshold, percent"]')
   );
   const currentToggle = (): HTMLButtonElement => {
-    const toggle = container.querySelector<HTMLButtonElement>("button.toggle[aria-pressed]");
+    const toggle = container.querySelector<HTMLButtonElement>(".codex-auto-switch-card button.toggle[aria-pressed]");
     if (!toggle) throw new Error("auto-switch toggle was not rendered");
     return toggle;
   };
@@ -233,7 +235,7 @@ describe("Codex auto-switch controller interactions", () => {
       value: async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-        if (url.endsWith("/api/codex-auth/accounts") && method === "GET") {
+        if (url.endsWith("/api/settings") && method === "GET") return Response.json({ codexQuotaAutoRefresh: {} });        if (url.endsWith("/api/codex-auth/accounts") && method === "GET") {
           return Response.json({ accounts: [] });
         }
         if (url.endsWith("/api/codex-auth/active") && method === "GET") {
@@ -301,7 +303,7 @@ describe("Codex auto-switch controller interactions", () => {
     const fetchRouter = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-      if (url.endsWith("/api/codex-auth/accounts") && method === "GET") {
+      if (url.endsWith("/api/settings") && method === "GET") return Response.json({ codexQuotaAutoRefresh: {} });      if (url.endsWith("/api/codex-auth/accounts") && method === "GET") {
         return Response.json({ accounts: [] });
       }
       if (url.endsWith("/api/codex-auth/active") && method === "GET") {
@@ -321,9 +323,9 @@ describe("Codex auto-switch controller interactions", () => {
           accountPoolStickyLimit: 1,
         });
       }
-      if (url.endsWith("/api/codex-auth/auto-switch") && method === "PUT") {
-        const body = JSON.parse(String(init?.body)) as { threshold: number };
-        writes.push(body.threshold);
+      if (url.endsWith("/api/pool/settings") && method === "PUT") {
+        const body = JSON.parse(String(init?.body)) as { autoSwitchThreshold: number };
+        writes.push(body.autoSwitchThreshold);
         const response = putResponses.shift();
         if (!response) throw new Error("unexpected auto-switch write");
         return await response;
@@ -346,7 +348,7 @@ describe("Codex auto-switch controller interactions", () => {
       await flush();
     });
 
-    const toggle = container.querySelector<HTMLButtonElement>("button.toggle[aria-pressed]");
+    const toggle = container.querySelector<HTMLButtonElement>(".codex-auto-switch-card button.toggle[aria-pressed]");
     expect(toggle).toBeNull();
     expect(writes).toEqual([]);
 
@@ -364,7 +366,7 @@ describe("Codex auto-switch controller interactions", () => {
     expect(advanced).not.toBeNull();
     await act(async () => { advanced!.click(); await flush(); });
 
-    const readyToggle = container.querySelector<HTMLButtonElement>("button.toggle[aria-pressed]");
+    const readyToggle = container.querySelector<HTMLButtonElement>(".codex-auto-switch-card button.toggle[aria-pressed]");
     expect(readyToggle?.disabled).toBe(false);
     expect(container.querySelector<HTMLInputElement>('input[aria-label="Usage threshold, percent"]')?.value).toBe("55");
     expect(writes).toEqual([]);

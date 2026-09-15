@@ -96,8 +96,11 @@ Le catalogue du transfert ChatGPT ajoute également les identifiants non qualifi
 
 Huit préréglages de fournisseurs utilisent une connexion OAuth. GitHub Copilot s'y ajoute au moyen d'un pont
 expérimental et non officiel reposant sur un flux d'autorisation d'appareil. opencodex enregistre leurs identifiants dans
-`~/.opencodex/auth.json` et les actualise automatiquement. La CLI de connexion accepte également `chatgpt` ;
-elle obtient un identifiant ChatGPT tout en créant une entrée de fournisseur en mode `forward`.
+`~/.opencodex/auth.json` et les actualise automatiquement. La CLI de connexion accepte également
+`ocx login codex`, qui n'est pas l'un des fournisseurs ci-dessus : la commande est routée vers la
+connexion au pool de comptes Codex (le même flux que `ocx account login codex`). Ce pool tient son
+propre registre de comptes, donc cette route nécessite un proxy en cours d'exécution. `chatgpt` et
+`openai` sont des alias de la même route.
 
 ```bash
 ocx login xai          # xAI Grok
@@ -108,8 +111,9 @@ ocx login kiro         # import kiro-cli credentials (or token fallback)
 ocx login google-antigravity
 ocx login cursor       # standalone Cursor PKCE login
 ocx login command-code # Command Code browser OAuth (or import ~/.commandcode/auth.json)
+ocx login devin       # Cognition/Devin : import de l'identifiant du Devin CLI, sinon connexion navigateur Auth0
 ocx login github-copilot  # GitHub device flow → Copilot token (Copilot Pro/Business)
-ocx login chatgpt      # standalone ChatGPT OAuth login
+ocx login codex        # pool de comptes Codex (alias : chatgpt, openai ; nécessite un proxy en cours d'exécution)
 ocx logout <provider>
 ```
 
@@ -122,7 +126,11 @@ ocx logout <provider>
 | `kiro` | `kiro` | `https://runtime.us-east-1.kiro.dev` | La connexion initiale importe la session de l'installation locale de `kiro-cli`, déjà authentifiée (sous Unix, installez avec `curl -fsSL https://cli.kiro.dev/install` &#124; `bash`; sous Windows PowerShell, utilisez `irm 'https://cli.kiro.dev/install.ps1'` &#124; `iex`; puis exécutez `kiro-cli login`). **Ajouter un compte** déconnecte `kiro-cli`, lance une nouvelle connexion dans le navigateur qui change le compte utilisé par `kiro-cli`, puis enregistre les métadonnées propres au profil. Les comptes OpenCodex existants sont préservés ; une annulation ou un échec restaure la session `kiro-cli` précédente. |
 | `google-antigravity` | `google` | `https://daily-cloudcode-pa.googleapis.com` | Google OAuth avec le protocole Cloud Code Assist. La découverte en direct utilise le point de terminaison CCA authentifié `v1internal:fetchAvailableModels` et publie les modèles d'agent accessibles au compte connecté ; le catalogue maintenu reste la solution de repli. |
 | `cursor` | `cursor` | `https://api2.cursor.sh` | Connexion PKCE expérimentale, transport HTTP/2 en direct et découverte de modèles filtrés par compte. |
+| `devin` | `devin` | `https://server.codeium.com` | Passerelle Cognition/Devin non officielle et expérimentale. La connexion importe d'abord l'identifiant que le Devin CLI installé détient déjà (`devin auth login` écrit un `devin-session-token` dans son propre `credentials.toml`) ; à défaut, elle ouvre l'authentification Auth0 dans le navigateur puis échange le jeton collé via `RegisterUser` contre une clé d'API durable. `ocx login devin-cli` reste accepté comme alias déprécié. Les modèles sont découverts par compte avec `GetCascadeModelConfigs` ; le streaming passe uniquement par `runTurn` sur Connect-RPC. Absente du préréglage du tableau de bord par défaut. |
 | `github-copilot` | `openai-chat` | `https://api.githubcopilot.com` | Expérimental. Flux d'appareil GitHub et échange `copilot_internal` (client OAuth de VS Code). Nécessite un abonnement Copilot actif ; il ne s'agit pas d'une API tierce officielle. |
+
+Les vérifications de quota Google Antigravity utilisent des points de terminaison Google fixes, y compris le repli vers la liste des modèles. Elles prennent en charge le DNS Fake-IP transparent pour ces destinations en conservant la vérification TLS, le refus des redirections et les contrôles des adresses privées. Une URL de base personnalisée ne modifie que les requêtes de modèles ; `NO_PROXY` conserve la politique de connexion directe.
+
 
 Après un échec définitif d'actualisation de Nous, exécutez `ocx login nous` pour vous réauthentifier.
 
@@ -187,9 +195,9 @@ de récupération strict, déterminé par `Retry-After`, par les en-têtes `rese
 plafond prévu — ou par un bref délai de repli par défaut. Les comptes soumis à un délai `Retry-After` explicite
 ne sont pas sondés avant son expiration. Les délais calculés à partir des informations de réinitialisation
 peuvent bénéficier d'une autorisation de sondage cadencée, afin de détecter la reprise sans submerger le
-fournisseur. Pour les modèles natifs, ces délais préservent également les groupes de quotas indépendants connus :
-`gpt-5.3-codex-spark` n'empêche pas le même compte d'essayer le quota partagé de GPT-5.6 Terra/Luna, tandis
-que les modèles de ce groupe partagé continuent de se protéger mutuellement. Les délais `Retry-After` explicites
+fournisseur. Pour les modèles natifs, ces délais séparent le quota partagé (dont GPT-5.6 Terra/Luna)
+de `gpt-reserve`. Les modèles du groupe partagé continuent de se protéger mutuellement ;
+une requête ordinaire réussie ne lève pas le délai de Reserve. Les délais `Retry-After` explicites
 et les délais par défaut s'appliquent toujours à l'ensemble du compte.
 
 **Affinité de session.** L'affinité entre le fil Codex et le compte est locale au processus — uniquement en mémoire et
@@ -210,7 +218,8 @@ identifiants de compte expurgés, aucun jeton. `ocx doctor` ajoute une section s
 contrôles du magasin accessible en écriture et de l'appel unique, ainsi que des lignes WARN qui indiquent une
 action de récupération. Lorsqu'un compte de fournisseur OAuth doit être réauthentifié, exécutez
 `ocx login <provider>` ou utilisez **Réauthentifier** dans le tableau de bord. Les comptes du pool Codex ne
-constituent pas un fournisseur `ocx login` : réauthentifiez-les dans le groupe de comptes Codex du tableau de bord. Consultez
+font pas partie de ces fournisseurs, mais `ocx login codex --reauth` est routé vers leur réauthentification
+dans le pool de comptes, ce que fait aussi le pool de comptes Codex du tableau de bord. Consultez
 [`ocx status` / `ocx doctor`](/fr/reference/cli/) dans la référence CLI.
 
 ### Importation des identifiants Kiro
@@ -309,6 +318,7 @@ promotionnels de Cline ne sont accessibles que dans l'IDE ou la CLI Cline, pas p
 | NVIDIA NIM | `https://integrate.api.nvidia.com/v1` |
 | Z.AI (GLM Coding) | `https://api.z.ai/api/coding/paas/v4` |
 | Zhipu AI (BigModel) | `https://open.bigmodel.cn/api/paas/v4` |
+| [BigModel Coding Plan — Responses (liste statique)](/guides/providers/#bigmodel-coding-plan-over-responses) | `https://open.bigmodel.cn/api/v1` |
 | Qwen Cloud | Forfait à jetons (par défaut) : `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` · Facturation à l'usage : `https://dashscope.aliyuncs.com/compatible-mode/v1` · ou personnalisé |
 | Tencent Cloud Coding Plan | `https://api.lkeap.cloud.tencent.com/coding/v3` |
 | SiliconFlow | `https://api.siliconflow.cn/v1` |
@@ -331,6 +341,21 @@ des indications propres au fournisseur ainsi qu'un `Retry-After` synthétique ; 
 reste prioritaire. L'attente et la nouvelle tentative avec la même clé restent facultatives et s'activent avec
 [`retryOn429`](/fr/reference/configuration/).
 
+**Le niveau sans clé `opencode-free` est actuellement fermé aux clients tiers.** Zen refuse toute requête
+qui arrive sans en-tête `x-opencode-session` et répond avec le type d'erreur `MissingSessionID` et le message
+« OpenCode's free tier can only be used in OpenCode ». Le contrôle porte uniquement sur la présence de
+l'en-tête : un proxy pourrait donc le franchir en inventant une valeur, ce que opencodex ne fait pas.
+Fabriquer un identifiant de session et un User-Agent versionné `opencode/<version>` revient à se déclarer
+client OpenCode, alors qu'OpenCode ne publie aucun contrat d'intégration tierce pour ce niveau sans clé ;
+une réponse HTTP 200 obtenue ainsi est un contrôle d'admission contourné, pas une autorisation. opencodex
+signale donc la restriction au lieu de la contourner : une requête vers `opencode-free` renvoie une erreur
+qui explique le blocage en amont.
+
+La voie prise en charge vers les mêmes modèles est le fournisseur **`opencode-zen`** avec une clé d'API
+OpenCode Zen obtenue sur [opencode.ai/auth](https://opencode.ai/auth). Si OpenCode publie plus tard un accès
+tiers pour le niveau sans clé, opencodex pourra le suivre ; d'ici là, le préréglage sert à documenter la
+restriction. Conditions en amont : [opencode.ai/docs/zen](https://opencode.ai/docs/zen/).
+
 La plupart utilisent l'adaptateur `openai-chat` avec une clé Bearer ; quelques fournisseurs qui n'exposent
 qu'un point de terminaison compatible Anthropic, comme **Xiaomi MiMo**, emploient l'adaptateur `anthropic`
 (`x-api-key`). Volcengine Agent Plan utilise son point de terminaison Responses natif par `openai-responses`.
@@ -338,6 +363,11 @@ Le préréglage DeepSeek intégré route également `deepseek-v4-flash` par son 
 et conserve le streaming SSE en amont. Si ce modèle termine tous les éléments de sortie mais omet l'événement
 Responses final, opencodex applique une réparation après un délai de grâce de cinq secondes, limitée à ce
 modèle ; les flux mal formés ou partiels sont fermés comme incomplets, et non déclarés réussis.
+Le modèle DeepSeek de première partie `deepseek-flash` déclare nativement les entrées `text` et `image` ;
+les requêtes contenant une image sont donc envoyées directement à DeepSeek par défaut sans passer par le
+sidecar de vision. Les déclarations explicites `noVisionModels` ou texte seul restent prioritaires. Les modèles
+de première partie `deepseek-chat`, `deepseek-reasoner` et `deepseek-v4-flash` restent desservis par le sidecar
+par défaut ; les routes Zen sont inchangées et n'ont pas été sondées dans cette mise à jour.
 
 > **Trois routes de facturation Volcengine :** `volcengine` correspond à l'API Ark facturée à l'usage,
 > `volcengine-coding-plan` consomme le quota Coding Plan et `volcengine-agent-plan` le quota Agent Plan.
@@ -347,7 +377,7 @@ modèle ; les flux mal formés ou partiels sont fermés comme incomplets, et non
 > des ressources d'embedding, d'image, de vidéo et de 3D, la passerelle Coding renvoie le même catalogue étendu,
 > et la passerelle Agent Plan ne possède aucune ressource `/models`. Le modèle par défaut de la route facturée à
 > l'usage est `doubao-seed-2-1-pro-260628` ; son catalogue sélectionné comprend également les modèles de texte
-> DeepSeek et GLM actuels. Coding Plan utilise `ark-code-latest` par défaut, et Agent Plan `deepseek-v4-pro`.
+> DeepSeek et GLM actuels. Coding Plan utilise `ark-code-latest` par défaut, et Agent Plan `deepseek-v4-flash`.
 
 > **Restriction d'utilisation des forfaits Volcengine :** selon la documentation de Volcengine, les quotas
 > Coding Plan et Agent Plan ne sont valables que dans les outils de programmation par IA pris en charge. Elle
@@ -492,7 +522,7 @@ une barre trompeuse.
 > programmation interactifs. L'automatisation générale par API, les services applicatifs personnalisés et les
 > traitements par lots non interactifs sont interdits et peuvent entraîner la suspension de la clé du forfait.
 
-> **Deux routes GLM :** `zai` correspond à l'abonnement international Z.AI Coding Plan ; `zhipu-bigmodel`
+> **Facturation GLM :** `zai` correspond à l'abonnement international Z.AI Coding Plan ; `zhipu-bigmodel`
 > correspond au point de terminaison national BigModel de Zhipu, facturé à l'usage. Les hôtes, les clés et la
 > facturation diffèrent : une clé émise pour l'un ne permet pas de s'authentifier auprès de l'autre.
 
@@ -539,8 +569,8 @@ flux d'appareil contre un jeton d'API Copilot de courte durée, et non contre un
 reste une passerelle à clé ou jeton d'abonnement sur son point de terminaison compatible OpenAI.
 **Cloudflare AI Gateway** exige que les identifiants de votre compte et de votre passerelle figurent dans l'URL.
 
-Copilot présente un catalogue qui utilise plusieurs protocoles : sa famille GPT-5 (`gpt-5.3-codex`, `gpt-5.4`,
-`gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) rejette
+Copilot présente un catalogue qui utilise plusieurs protocoles : ces modèles (`gpt-5.3-codex`, `gpt-5.4`,
+`gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`) rejettent
 `/chat/completions` pour le trafic d'agent. opencodex route donc ces modèles sur l'API Responses par défaut,
 tandis que tous les autres modèles Copilot restent sur Chat Completions. L'ordre de priorité est le suivant :
 verrouillage explicite du protocole → entrée [`modelAdapters`](/fr/reference/configuration/providers/) définie
@@ -581,7 +611,7 @@ native d'Ollama (`POST /api/chat`) plutôt que via la surface compatible OpenAI,
 liste des modèles auprès du fournisseur : les nouveaux modèles Ollama Cloud apparaissent sans
 modifier la configuration. opencodex classe les modèles cloud selon leurs
 capacités visuelles, afin que le [service auxiliaire de vision](/fr/guides/sidecars/) n'intervienne que pour les modèles
-exclusivement textuels. Ces derniers, par exemple `glm-5.2`, `deepseek-v4-pro`, `gpt-oss`, `qwen3-coder`,
+exclusivement textuels. Ces derniers, par exemple `glm-5.2`, `deepseek-v4-flash`, `gpt-oss`, `qwen3-coder`,
 `minimax-m2.x` et `nemotron-3-*`, figurent dans `noVisionModels` ; les modèles à vision native, comme
 `kimi-k2.6`, `minimax-m3`, `gemma4`, `qwen3.5` et `gemini-3-flash-preview`, n'y figurent pas. La correspondance
 tolère les balises `:size` d'Ollama : `gpt-oss` couvre donc `gpt-oss:120b` et `gpt-oss:20b`.

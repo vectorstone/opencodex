@@ -1,6 +1,17 @@
 import { createRequire } from "node:module";
 import { resolveEnvValue, saveConfigPreservingClaudeCode } from "../config";
 import type { OcxConfig, OcxProviderConfig } from "../types";
+import type { ProviderRegistryEntry } from "./registry";
+
+/** Shared with routing: a key-mode override is effective only while its key resolves. */
+export function providerUsesKeyAuthOverride(
+  entry: Pick<ProviderRegistryEntry, "authKind" | "allowKeyAuthOverride">,
+  provider: Pick<OcxProviderConfig, "authMode">,
+  resolvedKey: string | undefined,
+): boolean {
+  return entry.authKind === "oauth" && entry.allowKeyAuthOverride === true
+    && provider.authMode === "key" && typeof resolvedKey === "string" && resolvedKey.trim().length > 0;
+}
 
 /**
  * Opt-in OS keychain storage for provider API keys (#1221).
@@ -51,6 +62,16 @@ export function isKeychainReference(value: string | undefined): value is string 
 
 function keychainAccount(reference: string): string {
   return reference.slice(KEYCHAIN_REFERENCE_PREFIX.length);
+}
+
+/**
+ * A reference belongs to `name` only when its account is that provider's own active account
+ * or one of its pool accounts. `storeProviderKeyInKeychain` writes exactly those two shapes,
+ * so anything else in a provider's config names another provider's secret.
+ */
+function keychainReferenceBelongsToProvider(reference: string, name: string): boolean {
+  const account = keychainAccount(reference);
+  return account === name || account.startsWith(`${name}/`);
 }
 
 function readKeychain(account: string): string | undefined {
@@ -174,6 +195,18 @@ export function restoreProviderKeyFromKeychain(config: OcxConfig, name: string):
   const pool = provider.apiKeyPool ?? [];
   const resolved = new Map<string, string>();
   const refs = [provider.apiKey, ...pool.map(e => e.key)].filter(isKeychainReference);
+  // Restore reads a secret out of the keychain, writes it back to config as plaintext, and then
+  // DELETES the keychain item. Following a reference to another provider's account would both
+  // disclose that secret through this provider's config and destroy the real owner's credential,
+  // so refuse before anything is read or removed.
+  const foreign = refs.filter(ref => !keychainReferenceBelongsToProvider(ref, name));
+  if (foreign.length > 0) {
+    return {
+      ok: false,
+      error: `provider "${name}" references a keychain account it does not own (${foreign.length} reference(s)); config left unchanged`,
+      status: 400,
+    };
+  }
   for (const ref of refs) {
     const account = keychainAccount(ref);
     if (resolved.has(account)) continue;
@@ -194,4 +227,3 @@ export function restoreProviderKeyFromKeychain(config: OcxConfig, name: string):
   saveConfigPreservingClaudeCode(config);
   return { ok: true, restored: resolved.size };
 }
-

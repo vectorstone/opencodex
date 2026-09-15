@@ -65,6 +65,10 @@ Proxy'yi **durdurmadan** yerel Codex'i geri yükleyin — enjekte edilen
 yapılandırma satırlarını ve yönlendirilen katalog girdilerini kaldırır, böylece
 düz `codex` tekrar yerel olarak çalışır. `eject`, `restore`'un bir takma adıdır.
 
+Geri yüklenen katalog, `gpt-5.3-codex-spark` dahil kullanımdan kaldırılan yerel modellerin
+yalın kimliklerini ve güvenilir hesap önekli girdilerini dışarıda bırakır. Katalog yedeği olsa da
+olmasa da bu kural geçerlidir; özgün yedek ve kullanıcının geçmiş model seçimleri korunur.
+
 Proxy yaşam döngüsünü değiştirmeden düz `codex`'i zaten çalışan bir proxy'ye
 yeniden yönlendirmek için her iki yazıma da `back` iletin:
 
@@ -83,6 +87,10 @@ Bu, geniş kapsamlı ve yıkıcı bir yeniden etiketlemedir: kullanıcı iletisi
 `opencodex` olarak etiketlenmiş her thread `openai` olarak değiştirilir, `exec` değeri `cli`
 olarak normalleştirilir ve event marker ayarlanır. Geçerli dedicated-provider geçmişi de kapsama
 dahildir. Durumu yedekleyin ve yalnızca bu kapsamın tamamını istiyorsanız çalıştırın.
+
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+Yönlendirilmiş bir sağlayıcı üzerinden sıkıştırılmış bir görevi yerel Codex ile sürdürmeden önce geçmişini onarın. Komut UUID ile yalnızca bir görevi seçer, önce özel ve bayt bayt bir yedek kaydeder, ardından yalnızca OpenCodeX'e ait `ocx1:` sıkıştırma durumunu yerel Codex'in yeniden oynatabileceği düz bir özete dönüştürür. Yerel şifreli içerik ve diğer görevler değişmeden kalır. Komutu çalıştırmadan önce seçili görevi kapatın; işlem sırasında rollout değişirse kurtarma dosyayı değiştirmeden durur.
 
 ### `ocx uninstall` · `ocx remove`
 
@@ -207,7 +215,7 @@ Doctor asla kimlik bilgilerini değiştirmez veya onarımlar uygulamaz.
 
 ## Katalog senkronizasyonu
 
-### `ocx sync [--restart-codex]`
+### `ocx sync [--restart-codex] [--restart-app-server-only]`
 
 Yapılandırılmış her sağlayıcıdan canlı model listesini alın ve birleştirilmiş
 kataloğu Codex'e yeniden enjekte edin. Bir sağlayıcı ekledikten sonra veya
@@ -223,16 +231,47 @@ kontrolü kullanır.
 Uzun ömürlü Codex `app-server` süreçleri hala çalışıyorsa `ocx sync`,
 `opencodex-catalog.json` / `models_cache.json` güncellenmiş olsa bile önceki
 bellek içi model listesini sunmaya devam edebilecekleri konusunda uyarır.
-Yalnızca geçerli kullanıcıya ait eşleşen `codex … app-server` ve
-`codex-code-mode-host` süreçlerine `SIGTERM` göndermek için `--restart-codex`
-iletin (aktif turlar kesintiye uğrayabilir). Geniş `pkill -f codex`
+Eşleşen `codex … app-server` ve `codex-code-mode-host` süreçlerini yeniden
+başlatmak **ve** model seçicinin kataloğu yeniden okuması için Codex masaüstü
+uygulamasını macOS, Linux ve Windows'ta tamamen kapatıp yeniden başlatmak üzere
+`--restart-codex` iletin. Canlı konuşmalar sona erer. Geniş `pkill -f codex`
 eşleştirmesinden kasıtlı olarak kaçınılır.
 
-### `ocx sync-cache [--restart-codex]`
+`--restart-desktop-app`, `--restart-codex` için kullanımdan kaldırılmış bir
+takma addır. Hâlâ çalışır, bir kullanımdan kaldırma bildirimi basar ve yalnızca
+Windows'a özgü değildir.
+
+`--restart-app-server-only` eski dar davranışı geri getirir: yalnızca geçerli
+kullanıcıya ait eşleşen app-server / code-mode-host süreçlerine `SIGTERM`
+gönderir, masaüstü uygulamasını çalışır bırakır (aktif turlar yine kesintiye
+uğrayabilir). `--restart-codex` veya `--restart-desktop-app` ile birlikte
+verilirse dar kapsam kazanır; çünkü canlı konuşmaları kaybetmek geri
+alınamaz, eski bir seçici ise alınabilir.
+
+Komut Codex uygulamasının içinden çalıştırıldığında yeniden başlatma ayrılmış
+bir yardımcıya devredilir ve bu oturum uygulamayla birlikte sona erer.
+
+### `ocx sync-cache [--restart-codex] [--restart-app-server-only]`
 
 Codex'in yerel model seçici önbelleğini geçersiz kılın, böylece aktif opencodex
 kataloğundan yeniden oluşturulur. `ocx sync` ile aynı eski `app-server` uyarısı
-ve isteğe bağlı `--restart-codex` davranışı geçerlidir.
+ve isteğe bağlı yeniden başlatma bayrakları geçerlidir.
+
+### `ocx catalog pull <https-url> [--auth-env <NAME>] [--json] [--restart-codex] [--restart-app-server-only]`
+
+Başka bir OpenCodex örneğinin `/v1/catalog` uç noktasının sunduğu eksiksiz kataloğu kurar ve
+ardından `models_cache.json` dosyasını eşitler. URL HTTPS olmalıdır; HTTP yalnızca loopback için
+kabul edilir. URL içine gömülü kimlik bilgileri, sorgular, parçalar, yönlendirmeler, boyutu aşan
+yanıtlar ve geçersiz kataloglar, herhangi bir yerel yazma işleminden önce reddedilir. Kimlik
+doğrulama isteğe bağlıdır ve yalnızca ortam değişkeni adıyla (`--auth-env`) okunur, argv'den
+alınmaz.
+
+Katalog ve önbellek, paylaşılan Codex katalog kilidi altında yazılır; bir hata durumunda
+last-known-good dosyalar korunur. Aynı baytlar, mtime değerlerini koruyan bir no-op'tur.
+`--restart-codex`, `--restart-app-server-only` ve kullanımdan kaldırılmış takma ad
+`--restart-desktop-app` yalnızca gerçek bir yazmadan sonra uygulanır ve `ocx sync` /
+`ocx sync-cache` ile aynı anlama gelir. `ETag` koşullu istekleri bu komutun kapsamında
+değildir. Tam `--json` zarfı ve çıkış kodları için [İngilizce referansa](/reference/cli/lifecycle/) bakın.
 
 ## Arka plan servisi
 
@@ -243,6 +282,12 @@ oturumla yönetilen bir arka plan servisi (macOS **launchd**, Linux **systemd
 kullanıcı birimi**, Windows **Görev Zamanlayıcı**) olarak çalıştırın. Servis
 çalıştırmaları `OCX_SERVICE=1` ayarlar, böylece bir yeniden başlatma Codex
 yapılandırmasını dalgalandırmaz.
+
+Windows Görev Zamanlayıcı kurulumları normal işlem önceliğini (`Priority=4`) kullanır. Eski arka plan
+önceliği (`7`; değer belirtilmediğinde de zamanlayıcının varsayılanı `7` olur), CPU çekişmesi sırasında
+sağlık denetimi yanıtlarını geciktirebilir ve işlem çalışırken bile sistem tepsisinde Offline görünmesine neden olabilir.
+Güncellemeden sonra kayıtlı bu önceliği değiştirmek ve servisi yeniden başlatmak için `ocx service repair` komutunu çalıştırın.
+UAC onayı gerekebilir. Zaten normal veya yüksek öncelik ayarlanmışsa yalnızca öncelik nedeniyle yeniden kayıt yapılmaz.
 
 | Alt komut | Eylem |
 | --- | --- |
@@ -416,7 +461,7 @@ simgeyi kontrol eder; proxy'yi kontrol etmek için menüsünü kullanın.
 ### `ocx gui`
 
 Çalışmıyorsa proxy'yi otomatik olarak başlatarak `http://localhost:<port>`
-adresindeki [web kontrol panelini](/tr/guides/web-dashboard/) açın.
+adresindeki [web kontrol panelini](/tr/guides/web-dashboard/) açın; hub'da yönetim ingress'i etkinse `http://127.0.0.1:<yönetim portu>` adresini açar.
 
 ## Güncelleme
 

@@ -107,6 +107,10 @@ function orderKnownKeys(keys: readonly string[], preferred: readonly string[]): 
 export function refreshablePathsOf(
   contribution: ManagedContribution,
 ): readonly (readonly string[])[] {
+  if (contribution.clientId === "cline") return [
+    ["settings", "providers", OPENCODE_PROVIDER_ID, "updatedAt"],
+    ["settings", "providers", OPENCODE_PROVIDER_ID, "settings", "model"],
+  ];
   if (contribution.clientId !== "zcode") return [];
   const fragment = contribution.fragments.find(candidate => (
     candidate.path.length === 2
@@ -134,6 +138,9 @@ export function validRefreshablePaths(
   contribution: ManagedContribution,
   value: unknown,
 ): value is readonly (readonly string[])[] {
+  if (contribution.clientId === "cline") {
+    return JSON.stringify(value) === JSON.stringify(refreshablePathsOf(contribution));
+  }
   if (contribution.clientId !== "zcode" || !Array.isArray(value) || value.length === 0) {
     return false;
   }

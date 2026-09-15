@@ -6,7 +6,9 @@ import { CodexPauseToggleLabel, CodexTicketBadge } from "./codex-account-pool-he
 import type { CodexAccountEntry } from "./codex-account-pool-types";
 import type { CodexAccountModeState } from "../codex-multi-state";
 import type { TFn } from "../i18n/shared";
+import type { MainDeviceReauthState } from "./use-main-device-reauth";
 import type { NoticeTone } from "../ui";
+import { navigateHash } from "../hash-routing";
 import {
   doctorCopyButtonLabel,
   formatOAuthHealthLabel,
@@ -35,6 +37,8 @@ export function CodexAccountPoolMainCard({
   onOpenReset,
   onCopyDoctor,
   doctorCopyOutcomeFor,
+  onManageMainHardLock,
+  mainReauth,
 }: {
   t: TFn;
   main: CodexAccountEntry | undefined;
@@ -59,6 +63,13 @@ export function CodexAccountPoolMainCard({
   onOpenReset: (account: CodexAccountEntry) => void;
   onCopyDoctor?: (accountId: string) => void;
   doctorCopyOutcomeFor?: (accountId: string) => "copied" | "unavailable" | null;
+  onManageMainHardLock?: () => void;
+  /** #3898: native-main device reauth flow state and controls (dedicated namespace). */
+  mainReauth?: {
+    state: MainDeviceReauthState;
+    start: () => Promise<void>;
+    cancel: () => Promise<void>;
+  } | undefined;
 }) {
   const mainFallbackLabel = t("codexAuth.codexApp");
   const mainId = main?.id ?? "__main__";
@@ -71,18 +82,26 @@ export function CodexAccountPoolMainCard({
     priority: main?.priority ?? 0,
     hasCredential: true,
     quota: main?.quota ?? null,
+    quotaAutoRefresh: main?.quotaAutoRefresh ?? {
+      fiveHourAvailable: false,
+      weeklyAvailable: false,
+      fiveHourEnabled: false,
+      weeklyEnabled: false,
+    },
   };
   const showReauth = Boolean(main?.needsReauth) || oauthHealthShowsReauth(main?.health?.status);
   const inCooldown = oauthHealthIsCooldown(main?.health?.status);
+  const policy = main?.mainAccountHardLock;
+  const hardLocked = policy?.enabled === true && policy.state === "blocked";
   const healthLabel = formatOAuthHealthLabel(t, main?.health);
   const healthSummary = main
     ? formatOAuthHealthSummary(t, "codex", mainId, main.health)
     : null;
 
   return (
-    <div className={`card ${isMainActive ? "card-active" : ""}`} style={{ marginBottom: 12 }}>
+    <div className={`card ${isMainActive && !hardLocked ? "card-active" : ""}`} style={{ marginBottom: 12 }}>
       <div className="card-head">
-        <span className={`dot ${showReauth ? "dot-amber" : "dot-green"}`} />
+        <span className={`dot ${showReauth || hardLocked ? "dot-amber" : "dot-green"}`} />
         <strong>{t("codexAuth.mainAccount")}</strong>
         <span className="card-badges">
           {main?.plan && <span className="badge badge-green">{main.plan}</span>}
@@ -98,7 +117,7 @@ export function CodexAccountPoolMainCard({
             <span className={oauthHealthBadgeClass(main?.health?.status)}>{healthLabel}</span>
           )}
           {showReauth && !healthLabel && <span className="badge badge-amber">{t("codexAuth.needsReauth")}</span>}
-          {!main?.paused && (
+          {!main?.paused && !hardLocked && (
             <span className={`badge ${isMainActive ? "badge-primary" : "badge-muted"}`}>
               {isMainActive
                 ? t(accountModeState === "direct" ? "codexAuth.poolPrepared" : "codexAuth.nextSession")
@@ -106,7 +125,7 @@ export function CodexAccountPoolMainCard({
             </span>
           )}
         </span>
-        {!main?.paused && (!isMainActive || pinnedId !== "__main__") && !showReauth && !inCooldown && (
+        {!main?.paused && !hardLocked && (!isMainActive || pinnedId !== "__main__") && !showReauth && !inCooldown && (
           <button type="button" className="btn btn-ghost btn-sm codex-account-switch" onClick={() => onSwitch(mainSwitchEntry)}>
             {switchActionLabel}
           </button>
@@ -155,6 +174,15 @@ export function CodexAccountPoolMainCard({
           />
         )}
       </div>
+      {policy?.enabled && (
+        <div className={`codex-main-hard-lock-status${hardLocked ? " is-blocked" : ""}`}>
+          <p role="status">{t(hardLocked ? "codexAuth.mainHardLockBlocked"
+            : policy.state === "ready" ? "codexAuth.mainHardLockMonitoring" : "codexAuth.mainHardLockUnknown")}</p>
+          {onManageMainHardLock
+            ? <button type="button" className="link-btn" onClick={onManageMainHardLock}>{t("codexAuth.mainHardLockManage")}</button>
+            : <button type="button" className="link-btn" onClick={() => navigateHash("codex-set")}>{t("codexAuth.mainHardLockManage")}</button>}
+        </div>
+      )}
       {healthSummary && (
         <div className="card-sub faint">{healthSummary}</div>
       )}
@@ -162,16 +190,56 @@ export function CodexAccountPoolMainCard({
         <div className="card-sub faint">{t("pws.healthCooldownHint")}</div>
       )}
       {showReauth
-        ? <div className="card-sub faint">{t("codexAuth.mainTokenExpired")}</div>
-        : !inCooldown && (
-          <QuotaBars
-            quota={main?.quota ?? null}
-            plan={main?.plan}
-            threshold={threshold}
-            t={t}
-            pending={main != null && main.quota == null}
-          />
-        )}
+        ? <div className="card-sub faint">
+            <p role="status">{t("codexAuth.mainTokenExpired")}</p>
+            {mainReauth && (mainReauth.state.phase === "idle" || mainReauth.state.phase === "failed") && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm codex-auth-action-btn"
+                  onClick={() => { void mainReauth.start(); }}
+                >
+                  {t("codexAuth.mainReauthDevice")}
+                </button>
+                {mainReauth.state.phase === "failed" && (
+                  <span className="badge badge-amber">{t("codexAuth.mainReauthFailed")}: {mainReauth.state.code}</span>
+                )}
+              </>
+            )}
+            {mainReauth && mainReauth.state.phase === "starting" && (
+              <span className="faint">{t("codexAuth.mainReauthPending")}</span>
+            )}
+            {mainReauth && (mainReauth.state.phase === "pending" || mainReauth.state.phase === "committing") && (
+              <span className="codex-main-reauth-pending">
+                {mainReauth.state.verificationUrl && (
+                  <span>{t("codexAuth.mainReauthOpen")}: {mainReauth.state.verificationUrl}</span>
+                )}
+                {mainReauth.state.deviceCode && (
+                  <strong>{t("codexAuth.mainReauthCode")}: {mainReauth.state.deviceCode}</strong>
+                )}
+                <span className="faint">{t("codexAuth.mainReauthPending")}</span>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm codex-auth-action-btn"
+                  onClick={() => { void mainReauth.cancel(); }}
+                >
+                  {t("codexAuth.mainReauthCancel")}
+                </button>
+              </span>
+            )}
+            {mainReauth && mainReauth.state.phase === "succeeded" && (
+              <span className="badge badge-primary">{t("codexAuth.mainReauthSucceeded")}</span>
+            )}
+          </div>
+        : !inCooldown && <>
+            <QuotaBars
+              quota={main?.quota ?? null}
+              plan={main?.plan}
+              threshold={threshold}
+              t={t}
+              pending={main != null && main.quota == null}
+            />
+          </>}
     </div>
   );
 }
@@ -186,9 +254,6 @@ export function CodexAccountPoolPageHead({
   actionFeedbackTone,
   onRefresh,
   onPauseExhausted,
-  sparkVisible,
-  sparkBusy,
-  onToggleSpark,
 }: {
   t: TFn;
   embedded: boolean;
@@ -199,10 +264,6 @@ export function CodexAccountPoolPageHead({
   actionFeedbackTone?: NoticeTone | null;
   onRefresh: () => void;
   onPauseExhausted: () => void;
-  /** undefined until the preference has loaded, so the switch never renders a guessed state. */
-  sparkVisible?: boolean;
-  sparkBusy?: boolean;
-  onToggleSpark?: () => void;
 }) {
   return (
     <div
@@ -218,39 +279,76 @@ export function CodexAccountPoolPageHead({
         >
           {actionFeedback ?? ""}
         </span>
-        {sparkVisible !== undefined && onToggleSpark && (
-          <span className="codex-auth-spark-toggle">
-            <span className="codex-auth-spark-toggle__label">{t("codexAuth.sparkQuota")}</span>
-            <button
-              type="button"
-              className={`toggle ${sparkVisible ? "on" : ""}`}
-              onClick={onToggleSpark}
-              disabled={!!sparkBusy}
-              aria-pressed={sparkVisible}
-              aria-label={t("codexAuth.sparkQuota")}
-              title={t("codexAuth.sparkQuotaHint")}
-            >
-              <span className="toggle-knob" />
-            </button>
-          </span>
+        {/* The standalone pause/refresh row sits next to the account cards. Embedded
+            surfaces keep those actions beside feedback because there is no page title. */}
+        {embedded && (
+          <CodexAccountPoolActionButtons
+            t={t}
+            refreshingQuota={refreshingQuota}
+            pausingExhausted={pausingExhausted}
+            pauseBusy={pauseBusy}
+            onRefresh={onRefresh}
+            onPauseExhausted={onPauseExhausted}
+          />
         )}
-        <button
-          type="button"
-          className="btn btn-sm btn-ghost codex-auth-action-btn"
-          onClick={onPauseExhausted}
-          disabled={refreshingQuota || pausingExhausted || !!pauseBusy}
-        >
-          <IconPause width={14} /> {pausingExhausted ? t("codexAuth.pausingExhausted") : t("codexAuth.pauseExhausted")}
-        </button>
-        <button
-          type="button"
-          className="btn btn-sm btn-ghost codex-auth-action-btn"
-          onClick={onRefresh}
-          disabled={refreshingQuota || pausingExhausted || !!pauseBusy}
-        >
-          <IconRefresh width={14} /> {refreshingQuota ? t("codexAuth.refreshingQuota") : t("codexAuth.refreshQuota")}
-        </button>
       </div>
+    </div>
+  );
+}
+
+/** The pause/refresh pair, shared by the embedded head and the standalone action row. */
+export function CodexAccountPoolActionButtons({
+  t,
+  refreshingQuota,
+  pausingExhausted,
+  pauseBusy,
+  onRefresh,
+  onPauseExhausted,
+}: {
+  t: TFn;
+  refreshingQuota: boolean;
+  pausingExhausted: boolean;
+  pauseBusy?: boolean;
+  onRefresh: () => void;
+  onPauseExhausted: () => void;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        className="btn btn-sm btn-ghost codex-auth-action-btn"
+        onClick={onPauseExhausted}
+        disabled={refreshingQuota || pausingExhausted || !!pauseBusy}
+      >
+        <IconPause width={14} /> {pausingExhausted ? t("codexAuth.pausingExhausted") : t("codexAuth.pauseExhausted")}
+      </button>
+      <button
+        type="button"
+        className="btn btn-sm btn-ghost codex-auth-action-btn"
+        onClick={onRefresh}
+        disabled={refreshingQuota || pausingExhausted || !!pauseBusy}
+      >
+        <IconRefresh width={14} /> {refreshingQuota ? t("codexAuth.refreshingQuota") : t("codexAuth.refreshQuota")}
+      </button>
+    </>
+  );
+}
+
+/**
+ * Standalone-page action row: the pause/refresh pair, moved out of the page head and
+ * placed directly above the account cards they operate on.
+ */
+export function CodexAccountPoolActions(props: {
+  t: TFn;
+  refreshingQuota: boolean;
+  pausingExhausted: boolean;
+  pauseBusy?: boolean;
+  onRefresh: () => void;
+  onPauseExhausted: () => void;
+}) {
+  return (
+    <div className="codex-auth-actions-row">
+      <CodexAccountPoolActionButtons {...props} />
     </div>
   );
 }

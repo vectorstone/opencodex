@@ -62,7 +62,7 @@ function stubPool(initial: PoolPayload): Record<string, unknown>[] {
   const puts: Record<string, unknown>[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.includes("/api/oauth/accounts/pool") && init?.method === "PUT") {
+    if (url.includes("/api/pool/settings") && init?.method === "PUT") {
       const body = init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
       puts.push(body);
       return new Response(JSON.stringify({
@@ -71,7 +71,7 @@ function stubPool(initial: PoolPayload): Record<string, unknown>[] {
         quotaWindow: body.quotaWindow,
       }), { status: 200 });
     }
-    if (url.includes("/api/oauth/accounts/pool")) {
+    if (url.includes("/api/pool/settings")) {
       return new Response(JSON.stringify(initial), { status: 200 });
     }
     throw new Error(`unexpected fetch: ${url} ${init?.method ?? "GET"}`);
@@ -182,8 +182,14 @@ describe("Anthropic account pool quota window", () => {
     const host = await mountPool();
 
     expect(host.textContent).toContain("Proactive usage-based switching is off");
-    // The stages that still run must be named, and the window must still be identified.
-    expect(host.textContent).toContain("new-session selection and 429 recovery");
+    // The stage that still runs must be named, and the window must still be identified.
+    expect(host.textContent).toContain("new-session selection");
+    // "429 recovery" is deliberately NOT named as a benefit of the enabled state any more:
+    // reactive failover stopped being something this toggle controls, so advertising it here
+    // would send an operator to the EXPERIMENTAL pool for something they already have
+    // unconditionally. Scoped to the description string -- the quota-window help text below
+    // legitimately mentions 429 when explaining which bar picks a replacement account.
+    expect(host.textContent).not.toContain("429 recovery");
     expect(host.textContent).not.toContain("prefer usage under 0%");
   });
 

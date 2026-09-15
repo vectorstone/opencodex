@@ -32,6 +32,16 @@ the stored main credential when an OpenCodex admission bearer is substituted). A
 Pool routing excludes unentitled accounts. If no roster can be confirmed, the gated row fails closed
 instead of spending a prompt on an upstream 400.
 
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` and `gpt-6-astra` are deliberately **not** gated that
+way: they are listed on every install, whatever the entitlement roster says. opencodex asks upstream
+under a client version new enough to return them, but it cannot make an answer appear — an
+unconfirmed account, a timed-out lookup or a shard that has not caught up would otherwise make the
+model disappear from the picker with no explanation. Listing them means the request is sent and you
+see the real upstream status instead. An account that does not have one of these models will get an
+upstream refusal at request time rather than an absent row, and in a multi-account Pool the request
+is no longer steered to the account that owns the model first. `disabledModels` is the lever for
+hiding any of them.
+
 A separate, explicit `customModels` entry can expose the same wire id as
 `openai/gpt-daybreak-blue-latest` through the canonical Codex-login forward provider:
 
@@ -53,6 +63,25 @@ metadata. The request still sends `gpt-daybreak-blue-latest`; opencodex does not
 or grant account entitlement. The separately billed
 `openai-apikey/daybreak-blue-latest` API row is a different route and its 1,050,000 / 922,000 limits
 are never copied into the Codex-login row.
+
+For custom Astra and Daybreak rows on that canonical `openai` Codex-forward destination,
+explicit `reasoningEfforts` are bounded by the model's pinned Codex capabilities. A custom
+`["none", "minimal", "low"]` becomes `["low"]` in the catalog; a nonempty list with no
+supported values also falls back to the native default as a single choice. An explicit `[]`
+stays empty and has no advertised default. A declared default is retained only if it belongs to
+the resulting list; otherwise the native default is used when present, then the first surviving
+choice. Stored custom configuration is unchanged, and repeated syncs do not add `max` back to a
+narrow custom list.
+
+The same catalog bound applies when the custom model id has pinned native capability metadata,
+including an arbitrary gateway such as `YYLJ/gpt-6-astra`. Desktop validates the model id, so
+`none` and `minimal` are stripped from that catalog row. Full native identity still requires the
+exact provider, destination, and capability-backed model identity; a gateway does not inherit
+Responses Lite, multi-agent, or native windows from its name.
+Codex's native Astra `ultra` choice is retained: it is a client delegation mode converted to a
+supported wire effort, distinct from the [API model's effort list](https://developers.openai.com/api/docs/models/gpt-6-astra).
+Catalog normalization does not rewrite existing thread settings. Request-time native effort
+clamps remain canonical-forward only.
 
 When the `codexAccountNamespaces` map is empty, account-qualified picker rows are off. If
 `codexAccountPickerEnabled` is omitted with a non-empty map, they are treated as enabled for
@@ -161,8 +190,8 @@ including OpenAI service-tier metadata.
 
 ## Current stable model coverage
 
-The native fallback set includes `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
-`gpt-5.3-codex-spark`, and GPT-5.6 Sol/Terra/Luna. For the GPT-5.5/5.4 family, opencodex preserves
+The native fallback set includes `gpt-5.5` and GPT-5.6 Sol/Terra/Luna.
+For the GPT-5.5 family, opencodex preserves
 the installed Codex catalog's richer live entries and only synthesizes a missing entry. The bundled
 upstream snapshot is used only for GPT-5.6, where it supplies the real per-model identity and
 metadata instead of an older-template approximation.
@@ -226,6 +255,17 @@ preserved, so Luna has `max` but no `ultra`.
 On the wire, routed adapters map or clamp unsupported tiers. For older native models whose real
 ladder stops at `xhigh`, `nativeEffortClamp` maps a direct `max` or an `ultra` selection to `xhigh`
 (for example, GPT-5.5). Sol, Terra, and Luna have a real `max` rung.
+
+Catalog advertisement of the two top tiers is unconditional: `ocx sync` no longer removes `max` or
+`ultra` when the installed Codex binary is too old to offer them — Codex versions without those
+rungs are out of support, and hiding them from current clients costs more than it buys. Other
+rungs are still intersected with the observed runtime ladder, and a clamp diagnostic recorded by a
+previous binary stops applying once the binary at that path reports a different version (the
+in-place upgrade case), so `ocx status` and `ocx doctor` stop warning about a clamp the upgraded
+runtime no longer needs.
+Catalog visibility is not entitlement: advertising `max`/`ultra` does not guarantee the upstream
+account or provider accepts the tier, and for older native models whose real ladder stops at
+`xhigh` the wire clamp above still maps the selection down at request time.
 
 ## Fast tier rules
 
@@ -292,3 +332,5 @@ ocx sync
 
 opencodex rewrites `models_cache.json` with a deliberately stale cache wrapper whenever catalog
 visibility, priority, or metadata changes, so the next Codex model refresh reads the new catalog.
+
+After a catalog or model-cache write, OpenCodex invalidates its cached app-server observation so the next request checks process freshness again. A configuration sync also invalidates the observation when catalog contents are unchanged. This refresh does not restart Codex processes.

@@ -5,6 +5,21 @@ description: 提供者条目、身份验证、端点、模型目录、配额、�
 
 提供者用于告诉 opencodex 模型位于哪里、使用哪种线协议适配器，以及请求如何进行身份验证。
 
+## 首次注册时的模型选择
+
+新的非 OAuth 连接会等待可靠的模型列表，再公开模型。如果 Models 标签页中去重后的模型行达到20个，所有模型开关初始为 OFF，但提供者本身保持 ACTIVE。实际认证方式为 OAuth 或 ChatGPT 登录的连接保留默认设置。
+
+仅在首次注册提供者时应用；更新、重新登录和更换密钥不会重置已有选择。初始化后，可在 Models 或使用以下 CLI 命令启用所需模型。后续新增模型的独立策略不变。请将 `<model-id>` 替换为列表中的 ID。
+
+```sh
+ocx models live --provider openrouter
+ocx models enable '<model-id>'
+ocx models disable '<model-id>'
+ocx models provider openrouter on
+```
+
+在界面中完成注册或 OAuth 登录后，提示框可打开 Models 页面。CLI 会输出模型管理命令，JSON 也包含后续步骤。`--no-wait` 表示登录仍在等待中，并非已完成。使用实时模型命令前，请先运行 `ocx start` 启动代理。
+
 ## 提供者相关顶级字段
 
 | 字段 | 类型 | 默认值 | 含义 |
@@ -12,16 +27,18 @@ description: 提供者条目、身份验证、端点、模型目录、配额、�
 | `providers` | `Record<string, OcxProviderConfig>` | — | 提供者名称到提供者配置的映射。 |
 | `openaiProviderTierVersion?` | `2` | 由迁移设置 | 标记单一、可感知选项的 OpenAI 投影已完成。 |
 | `disabledModels?` | `string[]` | — | 从 Codex catalog 和 `/v1/models` 中隐藏、但不阻止直接 proxy 调用的 model。routed id 会从列表中移除。account-qualified native id 只隐藏对应 selector row；bare native GPT id 会隐藏 bare row 以及该 model 的所有 account-selector row。Models 页面只显示裸原生行和路由行；若只隐藏一个 selector-qualified 行，请直接设置此配置字段。 |
-| `providerContextCaps?` | `Record<string, number>` | `{}` | 按提供者设置、对 Codex 可见的上下文上限。上限只会降低已知的上下文窗口。 |
-| `contextCapValue?` | `number` | `350000` | 仪表板上下文上限控件使用的默认值。仅当勾选“应用到所有已路由的提供方”时，修改它才会把值应用到所有已路由提供方（包括没有现有 `providerContextCaps` 条目的提供方）；否则每个提供方保留自己的上限。 |
+| `providerContextCaps?` | `Record<string, number>` | `{}` | 按提供商设置的有效上下文上限。普通窗口只能缩小；支持长窗口的原生模型可以扩展到该模型支持的上限。 |
+| `providerContextCapValues?` | `Record<string, number>` | `{}` | 各提供商最后选择的上限，关闭后仍保留。仅保存这些值不会启用上限。有效值优先于保存的选择值。 |
+| `contextCapValue?` | `number` | `350000` | 首次开启时使用的默认值。再次开启时恢复该提供商的选择值。修改全局值时附带 `setAll: true` 只会更新已开启的上限；不带值的 `setAll: true` 会按当前全局值开启所有已配置提供商的上限。 |
 | `codexAccounts?` | `CodexAccount[]` | `[]` | 由 Codex Auth 管理的 ChatGPT/Codex 池账户元数据。密钥单独存放在 `codex-accounts.json` 中。 |
 | `pausedCodexAccountIds?` | `string[]` | `[]` | 在恢复之前从 Pool 选择中排除的账户，包括被暂停时的主 `__main__` 账户。 |
 | `codexAccountNamespaces?` | `Record<string, string>` | — | 将任意公开 model selector 映射到已保存 Codex account target 的可选配置。启用账户限定的选择器行后，target 存在的每个 selector 都会在 Codex picker 中添加独立的 `<selector>/<native-openai-model>` row，且每个 row 只使用对应账户。只要有 selector 生效，bare native row 就会在 picker 中隐藏；但除非显式禁用，其 id 仍可路由，并继续列在 raw `/v1/models` 中。 |
 | `codexAccountPickerEnabled?` | `boolean` | 映射为空时关闭 | 控制是否根据有效的 `codexAccountNamespaces` 映射生成账户限定的 Codex 选择器行。`true` 允许显示映射行。在非空映射中省略此字段时，为保持向后兼容会视为已启用；映射为空时则关闭。`false` 会隐藏生成行并恢复选择器中的裸原生行，但不会删除映射，也不会禁用精确的 `<selector>/<native-openai-model>` 路由。 |
 | `activeCodexAccountId?` | `string` | — | 为下一次请求手动选定的 Pool 账户。选择会清除线程亲和性；进行中的请求会保留捕获到的凭据。 |
 | `codexAccountPriorities?` | `Record<string,number>` | — | Codex pool 各账号的选择顺序：账号 ID → `-100` 到 `100` 的整数，**数值越大越先使用**，未设置即为 `0`。这是顺序边界而非资格边界：选择会把已经合格的账号收窄到仍有 quota 余量的最高 tier，再由 `accountPoolStrategy` 在该 tier 内挑选。只有当某个 tier 的所有成员都超过 `autoSwitchThreshold`、处于 cooldown、被 soft-avoid、已暂停或需要重新认证时，该 tier 才会被跳过；usage 未知不会让 tier 耗尽。顺序不会让不合格的账号变得可选，也不会重新绑定已经绑定账号的 thread。主账号 `__main__` 同样参与排序，因此可以让 Codex Desktop 登录账号最后才被用到。没有任何条目时，行为与以往完全一致。映射格式非法时会打印警告并关闭排序（不会触发 config 修复）。可通过 `ocx account priority` 和 Codex Auth 页面管理。 |
-| `autoSwitchThreshold?` | `number` | `80` | 基于用量的主动切换阈值。`quota` 可在下一次请求中重新评估已绑定和未绑定任务；`fill-first` 仅把它用作未绑定分配的耗尽点；正常 `round-robin` 不使用它。分数取已知 5 小时、周或 30 天 quota window 的最高值。`0` 只关闭基于用量的主动切换，不关闭未绑定任务分配或故障恢复。 |
-| `accountPoolStrategy?` | `"quota" \| "round-robin" \| "fill-first"` | `"quota"` | 新建/未绑定 Codex 请求的分配策略。没有 live `(parent thread id, quota scope)` affinity 的请求属于未绑定；代理重启或 affinity 重置后，已有可见任务也可能未绑定。`quota` 在没有活跃账号时选择已知 usage 最低的合格账号；活跃账号合格且低于 `autoSwitchThreshold` 时继续使用；达到阈值后，可把未绑定请求或已绑定任务的下一次请求切换到 usage 更低的合格账号。`round-robin` 均匀分配未绑定请求；`fill-first` 在 cooldown、不可用或耗尽阈值前持续分配给活跃账号。 |
+| `autoSwitchThreshold?` | `number` | `80` | 基于用量的主动切换阈值。`quota` 可在下一次请求中重新评估未绑定任务。已绑定任务默认（`pool.cacheAffinity`）在越过阈值后仍保留账号，直到该账号耗尽或无法继续服务，并且只改绑到确有额度余量且 usage 严格更低的账号。将 `pool.cacheAffinity` 设为 `false` 才会在该阈值重新评估已绑定任务。`fill-first` 仅把它用作未绑定分配的耗尽点；正常 `round-robin` 不使用它。分数取已知 5 小时、周或 30 天 quota window 的最高值。`0` 只关闭基于用量的主动切换，不关闭未绑定任务分配或故障恢复。 |
+| `accountPoolStrategy?` | `"quota" \| "round-robin" \| "fill-first" \| "reset-first"` | `"quota"` | 新建/未绑定 Codex 请求的分配策略。没有 live `(parent thread id, quota scope)` affinity 的请求属于未绑定；代理重启或 affinity 重置后，已有可见任务也可能未绑定。`quota` 在没有活跃账号时选择已知 usage 最低的合格账号；活跃账号合格且低于 `autoSwitchThreshold` 时继续使用；达到阈值后，可把未绑定请求切换到 usage 更低的合格账号。已绑定任务默认会保留到账号耗尽（已知 usage 为 100%）或无法继续服务，改绑时只前往确有额度余量且 usage 严格更低的账号。关闭该标志后，也可在该阈值把已绑定任务的下一次请求改绑到确有额度余量且 usage 严格更低的账号。`round-robin` 均匀分配未绑定请求；`fill-first` 在 cooldown、不可用或耗尽阈值前持续分配给活跃账号。  `reset-first`: 在低于用量阈值的账号中，优先选择下次5小时或周额度重置最早的账号。已绑定任务遵循配置的亲和策略。独立模型额度按用量排序。 此排序不使用月额度重置时间。 |
+| `pool.cacheAffinity?` | `boolean` | `true` | 已绑定 Codex 线程的 cache-affinity 排序，独立于 `pool.kernel`。默认开启；省略该键或设为 `true` 即为开启，非法值视为开启。live 绑定优先于 quota 余量：`quota` 不会仅因用量越过 `autoSwitchThreshold` 就移动线程。账号暂停、不可用或真正耗尽（已知 usage 为 100%）时仍会离开，且只改绑到确有额度余量且 usage 严格更低的账号。用量未知的账号不会作为已绑定任务的改绑目标。设为 `false` 可恢复按阈值改绑。affinity 是重排而非钉死。 |
 | `accountPoolStickyLimit?` | `number` | `1` | 一次 round-robin 选择在推进前保留的新建/未绑定任务分配数。计数在任务绑定时增加，而不是在上游成功后增加。范围 1–100；仅当 `accountPoolStrategy` 为 `round-robin` 时生效。 |
 | `upstreamFailoverThreshold?` | `number` | `3` | 连续发生多少次瞬态故障后，后续新会话会切换到备用上游。设为 `0` 可禁用。对于常规 Responses 和原生 compact 发送，已证明的连接前 DNS/TCP 不可达故障按 provider-host 粒度记录，不影响账户健康、账户冷却、线程/会话亲和性、活动账户选择或 Pool 路由，也不会计入此阈值。 |
 | `upstreamHostCircuitThreshold?` | `number` | `0` | 原生 OpenAI forward Responses 与 compact 发送的可选断路器阈值，仅统计已证明的连接前 DNS/TCP 故障。`0` 表示禁用；`1`–`20` 表示在这么多个终止逻辑请求失败后，对 provider-origin 冷却 30 秒。断路期间会在账户选择和上游发送之前返回带 `Retry-After` 的 `503`；冷却结束后只允许一个半开请求。超时和 HTTP 响应不计数，任意 HTTP 响应都会关闭断路器。 仅适用于未固定账户的 Codex Pool 路由；在 `codexAccountMode: "direct"` 或使用账户限定选择器时不会启用。 |
@@ -50,6 +67,10 @@ selector，而不是分配一个新名称。
 
 `openaiProviderTierVersion: 2` 标记当前的单提供者投影。对已发布的 v1 配置进行迁移之前，opencodex 会创建 `config.json.pre-openai-tiers-v2.bak`，且不会覆盖不同的备份文件，并会把已知的旧式命名空间选择 id 重写为裸 id。
 
+## 提供者命名空间别名
+
+提供者可以有内置缩写，例如 `google-antigravity` 的 `agy`。如果已配置的提供者名称或显式别名占用了该缩写（不区分大小写），另一个提供者的内置缩写就会在目录名称和别名路由中同时禁用。例如，配置名为 `agy` 的提供者后，Google 模型会显示为 `google-antigravity/<model>`，而 `agy/<model>` 会选择已配置的提供者。规范提供者名称仍要求大小写完全一致；无法识别的前缀继续沿用现有的模型路由回退行为。
+
 ## 提供者条目（`OcxProviderConfig`）
 
 | 字段 | 类型 | 含义 |
@@ -66,7 +87,7 @@ selector，而不是分配一个新名称。
 | `apiKeyTransport?` | `"x-api-key" \| "bearer"` | Anthropic key 头部样式。默认使用原生 `x-api-key`；仅对 key-auth `anthropic` 提供者有效。 |
 | `apiKeyPool?` | `ApiKeyPoolEntry[]` | 多 key 池。`apiKey` 会镜像当前激活条目；每个条目都有 `id`、`key`、可选 `label`，以及可选的数值 `addedAt`。 |
 | `defaultModel?` | `string` | 当选择该提供者但未显式指定模型时使用的模型。 |
-| `models?` | `string[]` | 种子/回退模型列表。配合 `liveModels: false` 时，这些就是唯一发现到的模型。 |
+| `models?` | `string[]` | 初始/回退模型列表。`liveModels: false` 时，非空 `models` 后接 `retainModels`；若 `models` 为空或省略，则按已配置的 `defaultModel`、`retainModels` 顺序构建初始列表，重复 ID 仅保留首次出现的位置。 |
 | `liveModels?` | `boolean` | 启动/同步时获取实时目录（默认 `true`）。自定义提供者使用 `${baseUrl}/models`；内置项可能使用注册表 URL 并进行过滤。 |
 | `selectedModels?` | `string[]` | 发现之后的目录允许列表。非空时只暴露这些 id；为空或省略时则暴露全部发现到的模型。 |
 | `modelDisplayNames?` | `Record<string, string>` | 持久的仅显示名称，以此提供者的精确原生模型 id 为键。键区分大小写。名称优先于提供者目录元数据，并且不会改变身份验证、适配器、路由、计费或上游请求。该映射最多可包含 2,000 个条目，与发现上限相同。 |
@@ -77,7 +98,7 @@ selector，而不是分配一个新名称。
 | `modelAutoCompactTokenLimits?` | `Record<string, number>` | 按模型设置的正安全整数软自动压缩预算。该值只能降低“上下文或最大输入的 90%”这一有效上限；没有已知的权威上下文窗口时不会输出。对于规范 `openai`，键必须是受支持的精确原生模型 ID，且不得包含提供者或账户选择器前缀。提供者 PATCH 会合并条目；将某个键设为 `null` 会删除该键，将整个字段设为 `null` 会清空映射。这些 `null` 删除标记仅适用于 PATCH。 |
 | `defaultMaxOutputTokens?` | `number` | 当客户端省略 `max_output_tokens` 时，`openai-chat` 的提供者级回退值。 |
 | `modelMaxOutputTokens?` | `Record<string, number>` | 正数型、按模型设置的 `openai-chat` 回退预算；精确/模式匹配优先于提供者默认值。 |
-| `modelCosts?` | `Record<string, Cost4>` | 按模型设置的显示价格（每 100 万 token 的美元数），以该提供者的精确上游模型 ID 为键（不是提供者标识符或路由后的 `provider/model` 标签），值为四个字段：`input`、`output`、`cacheRead`、`cacheWrite`（示例：`{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`）。任何模型 ID 都是有效键——自定义提供者可以通过 `openai-chat` 适配器指向任意 OpenAI 兼容端点，即使不存在于内置目录中，本地 OpenAI 兼容和内部提供者的 ID 同样有效。用户配置的价格在 Logs 的 `~$` 和 Usage 估算中优先于内置目录；历史条目也会按当前覆盖项重新计价，因此修改价格可能改变过去的总额（回退顺序：用户配置 → jawcode 目录 → expected-price 覆盖 → 模型级厂商价格）；全零条目会回退到该顺序中的下一个来源。每个费率必须是大于等于 0 的有限数字，且不超过 1,000,000（每 100 万 token 的美元数）；超出范围的条目会在管理边界被拒绝，并在加载时被丢弃。仅用于显示的估算：覆盖项不影响路由、账户选择、配额或计费。 |
+| `modelCosts?` | `Record<string, Cost4>` | 按模型设置的显示价格（每 100 万 token 的美元数），以该提供者的精确上游模型 ID 为键（不是提供者标识符或路由后的 `provider/model` 标签），值为四个字段：`input`、`output`、`cacheRead`、`cacheWrite`（示例：`{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`）。任何模型 ID 都是有效键——自定义提供者可以通过 `openai-chat` 适配器指向任意 OpenAI 兼容端点，即使不存在于内置目录中，本地 OpenAI 兼容和内部提供者的 ID 同样有效。用户配置的价格在 Logs 的 `~$` 和 Usage 估算中优先于内置目录；历史条目也会按当前覆盖项重新计价，因此修改价格可能改变过去的总额（回退顺序：用户配置 → jawcode 目录 → expected-price 覆盖 → 模型级厂商价格）；用户明确将所有费率设为零时，会得到已知的零费用估算；删除该模型的覆盖项即可恢复自动定价。目录中的全零价格仍会回退到下一个来源。每个费率必须是大于等于 0 的有限数字，且不超过 1,000,000（每 100 万 token 的美元数）；超出范围的条目会在管理边界被拒绝，并在加载时被丢弃。仅用于显示的估算：覆盖项不影响路由、账户选择、配额或计费。 |
 | `headers?` | `Record<string, string>` | 额外的上游请求头。会拒绝 Authorization、cookie、API key 头、嵌入换行符以及无效名称。 |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | 默认的 OpenRouter `order`、`only` 和 `allowFallbacks` 偏好；仅对使用 `openai-chat` 的规范 OpenRouter 有效。 |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | 精确模型 id 级别的覆盖项，会替换提供者级 OpenRouter 偏好。 |
@@ -89,19 +110,20 @@ selector，而不是分配一个新名称。
 | `modelReasoningEfforts?` | `Record<string, string[]>` | 按模型设置的标签。空列表会隐藏 effort 控件。 |
 | `modelSupportsReasoningSummaries?` | `Record<string, boolean>` | 将某个模型设为 `false`，即可停止暴露摘要并移除摘要交付字段。 |
 | `modelReasoningSummaryDelivery?` | `Record<string, "sequential" \| "sequential_cutoff" \| "concurrent" \| "concurrent_cutoff">` | 按模型设置的 Responses 交付枚举；会重写现有的 delivery 字段。 |
-| `modelAdapters?` | `Record<string, string>` | 按模型设置的 `openai-chat` 或 `openai-responses` 线协议覆盖项，用于混合线协议网关。显式条目优先于注册表默认值；DeepSeek 预设可以为 `deepseek-v4-flash` 选择原生 Responses，GitHub Copilot 则为 GPT-5 系列（`gpt-5.3-codex`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`）声明了 Responses 专用默认值，因为这些模型在代理流量下会拒绝 `/chat/completions`。没有内置默认值的模型（例如 `gpt-5.4-nano`）可以在此手动启用。单一线协议上游固定项和规范 ChatGPT forward 会拒绝覆盖。 |
+| `modelAdapters?` | `Record<string, string>` | 按模型设置的 `openai-chat` 或 `openai-responses` 线协议覆盖项，用于混合线协议网关。显式条目优先于注册表默认值；DeepSeek 预设可以为 `deepseek-v4-flash` 选择原生 Responses，GitHub Copilot 则为 模型（`gpt-5.3-codex`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`）声明了 Responses 专用默认值，因为这些模型在代理流量下会拒绝 `/chat/completions`。没有内置默认值的模型（例如 `gpt-5.4-nano`）可以在此手动启用。单一线协议上游固定项和规范 ChatGPT forward 会拒绝覆盖。 |
 | xAI Responses 启用项（仪表板） | 开关 | 仅用于 `xai`，以原子方式设置或清除 `grok-4.5` 和 `grok-4.6` 的 `modelAdapters` 条目。若只存在一个条目，则显示混合状态，直到下次开关写入将两者统一。其他覆盖项和层级行为不变。 |
 | `xaiResponsesXSearch?` | `boolean` | 默认禁用。在 xAI Responses 目标上，仅当有效的 `web_search` 工具在最终请求规范化后仍保留时，才附加由提供方托管的 `x_search` 声明。不会重复已有声明，绝不会扩大调用方的 `tool_choice`/`allowed_tools` 选择范围，并且此项独立于网络搜索辅助服务的 `search.xSearch` 选项。 |
 | `modelPreferHostedTools?` | `Record<string,string[]>` | 非 forward Responses gateway 的精确模型 ID opt-in，用于上游预留 hosted tool namespace 的情况。目前只支持 `["image_generation"]`；匹配模型必须使用 `openai-responses` wire 且支持该 hosted 工具。它会移除冲突的客户端 `image_gen` 声明，并改写其 selector 以保持调用方的 tool choice。对于 OpenAI API 的虚拟 `-pro` 模型，先匹配所选公开 ID，未命中时才使用解析出的基础 wire-model ID 作为回退。`modelAdapters` 会先按公开 ID、再按基础 ID 解析；后一次结果决定最终 wire。未配置模型保持普通 alias 行为。 |
 | `annotateEmptyToolOutputs?` | `boolean` | 在工具结果到达模型之前，将存在但为空的结果替换为简短标记，以免空白结果被误认为缺失结果。适用于空白字符串和仅包含文本的部件数组；图像、文件和加密部件绝不会被修改。内置注册表中 `DeepSeek` 的默认值为 `true`，其他情况下不设置。设为 `false` 可让提供者退出此行为——后续编辑即使省略该字段，也会保留显式的 `false`。`PATCH /api/providers?name=<provider>` 接受 `true`、`false` 或 `null`；传入 `null` 可清除覆盖值并恢复注册表默认行为。 |
-| `reasoningEffortMap?` | `Record<string, string>` | 提供者级、用于推理标签的线协议别名。 |
-| `modelReasoningEffortMap?` | `Record<string, Record<string, string>>` | 按模型设置的推理标签线协议别名。 |
+| `reasoningEffortMap?` | `Record<string, string>` | 提供者级、用于推理标签的线协议别名。将标签映射为 `"__omit__"` 可在上游请求中完全省略推理字段（例如针对需要省略 `reasoning_effort` 才能触发深度思考模式的 Ollama 本地模型）。 |
+| `modelReasoningEffortMap?` | `Record<string, Record<string, string>>` | 按模型设置的推理标签线协议别名。将标签映射为 `"__omit__"` 可在上游请求中完全省略推理字段。 |
 | `reasoningWireFormat?` | `"gateway-object"` | 用于接受 `reasoning: { enabled, effort }` 而非 `reasoning_effort` 的 OpenAI 兼容 gateway。ClinePass preset 会自动设置。 |
 | `noReasoningModels?` | `string[]` | 会拒绝推理/思考参数的模型。 |
 | `noTemperatureModels?` | `string[]` | 会拒绝调用方指定 `temperature` 的模型。 |
 | `noTopPModels?` | `string[]` | 会拒绝调用方指定 `top_p` 的模型。 |
 | `noPenaltyModels?` | `string[]` | 会拒绝 presence/frequency penalty 的模型。 |
 | `noStructuredOutputModels?` | `string[]` | `openai-chat` 端点拒绝 `response_format` 的精确模型 ID。仅当请求模型与条目完全匹配时才省略该字段；其他 `openai-chat` 模型仍启用 structured-output 转换。 |
+| `noJsonSchemaModels?` | `string[]` | `openai-chat` 端点拒绝 `json_schema` 形式但仍接受 `json_object` 的精确模型 ID。这类请求会降级为 `json_object` 而不是被丢弃，因此请求 JSON 的调用方仍能拿到 JSON。同一模型同时出现在两个列表时，以 `noStructuredOutputModels` 为准。`opencode go`、`opencode zen`、`opencode free` 预设已为其 DeepSeek 路由内置该项。 |
 | `parallelToolCalls?` | `boolean` | 切换并行工具调用。OpenAI Chat 默认开启；非 chat 适配器只有显式 `true` 时才会声明支持。 |
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` | 默认关闭的下游 SSE 修复，用于精确占位 id、缺失的终止 id，以及（`repairInvalidIds`）缺少规范 `msg_`/`rs_` 前缀的 message/reasoning id。function-call id 永远不会被重写。内置 DeepSeek 默认启用后两项。 |
 | `responsesSnapshotRepair?` | `boolean` | 默认关闭的客户端修复，用于补全 SSE 与 JSON 中稀疏 Responses 生命周期快照缺失的 status、output 和工具元数据；原始检查与持久化保持不变。 |
@@ -134,12 +156,13 @@ API key 提供者可以持有字面量 key，或环境引用。OAuth 提供者�
 
 私有/本地目标需要 `allowPrivateNetwork: true`，并且在出站代理启用时，还需要匹配的 `NO_PROXY` 条目。回环地址会自动加入；每个 LAN 主机都必须显式列出，因为 CIDR 条目不会被解释。匹配器支持精确主机、域后缀、可选端口、带方括号的 IPv6 以及 `*`；例如，应显式列出 `192.168.1.50`。元数据和链路本地目标仍会被阻止。诊断请求会拒绝重定向，并报告一个已剥离凭据的目标。普通提供者请求的重定向审查仍然独立于这个诊断保护。
 
+面向 Clash / Surge / Mihomo 用户的 fake-IP DNS 例外有两种，且都只作用于 DNS *应答*——URL 中的字面地址仍会被拒绝。IANA 基准段 `198.18.0.0/15`（含 IPv4-mapped IPv6 写法）在该主机适用出站代理时被接受。Mihomo 默认的 IPv6 fake-IP 段 `fdfe:dcba:9876::/48` 采用更严格的门槛：必须设置与 URL 协议匹配的代理变量（`https:` 对应 `HTTPS_PROXY`，`http:` 对应 `HTTP_PROXY`，`ALL_PROXY` 不算），主机不能命中 `NO_PROXY`，随后请求会被显式绑定到该代理。其他 ULA、相邻前缀，或与真实私网应答混合的 fake-IP 应答仍需要 `allowPrivateNetwork: true`。提供方保存时的校验不应用该 IPv6 例外。
+
 ## Codex 账户池
 
 请在仪表盘 **Codex Auth** 页面添加 pool account 并刷新 quota。配置只保存非 secret account
 metadata；access/refresh token 存放在加固的 Codex account credential store 中。Pool routing
-分为新建/未绑定任务分配、基于用量的主动切换和故障恢复。已绑定任务通常保持 affinity，但 `quota`
-可在超过阈值后的下一次请求中重新绑定；暂停、cooldown、重新认证和故障处理也能独立清除或改变
+分为新建/未绑定任务分配、基于用量的主动切换和故障恢复。已绑定任务通常保持 affinity。默认（`pool.cacheAffinity`）下，该重新绑定会等到绑定账号耗尽或无法继续服务，并且只改绑到确有额度余量且 usage 严格更低的账号；所有账号都高于阈值时，已绑定任务留在原账号。关闭该标志后，`quota` 可在超过阈值后的下一次请求中重新绑定，但仍只改绑到确有额度余量且 usage 严格更低的账号。暂停、cooldown、重新认证和故障处理也能独立清除或改变
 routing。未绑定请求没有 live 账号绑定，也可能是代理重启或 affinity 重置后的已有任务。输出前的
 **429/402** 即使在关闭基于用量的主动切换时，也可在同一请求中对合格替代账号重试一次。
 账号变化后会保留并重放对话上下文，但账号间的 provider prompt cache 不保证复用，可能需要重新预热。
@@ -152,7 +175,7 @@ routing。未绑定请求没有 live 账号绑定，也可能是代理重启或 
 并可将请求切换到另一个符合条件的 Pool 账户。即使 `autoSwitchThreshold: 0`，
 这些故障恢复流程仍然有效；`0` 只会禁用基于用量的主动切换。
 
-**分配与主动切换策略：** `quota`（默认）在没有活跃账号时选择 usage 最低的合格账号；活跃账号合格且低于 `autoSwitchThreshold` 时继续使用；达到阈值后，可把未绑定请求或已绑定任务的下一次请求切换到 usage 更低的合格账号。`round-robin` 均匀分配未绑定请求，用量
+**分配与主动切换策略：** `quota`（默认）在没有活跃账号时选择 usage 最低的合格账号；活跃账号合格且低于 `autoSwitchThreshold` 时继续使用；达到阈值后，可把未绑定请求切换到 usage 更低的合格账号。默认下 cache affinity 优先于 quota 余量，已绑定任务会保留到账号耗尽（已知 usage 为 100%）或无法继续服务，改绑时只前往确有额度余量且 usage 严格更低的账号。关闭该标志后，也可在该阈值把已绑定任务的下一次请求改绑到确有额度余量且 usage 严格更低的账号。`round-robin` 均匀分配未绑定请求，用量
 阈值不会改变正常轮换。`accountPoolStickyLimit`（默认 `1`，1–100）统计分配/绑定，而不是成功响应。
 `fill-first` 在 cooldown、重新认证或耗尽阈值前把未绑定请求分配给活跃账号；健康的已绑定任务保持
 affinity。这些策略不能规避 provider enforcement。
@@ -163,7 +186,7 @@ affinity。这些策略不能规避 provider enforcement。
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `anthropicAccountPool.enabled?` | `boolean` | `false` | 启用粘性亲和性和 429 冷却故障转移。 |
+| `anthropicAccountPool.enabled?` | `boolean` | `false` | 启用粘性会话亲和性与基于用量的新会话选择。**429 故障转移不由此开关控制**：只要存有两个及以上可用账号就会生效，与其他多凭据提供方一致，且无法关闭。 |
 | `anthropicAccountPool.autoSwitchThreshold?` | `number` | `80` | 对于新会话，当活动账户达到此阈值时，选择配置窗口中已知缓存使用率最低的账户。`0` 会禁用配额选择。 |
 | `anthropicAccountPool.strategy?` | `"quota" \| "round-robin" \| "fill-first"` | `"quota"` | 新会话策略；`quota` 按 `quotaWindow` 指定的窗口（默认是 5 小时条形数据）对账户排序，`fill-first` 也在同一窗口中判定其耗尽阈值。 |
 | `anthropicAccountPool.quotaWindow?` | `"five-hour" \| "weekly" \| "max-utilization"` | `"five-hour"` | 基于用量选择账户时使用的、由提供商报告并缓存的用量条。`five-hour` 保持原有行为。`weekly` 使用每周用量条，并在仍有其他可用账户时跳过 5 小时用量已耗尽的账户；若没有其他账户，则回退使用这些账户。`max-utilization` 使用已知值中的最高值，因此每周用量尚不可用时仍可使用 5 小时用量；两者都未知时，账户遵循 unknown 用量排序。已知用量排在 unknown 之前，但如果所有可用账户都未知，仍会按可用顺序选择一个账户。在前述较低 5 小时用量的同分判定之后，完全相同时也保留可用顺序。不会主动重新平衡健康且已建立亲和性的会话。在新会话分配和符合条件的 429 替代后的路由恢复中，`quota` 直接按此窗口对可用候选账户排序；`fill-first` 按此窗口的阈值和耗尽规则以稳定顺序前进；`round-robin` 忽略此设置。冷却状态、故障转移上限和重新认证资格仍是独立的本地状态。各账户的每周用量只有在控制面板的提供商页面完成查询后才可用。 |
@@ -192,7 +215,7 @@ affinity。这些策略不能规避 provider enforcement。
 | `failureBackoffMaxSeconds?` | `number` | `3600` | 退避上限和永久故障延迟。 |
 | `codexWarmupEnabled?` | `boolean` | `false` | 启用合成的 Codex 池账户验证。 |
 | `codexWarmupMaxAgeSeconds?` | `number` | `691200` | 8 天后重新验证账户。 |
-| `codexWarmupModel?` | `string` | `gpt-5.4-mini` | 用于可选预热的原生模型。 |
+| `codexWarmupModel?` | `string` | `gpt-5.6-luna` | 用于可选预热的原生模型。 |
 
 ## 固定提供者端点
 
@@ -340,11 +363,26 @@ Vercel AI Gateway 可以在多个底层推理提供者之间路由一个模型�
 
 ## 静态模型允许列表
 
-将 `liveModels: false` 设为只暴露 `models`。如果 `models` 为空或省略，该提供者将不暴露任何路由模型。实时发现会在缓存前拒绝超过 4 MiB 或 2,000 条原始模型行；内置预设可能使用更低的限制，并过滤为可聊天的行。过大或格式错误的结果会走陈旧/配置回退。合法的、零可用结果的发现仍然具有权威性，不会被静默替换或截断。
+`liveModels: false` 时，若 `models` 为空或省略，初始列表先加入已配置的 `defaultModel`，
+再加入 `retainModels`，重复 ID 仅保留首次出现的位置。若显式设置了非空 `models`，则按
+`models`、`retainModels` 顺序构建，不会自动加入另一个 `defaultModel`；仍可将该模型明确写入
+`models` 或 `retainModels`。这些字段均未提供 ID 时，初始列表为空。此顺序不保证最终选择器的显示顺序。
+`selectedModels`、`disabledModels` 和提供商禁用策略仍然适用。`authMode: "forward"` 保留原有独立分支，
+不使用此静态路由列表。这些规则不改变实时发现失败时的回退行为。
+
+实时发现会在缓存前拒绝超过 4 MiB 或 2,000 条原始模型行；内置预设可能使用更低的限制，并过滤为可聊天的行。过大或格式错误的结果会走陈旧/配置回退。合法的、零可用结果的发现仍然具有权威性，不会被静默替换或截断。
 
 当需要继续运行发现，但只有选定 id 应该出现在 Codex 和 `/v1/models` 中时，请使用 `selectedModels`。仪表板会保留完整的已发现列表，以便之后调整允许列表。
 
 请使用 `modelDisplayNames` 设置显示名称。优先顺序是操作者设置的 `modelDisplayNames`、提供者目录元数据，然后是普通的 `provider/model` 显示。键是此提供者内精确的原生模型 id，例如 `xai/grok-4.6` 的键是 `grok-4.6`。名称只改变显示，不会改变精确路由 id 或上游模型 id。请只把此字段加入 `config.json` 中现有的提供者设置，并保留所有其他字段。向 `PUT /api/providers/:provider/model-display-names` 发送 `{ "modelId": "grok-4.6", "displayName": "Grok 4.6" }` 可保存名称，发送 `displayName: null` 只重置该名称。
+
+本地 Codex 目录中受支持的不带前缀的原生 GPT 条目也可以通过
+`providers.openai.modelDisplayNames` 设置精确的显示名称, 例如 `"gpt-6-astra": "GPT 6 Astra"`。
+启动时同步和本地目录收敛都会重新应用这些名称。删除名称设置时, 只有条目的当前显示名称仍与已应用的覆盖值一致,
+才会恢复原始原生名称。外部更改的显示名称仍受现有原生元数据规范化规则约束。
+例如，Astra (`gpt-6-astra`) 仍会将不同于固定原生名称的名称替换为该固定名称。
+显示名称覆盖不会改变模型 ID、元数据（包括能力）、排序、路由组合别名和带账户限定的条目。
+此本地目录覆盖不会重命名 HTTP 模型列表中的条目或虚拟 `*-pro` 条目。
 
 预览版 GPT-5.6 回退条目使用相同机制。OpenAI API key 预设会为基础和 Pro id 设定 `922000` 上下文和 `922000` 最大输入；OpenRouter 会为 `openai/gpt-5.6-sol`、`openai/gpt-5.6-terra` 和 `openai/gpt-5.6-luna` 设定 `922000` 上下文。Pool/Direct 会声明 `922000`；同步后的目录会声明 `max`，同时保留 `xhigh` 的独立性。
 
@@ -361,6 +399,18 @@ Vercel AI Gateway 可以在多个底层推理提供者之间路由一个模型�
   }
 }
 ```
+
+## 模型显示名称编辑器
+
+仪表板的 **Models** 可让你为已发现的模型持久保存易读名称。展开提供者，找到一个已发现的模型，然后选择 **Name**。
+保存易读名称时，对话框会一直显示精确的 `provider/model` 选择器。选择 **Reset name** 可恢复为
+提供者元数据中的名称，或默认的选择器显示。**Name** 只改变显示；单独的别名铅笔图标用于修改
+短路由别名，并不是显示名称编辑器。原生 OpenAI 和自定义模型条目保留现有控件。
+
+如果更改已保存但刷新失败，对话框会反映已保存的覆盖值，并继续提供 **Retry**。如果服务器报告
+目录收敛失败，Retry 会重新执行目录收敛；如果只是列表请求失败，则重新加载列表。重置后的恢复
+会保留重置操作，不会恢复旧名称。请求的总时限为 60 秒，涵盖写入及后续的列表刷新。超时不会撤销
+写入：进行其他更改前，请使用 **Retry** 检查当前名称。
 
 ## 完整示例
 
@@ -384,7 +434,7 @@ Vercel AI Gateway 可以在多个底层推理提供者之间路由一个模型�
       "baseUrl": "https://ollama.com/v1",
       "apiKey": "${OLLAMA_API_KEY}",
       "defaultModel": "glm-5.2",
-      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
+      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-flash"]
     }
   },
   "subagentModels": ["anthropic/claude-opus-5", "ollama-cloud/glm-5.2"],

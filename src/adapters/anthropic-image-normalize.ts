@@ -20,245 +20,22 @@ import {
   TOTAL_IMAGE_BASE64_BUDGET,
   type ImageBlockRef,
 } from "./anthropic-image-guard";
-import { enforceAppOwnedMemoryBudget } from "../lib/app-owned-memory";
 
-/** One ladder position: dimension cap, JPEG quality attempts, per-image base64 cap. */
-export interface TierSpec {
-  maxEdge: number;
-  qualities: number[];
-  /** Hard per-image base64-length cap at this position; Infinity = terminal (measured size accepted). */
-  hardCap: number;
-}
+export type { TierSpec, NormalizeOptions, EncodeFn, ValidateFn } from "./anthropic-image-codec";
+export { TIER_SPECS, MAX_INPUT_BASE64_LENGTH, IMAGE_NORMALIZE_CONCURRENCY, MAX_INPUT_PIXELS } from "./anthropic-image-codec";
+export { IMAGE_NORMALIZE_CACHE_MAX_BYTES } from "./anthropic-image-codec";
+export { getNormalizeStatsForTests, resetNormalizeStateForTests, setNormalizeCacheLimitsForTests } from "./anthropic-image-codec";
+export { anthropicImageNormalizeRetainedStoreSnapshot, evictOldestAnthropicImageNormalizeForBudget } from "./anthropic-image-codec";
 
-const KiB = 1024;
-const MiB = 1024 * 1024;
-
-/**
- * Ladder positions 0-5. 0-2 are the age-assigned tiers; 3-5 are demotion floor steps.
- * Terminal (last) accepts its measured output so the aggregate loop always terminates
- * (audit round 2, blocker 1).
- */
-export const TIER_SPECS: TierSpec[] = [
-  { maxEdge: 2000, qualities: [80, 60, 40, 30], hardCap: 2 * MiB },
-  { maxEdge: 1024, qualities: [70, 50], hardCap: 512 * KiB },
-  { maxEdge: 700, qualities: [60, 40], hardCap: 192 * KiB },
-  { maxEdge: 500, qualities: [40], hardCap: 100 * KiB },
-  { maxEdge: 400, qualities: [30], hardCap: 100 * KiB },
-  { maxEdge: 320, qualities: [25], hardCap: Infinity },
-];
-const TERMINAL_POS = TIER_SPECS.length - 1;
-
-/** Newest 6 images ride tier 0, the next 14 tier 1, the rest tier 2 (020 tier table). */
-const TIER0_COUNT = 6;
-const TIER1_COUNT = 14;
-
-/** Decode-bomb guards: refuse to decode absurd inputs (020 guards; "extreme values excluded"). */
-export const MAX_INPUT_BASE64_LENGTH = 64 * MiB;
-
-/**
- * First-pass worker-pool width. Memory-bound, not CPU-bound: each in-flight item can
- * hold a decoded bitmap, so this bounds peak memory to ~4 decoded images while still
- * overlapping I/O and native-encode threadpool work. Fixed on purpose — a config knob
- * would widen the adapter contract with no demonstrated need.
- */
-export const IMAGE_NORMALIZE_CONCURRENCY = 4;
-export const MAX_INPUT_PIXELS = 100_000_000;
+import { bunImageEncode, bunImageValidate, processAt, TERMINAL_POS, TIER0_COUNT, TIER1_COUNT } from "./anthropic-image-codec";
+import { recordedEmittedPosition, recordEmittedPosition } from "./anthropic-image-codec";
+import { IMAGE_NORMALIZE_CONCURRENCY, MAX_INPUT_BASE64_LENGTH, MAX_INPUT_PIXELS } from "./anthropic-image-codec";
+import type { NormalizeOptions } from "./anthropic-image-codec";
 
 const UNDECODABLE_TEXT = "[image omitted: undecodable or corrupt image data]";
 const BOMB_TEXT = "[image omitted: image too large to process safely]";
 const OVERFLOW_DROP_TEXT = "[image omitted: total image payload exceeded the provider request budget; older images were dropped]";
 
-/** Formats Anthropic accepts as-is; anything else must be transcoded or dropped. */
-const PASSTHROUGH_MEDIA = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
-
-export interface NormalizeOptions {
-  /** Shift every image's starting ladder position down (413 retry tightening; 030). */
-  tierBias?: number;
-  /** Test seam: replaces the Bun.Image encode path (audit round 1, blocker 6). */
-  encode?: EncodeFn;
-  /** Test seam: replaces the pass-through decode validation (C-gate round 1, blocker 1). */
-  validate?: ValidateFn;
-}
-
-export type EncodeFn = (
-  input: Uint8Array,
-  spec: TierSpec,
-  quality: number,
-) => Promise<{ data: string; mediaType: string }>;
-
-/** Proves the payload fully decodes; must throw for corrupt/truncated data. */
-export type ValidateFn = (input: Uint8Array) => Promise<void>;
-
-type ProcessResult =
-  | { kind: "pass"; b64Length: number }
-  | { kind: "encoded"; data: string; mediaType: string }
-  | { kind: "failed" };
-
-/**
- * Byte-weighted LRU over normalized outputs (audit round 1, blocker 2): aggregate cap,
- * not entry count. Entries are immutable snapshots — demotions write NEW tier-suffixed
- * keys, never mutate stored values.
- */
-export const IMAGE_NORMALIZE_CACHE_MAX_BYTES = 64 * MiB;
-const CACHE_MAX_ENTRIES = 4_096;
-const CACHE_MAX_ENTRY_BYTES = 20 * MiB;
-// "pass" = validated pass-through; "miss" = this position's ladder cannot meet its hard
-// cap for these bytes (skip straight to the next position — C-gate round 2, blocker 1).
-type CacheValue = { data: string; mediaType: string } | "pass" | "miss";
-interface CacheEntry {
-  value: CacheValue;
-  sizeBytes: number;
-  metadataBytes: number;
-  storedAt: number;
-}
-interface NormalizeCacheLimits {
-  maxBytes: number;
-  maxEntries: number;
-  maxEntryBytes: number;
-}
-const DEFAULT_CACHE_LIMITS: NormalizeCacheLimits = {
-  maxBytes: IMAGE_NORMALIZE_CACHE_MAX_BYTES,
-  maxEntries: CACHE_MAX_ENTRIES,
-  maxEntryBytes: CACHE_MAX_ENTRY_BYTES,
-};
-const cacheEncoder = new TextEncoder();
-const cache = new Map<string, CacheEntry>();
-let cacheLimits = { ...DEFAULT_CACHE_LIMITS };
-let cacheBytes = 0;
-let cacheMetadataBytes = 0;
-let cacheSentinelEntries = 0;
-let encodeCalls = 0;
-
-function cacheEntry(key: string, value: CacheValue): CacheEntry {
-  const keyBytes = cacheEncoder.encode(key).byteLength;
-  const valueBytes = typeof value === "string"
-    ? cacheEncoder.encode(value).byteLength
-    : cacheEncoder.encode(value.mediaType).byteLength + cacheEncoder.encode(value.data).byteLength;
-  const metadataBytes = keyBytes + (typeof value === "string"
-    ? cacheEncoder.encode(value).byteLength
-    : cacheEncoder.encode(value.mediaType).byteLength);
-  return { value, sizeBytes: keyBytes + valueBytes, metadataBytes, storedAt: Date.now() };
-}
-
-function deleteCacheEntry(key: string): number {
-  const entry = cache.get(key);
-  if (!entry) return 0;
-  cache.delete(key);
-  cacheBytes -= entry.sizeBytes;
-  cacheMetadataBytes -= entry.metadataBytes;
-  if (typeof entry.value === "string") cacheSentinelEntries--;
-  return entry.sizeBytes;
-}
-
-function cachePut(key: string, value: CacheValue): boolean {
-  const next = cacheEntry(key, value);
-  if (
-    next.sizeBytes > cacheLimits.maxEntryBytes
-    || next.sizeBytes > cacheLimits.maxBytes
-    || cacheLimits.maxEntries <= 0
-  ) return false;
-  const existing = cache.get(key);
-  if (existing !== undefined) {
-    deleteCacheEntry(key); // re-insert refreshes recency and prevents double-count on concurrent misses
-  }
-  while (cache.size + 1 > cacheLimits.maxEntries || cacheBytes + next.sizeBytes > cacheLimits.maxBytes) {
-    const oldest = cache.keys().next().value;
-    if (oldest === undefined || deleteCacheEntry(oldest) === 0) return false;
-  }
-  cache.set(key, next);
-  cacheBytes += next.sizeBytes;
-  cacheMetadataBytes += next.metadataBytes;
-  if (typeof value === "string") cacheSentinelEntries++;
-  enforceAppOwnedMemoryBudget();
-  return true;
-}
-
-/** Read a cache entry, refreshing its recency (true LRU, C-gate round 1 blocker 5). */
-function cacheGet(key: string): CacheValue | undefined {
-  const entry = cache.get(key);
-  if (entry !== undefined) {
-    cache.delete(key);
-    entry.storedAt = Date.now();
-    cache.set(key, entry);
-  }
-  return entry?.value;
-}
-
-/** Test hooks: encoder-invocation counter + cache reset (no production caller). */
-export function getNormalizeStatsForTests(): {
-  encodeCalls: number;
-  cacheEntries: number;
-  cacheBytes: number;
-  sentinelEntries: number;
-  metadataBytes: number;
-  oldestAt: number | null;
-} {
-  return {
-    encodeCalls,
-    cacheEntries: cache.size,
-    cacheBytes,
-    sentinelEntries: cacheSentinelEntries,
-    metadataBytes: cacheMetadataBytes,
-    oldestAt: cache.values().next().value?.storedAt ?? null,
-  };
-}
-export function resetNormalizeStateForTests(): void {
-  cache.clear();
-  cacheBytes = 0;
-  cacheMetadataBytes = 0;
-  cacheSentinelEntries = 0;
-  encodeCalls = 0;
-}
-
-export function setNormalizeCacheLimitsForTests(limits?: Partial<NormalizeCacheLimits>): void {
-  resetNormalizeStateForTests();
-  cacheLimits = limits ? { ...DEFAULT_CACHE_LIMITS, ...limits } : { ...DEFAULT_CACHE_LIMITS };
-}
-
-export function anthropicImageNormalizeRetainedStoreSnapshot(): {
-  count: number;
-  bytes: number;
-  evictableBytes: number;
-  pinnedBytes: number;
-  oldestAt: number | null;
-} {
-  return {
-    count: cache.size,
-    bytes: cacheBytes,
-    evictableBytes: cacheBytes,
-    pinnedBytes: 0,
-    oldestAt: cache.values().next().value?.storedAt ?? null,
-  };
-}
-
-export function evictOldestAnthropicImageNormalizeForBudget(): number {
-  const oldest = cache.keys().next().value;
-  return oldest === undefined ? 0 : deleteCacheEntry(oldest);
-}
-
-/** Default encoder: Bun.Image resize-to-fit + JPEG at the given quality. */
-const bunImageEncode: EncodeFn = async (input, spec, quality) => {
-  const image = new Bun.Image(input);
-  const meta = await image.metadata();
-  const w = typeof meta.width === "number" ? meta.width : 0;
-  const h = typeof meta.height === "number" ? meta.height : 0;
-  let pipeline = new Bun.Image(input);
-  if (w > spec.maxEdge || h > spec.maxEdge) {
-    const scale = spec.maxEdge / Math.max(w, h);
-    pipeline = pipeline.resize(Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)));
-  }
-  const out = await pipeline.jpeg({ quality }).toBuffer();
-  return { data: Buffer.from(out).toString("base64"), mediaType: "image/jpeg" };
-};
-
-/**
- * Default pass-through validation: force a full decode (resize forces pixel decoding, a
- * header-only metadata read does not). A sniffable-but-truncated payload must throw here
- * instead of riding pass-through to an Anthropic 400 (C-gate round 1, blocker 1).
- */
-const bunImageValidate: ValidateFn = async input => {
-  await new Bun.Image(input).resize(1, 1).jpeg({ quality: 1 }).toBuffer();
-};
 
 function mediaTypeOf(ref: ImageBlockRef): string {
   const block = ref.container[ref.index] as { source?: { media_type?: unknown } } | undefined;
@@ -279,72 +56,6 @@ function initialPosition(newestFirstIndex: number, bias: number): number {
   return Math.min(base + Math.max(0, bias), TERMINAL_POS);
 }
 
-/**
- * Process one image at a ladder position: pass through when it already fits the
- * position's caps (Anthropic-native format, dims within maxEdge, size within hardCap —
- * this also exempts possibly-animated GIF/WebP from a lossy re-encode; pass-through is
- * additionally VALIDATED with a full decode once, cached), otherwise walk positions
- * downward encoding until a hard cap is met; terminal accepts measured size.
- * `mediaType` must be the ORIGINAL source media type (cache keys include it — C-gate
- * round 1, blocker 4 — and pass-through eligibility depends on it).
- */
-async function processAt(
-  b64: string,
-  startPos: number,
-  mediaType: string,
-  encode: EncodeFn,
-  validate: ValidateFn,
-): Promise<ProcessResult & { pos: number }> {
-  const dims = sniffImageDimensions(b64);
-  const hash = Bun.hash(b64).toString(36);
-  let input: Uint8Array;
-  try {
-    input = Uint8Array.from(Buffer.from(b64, "base64"));
-  } catch {
-    return { kind: "failed", pos: startPos };
-  }
-  for (let pos = startPos; pos <= TERMINAL_POS; pos++) {
-    const spec = TIER_SPECS[pos];
-    const key = `${hash}:${mediaType}:${pos}`;
-    const cached = cacheGet(key);
-    if (cached === "pass") return { kind: "pass", b64Length: b64.length, pos };
-    if (cached === "miss") continue; // known cap miss: skip to the next position
-    if (cached) return { kind: "encoded", data: cached.data, mediaType: cached.mediaType, pos };
-
-    const fitsDims = dims !== null && dims.width <= spec.maxEdge && dims.height <= spec.maxEdge;
-    if (PASSTHROUGH_MEDIA.has(mediaType) && fitsDims && b64.length <= spec.hardCap) {
-      try {
-        await validate(input); // sniffable-but-truncated data must not ride pass-through
-      } catch {
-        return { kind: "failed", pos };
-      }
-      cachePut(key, "pass");
-      return { kind: "pass", b64Length: b64.length, pos };
-    }
-
-    let last: { data: string; mediaType: string } | null = null;
-    try {
-      for (const quality of spec.qualities) {
-        encodeCalls++;
-        last = await encode(input, spec, quality);
-        if (last.data.length <= spec.hardCap) {
-          cachePut(key, last);
-          return { kind: "encoded", data: last.data, mediaType: last.mediaType, pos };
-        }
-      }
-    } catch {
-      // Decode/encode failure: corrupt or unsupported payload (audit round 2, blocker 2).
-      return { kind: "failed", pos };
-    }
-    if (pos === TERMINAL_POS && last) {
-      cachePut(key, last);
-      return { kind: "encoded", data: last.data, mediaType: last.mediaType, pos };
-    }
-    // Hard cap missed at this position — remember the miss, continue down the ladder.
-    cachePut(key, "miss");
-  }
-  return { kind: "failed", pos: TERMINAL_POS };
-}
 
 /**
  * Wire-neutral image handle (devlog/260714_image_normalization_pipeline/050): the core
@@ -358,6 +69,14 @@ export interface NormalizeTarget {
   mediaType: string;
   replace(data: string, mediaType: string): void;
   drop(note: string): void;
+  /**
+   * True when `drop` leaves the original bytes on the wire instead of removing or
+   * textifying them (openai-chat, which has no downstream guard that could re-attach a
+   * dropped image). The core normally stops counting a dropped target, which is correct
+   * only when the bytes actually leave. Here they do not, so those bytes keep counting
+   * toward the budget and the demotion loop keeps shrinking the images it still can.
+   */
+  retainsBytesOnDrop?: boolean;
 }
 
 export interface NormalizeTargetsOptions extends NormalizeOptions {
@@ -417,18 +136,43 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
       if (newestFirstIndex >= processLimit) continue;
       if (b64.length > MAX_INPUT_BASE64_LENGTH) {
         target.drop(BOMB_TEXT);
+        if (target.retainsBytesOnDrop) {
+          entries[i] = { target, sourceB64: b64, sourceMedia: target.mediaType.toLowerCase(), pos: TERMINAL_POS, size: b64.length, done: true };
+        }
         continue;
       }
       const dims = sniffImageDimensions(b64);
       if (dims && dims.width * dims.height > MAX_INPUT_PIXELS) {
         target.drop(BOMB_TEXT);
+        if (target.retainsBytesOnDrop) {
+          entries[i] = { target, sourceB64: b64, sourceMedia: target.mediaType.toLowerCase(), pos: TERMINAL_POS, size: b64.length, done: true };
+        }
         continue;
       }
       const sourceMedia = target.mediaType.toLowerCase();
-      const pos = initialPosition(newestFirstIndex, bias);
+      // #4532: pin the start position to the image's own identity. A never-seen
+      // image still gets the age-derived tier; a seen image resumes where it last
+      // EMITTED, so appending a newer image cannot re-encode history and bust
+      // Anthropic's prompt prefix cache. tierBias (413 retry) applies on top of
+      // either base and still clamps to TERMINAL_POS.
+      //
+      // Every read in this pass sees the store as it was BEFORE this request,
+      // because nothing is written until the whole request settles (see the
+      // record loop at the end). That is load-bearing, not incidental: an image
+      // can appear more than once in one history, and identity keying collapses
+      // those occurrences onto one entry. Writing during the pass let the OLDEST
+      // occurrence's tier win a race against the newest one and drag it down —
+      // 30 copies of a screenshot all landed on the oldest copy's tier instead of
+      // the age pyramid. Reading a fixed snapshot gives each occurrence its own
+      // age tier on a cold store, which is the pre-#4532 behaviour.
+      const recorded = recordedEmittedPosition(b64, sourceMedia);
+      const pos = Math.min((recorded ?? initialPosition(newestFirstIndex, 0)) + Math.max(0, bias), TERMINAL_POS);
       const result = await processAt(b64, pos, sourceMedia, encode, validate);
       if (result.kind === "failed") {
         target.drop(UNDECODABLE_TEXT);
+        if (target.retainsBytesOnDrop) {
+          entries[i] = { target, sourceB64: b64, sourceMedia, pos: TERMINAL_POS, size: b64.length, done: true };
+        }
         continue;
       }
       let size = b64.length;
@@ -468,8 +212,14 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
     const result = await processAt(entry.sourceB64, entry.pos + 1, entry.sourceMedia, encode, validate);
     if (result.kind === "failed") {
       entry.target.drop(UNDECODABLE_TEXT);
-      sum -= entry.size;
-      entries[entries.indexOf(entry)] = null;
+      if (entry.target.retainsBytesOnDrop) {
+        // Bytes stay on the wire, so they stay in the total; mark it terminal so the
+        // loop moves on to a target it can still shrink instead of retrying this one.
+        entry.done = true;
+      } else {
+        sum -= entry.size;
+        entries[entries.indexOf(entry)] = null;
+      }
       continue;
     }
     let newSize = entry.size;
@@ -485,6 +235,16 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
     entry.done = result.pos >= TERMINAL_POS;
   }
 
+  // #4532: commit the positions these images actually went out at, now that the
+  // first pass and the aggregate demotion loop have both settled. Written here
+  // rather than inline so every read above saw one consistent pre-request
+  // snapshot. `recordEmittedPosition` keeps the deeper of the stored and the new
+  // position, so a repeated image converges on the most-demoted tier it was ever
+  // emitted at and never moves back up.
+  for (const entry of entries) {
+    if (entry) recordEmittedPosition(entry.sourceB64, entry.sourceMedia, entry.pos);
+  }
+
   // Terminal overflow (050 audit round 1, blocker 3): with no downstream guard, drop
   // OLDEST targets until the sum fits.
   if (overflowAction === "drop") {
@@ -492,6 +252,11 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
       const e = entries[i];
       if (!e) continue;
       e.target.drop(OVERFLOW_DROP_TEXT);
+      if (e.target.retainsBytesOnDrop) {
+        // The drop left the bytes in place, so they still count and dropping another
+        // copy of this target would not help. Move on to one that can actually leave.
+        continue;
+      }
       sum -= e.size;
       entries[i] = null;
     }

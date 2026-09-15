@@ -13,7 +13,7 @@ Vous pouvez vous connecter à plusieurs comptes Claude via le tableau de bord de
 ajouter un compte). Par défaut, chaque requête utilise uniquement le compte **actif**.
 
 Un groupe de comptes Claude **expérimental et facultatif** (`anthropicAccountPool.enabled`) ajoute l'affinité de
-session et le basculement en cas de délai de récupération 429 entre ces comptes OAuth. Pour les **nouvelles**
+session et la sélection des nouvelles sessions basée sur l'usage entre ces comptes OAuth. Il ne contrôle **pas** le basculement sur 429 : dès que deux comptes utilisables sont enregistrés, une requête limitée bascule vers un autre compte que l'option soit activée ou non, et cela ne peut pas être désactivé. Pour les **nouvelles**
 sessions uniquement, `anthropicAccountPool.strategy` sélectionne un compte éligible : `quota` (par défaut)
 choisit la plus faible utilisation connue dans la fenêtre configurée par `anthropicAccountPool.quotaWindow`
 (`five-hour` par défaut, `weekly` ou `max-utilization`) lorsqu'elle dépasse `autoSwitchThreshold` ; `round-robin`
@@ -67,6 +67,32 @@ ignore les identifiants Anthropic introduits uniquement par un fichier dotenv du
 dans votre shell reste toujours prioritaire, quel que soit le mode d'authentification. Pour utiliser volontairement une clé API,
 exportez-la (`export ANTHROPIC_API_KEY=...`) au lieu de la laisser dans un fichier de projet.
 
+### Lancement natif de repli quand le routage Claude est désactivé
+
+`ocx claude` échouait auparavant avec une erreur lorsque le routage Claude était désactivé. Il lance
+désormais le binaire natif `claude` à la place, de sorte que la commande reste utile routage coupé :
+
+| Où le routage est désactivé | Ce qui se passe |
+| --- | --- |
+| `claudeCode.enabled: false` dans la configuration | Lancement natif, avec un avis indiquant que le routage est désactivé |
+| Le proxy en cours renvoie `enabled: false` depuis `GET /api/claude-code` | Lancement natif, avec un avis de redémarrer le service après réactivation |
+| `claudeCode.enabled` absent ou `true` | Routage par le proxy, inchangé |
+
+Seul un `false` explicite déclenche le repli : un proxy antérieur à ce champ reste donc routé. Un proxy
+absent n'est pas non plus un déclencheur — routage activé, `ocx claude` démarre toujours le proxy.
+
+Une session native ne doit pas hériter de l'état du proxy. Le repli supprime donc uniquement les valeurs
+dont OpenCodex peut **prouver** la propriété : `ANTHROPIC_BASE_URL` seulement lorsqu'elle pointe vers
+l'adresse de bouclage et le port configuré de ce proxy *et* que le jeton d'admission associé a bien été
+émis par lui ; les leviers `CLAUDE_CODE_*` de découverte et d'auto-contexte ; et les emplacements de
+modèle qui ne se résolvent qu'à travers le proxy (alias routés et identifiants `provider/model`). Tout
+le reste vous appartient et est préservé — une passerelle `http://localhost:8080` sans rapport et vos
+propres identifiants `sk-ant-` survivent tous les deux.
+
+Si le modèle par défaut enregistré dans le sélecteur `/model` est réservé au proxy, la session native
+bascule sur `claudeCode.model` lorsque celui-ci est utilisable nativement, et vous avertit sinon de
+passer `--model <modèle Anthropic>`. Un argument `--model` explicite l'emporte toujours.
+
 ## Mode d'authentification
 
 Claude Code a besoin d'un jeton dans `ANTHROPIC_AUTH_TOKEN` pour communiquer avec une passerelle, mais définir cette
@@ -108,9 +134,12 @@ est temporairement indisponible, la première route disponible de la famille est
 
 Vous pouvez également gérer le même profil depuis la ligne de commande :
 
+Les instructions de modification ci-dessous concernent le profil local. L'application via un hub connecté est décrite séparément plus bas.
+
 ```bash
 ocx claude desktop [apply]
 ocx claude desktop show [--json]
+ocx claude desktop status [--json]
 ocx claude desktop move <route> <opus|fable|sonnet|haiku> [--default]
 ocx claude desktop default <opus|fable|sonnet|haiku> <route|none>
 ocx claude desktop export <path|->
@@ -178,6 +207,67 @@ l'en-tête d'admission dédié du proxy est valide. Par conséquent, l'avertisse
 Désactivez ce comportement avec `claudeCode.nativePassthrough: false` ; définissez une autre destination avec
 `claudeCode.anthropicBaseUrl`.
 
+## Claude Desktop connecté à un hub distant
+
+Sur une machine connectée, `ocx claude desktop apply` ou `ocx claude desktop` récupère
+l'instantané Desktop du hub et écrit son origine ainsi que ses identifiants exacts dans la
+configuration Desktop locale, sans créer d'alias locaux. Les modes static/hybrid copient les
+entrées ; discovery-only utilise l'origine du hub sans intégrer la liste.
+
+Le hub gère le profil, les familles et les valeurs par défaut. Modifiez-les sur le hub, puis
+réappliquez côté client et sélectionnez à nouveau le modèle dans Desktop. Les anciens alias
+créés uniquement sur le client nécessitent aussi cette opération. `show`, les modifications
+locales et import/export restent locaux. En connexion distante,
+`ocx claude desktop import <path> --apply` est refusé avant l'enregistrement ; sans `--apply`,
+l'importation reste locale.
+
+La lecture utilise l'identifiant d'accès aux données de la connexion existante, sans jeton
+administrateur ni envoi de profil. Un ancien hub incompatible, une réponse invalide ou une liste
+Desktop vide fait échouer l'application, sans catalogue local ni adresse de bouclage de secours.
+Mettez à jour ou configurez le hub, puis réappliquez.
+
+Ce changement d'alias ne résout pas la demande distincte de [#3719](https://github.com/lidge-jun/opencodex/issues/3719) concernant la relecture de
+`thinking` / `redacted_thinking` et le cache de prompts. L'accès au proxy seul n'active pas le
+passthrough Anthropic natif ; les routes Anthropic traduites peuvent néanmoins utiliser le cache.
+La fidélité de relecture et la comparaison des accès au cache restent à traiter séparément.
+
+### Rotation des clés, récupération et déconnexion
+
+La rotation et la récupération mettent à jour la clé du profil Desktop géré par la connexion
+avec celle de la connexion locale, sans réapplication manuelle pour migrer la clé. Les ID de
+modèles, familles, valeurs par défaut et la sélection courante sont conservés ; la rotation ne
+resélectionne pas le profil géré et ne réactive pas une intégration désactivée. Dans le JSON CLI,
+`rotation: "committed"` signifie que la nouvelle clé est active ; `rotation: "rolled_back"` signifie
+que l'ancienne a été conservée ou restaurée, sans prétendre qu'elle a été révoquée. Une récupération
+incertaine ou incomplète n'est pas annoncée comme une rotation réussie.
+
+La première application connectée conserve les paramètres gérés et la sélection antérieurs pour
+les restaurer. Réapplication et rotation ne remplacent pas cette référence initiale.
+`ocx disconnect` restaure les paramètres appartenant à la connexion en préservant les champs
+ajoutés par l'utilisateur et les autres profils. La sélection antérieure n'est restaurée que si
+le profil géré reste sélectionné ; un autre profil valide choisi depuis reste sélectionné.
+Un profil créé puis enrichi par l'utilisateur est conservé en mode standard lisible.
+`--keep-catalog` conserve le catalogue, pas la clé Desktop de la connexion.
+
+Un ancien profil géré sans historique peut être migré s'il appartient sans ambiguïté au hub
+courant et à une clé de connexion reconnue. Apply, rotation/récupération ou déconnexion directe
+le prennent en charge sans nouveau drapeau ni réapplication préalable. Un avertissement précise
+que la déconnexion utilisera le mode standard faute de paramètres antérieurs enregistrés.
+Seuls les paramètres de passerelle appartenant à la connexion sont retirés ; les champs utilisateur
+et une sélection distincte valide restent intacts. Ce résultat est un repli standard, pas une
+restauration de l'original.
+
+Les conflits de paramètres gérés, identifiants inconnus ou données de restauration endommagées
+sont conservés et signalés. Un nettoyage interrompu reprend uniquement pour la même connexion,
+sans effacer une nouvelle connexion ni annoncer une restauration incomplète comme terminée.
+Terminez la récupération de rotation avant la déconnexion et gardez le même choix de conservation
+du catalogue lors d'une nouvelle tentative.
+
+Quittez complètement puis rouvrez Claude Desktop après application, rotation/récupération ou
+restauration : le processus en cours peut garder l'ancienne clé. Aucun redémarrage automatique
+n'est effectué. La déconnexion locale ne révoque pas automatiquement la clé du hub et n'efface
+pas les copies externes ; révoquez-la séparément sur le hub si nécessaire.
+
 ## Le sélecteur /model (« Depuis la passerelle »)
 
 Claude Code 2.1.129+ découvre les modèles de passerelle via `GET /v1/models?limit=1000` et les répertorie dans
@@ -200,8 +290,16 @@ anciens alias hachés et les identifiants `claude-ocx-<provider>--<model>` des c
 toujours résolus.
 
 Si le sélecteur situé au bas de Claude Desktop ne modifie pas le modèle d'une conversation 3P déjà en cours,
-utilisez `/model <id>` dans cette conversation. OpenCodex ne peut pas observer l'état du sélecteur ; il
-achemine l’identifiant du modèle porté par chaque requête. Confirmez le résultat sous **Journaux → requestModel**.
+vous pouvez essayer `/model <id>`, mais ce contournement peut également échouer sur les versions de Desktop
+concernées. Le [ticket #3782](https://github.com/lidge-jun/opencodex/issues/3782) rapporte que sous Windows,
+avec Claude Desktop 1.46388.4, la conversation continue d'utiliser son modèle initial après des changements
+via le sélecteur du bas comme via `/model`. Ce signalement ne permet pas d'établir quel composant du client
+ou du routage est à l'origine de ce comportement.
+
+Vous pouvez aussi essayer de sélectionner le modèle par défaut souhaité dans le profil Claude Desktop
+d'OpenCodex, de réappliquer ce profil et de démarrer une nouvelle conversation. Il s'agit d'une étape de
+dépannage, sans garantie de résolution. OpenCodex ne peut pas observer l'état du sélecteur ; il achemine
+l'identifiant du modèle porté par chaque requête. Vérifiez ce que le client envoie sous **Logs → requestedModel**.
 
 Les modèles dont la fenêtre de contexte de référence atteint 1M obtiennent une ligne supplémentaire `…[1m]` dans le sélecteur.
 Sa sélection indique à Claude Code la fenêtre complète de 1M pour ce modèle, tout en maintenant le compactage automatique ; le proxy retire
@@ -221,6 +319,16 @@ utilisent l'alias haché. Les identifiants de modèle peuvent contenir `--` (la 
 
 **Ordre de résolution du modèle :** retrait du marqueur `[1m]` → décodage de l'alias lisible → décodage de l'alias haché
 de Claude Desktop → correspondance exacte dans `modelMap` → correspondance sans date (suffixe `-20250514` retiré) → transfert direct.
+
+<a id="desktop-alias-resolution"></a>
+
+Un ID Desktop de forme datée non résolu peut aussi être un véritable modèle natif absent de
+la découverte. Messages et count-tokens renvoient HTTP 503 avec l’erreur fixe `desktop_model_mapping_unavailable` lorsque les informations disponibles ne permettent pas de résoudre cet ID ; cela ne
+prouve pas que le modèle est invalide. Les anciens alias de type hash inconnus restent rejetés
+avec HTTP 400. Aucun des deux cas ne retire la date ni ne choisit une autre route. Les ID connus,
+les correspondances enregistrées et les entrées exactes de `modelMap`, dont les véritables ID
+natifs reconnus, conservent leur traitement. Actualisez la découverte ou réappliquez le profil du
+hub connecté avant de réessayer ; une simple nouvelle tentative ne garantit pas la résolution.
 
 Chaque entrée porte un nom d'affichage tel que `gemini-3-pro (gemini)`, ainsi que toutes les fonctionnalités du modèle
 (échelle d'effort de raisonnement et types de réflexion) dans la structure officielle `ModelInfo`. Les véritables modèles Anthropic
@@ -319,6 +427,8 @@ l'élision). Le contenu de remplacement préserve l'association entre l'appel d'
 
 Ordre de recherche : alias de découverte → identifiant exact → identifiant sans le suffixe de date (`-20250514`) → transfert direct.
 
+Voir la [résolution des alias Desktop](#desktop-alias-resolution) pour les règles de rejet.
+
 ## Matrice des services auxiliaires : recherche web et compréhension des images
 
 Les modèles routés ne disposent pas tous des mêmes outils hébergés ou de la même prise en charge des images. opencodex comble ces lacunes
@@ -398,11 +508,13 @@ Le proxy traduit chaque requête Anthropic Messages API au format Codex Response
 | Texte assistant | `output_text` |
 | Assistant `tool_use` | `function_call` (`input` → JSON-stringifié `arguments`) |
 | Utilisateur `tool_result` | `function_call_output` (`is_error` → préfixe `[tool error]`) |
-| Relecture de `thinking` / `redacted_thinking` | Ignorée |
+| Relecture de `thinking` / `redacted_thinking` | Éléments `reasoning` avec enveloppes `ocxr1` bornées pour les signatures et les contenus masqués |
 | Outils fonctionnels | `{type: "function"}` (`web_search*` → `{type: "web_search"}`) |
 | `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, fonction nommée→`{type:"function",name}`, hébergée WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
+
+Sur l’adaptateur Anthropic prévu, les blocs signés non masqués (y compris thinking vide) et les blocs redacted opaques sont préservés. `hideThinkingSummary` reste inchangé : le texte signé masqué localement n’est pas exposé aux clients Claude ; sa relecture sans perte via cette frontière reste non établie. Les anciennes enveloppes combinées ne permettent pas de rétablir l’ordre après émission du texte en streaming. `claudeCode.compatibility: "enforce"` refuse toujours la relecture thinking. Cela ne prouve ni l’acceptation réelle par Anthropic ni une amélioration du cache ; [#3719](https://github.com/lidge-jun/opencodex/issues/3719) reste ouvert.
 
 **Cas d'erreur (400) :** JSON mal formé ; `model` absent ou vide ; `messages` absent ou vide ; rôle non pris en charge ;
 `tool_result` sans `tool_use_id` ; `tool_use` sans identifiant ni nom ; `tool_choice` nommé sans nom.
@@ -414,7 +526,8 @@ Le proxy traduit chaque requête Anthropic Messages API au format Codex Response
 | `response.created` | `message_start` + `ping` |
 | Battement de coeur | `ping` |
 | Deltas de texte | `content_block_start` → `content_block_delta` (texte) → `content_block_stop` |
-| Résumé ou texte de raisonnement | Bloc `thinking` avec signature synthétique |
+| Résumé ou texte de raisonnement | Bloc `thinking` avec la signature relue, ou une enveloppe de secours `ocxr1` bornée |
+| Raisonnement expurgé | Blocs `redacted_thinking` relus depuis l'enveloppe de raisonnement |
 | Trames d'appel de fonction | Bloc `tool_use` avec `input_json_delta` |
 | Événement terminal | `message_delta` → `message_stop` |
 | EOF avant la borne | style 502 `api_error` |
@@ -510,3 +623,7 @@ par défaut par un contenu minimal (`blockedSkills: ["claude-api"]`).
 **Les sous-agents sont envoyés au mauvais modèle** — Les agents de la liste (`ocx-*`) utilisent les directives
 `<!-- ocx-route: ... -->`, et non l'argument `model` de l'outil Agent. Vérifiez que la directive désigne la route voulue.
 Utilisez `"haiku"` comme valeur de remplacement pour le modèle.
+
+Dans `config.json`, `claudeCode.stabilizePromptCache: true` déplace les notices Claude reconnues en fin des instructions système vers un dernier message utilisateur sur les routes traduites. La valeur par défaut est `false`. Activez cette option seulement si ce changement de rôle convient à vos clients. Les exemples dans des blocs de code et le texte non reconnu sont conservés ; le transfert Anthropic natif reste inchangé. Sans métadonnées, la clé de cache suit les instructions stabilisées. Cette option ne crée pas une identité de conversation et ne garantit aucun succès du cache amont.
+
+Sur la route Chat d’OpenCode Go pour `deepseek-v4.1-flash`, les rappels système traduits dans l’historique conservent automatiquement leur position et leur rôle system, après les résultats d’outils encore attendus. Ainsi, l’ajout de rappels ne réécrit pas le prompt système initial. Ce comportement s’applique avec ou sans `stabilizePromptCache` ; la conversion des autres modèles et destinations, ainsi que le transfert Anthropic natif, restent inchangés. La réutilisation du cache exige toujours une identité de session stable et un cache disponible en amont. Les changements des instructions ou outils antérieurs et la compaction de la conversation peuvent aussi affecter les succès du cache ; préserver l’ordre des rappels ne suffit pas à garantir sa réutilisation.

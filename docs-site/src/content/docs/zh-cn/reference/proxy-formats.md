@@ -19,6 +19,10 @@ Responses 表示是这座桥的中心。原生兼容的路由可以跳过部分�
 [Configuration](/reference/configuration/) 中配置监听器和准入密钥；当一个公开模型 ID
 需要在多个目标之间选择时，请使用 [Combos](/guides/combos/)。
 
+## 上游重定向
+
+携带凭据的模型、图像、视频和搜索请求不会自动跟随 HTTP 重定向，包括同源重定向。请配置最终上游 API URL，而不是会重定向的别名。服务器不会向重定向目标重新发送凭据或请求正文。各响应处理路径保留原有的错误处理或转发行为；原生 Responses 和 compact 路径仍可向客户端返回原始 3xx 和 `Location`。客户端的重定向行为与此服务器传输策略是不同的边界。
+
 ## 端点总览
 
 | 客户端表面 | 端点 | 成功的非流式结果 | 成功的流式或套接字结果 |
@@ -27,7 +31,7 @@ Responses 表示是这座桥的中心。原生兼容的路由可以跳过部分�
 | OpenAI Chat Completions | `POST /v1/chat/completions` | `chat.completion` JSON | 以 `chat.completion.chunk` SSE 结尾并带 `[DONE]` |
 | Anthropic Messages | `POST /v1/messages` | Anthropic `message` JSON | Anthropic Messages SSE |
 | Anthropic token count | `POST /v1/messages/count_tokens` | `{ "input_tokens": number }` | 不适用 |
-| 模型发现 | `GET /v1/models` | 三种目录契约之一 | 不适用 |
+| 模型发现 | `GET /v1/models` | 目录或显式 Desktop 快照 | 不适用 |
 | 语音和 Realtime | `POST /v1/live`, `POST /v1/realtime/calls` | 转发的调用创建响应 | 独立的 sideband WebSocket 双向转发帧 |
 | Responses compaction | `POST /v1/responses/compact` | 替换历史 JSON | 不适用 |
 
@@ -149,6 +153,10 @@ choice 增量、带 `finish_reason` 的终止 choice，以及 `data: [DONE]`。�
 
 这些端点使用 Claude Code 和兼容客户端所采用的 Anthropic Messages 方言。大多数请求会被转换为 Responses，按常规路由，然后再转换回 Anthropic JSON 或 Anthropic SSE。
 
+转换后的 Messages 请求在重放推理数据时共享整个请求的转换预算，其中包含编码和解码产生的副本开销。
+超出预算时返回 HTTP 413 和 `translation_buffer_limit`，不会为了满足限制而截断签名或不透明推理数据。
+原生 Anthropic 透传使用独立的请求体大小限制。
+
 只有在满足以下全部条件时，原生 Anthropic 透传才有资格启用：
 
 - Claude Code 配置中尚未禁用原生透传；
@@ -168,9 +176,15 @@ choice 增量、带 `finish_reason` 的终止 choice，以及 `data: [DONE]`。�
 { "input_tokens": 123 }
 ```
 
+无法解析的日期型 Desktop ID 也可能是发现结果中缺失的真实原生模型 ID。现有信息不足以
+解析该 ID 时，Messages 和 count-tokens 返回 HTTP 503 及固定错误 `desktop_model_mapping_unavailable`；这并不证明
+模型无效。未知的旧版哈希别名仍返回 HTTP 400。两种情况都不会去除日期或回退到其他路由。
+已知 ID、已注册映射、精确 `modelMap` 匹配及已识别的真实原生 ID 保持原有处理方式。
+请刷新模型发现或重新应用已连接 hub 的配置后再试；仅重试本身不能保证解决。
+
 ## `GET /v1/models`
 
-同一路由要服务三种期望不兼容目录封装的客户端。除非同时存在 `client_version`，否则 Anthropic 形态优先。
+未指定 `format=desktop-config` 时，使用以下普通目录契约：
 
 | 契约 | 触发条件 | 顶层形态 | 模型 ID 行为 |
 | --- | --- | --- | --- |
@@ -178,7 +192,30 @@ choice 增量、带 `finish_reason` 的终止 choice，以及 `data: [DONE]`。�
 | Codex catalog | `client_version` 查询参数 | `{ "models": [...] }` | 原生和路由条目携带更丰富的 Codex catalog 字段、可见性、effort、WebSocket 和 multi-agent 元数据 |
 | Plain OpenAI list | 两个触发条件都没有 | `{ "object": "list", "data": [...] }` | 可见的原生 ID 是裸值；路由 ID 是别名或 `provider/model` |
 
+### Desktop 配置快照
+
+`GET /v1/models?ids=desktop&format=desktop-config` 显式选择 Desktop 快照，不依赖
+user-agent。响应为 `{ "version": 1, "models": [...] }`，带有 `Cache-Control: no-store`。
+客户端发送 `Accept: application/json`、`anthropic-version: 2023-06-01` 及现有数据访问凭证；
+不需要管理员令牌，也不上传配置。条目是 hub 发放的 Desktop 配置模型，不是 Codex 目录行。
+
+此格式与 `ids=cli` 或任意 `client_version` 一起使用时返回 HTTP 400。不指定格式时，上述普通
+契约保持不变。Claude 关闭时返回 `{ "version": 1, "models": [] }`；已连接的 Desktop apply
+会视为不可用，不写入替代配置。返回普通目录而非版本 1 的旧 hub 不受支持，客户端不会回退到
+本地生成的 ID。
+
+快照仍是只读模型列表，不是密钥轮换或配置上传 API。Desktop 密钥迁移、恢复与断开由现有
+客户端连接流程处理。轮换保留模型条目和选择；CLI 的 `rotation` 区分 `committed` 与
+`rolled_back`。断开会恢复管理设置，或对已确认的旧配置报告标准回退，同时保留用户字段和
+后来有效的选择。冲突或未完成的恢复不会标为完成。需要重启 Desktop 才会读取磁盘变更；
+断开不会自动撤销 hub 密钥。参见 [Desktop 指南](/zh-cn/guides/claude-code/)。
+thinking 重放与提示缓存仍由独立的 [#3719](https://github.com/lidge-jun/opencodex/issues/3719) 跟进。
+
 ## `POST /v1/live` 和 Realtime sideband
+
+下文的账户绑定说明适用于原生 Codex 客户端。通过外部 API 密钥使用语音转写和 GPT-Live，请参阅[英文音频 API 规范](/reference/proxy-formats/#streaming-dictation)。
+
+Connections > API keys 包含独立的听写和实时语音区域。数据密钥仅保留在表单内存中。听写会上传所选文件；语音连接检查不使用麦克风，而是等待会话确认。已配置不代表连接成功。
 
 `POST /v1/live` 接受 ChatGPT/Codex App 的 Frameless call-creation 表面。
 `POST /v1/realtime/calls` 接受 OpenAI Realtime 的 call-creation 表面。opencodex 会选择
@@ -218,15 +255,20 @@ Compaction 会为需要缩短长 Responses 会话的客户端返回替换历史�
 
 | 表面 | Dedicated | Bearer | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP 和 WebSocket | 必需 | 被代理准入拒绝 | 被拒绝 |
-| `/v1/responses/compact` | 必需 | 被代理准入拒绝 | 被拒绝 |
-| `/v1/chat/completions` | 必需 | 被代理准入拒绝 | 被拒绝 |
+| `/v1/responses` HTTP 和 WebSocket | 接受 | 接受 | 被拒绝 |
+| `/v1/responses/compact` | 接受 | 接受 | 被拒绝 |
+| `/v1/chat/completions` | 接受 | 接受 | 被拒绝 |
 | `/v1/messages` 和 `/v1/messages/count_tokens` | 接受 | 接受 | 接受 |
 | `/v1/models` | 接受 | 接受 | 接受 |
 | `/v1/live`、`/v1/realtime/calls` 和 sideband join | 接受 | 接受 | 接受 |
 
-Responses 家族和 Chat 请求会把 `Authorization` 留给提供方或 Codex Direct
-透传，因此远程代理密钥必须使用专用头。Messages 和 Realtime 表面需要更广泛的客户端兼容性，因此接受这三种形式。
+Responses 系列和 Chat 请求接受专用标头或 Bearer 字段中的代理密钥。在原生路由上，所选的已保存 Codex 凭据会替换 admission bearer；其他路由会移除该 bearer。代理密钥绝不会用作 upstream 凭据。如果还要提供独立的 provider bearer，请将代理密钥放在专用标头中。
+
+没有密钥且不使用 OAuth 的 Cursor 路由可以使用调用方单独提供的 bearer，但不能使用代理 secret 或自动补充的 ChatGPT main 凭据。Combo/policy 选择以及实际发生的 shadow/thread-spawn 路由改写不会将调用方的原始凭据传递给新目标。规范 OpenAI 路由仅在 JWT 包含 ChatGPT 账户声明，且任何显式账户标头都与该声明匹配时，才可在内部路由变更后恢复调用方的单个非代理密钥 bearer。 向可选的 OpenAI sidecar 转发调用方认证时，需要单个 JWT 以及显式提供且匹配的 `chatgpt-account-id`。即使提供了显式账户标头，opaque bearer 也不会跨路由变更恢复。 除此之外，最终目标必须拥有自己的配置、OAuth 或已保存凭据，否则请求会在本地失败。只有 thread-spawn 标记而没有路由变化时，不会移除凭据。
+
+对于未配置密钥的 Cursor Chat 请求，只有实际计划了 OpenAI 辅助调用且存在规范的 Direct 候选时，才会补充已存储的 main 身份验证。无关的 Cursor 请求不会通过此流程占用 native main，因此不会延迟配置文件切换。辅助调用凭据仍受启动和切换保护限制，并与 Cursor bearer 分离。Pool 及明确指定账号的辅助调用保留现有账号选择。
+
+Claude replay 只会以当前 turn 已取得所有权的内存 snapshot 保留 main 凭据，并且仅在最终目标为规范 ChatGPT 路由时恢复它。
 
 :::caution
 数据平面密钥不是管理凭证。管理 API 使用单独的 admin secret；
@@ -242,7 +284,7 @@ Responses 家族和 Chat 请求会把 `Authorization` 留给提供方或 Codex D
 | 401 | `authentication_error` | 所需的代理准入凭证缺失或无效 |
 | 403 | `origin_rejected` | 一条 Responses/OpenAI 数据平面请求或 WebSocket 升级来自不允许的 origin |
 | 503 | `combo_unavailable` | 所选 combo 中的所有目标都不可用、处于冷却、已禁用或以其他方式不具备资格 |
-| 400 | `unreadable_encrypted_agent_task` | 一个加密的 v2 worker task 没有任何可消费它的合格原生 ChatGPT 目标 |
+| 400 | `unreadable_encrypted_agent_task` | 一个加密的 v2 worker task 没有任何可处理它的合格规范 ChatGPT 目标或明确信任的 Responses 目标 |
 | 426 | `upgrade_required` | Responses WebSocket 传输被禁用，或升级失败；请改用 HTTP |
 
 Anthropic 来源的失败会以 Anthropic 的错误封装呈现，因此该方言中的 origin 拒绝会是

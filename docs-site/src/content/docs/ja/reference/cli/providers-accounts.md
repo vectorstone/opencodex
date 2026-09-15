@@ -13,7 +13,7 @@ description: プロバイダー構成、資格情報、クォータ、および�
 
 |サブコマンド |サポートされているフラグ |アクション |
 | --- | --- | --- |
-| `list` | `--json` |構成されたプロバイダーと残りのレジストリ エントリを一覧表示します。 |
+| `list` | `--json`, `--jsonl` |構成されたプロバイダーと残りのレジストリ エントリを一覧表示します。 `--jsonl` は設定済みプロバイダーごとに1行の JSON オブジェクトを出力します。 |
 | `add <name>` | `--adapter <adapter>`、`--base-url <url>`、`--api-key <key>`、`--default-model <model>`、`--set-default`、`--force`、`--json`、`--sync` |レジストリ/カスタムプロバイダーを追加します。 `--force` は上書きします。 `--sync` は、実行中のプロキシを人間出力モードで更新します。 |
 | `edit <name>` |プロバイダーフィールドフラグ、`--headers <json>`、`--json` |キー プールを置き換えずに、検証済みのライブ プロバイダー フィールドを編集します。`--headers` はカスタム要求ヘッダーをマージします。`{}` または `-` を渡すとクリアします。 |
 | `test <name>` | `--json` |実際の上流モデルのエンドポイントを調査します。 |
@@ -27,6 +27,7 @@ description: プロバイダー構成、資格情報、クォータ、および�
 
 ```bash
 ocx provider list --json
+ocx provider list --jsonl
 ocx provider test ark
 ocx provider add anthropic --api-key sk-ant-... --set-default --sync
 ocx provider add local-dev --adapter openai-chat --base-url http://localhost:11434/v1
@@ -34,6 +35,8 @@ ocx provider show anthropic --json
 ocx models --provider anthropic --json
 ocx models live --provider ark --json
 ```
+
+`--jsonl` は設定済みプロバイダーのみを、1行につき1つの JSON オブジェクトとして出力します。各オブジェクトのフィールドは `--json` の `configured` 配列の要素と同じで、`registryCount` の集計は含みません。スクリプトは各行のオブジェクトを順に処理できます。`--json` と `--jsonl` は同時に指定できません。
 
 :::caution[カスタムヘッダーは認証情報の経路ではありません]
 `--headers` は秘密ではないリクエストメタデータ用です — ルーティングヒント、テナントや
@@ -58,7 +61,7 @@ ocx models live --provider ark --json
 
 プロバイダーの登録済みログイン フローを開始します。 OAuth プロバイダーはブラウザを開き、自動更新された認証情報を `~/.opencodex/` に保存します。 API キー ログイン プロバイダーは、キー ダッシュボードを開き、キーの入力を求め、可能な場合は検証し、結果のプロバイダー設定を保存します。名前が欠落しているか不明な場合、このコマンドは現在受け入れられている OAuth および API キーのプロバイダー ID を出力します。
 
-`ocx status` / `ocx doctor` が再認証が必要であるか、端末の更新失敗を報告した後、同じコマンドを使用して **再認証**します (またはダッシュボードで再認証を使用します)。 Codex プール アカウントはパブリック `ocx login` プロバイダーではありません。代わりに、ダッシュボード Codex アカウント プール (再認証) またはヘッドレス `ocx account reauth` フローを介して再認証します。
+`ocx status` / `ocx doctor` が再認証が必要であるか、端末の更新失敗を報告した後、同じコマンドを使用して **再認証**します (またはダッシュボードで再認証を使用します)。 Codex プール アカウントは上記の OAuth / API キーのプロバイダーではありませんが、`ocx login codex` から到達できます。このコマンドはアカウントプールのログインに転送されるため、`ocx login codex --reauth` は `ocx account reauth codex` と同じです。ダッシュボードの Codex アカウントプール (再認証) でも行えます。この経路はプロキシ内部で動くため、プロキシの起動が必要です。
 
 ```bash
 ocx login xai
@@ -76,7 +79,7 @@ ocx login anthropic
 実行中のプロキシを介してプロバイダー アカウントと API キー プールを一覧表示し、切り替えます。出荷されたヘルプ画面は次のとおりです。
 
 ```text
-Usage: ocx account <list|current|use|refresh|auto-switch|priority|login|reauth|code|cancel|remove|add-key|reset-credits> ...
+Usage: ocx account <list|current|use|refresh|auto-switch|priority|login|reauth|code|cancel|remove|add-key|reset-credits|grok-reset-coupons> ...
 
 list [provider]     Codex account pool, OAuth accounts and API keys (identifiers shown masked as the API returns them).
 current <provider>  Show the active account or key.
@@ -88,6 +91,7 @@ remove <provider> <id> --yes  Remove a stored account or key after an existence 
 add-key <provider> [--label <label>]  Add a key read only from piped stdin.
 login/reauth/code/cancel  Run browser or manual-code auth from a headless shell.
 reset-credits <id|main> [--consume --yes]  Inspect or consume Codex reset credits.
+grok-reset-coupons [<id>] [--consume --yes] [--token-id <token-id>] [--operation-id <uuid>]  Inspect or redeem Grok reset coupons.
 Codex pool selection applies to the next request after clearing existing affinity; in-flight requests keep their captured account.
 ```
 
@@ -113,7 +117,7 @@ Codex pool selection applies to the next request after clearing existing affinit
 
 ### `ocx account list [provider] [--json] [--all] [--quota [--refresh]]`
 
-プロバイダーを使用しない場合、Codex プール、OAuth アカウント、および設定された API キー プールが一覧表示されます。 `--all` が存在しない限り、空のプロバイダーはスキップされます。プロバイダーを使用すると、その資格情報ファミリーのみがリストされます。人間の出力では `PROVIDER TYPE ID PLAN/LABEL PRIORITY STATUS` を使用します。手動で選択した Codex 行には `selected` というマークが付けられます。利用可能な Kiro アカウントが 2 つ以上保存されている場合、既定では 429 を受けると別のアカウントへ自動的に切り替え、既知の残り利用枠が最も多いアカウントを優先します。この切り替えはアカウントの存在によって有効になり、`oauthAccountFailover.enabled: false` で無効にできます。`ocx account login kiro` はアカウントを 1 件ずつプールへ追加します。結果が空であっても成功です。 `--json` は次を返します:
+プロバイダーを使用しない場合、Codex プール、OAuth アカウント、および設定された API キー プールが一覧表示されます。 `--all` が存在しない限り、空のプロバイダーはスキップされます。プロバイダーを使用すると、その資格情報ファミリーのみがリストされます。人間の出力では `PROVIDER TYPE ID PLAN/LABEL PRIORITY STATUS` を使用します。手動で選択した Codex 行には `selected` というマークが付けられます。利用可能な Kiro アカウントが 2 つ以上保存されている場合、既定では 429 を受けると別のアカウントへ自動的に切り替え、既知の残り利用枠が最も多いアカウントを優先します。この切り替えはアカウントの存在によって有効になり、無効にはできません。`oauthAccountFailover.enabled: false` が断るのは 429 復旧ではなく、送信前にアカウントを選ぶ動作だけです。`ocx account login kiro` はアカウントを 1 件ずつプールへ追加します。結果が空であっても成功です。 `--json` は次を返します:
 
 ```text
 { accounts: AccountRow[], notes: string[] }
@@ -149,10 +153,11 @@ OAuth プロバイダーと API キー プロバイダーの場合、これに�
 
 ### `ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]`
 
-`openai` Codex アカウント プールのみを制御します。 `on` は 80% を設定し、`off` は 0% を設定します。`status` は現在の値を読み取り、`threshold <n>` は 0 ～ 100 の整数を受け入れます。他のプロバイダーと無効な値は 1 を終了します。`--json` は次を返します。
+`openai` Codex プールのしきい値を制御するか、汎用 OAuth プールのしきい値を保存します。`on` は 80%、`off` は 0%、`threshold <n>` は 0–100 を保存します。汎用プールのしきい値は `pool.kernel` が有効で `strategy: "fill-first"` の場合にのみ選択へ反映されます。フラグが無効なら、保存してもしきい値による切り替えは有効になりません。いずれの場合もプロバイダーの有効化設定と 429 エラー時のローテーションは変更されません。汎用プールの照会と変更の結果はサーバーの確認値を使用します。汎用プールの `poolEnabled` は保存された設定で、`null` は未指定です。継承後の実効状態ではありません。`inert: true` は保存済みで未適用、`inert: false` はプールが適用中であることを示します。`inert` が無い場合は機能が不明であり、その場合も `enabled: true` とは表示しません。API キープロバイダー、Anthropic、不正な値は拒否されます。
 
 ```text
-{ provider, autoSwitchThreshold: number, enabled: boolean }
+openai: { provider, autoSwitchThreshold: number, enabled: boolean }
+generic OAuth: { provider, autoSwitchThreshold: number | null, enabled: boolean, poolEnabled: boolean | null, inert: boolean | null }
 ```
 
 ### `ocx account priority <provider> <account-id|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]`
@@ -170,7 +175,7 @@ Codex pool のアカウント別選択順を読み書きします。**値が大�
 適格なアカウントの中で行われ、まだ quota に余裕がある最上位 tier を取り、その中は
 `accountPoolStrategy` が選びます。一時停止、cooldown、再認証には影響しません。変更は新しいセッションだけでなく **次の未バインドリクエスト** から適用されます。上位の順序に余裕が戻れば
 preemption が未バインドリクエストを直ちに引き上げます。既にアカウントに紐づいた thread は、通常はそのアカウントを
-使い切るまで維持します。ただし再認証エラー、quota cooldown、一時的な失敗の連続はそれより早く紐付けを解除します。受理された書き込みは、どのアカウントの手動の「今すぐこのアカウントを使う」固定も解除します。すでに設定済みの順序を書き込んだ場合も同様で、これは現在選択中のアカウントを保ったまま固定を解除する唯一の方法です（管理 API でアクティブアカウントを解除しても固定は解除されますが、その選択自体も失われます）。プロキシに接続できない場合、
+使い切るまで維持します。再認証エラーと quota cooldown はそれより早く紐付けを解除できます。一時的な失敗の連続は live な紐付けを削除しなくなりました。受理された書き込みは、どのアカウントの手動の「今すぐこのアカウントを使う」固定も解除します。すでに設定済みの順序を書き込んだ場合も同様で、これは現在選択中のアカウントを保ったまま固定を解除する唯一の方法です（管理 API でアクティブアカウントを解除しても固定は解除されますが、その選択自体も失われます）。プロキシに接続できない場合、
 不明なアカウント id、受け付けない値はいずれも終了コード 1 です。`--json` は次を返します。
 
 ```text
@@ -209,6 +214,26 @@ security find-generic-password -w openrouter | ocx account add-key openrouter --
 
 アカウントの Codex リセット クレジットを検査します。クレジットの消費は破壊的であり、`--consume` と `--yes` の両方が必要です。
 
+### `ocx account grok-reset-coupons [<account-id>] [--consume --yes [--token-id <id>] [--operation-id <uuid>]] [--json]`
+
+xAI / Grok アカウントの残りリセット クーポンを検査または換金します。
+
+`--consume` を付けずに実行すると、利用可能なクーポン トークンと有効期限ウィンドウを返します:
+
+```bash
+ocx account grok-reset-coupons
+ocx account grok-reset-coupons acc_xai_01 --json
+```
+
+リセット クーポンの換金は請求状態を変更し、クーポン トークンを 1 つ恒久的に消費します。`--consume` には `--yes` が厳密に必要です:
+
+```bash
+ocx account grok-reset-coupons --consume --yes
+ocx account grok-reset-coupons --consume --yes --token-id <token-id>
+```
+
+`--operation-id <uuid>`（有効な UUIDv4 である必要があります）を指定すると、冪等な確定が保証されます。ネットワークが切断されたりコマンドが再試行されたりしても、同一の操作 ID は 2 つ目のクーポンを消費する代わりに、永続化された結果を再生します。
+
 ### `ocx account main <subcommand>`
 
 OpenCodex のアカウントプールルーティングを変更せずに、名前付きのネイティブ Codex メインログインプロファイルを管理します。
@@ -218,6 +243,9 @@ ocx account main doctor [--json]
 ocx account main list [--json]
 ocx account main register <label> [--json]
 ocx account main add <label>
+ocx account main reauth --device [--no-wait] [--json]
+ocx account main reauth status --flow <id> [--json]
+ocx account main reauth cancel --flow <id> [--json]
 ocx account main switch <profile-id-or-label> --yes [--json]
 ocx account main recover [--rollback --yes] [--json]
 ```

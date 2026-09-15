@@ -40,6 +40,11 @@ Vérifie de manière idempotente qu’un proxy d’arrière-plan est actif, puis
 
 Rétablit le fonctionnement natif de Codex **sans arrêter** le proxy : les lignes de configuration injectées et les entrées routées du catalogue sont supprimées, de sorte qu’une invocation simple de `codex` utilise de nouveau Codex directement. `eject` est un alias de `restore`.
 
+Le catalogue restauré exclut les modèles natifs retirés, dont `gpt-5.3-codex-spark`,
+que leurs identifiants soient nus ou qualifiés par un compte de confiance. Cette règle
+s’applique avec ou sans sauvegarde ; la sauvegarde originale et les anciens choix de modèles
+enregistrés par l’utilisateur sont conservés.
+
 Ajoutez `back` à l’une ou l’autre forme pour rediriger une invocation simple de `codex` vers un proxy déjà actif, sans modifier le cycle de vie du proxy :
 
 ```bash
@@ -52,6 +57,10 @@ ocx eject back
 Récupération explicite destinée aux anciennes versions de développement qui remappaient l’historique de Codex App avant l’ajout des sauvegardes réversibles. Fermez d’abord Codex si sa base de données d’historique est verrouillée.
 
 Il s'agit d'un réétiquetage large et destructif : chaque fil contenant un message utilisateur et actuellement marqué `opencodex` passe à `openai`, `exec` est normalisé en `cli` et l'indicateur d'événement est activé. L'historique légitime d'un fournisseur dédié est également concerné. Sauvegardez l'état et n'exécutez la commande que si vous souhaitez cette portée complète.
+
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+Réparez l'historique d'une tâche compactée par un fournisseur routé avant de la reprendre avec Codex natif. La commande sélectionne exactement une tâche par UUID, enregistre d'abord une sauvegarde privée octet par octet, puis convertit uniquement l'état de compaction `ocx1:` propre à OpenCodeX en résumé ordinaire relisible par Codex natif. Le contenu chiffré natif et les autres tâches restent inchangés. Fermez la tâche sélectionnée avant d'exécuter la commande ; toute modification simultanée du rollout interrompt la récupération sans remplacer le fichier.
 
 ### `ocx uninstall` · `ocx remove`
 
@@ -134,23 +143,52 @@ La section **OAuth reliability** indique si le stockage des identifiants est acc
 
 ## Synchronisation du catalogue
 
-### `ocx sync [--restart-codex]`
+### `ocx sync [--restart-codex] [--restart-app-server-only]`
 
 Récupère la liste active des modèles de chaque fournisseur configuré et réinjecte le catalogue fusionné dans Codex. Exécutez cette commande après l’ajout d’un fournisseur ou pour actualiser les modèles disponibles.
 
 Avant la découverte des fournisseurs ou le remplacement du catalogue et du cache, `ocx sync` vérifie que la configuration Codex gérée peut recevoir l’injection. Si cette validation refuse la configuration, la commande renvoie un code non nul, affiche la cause précise sur stderr et laisse le catalogue ainsi que le cache existants inchangés. `ocx restore back` effectue la même vérification préalable sans écriture avant de réactiver le routage.
 
-Si des processus Codex `app-server` de longue durée sont encore actifs, `ocx sync` avertit qu’ils peuvent continuer à servir l’ancienne liste de modèles conservée en mémoire, même après la mise à jour de `opencodex-catalog.json` / `models_cache.json`. Ajoutez `--restart-codex` pour envoyer `SIGTERM` uniquement aux processus `codex … app-server` et `codex-code-mode-host` correspondants qui appartiennent à l’utilisateur actuel ; les tours actifs peuvent être interrompus. La recherche générale `pkill -f codex` est volontairement évitée.
+Si des processus Codex `app-server` de longue durée sont encore actifs, `ocx sync` avertit qu’ils peuvent continuer à servir l’ancienne liste de modèles conservée en mémoire, même après la mise à jour de `opencodex-catalog.json` / `models_cache.json`. Ajoutez `--restart-codex` pour redémarrer les processus `codex … app-server` et `codex-code-mode-host` correspondants **et** quitter puis relancer entièrement l’application Codex Desktop, sous macOS, Linux et Windows, afin que le sélecteur de modèles relise le catalogue. Les conversations en cours se terminent. La recherche générale `pkill -f codex` est volontairement évitée.
 
-### `ocx sync-cache [--restart-codex]`
+`--restart-desktop-app` est un alias déprécié de `--restart-codex`. Il fonctionne encore, affiche un avis de dépréciation, et n’est pas limité à Windows.
 
-Invalide le cache local du sélecteur de modèles de Codex afin qu’il soit reconstruit à partir du catalogue opencodex actif. Le même avertissement concernant un `app-server` obsolète et le même comportement facultatif `--restart-codex` que pour `ocx sync` s’appliquent.
+`--restart-app-server-only` rétablit le comportement étroit d’avant : `SIGTERM` uniquement aux processus app-server et code-mode-host correspondants appartenant à l’utilisateur actuel, l’application Desktop restant ouverte. Les tours actifs peuvent encore être interrompus. Combiné avec `--restart-codex` ou `--restart-desktop-app`, c’est la portée étroite qui l’emporte, car perdre des conversations en cours est irrécupérable, contrairement à un sélecteur périmé.
+
+Lorsque la commande s’exécute depuis l’application Codex, le redémarrage est confié à un assistant détaché et cette session se termine avec l’application.
+
+### `ocx sync-cache [--restart-codex] [--restart-app-server-only]`
+
+Invalide le cache local du sélecteur de modèles de Codex afin qu’il soit reconstruit à partir du catalogue opencodex actif. Le même avertissement concernant un `app-server` obsolète et les mêmes options de redémarrage que pour `ocx sync` s’appliquent.
+
+### `ocx catalog pull <https-url> [--auth-env <NAME>] [--json] [--restart-codex] [--restart-app-server-only]`
+
+Installe un catalogue complet servi par le point de terminaison `/v1/catalog` d'une autre instance
+OpenCodex, puis synchronise `models_cache.json`. L'URL doit être en HTTPS ; le HTTP est accepté
+uniquement en loopback. Les identifiants intégrés à l'URL, les requêtes, les fragments, les
+redirections, les réponses trop volumineuses et les catalogues invalides sont refusés avant toute
+écriture locale. L'authentification est facultative et lue uniquement par référence à une variable
+d'environnement (`--auth-env`), jamais depuis argv.
+
+Le catalogue et le cache sont écrits sous le verrou de catalogue Codex partagé ; un échec préserve
+les derniers fichiers valides connus. Des octets identiques constituent une non-opération qui
+préserve les mtimes. `--restart-codex`, `--restart-app-server-only` et l'alias déprécié
+`--restart-desktop-app` ont ici le même sens que pour `ocx sync` et `ocx sync-cache`, et ne
+s'appliquent qu'après une écriture réelle. Les requêtes conditionnelles `ETag` ne font pas partie
+de cette commande. Voir la [référence anglaise](/reference/cli/lifecycle/) pour l'enveloppe
+`--json` complète et les codes de sortie.
 
 ## Service d’arrière-plan
 
 ### `ocx service [install|repair|restart|start|stop|status|uninstall|remove]`
 
 Exécute opencodex comme service d’arrière-plan géré à l’ouverture de session — **launchd** sous macOS, **unité utilisateur systemd** sous Linux et **Task Scheduler** sous Windows — qui démarre automatiquement à la connexion et redémarre après un plantage. Les services définissent `OCX_SERVICE=1` afin qu’un redémarrage ne réécrive pas inutilement la configuration Codex.
+
+Les installations via le Planificateur de tâches Windows utilisent une priorité de processus normale (`Priority=4`).
+L’ancienne priorité d’arrière-plan (`7`, également la valeur par défaut si le paramètre est omis) peut retarder les réponses
+aux contrôles de santé en cas de contention CPU : la zone de notification affiche alors Offline même si le processus fonctionne.
+Après la mise à jour, exécutez `ocx service repair` pour migrer cette priorité enregistrée et redémarrer le service.
+Une confirmation UAC peut être nécessaire. Une priorité déjà normale ou haute ne déclenche pas, à elle seule, de réenregistrement.
 
 | Sous-commande | Action |
 | --- | --- |
@@ -260,7 +298,7 @@ Installe et contrôle l’icône OpenCodex dans la zone de notification Windows.
 
 ### `ocx gui`
 
-Ouvre le [tableau de bord Web](/fr/guides/web-dashboard/) à l’adresse `http://localhost:<port>` et démarre automatiquement le proxy s’il n’est pas actif.
+Ouvre le [tableau de bord Web](/fr/guides/web-dashboard/) à l’adresse `http://localhost:<port>` — ou `http://127.0.0.1:<port de gestion>` lorsque l’ingress de gestion du hub est activé — et démarre automatiquement le proxy s’il n’est pas actif.
 
 ## Mise à jour
 

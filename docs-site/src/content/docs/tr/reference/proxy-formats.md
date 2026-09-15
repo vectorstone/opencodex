@@ -23,6 +23,10 @@ sınırında gerçekleşir. Dinleyiciyi ve kabul anahtarlarını
 genel model kimliği birkaç hedef arasından seçim yapması gerektiğinde
 [Kombolar](/tr/guides/combos/) kullanın.
 
+## Üst sunucu yönlendirmeleri
+
+Kimlik bilgisi taşıyan model, görsel, video ve arama istekleri, aynı origin içindeki yönlendirmeler dâhil HTTP yönlendirmelerini otomatik izlemez. Yönlendiren bir adres yerine son API URL’sini yapılandırın. Sunucu, kimlik bilgilerini veya istek gövdesini yönlendirme hedefine yeniden göndermez. Mevcut hata işleme ve yanıt aktarma davranışı korunur; native Responses ve compact yolları, özgün 3xx ve `Location` değerini istemciye döndürebilir. İstemcinin yönlendirme davranışı bu sunucu aktarım politikasından ayrıdır.
+
 ## Uç nokta genel bakışı
 
 | İstemci yüzeyi | Uç nokta | Başarılı akışsız sonuç | Başarılı akış veya soket sonucu |
@@ -31,7 +35,7 @@ genel model kimliği birkaç hedef arasından seçim yapması gerektiğinde
 | OpenAI Chat Completions | `POST /v1/chat/completions` | `chat.completion` JSON | `[DONE]` ile biten `chat.completion.chunk` SSE |
 | Anthropic Messages | `POST /v1/messages` | Anthropic `message` JSON | Anthropic Messages SSE |
 | Anthropic belirteç sayısı | `POST /v1/messages/count_tokens` | `{ "input_tokens": sayi }` | Geçerli değil |
-| Model keşfi | `GET /v1/models` | Üç katalog sözleşmesinden biri | Geçerli değil |
+| Model keşfi | `GET /v1/models` | Katalog veya açıkça istenen Desktop anlık görüntüsü | Geçerli değil |
 | Ses ve Realtime | `POST /v1/live`, `POST /v1/realtime/calls` | İletilen çağrı oluşturma yanıtı | Ayrı bir yan bant WebSocket her iki yönde de çerçeveleri iletir |
 | Responses sıkıştırması | `POST /v1/responses/compact` | Değiştirme geçmişi JSON'ı | Geçerli değil |
 
@@ -233,10 +237,18 @@ yerel belgelenmiş tahmini kullanır ve şunu döndürür:
 { "input_tokens": 123 }
 ```
 
+Çözümlenemeyen tarih biçimli bir Desktop kimliği, keşifte yer almayan gerçek bir yerel model
+kimliği de olabilir. Mevcut bilgi kimliği çözmeye yetmiyorsa Messages ve count-tokens sabit
+`desktop_model_mapping_unavailable` hatasıyla HTTP 503 döndürür; bu, modelin geçersiz olduğunu kanıtlamaz.
+Bilinmeyen eski hash takma adları HTTP 400 ile reddedilmeye devam eder. Her iki durumda da tarih
+kaldırılmaz ve başka rotaya geçilmez. Bilinen kimlikler, kayıtlı eşlemeler, tam `modelMap`
+eşleşmeleri ve tanınan gerçek yerel kimlikler aynı şekilde işlenir. Yeniden denemeden önce model
+keşfini yenileyin veya bağlı hub profilini yeniden uygulayın; yalnızca tekrar denemek çözümü
+garanti etmez.
+
 ## `GET /v1/models`
 
-Aynı rota uyumsuz katalog zarfları bekleyen üç istemciye hizmet verir.
-`client_version` da mevcut olmadıkça Anthropic türü kazanır.
+`format=desktop-config` belirtilmezse aşağıdaki olağan katalog sözleşmeleri kullanılır:
 
 | Sözleşme | Tetikleyici | Üst düzey şekil | Model kimliği davranışı |
 | --- | --- | --- | --- |
@@ -244,7 +256,34 @@ Aynı rota uyumsuz katalog zarfları bekleyen üç istemciye hizmet verir.
 | Codex kataloğu | `client_version` sorgu parametresi | `{ "models": [...] }` | Yerel ve yönlendirilen girdiler daha zengin Codex katalog alanlarını, görünürlüğü, çabayı, WebSocket ve çoklu ajan meta verilerini taşır |
 | Düz OpenAI listesi | Hiçbir tetikleyici yok | `{ "object": "list", "data": [...] }` | Görünür yerel kimlikler yalındır; yönlendirilen kimlikler takma adlar veya `sağlayıcı/model`'dir |
 
+### Desktop yapılandırma anlık görüntüsü
+
+`GET /v1/models?ids=desktop&format=desktop-config`, user-agent'tan bağımsız olarak Desktop
+anlık görüntüsünü seçer. Yanıt `{ "version": 1, "models": [...] }` ve `Cache-Control: no-store`
+başlığıdır. İstemci `Accept: application/json`, `anthropic-version: 2023-06-01` ve mevcut veri
+erişim kimlik bilgilerini gönderir; yönetici belirteci veya profil yüklemesi gerekmez.
+Girdiler Codex katalog satırları değil, hub'ın verdiği Desktop yapılandırma modelleridir.
+
+Bu biçim `ids=cli` veya herhangi bir `client_version` ile kullanılırsa HTTP 400 döner. Biçim
+seçicisi yoksa yukarıdaki olağan sözleşmeler değişmez. Claude kapalıysa
+`{ "version": 1, "models": [] }` döner; bağlı Desktop apply bunu kullanılamaz sayar ve yeni
+profil yazmaz. Sürüm 1 yerine olağan katalog döndüren eski hub'lar desteklenmez; yerel üretilmiş
+kimliklere geçilmez.
+
+Anlık görüntü salt okunur model listesidir; anahtar döndürme veya profil yükleme API'si değildir.
+Desktop anahtar taşıma, kurtarma ve bağlantıyı kesme mevcut istemci yaşam döngüsünü kullanır.
+Döndürme modelleri ve seçimi korur; CLI `rotation` alanı `committed` ile `rolled_back` sonucunu
+ayırır. Bağlantıyı kesme yönetilen ayarları geri yükler veya tanınan eski profil için standart
+moda dönüşü bildirir; kullanıcı alanları ve sonraki geçerli seçimler korunur. Çatışma veya eksik
+kurtarma tamamlanmış sayılmaz. Disk değişiklikleri için Desktop'ı yeniden başlatın; bağlantıyı
+kesmek hub anahtarını otomatik iptal etmez. [Desktop kılavuzuna](/tr/guides/claude-code/) bakın.
+Thinking yeniden gönderimi ve önbellek, ayrı [#3719](https://github.com/lidge-jun/opencodex/issues/3719) işidir.
+
 ## `POST /v1/live` ve Realtime yan bandı
+
+Aşağıdaki hesap bağlantısı yerel Codex istemcileri içindir. Harici API anahtarıyla dikte ve GPT-Live kullanımı için [İngilizce ses API belirtimine](/reference/proxy-formats/#streaming-dictation) bakın.
+
+Connections > API keys altında Dikte ve Canlı Ses bölümleri bulunur. Veri anahtarı yalnızca form belleğinde tutulur. Dikte seçilen dosyayı gönderir; ses bağlantısı kontrolü mikrofon kullanmadan oturum onayını bekler. Yapılandırılmış olması bağlantının başarılı olduğu anlamına gelmez.
 
 `POST /v1/live`, ChatGPT/Codex App Frameless çağrı oluşturma yüzeyini kabul
 eder. `POST /v1/realtime/calls`, OpenAI Realtime çağrı oluşturma yüzeyini kabul
@@ -295,17 +334,20 @@ ve `x-api-key` anlamına gelir.
 
 | Yüzey | Özel | Bearer | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP ve WebSocket | Gerekli | Proxy kabulü için reddedilir | Reddedilir |
-| `/v1/responses/compact` | Gerekli | Proxy kabulü için reddedilir | Reddedilir |
-| `/v1/chat/completions` | Gerekli | Proxy kabulü için reddedilir | Reddedilir |
+| `/v1/responses` HTTP ve WebSocket | Kabul Edilir | Kabul Edilir | Reddedilir |
+| `/v1/responses/compact` | Kabul Edilir | Kabul Edilir | Reddedilir |
+| `/v1/chat/completions` | Kabul Edilir | Kabul Edilir | Reddedilir |
 | `/v1/messages` ve `/v1/messages/count_tokens` | Kabul Edilir | Kabul Edilir | Kabul Edilir |
 | `/v1/models` | Kabul Edilir | Kabul Edilir | Kabul Edilir |
 | `/v1/live`, `/v1/realtime/calls` ve yan bant katılımları | Kabul Edilir | Kabul Edilir | Kabul Edilir |
 
-Responses ailesi ve Sohbet istekleri `Authorization`'ı sağlayıcı veya Codex
-Direct doğrudan geçişi için ayırır, bu nedenle uzak bir proxy anahtarı özel
-başlığı kullanmalıdır. Messages ve Realtime yüzeyleri daha geniş istemci
-uyumluluğuna ihtiyaç duyar ve bu nedenle üç formu da kabul eder.
+Responses ailesi ve Chat istekleri, özel başlıkta veya Bearer alanında bir proxy anahtarını kabul eder. Yerel Codex rotalarında seçilen kayıtlı Codex kimlik bilgisi kabul bearer’ının yerini alır; diğer rotalarda bu bearer kaldırılır. Proxy anahtarı hiçbir zaman upstream kimlik bilgisi olarak kullanılmaz. Ayrı bir sağlayıcı bearer’ı da gönderiyorsanız proxy anahtarını özel başlığa koyun.
+
+Anahtarı olmayan ve OAuth kullanmayan bir Cursor rotası, çağıranın ayrı bearer’ını kullanabilir; proxy sırrını veya otomatik eklenen ChatGPT main kimlik bilgisini kullanamaz. Combo/policy seçimi ve gerçekleşen shadow/thread-spawn rota değişiklikleri, çağıranın ham kimlik bilgilerini yeni hedeflere aktarmaz. Kanonik OpenAI yönlendirmesi, dahili rota değişikliğinden sonra çağıranın proxy anahtarı olmayan tek bearer’ını yalnızca JWT’si bir ChatGPT hesap claim’i içeriyorsa ve açıkça belirtilmiş herhangi bir hesap başlığı bu claim ile eşleşiyorsa geri yükleyebilir. Çağıranın kimlik doğrulamasını isteğe bağlı OpenAI sidecar’larına iletmek için tek bir JWT ve onunla eşleşen, açıkça belirtilmiş bir `chatgpt-account-id` gerekir. Opaque bearer’lar, açıkça belirtilmiş bir hesap başlığı olsa bile rota değişikliklerinden sonra geri yüklenmez. Diğer durumlarda son hedefin kendi yapılandırılmış, OAuth veya kayıtlı kimlik bilgisi bulunmalıdır; aksi hâlde istek yerel olarak başarısız olur. Rota değişmeden yalnızca thread-spawn işaretinin bulunması kimlik bilgilerini kaldırmaz.
+
+Yapılandırılmış anahtarı olmayan Cursor'a gönderilen Chat isteğinde, kayıtlı main kimliğiyle isteğe bağlı tamamlama ancak bir OpenAI yardımcısı gerçekten planlandığında ve kanonik Direct adayı bulunduğunda yapılır. İlgisiz bir Cursor isteği bu yoldan native main üzerinde sahiplik almaz ve profil geçişini geciktirmez. Yardımcı kimlik bilgileri başlangıç ve profil geçişi korumalarına uyar ve Cursor bearer'ından ayrı tutulur. Pool ve belirli hesaba yönelen yardımcılar mevcut hesap seçimini korur.
+
+Claude replay, main kimlik bilgisini yalnızca ilgili turn tarafından sahipliği alınmış bir bellek snapshot’ında tutar ve yalnızca son hedef kanonik bir ChatGPT rotasıysa geri yükler.
 
 :::caution
 Veri düzlemi anahtarları yönetim kimlik bilgileri değildir. Yönetim API'si ayrı
@@ -324,7 +366,7 @@ anlamları kararlıdır:
 | 401 | `authentication_error` | Gerekli bir proxy kabul kimlik bilgisi eksik veya geçersiz |
 | 403 | `origin_rejected` | Bir Responses/OpenAI veri düzlemi isteği veya WebSocket yükseltmesi izin verilmeyen bir kaynaktan geldi |
 | 503 | `combo_unavailable` | Seçilen komdodaki her hedef kullanılamaz, soğumada, devre dışı veya başka şekilde uygun değil |
-| 400 | `unreadable_encrypted_agent_task` | Şifrelenmiş bir v2 çalışan görevinin onu tüketebilecek uygun yerel bir ChatGPT hedefi yok |
+| 400 | `unreadable_encrypted_agent_task` | Şifrelenmiş bir v2 çalışan görevinin onu işleyebilecek uygun kurallı ChatGPT hedefi veya `allowEncryptedV2AgentTasks: true` ile açıkça güvenilen doğrudan anahtar kimlik doğrulamalı Responses hedefi yok |
 | 426 | `upgrade_required` | Responses WebSocket aktarımı devre dışı bırakıldı veya yükseltme başarısız oldu; HTTP kullanın |
 
 Anthropic kaynaklı arızalar Anthropic'in hata zarfında işlenir, bu nedenle
@@ -347,4 +389,3 @@ okuyamazsa opencodex bu sağlayıcıya okunamayan baytlar göndermek yerine
 `unreadable_encrypted_agent_task` ile başarısız olur. Çalışan görevleri
 etrafındaki istemci davranışı için [Alt Ajan
 Arayüzü](/tr/guides/sub-agent-surface/) sayfasına bakın.
-

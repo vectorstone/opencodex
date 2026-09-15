@@ -94,8 +94,9 @@ rehberlik yalnızca tercih edilen bir model, uygun kadro veya geri dönüş zinc
 istem oluşturmak için yeterlidir; yalın bir değer benzersiz şekilde
 çözümlenemezse `{{model}}` boş bir dizeye genişler.
 
-v1'de opencodex yalnızca `max` veya `ultra` çabada yukarı akış tarzı proaktif
-yetkilendirme rehberliğini enjekte eder. v1'de tercih edilen bir model, kadro,
+v1'de opencodex, yalnızca `max` veya `ultra` çaba düzeylerinde v2'nin önerilen ön ayarıyla aynı proaktif görev devri metnini enjekte eder.
+Yalnızca tetikleme koşulu değişir: ayrıca görev devri talep edilmesi gerekmez; kullanıcı talimatları, yetkiler, görev kapsamı ve iş birliği araçlarının kuralları geçerliliğini korur.
+v1'de tercih edilen bir model, kadro,
 geri dönüş listesi veya özel istem eklemez.
 
 Varsayılan olarak kapalı olan `syncCodexSubagentDefaults` seçeneği rehberlikten
@@ -133,8 +134,10 @@ probları `subagentModelFallbackPollMs` (varsayılan olarak 60 saniye) boyunca
 önbelleğe alınır.
 
 Geri dönüş, uyumsuz şifrelenmiş görevleri okunabilir kılmaz. Çocuk görevi
-ChatGPT için şifrelendiğinde, zincirde daha önce harici bir model görünse bile
-seçim kurallı yerel ChatGPT hedefleriyle sınırlandırılır.
+ChatGPT için şifrelendiğinde, zincirde daha önce başka bir harici model görünse
+bile seçim kurallı yerel ChatGPT hedefleriyle ve
+`allowEncryptedV2AgentTasks: true` kullanılarak açıkça güvenilen doğrudan anahtar kimlik doğrulamalı Responses
+rotalarıyla sınırlıdır. Kombolar yalnızca kurallı yerel hedefleri kullanmaya devam eder.
 
 ## Şifrelenmiş v2 görev teslimi
 
@@ -146,18 +149,19 @@ bilinen [#92 sınırlamasıdır](https://github.com/lidge-jun/opencodex/issues/9
 opencodex boş veya okunamayan bir görevi iletmek yerine güvenli bir şekilde
 başarısız olur:
 
-- Doğrudan yerel olmayan bir rota `error.code =
-  "unreadable_encrypted_agent_task"` ile HTTP 400 döndürür ve şifreli metni
-  yankılamaz.
+- Uygun olmayan doğrudan yerel olmayan bir rota `error.code =
+  "unreadable_encrypted_agent_task"` ile HTTP 400 döndürür ve şifreli metni yankılamaz.
+  `allowEncryptedV2AgentTasks: true` ile açıkça etkinleştirilen uygun bir doğrudan anahtar
+  kimlik doğrulamalı Responses sağlayıcısı bunun yerine opak şifreli metni alır ve bu hatayı atlar.
 - Bir kombo, yeniden denemeler de dahil olmak üzere bu görev için yalnızca
   kurallı yerel ChatGPT hedeflerini değerlendirir. Hiçbiri yoksa aynı 400
   hatasını döndürür.
 - Okunabilir bir düz metin görevi normal rota ve geri dönüş davranışını korur.
 
-Kurtarma seçenekleri, yerel bir ChatGPT çocuğu seçmek, komboya yerel bir ChatGPT
-hedefi eklemek, heterojen sağlayıcı yetkilendirmesi için v1 kullanmak veya
-arayanı denetlediğinizde görevi düz metin v2 `agent_message` içeriği olarak
-yeniden göndermektir.
+Kurtarma seçenekleri, yerel bir ChatGPT çocuğu seçmek, opak yükü tüketebilen doğrudan anahtar
+kimlik doğrulamalı bir Responses geçidine açıkça güvenmek, komboya yerel bir ChatGPT hedefi
+eklemek, heterojen sağlayıcı yetkilendirmesi için v1 kullanmak veya arayanı denetlediğinizde
+görevi düz metin v2 `agent_message` içeriği olarak yeniden göndermektir.
 
 Deneysel, varsayılan olarak devre dışı bırakılmış bir `agentTaskRecovery`
 seçeneği, `authMode: "forward"` ile kurallı `openai` sağlayıcısı tarafından
@@ -210,7 +214,7 @@ kullanın:
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
-ocx agent fallback set gpt-5.4-mini,xai/grok-4.5 --poll-ms 60000
+ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx agent effort set --subagent max
 ```
 
@@ -315,5 +319,3 @@ sabitler.
 
 Model bağlam sınırı alt ajan modundan bağımsızdır. Modeller sayfasında
 yapılandırın; yerel OpenAI modelleri gerçek bağlam pencerelerini korur.
-
-

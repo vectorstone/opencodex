@@ -9,7 +9,7 @@
  * - 다른 대안 대신 이 방식을 선택한 이유: GUI/CLI의 검증 규칙이 갈라지지 않고 fallback port도 안전하게 찾는다.
  * - 장점, 단점 및 영향: 동작 일관성이 높아지는 대신 live 관리 명령은 실행 중인 proxy가 필요하다.
  */
-import { findLiveProxy, probeHostname } from "../server/proxy-liveness";
+import { findLiveProxy, probeHostname, type LivenessIo, type LiveProxy } from "../server/proxy-liveness";
 import { runningProxyUpdateHeaders } from "../oauth/login-cli";
 
 export type CliStdin = NodeJS.ReadableStream & { isTTY?: boolean; readableEnded?: boolean };
@@ -20,6 +20,8 @@ export interface RuntimeApiDeps {
   /** Test injection for commands that read a secret from stdin instead of argv. */
   stdinImpl?: CliStdin;
   stdinTimeoutMs?: number;
+  /** Optional proxy liveness probe injection for commands that check or fall back around live runtime state. */
+  findLiveProxy?: (io?: LivenessIo) => Promise<LiveProxy | null>;
 }
 
 export class CliUsageError extends Error {
@@ -42,7 +44,7 @@ export class RuntimeApiError extends Error {
 
 export async function runtimeBaseUrl(deps: RuntimeApiDeps = {}): Promise<string> {
   if (deps.baseUrl) return deps.baseUrl.replace(/\/$/, "");
-  const live = await findLiveProxy();
+  const live = await (deps.findLiveProxy ?? findLiveProxy)();
   if (!live) throw new RuntimeApiError("Proxy is not running. Start it with: ocx start", 503, null);
   return `http://${probeHostname(live.hostname)}:${live.port}`;
 }
@@ -77,7 +79,12 @@ function responseMessage(body: unknown, status: number): string {
   if (reason && reason !== primary) parts.push(`reason: ${reason}`);
   const hint = stringField(record, "hint");
   if (hint && hint !== primary) parts.push(`hint: ${hint}`);
-  return parts.join("\n").slice(0, 1200);
+  const snapshotPath = stringField(record, "snapshotPath");
+  const recovery = [
+    ...(snapshotPath ? [`Backup: ${snapshotPath.slice(0, 32768)}`] : []),
+    ...(record.residual === true ? ["Automatic recovery did not finish; check the client configuration before retrying."] : []),
+  ];
+  return [parts.join("\n").slice(0, 1200), ...recovery].join("\n");
 }
 
 export async function runtimeRequest<T = unknown>(
@@ -341,6 +348,31 @@ export async function readSecretLine(deps: RuntimeApiDeps, label: string): Promi
 export function printData(value: unknown, wantsJson: boolean, lines?: string[]): void {
   if (wantsJson || !lines) console.log(JSON.stringify(value, null, 2));
   else for (const line of lines) console.log(line);
+}
+
+/**
+ * Render untrusted diagnostic text without letting it control the operator's terminal. Catalog
+ * values are hub-supplied and surface on more than one CLI path -- first-time `ocx connect` and the
+ * connected `ocx sync` refresh both print them -- so the escaping sits beside `printData`, at the
+ * one boundary that already separates human output from structured output. Structured output keeps
+ * the exact value: escaping is a rendering decision for a tty, not a change to the data.
+ */
+export function terminalSafeText(value: string): string {
+  return value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, character => {
+    const code = character.charCodeAt(0);
+    return code <= 0x7f
+      ? `\\x${code.toString(16).padStart(2, "0")}`
+      : `\\u${code.toString(16).padStart(4, "0")}`;
+  });
+}
+
+/**
+ * The same rendering for a failure about to be printed or rethrown. The original is kept as
+ * `cause` rather than discarded, so a caller that inspects the domain error still reads the exact
+ * message and fields it threw.
+ */
+export function terminalSafeError(error: unknown): Error {
+  return new Error(terminalSafeText(error instanceof Error ? error.message : String(error)), { cause: error });
 }
 
 /** Compact human view for safe management DTOs; JSON remains available for complete fidelity. */

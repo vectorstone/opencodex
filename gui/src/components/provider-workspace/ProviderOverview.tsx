@@ -7,12 +7,14 @@ import { readJsonOrThrow } from "../../fetch-json";
 import { useT, useI18n } from "../../i18n/shared";
 import { IconAlert, IconCheck } from "../../icons";
 import { binProviderStatus, type WorkspaceItem } from "../../provider-workspace/catalog";
-import { formatRelativeTime, relativeTimeLabelsFromT, formatRequestCount, formatTokenCount } from "../../provider-workspace/usage";
-import { accountQuotaFromReport, formatQuotaSourceLabel, type ProviderQuotaReportView } from "../../provider-workspace/report";
-import type { ProviderUsageTotals } from "./types";
+import { formatRequestCount, formatTokenCount } from "../../provider-workspace/usage";
+import type { ProviderQuotaReportView } from "../../provider-workspace/report";
+import type { AccountQuotaReading, ProviderUsageTotals } from "./types";
 import { authModeLabel } from "./ProviderRail";
 import type { ProviderUpdatePatch, ProviderUpdateResult } from "./types";
-import { ProviderCapacityQuota } from "./ProviderCapacityQuota";
+import ProviderCurrentQuota from "./ProviderCurrentQuota";
+import type { CatalogPreset } from "../provider-catalog/provider-presets";
+import ProviderSponsor from "./ProviderSponsor";
 
 type ConnectionTestResult = {
   applicable?: boolean;
@@ -30,14 +32,17 @@ type ConnectionTestState = {
 };
 
 export default function ProviderOverview({
-  item, usageTotals, quotaReport, oauthEmail, oauth,
+  item, preset, usageTotals, quotaReport, currentQuotaReading, onRefreshQuota, oauthEmail, oauth,
   apiBase, connectionIdentity,
   onEditSettings, onViewUsage, onUpdateProvider,
   onReauthenticate, onCancelLogin, reauthBusy = false,
 }: {
   item: WorkspaceItem;
+  preset?: CatalogPreset;
   usageTotals?: ProviderUsageTotals;
   quotaReport?: ProviderQuotaReportView;
+  currentQuotaReading?: AccountQuotaReading;
+  onRefreshQuota?: () => Promise<boolean>;
   oauthEmail?: string;
   /** Login state for OAuth summaries that carry no email (e.g. Cursor/Kimi). */
   oauth?: { loggedIn?: boolean };
@@ -53,7 +58,6 @@ export default function ProviderOverview({
 }) {
   const t = useT();
   const { locale } = useI18n();
-  const timeLabels = relativeTimeLabelsFromT(t);
   const status = binProviderStatus(item);
   const needsAttention = Boolean(item.activeNeedsReauth);
   const statusText = status === "ready"
@@ -63,7 +67,6 @@ export default function ProviderOverview({
       : t("prov.disabledBadge");
   const requests = usageTotals?.requests;
   const tokens = usageTotals?.totalTokens;
-  const quota = accountQuotaFromReport(quotaReport);
   const connectionProbeKey = JSON.stringify([
     apiBase ?? null,
     item.name,
@@ -140,6 +143,8 @@ export default function ProviderOverview({
       ? (connectionResult.message || t("pws.connectionOk"))
       : (connectionResult?.error || t("pws.connectionFailed"));
   return (
+    <>
+    <ProviderSponsor item={item} preset={preset} />
     <div className="pws-overview-layout">
       <div className="pws-overview-main">
       <section className="pws-section" aria-label={t("pws.connection")}>
@@ -166,12 +171,6 @@ export default function ProviderOverview({
             <dt>{t("modal.defaultModel")}</dt>
             <dd>{item.defaultModel ?? <span className="muted">—</span>}</dd>
           </div>
-          {item.note && (
-            <div className="pws-kv-row">
-              <dt>{t("pws.cell.note")}</dt>
-              <dd className="muted">{item.note}</dd>
-            </div>
-          )}
         </dl>
         {apiBase && (
           <div className="row" style={{ marginTop: 12, alignItems: "center" }}>
@@ -200,13 +199,6 @@ export default function ProviderOverview({
           </button>
         )}
       </section>
-
-      {quotaReport && (
-        <section className="pws-section" aria-label={t("pws.rateLimits")}>
-          <h3 className="pws-section-title">{t("pws.rateLimits")}</h3>
-          <ProviderCapacityQuota report={quotaReport} pending={false} />
-        </section>
-      )}
 
       <section className="pws-section" aria-label={t("pws.authSummary")}>
         <h3 className="pws-section-title">{t("pws.authSummary")}</h3>
@@ -257,6 +249,7 @@ export default function ProviderOverview({
           </div>
         )}
       </section>
+      <NotesSection item={item} onUpdateProvider={onUpdateProvider} />
       </div>
 
       <aside className="pws-overview-sidebar">
@@ -275,18 +268,7 @@ export default function ProviderOverview({
               <dd className="pws-kv-mono">{formatTokenCount(tokens, locale)}</dd>
             </div>
           )}
-          {quotaReport && (
-            <div className="pws-kv-row">
-              <dt>{t("pws.stats.quotaUpdated")}</dt>
-              <dd
-                className="pws-kv-mono"
-                title={quotaReport.source ? formatQuotaSourceLabel(quotaReport.source) : undefined}
-              >
-                {formatRelativeTime(quotaReport.updatedAt, timeLabels)}
-              </dd>
-            </div>
-          )}
-          {typeof requests !== "number" && typeof tokens !== "number" && !quotaReport && (
+          {typeof requests !== "number" && typeof tokens !== "number" && (
             <div className="muted">{t("pws.usageUnavailable")}</div>
           )}
         </dl>
@@ -295,12 +277,12 @@ export default function ProviderOverview({
             {t("pws.viewUsage")} →
           </button>
         )}
-        {quota && <div className="muted pws-stats-note">{t("pws.stats.quotaTracked")}</div>}
       </section>
 
-      <NotesSection item={item} onUpdateProvider={onUpdateProvider} />
+      <ProviderCurrentQuota key={`${item.name}:${connectionIdentity ?? ""}`} report={quotaReport} reading={currentQuotaReading} onRefreshQuota={onRefreshQuota} />
       </aside>
     </div>
+    </>
   );
 }
 

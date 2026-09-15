@@ -86,8 +86,10 @@ ChatGPT パススルーカタログには GPT-5.6 Sol/Terra/Luna の名前空間
 
 OAuth ログインを使うプロバイダープリセットは 8 つで、これに実験的な非公式デバイスフロー
 ブリッジ経由の GitHub Copilot が加わります。認証情報は `~/.opencodex/auth.json` に保存され、
-自動更新されます。ログイン CLI は `chatgpt` も受け付けます。このコマンドは ChatGPT 認証情報を
-発行し `forward` モードのプロバイダーエントリを作成します。
+自動更新されます。`ocx login codex` も受け付けますが、これは上記のプロバイダーではありません。
+Codex アカウントプールのログイン (`ocx account login codex` と同じフロー) に転送されます。
+プールは独自の台帳を持ち、この経路はプロキシの起動を必要とします。`chatgpt` と `openai` は
+同じ経路の別名です。
 
 ```bash
 ocx login xai          # xAI Grok
@@ -98,8 +100,9 @@ ocx login kiro         # kiro-cli 認証情報の取り込み(トークンフォ
 ocx login google-antigravity
 ocx login cursor       # Cursor 専用 PKCE ログイン
 ocx login command-code # Command Code のブラウザ OAuth (または ~/.commandcode/auth.json を取り込み)
+ocx login devin       # Cognition/Devin: Devin CLI の資格情報を優先インポート、なければ Auth0 ブラウザサインイン
 ocx login github-copilot  # GitHub デバイスフロー → Copilot トークン (Copilot Pro/Business)
-ocx login chatgpt      # 別途 ChatGPT OAuth ログイン
+ocx login codex        # Codex アカウントプール (別名: chatgpt, openai / プロキシの起動が必要)
 ocx logout <provider>
 ```
 
@@ -112,7 +115,11 @@ ocx logout <provider>
 | `kiro` | `kiro` | `https://runtime.us-east-1.kiro.dev` | 初回ログインは、インストール済みでサインインした `kiro-cli` セッションを取り込みます（Unix では `curl -fsSL https://cli.kiro.dev/install` &#124; `bash`、Windows PowerShell では `irm 'https://cli.kiro.dev/install.ps1'` &#124; `iex` でインストールしてから `kiro-cli login` を実行）。**アカウントを追加**は `kiro-cli` をログアウトして新しいブラウザログインを開始し、`kiro-cli` 自体のアカウントを切り替えてアカウント別プロファイルメタデータを保存します。既存の OpenCodex アカウントは保持され、キャンセルまたは失敗時には以前の `kiro-cli` セッションが復元されます。 |
 | `google-antigravity` | `google` | `https://daily-cloudcode-pa.googleapis.com` | Google OAuth を Cloud Code Assist wire で使用。ライブ探索は認証済みの CCA `v1internal:fetchAvailableModels` エンドポイントを使用し、ログイン中のアカウントで利用可能な agent モデルのみを公開します。管理されたカタログはフォールバックとして残ります。 |
 | `cursor` | `cursor` | `https://api2.cursor.sh` | 実験的 PKCE ログイン、HTTP/2 トランスポート、アカウント別モデル探索をサポート。 |
+| `devin` | `devin` | `https://server.codeium.com` | 実験的な非公式 Cognition/Devin ブリッジ。ログインはまず、インストール済み Devin CLI が保持する認証情報を取り込みます（`devin auth login` が `devin-session-token` を自身の `credentials.toml` に書き込みます）。なければ Auth0 のブラウザサインインを開き、貼り付けたトークンを `RegisterUser` で長期 API キーに交換します。`ocx login devin-cli` は非推奨エイリアスとして引き続き使えます。モデル一覧は `GetCascadeModelConfigs` でアカウントごとに取得し、ストリーミングは Connect-RPC 上の `runTurn` 経路のみを使います。ダッシュボードのプリセットには既定で含まれません。 |
 | `github-copilot` | `openai-chat` | `https://api.githubcopilot.com` | 実験的。GitHub デバイスフロー + `copilot_internal` 交換（VS Code OAuth クライアント）。有効な Copilot サブスクリプションが必要で、公式のサードパーティ API ではありません。 |
+
+Google Antigravity のアカウント・プロバイダーのクォータ確認は、モデル一覧へのフォールバックも含め、固定の Google エンドポイントを使用します。その宛先では透過 Fake-IP DNS に対応し、TLS 検証、リダイレクト拒否、プライベートアドレス検査を維持します。カスタム base URL はモデル要求にのみ適用されます。`NO_PROXY` は直接接続のポリシーを維持します。
+
 
 Nous の refresh が終端失敗した場合は、再認証に `ocx login nous` を実行してください。
 
@@ -213,6 +220,7 @@ Cline IDE/CLI のみで API からは使えません。`minimax/minimax-m2.5` �
 | NVIDIA NIM | `https://integrate.api.nvidia.com/v1` |
 | Z.AI (GLM Coding) | `https://api.z.ai/api/coding/paas/v4` |
 | Zhipu AI (BigModel) | `https://open.bigmodel.cn/api/paas/v4` |
+| [BigModel Coding Plan — Responses (静的モデル一覧)](/guides/providers/#bigmodel-coding-plan-over-responses) | `https://open.bigmodel.cn/api/v1` |
 | Qwen Cloud | トークンプラン(デフォルト): `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` · 従量課金: `https://dashscope.aliyuncs.com/compatible-mode/v1` · またはカスタム |
 | Tencent Cloud Coding Plan | `https://api.lkeap.cloud.tencent.com/coding/v3` |
 | SiliconFlow | `https://api.siliconflow.cn/v1` |
@@ -227,6 +235,10 @@ Cline IDE/CLI のみで API からは使えません。`minimax/minimax-m2.5` �
 **OpenCode Zen**（`opencode-zen`）とキー不要の **OpenCode Free** プリセットは
 `https://opencode.ai/zen/v1` を共有します。このゲートウェイ上の無料モデルは、しばしばおおよそ毎分 15–20 リクエストの短時間レート制限に当たります（コミュニティ計測。OpenCode は RPM を公表しません）。Zen は `Retry-After` / `X-RateLimit-*` ヘッダーなしの汎用 429 を返すことがあります。これはキー不要デスクトップ枠（`opencode-free` で Big Pickle/無料モデル約 200 回 / 5 時間）とは別です。Zen がそのような 429 で `Retry-After` を省略した場合、opencodex はクライアント向けエラーに案内を足し、合成 `Retry-After` を付けます（上流の `Retry-After` があればそれが優先されます）。同一キーの待機再試行は [`retryOn429`](/ja/reference/configuration/) でオプトインします。
 
+**キー不要の `opencode-free` 枠は、現在サードパーティのクライアントに閉じられています。** Zen は `x-opencode-session` ヘッダーを伴わないリクエストをすべて拒否し、エラータイプ `MissingSessionID` と "OpenCode's free tier can only be used in OpenCode" というメッセージを返します。関門はヘッダーの有無だけを見るため、プロキシは値をでっち上げれば通過できますが、opencodex はそうしません。セッション識別子とバージョン付きの `opencode/<version>` User-Agent を作って送ることは、自分が OpenCode クライアントであると主張することであり、OpenCode はこのキー不要の枠についてサードパーティ連携の契約を公開していません。その方法で得た HTTP 200 は許可ではなく、突破された関門にすぎません。そこで opencodex は回避せずに制限を報告します。`opencode-free` へのリクエストは、上流の関門を説明するエラーを返します。
+
+同じモデルに至るサポートされた経路は、[opencode.ai/auth](https://opencode.ai/auth) で発行した OpenCode Zen API キーを使う **`opencode-zen`** プリセットです。OpenCode が後にキー不要の枠へのサードパーティ経路を公開すれば、opencodex もそれに従えます。それまでこのプリセットは制限を記録する役割を担います。上流の規約: [opencode.ai/docs/zen](https://opencode.ai/docs/zen/)。
+
 大半は bearer キーと共に `openai-chat` アダプターを使い、Anthropic 互換エンドポイントのみを公開する一部
 (例: **Xiaomi MiMo**)は `anthropic` アダプター(`x-api-key`)を使います。
 Volcengine Agent Plan は `openai-responses` アダプターでネイティブ Responses エンドポイントを使用します。
@@ -240,7 +252,7 @@ Volcengine Agent Plan は `openai-responses` アダプターでネイティブ R
 > Agent Plan ゲートウェイには `/models` リソースがありません。従量課金のデフォルトは
 > `doubao-seed-2-1-pro-260628` で、静的カタログには現在の DeepSeek と GLM のテキストモデルも
 > 含まれます。Coding Plan のデフォルトは `ark-code-latest`、Agent Plan は
-> `deepseek-v4-pro` です。
+> `deepseek-v4-flash` です。
 
 **Chutes の discovery:** `chutes` preset は Chutes の固定された共有 OpenAI 互換 LLM gateway を使います。
 公開 `/v1/models` catalog から `supported_features` が `tools` を示す行だけを残し、スラッシュを含む
@@ -335,7 +347,7 @@ model ごとに capability が異なるため、provider 全体の parallel tool
 > コーディングツール専用としています。一般的な API 自動化、カスタムアプリのバックエンド、
 > 非対話型バッチ利用は禁止されており、プランキーが停止される場合があります。
 
-> **GLM の経路は 2 つあります:** `zai` は Z.AI の国際コーディングプラン契約、`zhipu-bigmodel`
+> **GLM の課金経路:** `zai` は Z.AI の国際コーディングプラン契約、`zhipu-bigmodel`
 > は Zhipu の中国国内向け BigModel 従量課金エンドポイントです。ホストもキーも課金も別で、
 > 一方で発行したキーはもう一方では認証されません。
 
@@ -380,8 +392,8 @@ Amazon Bedrock ネイティブ API のような、これらの実装のいずれ
 **サブスクリプショントークン**(通常の API キーではない)で認証します。**Cloudflare AI
 Gateway** は URL にアカウント + ゲートウェイ ID を埋める必要があります。
 
-Copilot は混在 wire カタログを提供します。GPT-5 系モデル（`gpt-5.3-codex`、`gpt-5.4`、
-`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`）はエージェント
+Copilot は混在 wire カタログを提供します。モデル（`gpt-5.3-codex`、`gpt-5.4`、
+`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`）はエージェント
 通信の `/chat/completions` を拒否するため、opencodex はこれらのモデルを組み込みデフォルトで
 Responses API 経由にルーティングし、他の Copilot モデルはすべて chat completions のままです。
 優先順位は次のとおりです: ハード wire ピン → 明示的な
@@ -417,7 +429,7 @@ Ollama Cloud はホステッド型(ローカルではない)Ollama です。`htt
 サーフェスではなく Ollama 自身の REST API(`POST /api/chat`)で接続し、モデル一覧はプロバイダーから
 動的に取得するため、新しい Ollama Cloud モデルは設定変更なしで現れます。opencodex はクラウド
 ラインナップをビジョン機能で分類し、[ビジョンサイドカー](/ja/guides/sidecars/)がテキスト専用モデルにのみ
-動作するようにします。テキスト専用モデル(例: `glm-5.2`、`deepseek-v4-pro`、`gpt-oss`、`qwen3-coder`、
+動作するようにします。テキスト専用モデル(例: `glm-5.2`、`deepseek-v4-flash`、`gpt-oss`、`qwen3-coder`、
 `minimax-m2.x`、`nemotron-3-*`)は `noVisionModels` に列挙され、ビジョンネイティブモデル(例:
 `kimi-k2.6`、`minimax-m3`、`gemma4`、`qwen3.5`、`gemini-3-flash-preview`)は含まれません。マッチングは
 Ollama の `:size` タグに寛容なので `gpt-oss` は `gpt-oss:120b` と `gpt-oss:20b` の両方を含みます。

@@ -39,6 +39,9 @@ ocx start --port 8080
 
 在不停止代理的情況下還原原生 Codex——剝除注入的設定行與路由目錄項目，使普通 `codex` 再次以原生方式運作。`eject` 是 `restore` 的別名。
 
+還原後的目錄會排除已退役的原生模型，包括 `gpt-5.3-codex-spark` 的裸 ID 與可信的帳號限定項目。
+無論是否有目錄備份，此規則皆適用；原始備份與使用者儲存的歷史模型選擇設定保持不變。
+
 對任一拼法傳入 `back` 可在不變更代理生命週期的情況下，將普通 `codex` 重新指向已在執行的代理：
 
 ```bash
@@ -51,6 +54,10 @@ ocx eject back
 針對在可逆備份支援存在前、重新對應 Codex App 歷史的舊開發組建進行明確復原。若其歷史資料庫被鎖定，請先關閉 Codex。
 
 這是範圍很廣且具破壞性的重新標記：所有含有使用者訊息且目前標記為 `opencodex` 的 thread 都會改標為 `openai`，`exec` 會正規化為 `cli`，並設定 event marker。正常的專用 provider 歷史也包含在內。請先備份狀態，而且只有在確實需要這個完整範圍時才執行。
+
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+在透過原生 Codex 恢復曾由路由提供方壓縮的工作前，修復該工作的歷史記錄。此命令依 UUID 精確選取一個工作，先儲存私有的逐位元組備份，然後只把 OpenCodeX 自有的 `ocx1:` 壓縮狀態轉換成原生 Codex 可重播的普通摘要。原生加密內容與其他工作不會變更。執行前請關閉所選工作；若 rollout 在處理期間發生變化，復原會停止且不會取代原始檔案。
 
 ### `ocx uninstall` · `ocx remove`
 
@@ -131,21 +138,37 @@ ocx status --json
 
 ## 目錄同步
 
-### `ocx sync [--restart-codex]`
+### `ocx sync [--restart-codex] [--restart-app-server-only]`
 
 從每個已設定的供應商擷取即時模型清單，並將合併後的目錄重新注入 Codex。在新增供應商後或要重新整理可用模型時執行它。
 
-若長壽的 Codex `app-server` 仍在執行，`ocx sync` 會警告它們可能繼續提供先前的記憶體內模型清單，即使 `opencodex-catalog.json` / `models_cache.json` 已更新。傳入 `--restart-codex` 以僅對目前使用者擁有的相符 `codex … app-server` 與 `codex-code-mode-host` 進程發送 `SIGTERM`（執行中的回合可能被中斷）。刻意避免廣泛的 `pkill -f codex` 比對。
+若長壽的 Codex `app-server` 仍在執行，`ocx sync` 會警告它們可能繼續提供先前的記憶體內模型清單，即使 `opencodex-catalog.json` / `models_cache.json` 已更新。傳入 `--restart-codex` 會重啟相符的 `codex … app-server` 與 `codex-code-mode-host` 進程，並在 macOS、Linux 與 Windows 上完全結束再重新啟動 Codex 桌面應用程式，讓模型選擇器重新讀取目錄。進行中的對話會結束。刻意避免廣泛的 `pkill -f codex` 比對。
 
-### `ocx sync-cache [--restart-codex]`
+`--restart-desktop-app` 是 `--restart-codex` 的已棄用別名。它仍然可用、會印出棄用提示，且不再僅限 Windows。
 
-使 Codex 的本機模型選擇器快取失效，使其從現用的 opencodex 目錄重建。與 `ocx sync` 相同的過時 `app-server` 警告與可選的 `--restart-codex` 行為適用。
+`--restart-app-server-only` 恢復先前的窄範圍行為：僅對目前使用者擁有的相符 app-server / code-mode-host 進程發送 `SIGTERM`，桌面應用程式保持執行（執行中的回合仍可能被中斷）。若與 `--restart-codex` 或 `--restart-desktop-app` 一起使用，窄範圍優先，因為失去進行中的對話無法復原，過期的選擇器可以。
+
+當命令在 Codex 應用程式內部執行時，重啟會交給分離的 helper，此工作階段會隨應用程式一起結束。
+
+### `ocx sync-cache [--restart-codex] [--restart-app-server-only]`
+
+使 Codex 的本機模型選擇器快取失效，使其從現用的 opencodex 目錄重建。與 `ocx sync` 相同的過時 `app-server` 警告與可選重啟旗標適用。
+
+### `ocx catalog pull <https-url> [--auth-env <NAME>] [--json] [--restart-codex] [--restart-app-server-only]`
+
+安裝由另一個 OpenCodex 執行個體的 `/v1/catalog` 端點提供的完整目錄，接著同步 `models_cache.json`。URL 必須是 HTTPS；僅回送位址允許 HTTP。URL 內嵌憑證、查詢、片段、重新導向、超出大小的回應以及無效目錄，都會在任何本機寫入之前遭拒。驗證為選用，且只透過環境變數名稱（`--auth-env`）讀取，不接受 argv 傳入。
+
+目錄與快取在共用的 Codex 目錄鎖之下寫入；失敗時保留 last-known-good 檔案。位元組完全相同時是保留 mtime 的無操作。`--restart-codex`、`--restart-app-server-only` 以及已棄用別名 `--restart-desktop-app` 僅在實際寫入之後生效，含義與 `ocx sync` / `ocx sync-cache` 相同。`ETag` 條件式請求不屬於此命令。完整的 `--json` 信封與結束碼請參見[英文參考](/reference/cli/lifecycle/)。
 
 ## 背景服務
 
 ### `ocx service [install|repair|restart|start|stop|status|uninstall|remove]`
 
 將 opencodex 作為登入管理的背景服務執行（macOS **launchd**、Linux **systemd user unit**、Windows **Task Scheduler**），在登入時自動啟動並在崩潰時自動重啟。服務執行時設定 `OCX_SERVICE=1`，使重啟不會折騰 Codex 設定。
+
+Windows 工作排程器安裝使用一般處理程序優先順序（`Priority=4`）。舊的背景優先順序（`7`，省略時排程器也預設使用 `7`）
+可能在 CPU 競爭時延遲健康檢查回應，導致處理程序仍在執行時系統匣顯示 Offline。升級後執行 `ocx service repair`，
+即可遷移該註冊優先順序並重新啟動服務；過程中可能需要核准 UAC 提示。已設為一般或高優先順序時，不會僅因優先順序而重新註冊。
 
 | 子指令 | 動作 |
 | --- | --- |
@@ -220,7 +243,7 @@ ocx codex-shim uninstall
 
 ### `ocx gui`
 
-在 `http://localhost:<port>` 開啟[網頁儀表板](/zh-tw/guides/web-dashboard/)，若代理未執行則自動啟動它。
+在 `http://localhost:<port>` 開啟[網頁儀表板](/zh-tw/guides/web-dashboard/)，若代理未執行則自動啟動它。在啟用管理 ingress 的 hub 上，開啟的是 `http://127.0.0.1:<管理埠>`。
 
 ## 更新
 

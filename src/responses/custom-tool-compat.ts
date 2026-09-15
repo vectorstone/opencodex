@@ -4,7 +4,7 @@ import {
   repairFreeformToolInput,
   unwrapFreeformToolInput,
 } from "./apply-patch-envelope";
-import { compileCodeModeHelperInput } from "./code-mode-helper-compat";
+import { compileCodeModeHelperInput, resolveCodeModeHelperName } from "./code-mode-helper-compat";
 import { collectResponsesToolGroups } from "./tool-groups";
 
 const ROUTED_CUSTOM_TOOL_PASSTHROUGH = new Set(["apply_patch"]);
@@ -261,6 +261,29 @@ export function rewriteRoutedCustomToolsForUpstream(
   return { body: rewriteForUpstream(body, conversionNames, callIds), names, repairNames };
 }
 
+/**
+ * A delta result has no tool name. Without its call, lowering cannot tell whether it belongs
+ * to a converted function or a native custom tool. Request full replay instead of guessing.
+ */
+export function hasUnmappedRoutedCustomToolOutput(
+  body: unknown,
+  supportsResponsesCustomTools?: boolean,
+): boolean {
+  if (!isPlainObject(body) || !Array.isArray(body.input)) return false;
+  if (collectRoutedCustomToolNames(body, supportsResponsesCustomTools).size === 0) return false;
+  const callIds = new Set<string>();
+  for (const item of body.input) {
+    if (isPlainObject(item)
+      && (item.type === "custom_tool_call" || item.type === "function_call")
+      && typeof item.call_id === "string") callIds.add(item.call_id);
+  }
+  return body.input.some(item => isPlainObject(item)
+    && item.type === "custom_tool_call_output"
+    && typeof item.call_id === "string"
+    && item.call_id.length > 0
+    && !callIds.has(item.call_id));
+}
+
 export function restoreRoutedCustomCalls(
   value: unknown,
   names: ReadonlySet<string>,
@@ -281,17 +304,33 @@ export function restoreRoutedCustomCalls(
     ) {
       const sourceInput = item.type === "function_call" ? item.arguments : item.input;
       const aliased = targetName !== wireName;
+      const itemNamespace = typeof item.namespace === "string" ? item.namespace : undefined;
+      // Name-based alias first; otherwise let a raw patch envelope submitted as the `exec`
+      // body resolve to the same apply_patch helper (devlog/_plan/260905_apply_patch_envelope_gap).
+      const helper = aliased && sourceInput !== ""
+        ? item.name
+        : resolveCodeModeHelperName(undefined, targetName, sourceInput, itemNamespace, declaredNames);
+      // Native custom input is already the tool's raw grammar. Only a recognized
+      // helper/envelope may reinterpret it; a JSON-looking native body is not a wrapper.
+      if (item.type === "custom_tool_call" && !aliased && !helper) {
+        const input = repairNames.has(wireName) && typeof sourceInput === "string"
+          ? normalizeApplyPatchDelimiters(sourceInput)
+          : sourceInput;
+        return input !== sourceInput
+          ? { value: { ...item, input }, changed: true }
+          : { value: item, changed: false };
+      }
       const restored: Record<string, unknown> = {
         ...item,
         type: "custom_tool_call",
         id: customToolItemId(item.id),
         name: aliased ? targetName : item.name,
-        input: aliased && sourceInput !== ""
-          ? compileCodeModeHelperInput(sourceInput, item.name)
+        input: helper
+          ? compileCodeModeHelperInput(sourceInput, helper)
           : repairFreeformToolInput(
             sourceInput,
             targetName,
-            typeof item.namespace === "string" ? item.namespace : undefined,
+            itemNamespace,
           ),
       };
       delete restored.arguments;

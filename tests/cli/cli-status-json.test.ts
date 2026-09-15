@@ -1,0 +1,1002 @@
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { createConnection, createServer } from "node:net";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { collectHubStatus, hubStatusLines, isConnectionRefused, isUncleanExitEvidence, proxyHealthFailureReason, resolveStatusPid, selectListenTarget } from "../../src/cli/status";
+import * as statusFacade from "../../src/cli/status";
+import * as statusProbes from "../../src/cli/status-probes";
+import { packageVersion } from "../../src/cli/help";
+import { getDefaultConfig } from "../../src/config";
+import { findDeadPid } from "../helpers/dead-pid";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS, STORE_BUDGET_MS } from "../helpers/test-budget";
+import { inspectClientRotationRecoveryGate, readClientConnectionState } from "../../src/client/state";
+import * as lifecycleLock from "../../src/client/lifecycle-lock";
+import { writeDesktopDisconnectReceipt } from "../../src/claude/desktop-remote-store";
+
+const repoRoot = dirname(fileURLToPath(new URL("../../package.json", import.meta.url)));
+const cliPath = join(repoRoot, "src", "cli", "index.ts");
+
+function runStatusJson(opencodexHome: string) {
+  return spawnSync(process.execPath, [cliPath, "status", "--json"], {
+    cwd: repoRoot,
+    env: { ...process.env, OPENCODEX_HOME: opencodexHome },
+    encoding: "utf8",
+  });
+}
+
+describe("status version skew projection", () => {
+  test.each([
+    ["0.0.1", "the running proxy is older"],
+    ["999999.0.0", "this ocx on PATH is older"],
+    [packageVersion(), null],
+    [`${packageVersion()}+skew-fixture`, "neither can be identified as older"],
+    ["not-a-version", "neither can be identified as older"],
+    ["unknown", null],
+    ["0.0.0", null],
+    [undefined, null],
+  ] as const)("projects proxy %s in JSON and human output", async (proxyVersion, expected) => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-status-skew-"));
+    const codexHome = join(home, "codex");
+    let server: ReturnType<typeof Bun.serve> | undefined;
+    try {
+      // Explicit CODEX_HOME must exist before the CLI imports codex/paths.ts.
+      mkdirSync(codexHome, { recursive: true });
+      server = Bun.serve({
+        hostname: "127.0.0.1", port: 0,
+        fetch(request) {
+          return new URL(request.url).pathname === "/healthz"
+            ? Response.json({ service: "opencodex", status: "ok", version: proxyVersion, uptime: 1 })
+            : new Response("not found", { status: 404 });
+        },
+      });
+      writeFileSync(join(home, "config.json"), JSON.stringify({
+        ...getDefaultConfig(), port: server.port, hostname: "127.0.0.1", codexAutoStart: false,
+      }));
+      for (const json of [true, false]) {
+        // Async child execution lets the fixture answer the real identity/health probes.
+        const child = Bun.spawn([process.execPath, cliPath, "status", ...(json ? ["--json"] : [])], {
+          cwd: repoRoot,
+          env: { ...process.env, OPENCODEX_HOME: home, CODEX_HOME: codexHome },
+          stdout: "pipe", stderr: "pipe",
+        });
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, INTERNAL_DEADLINE_MS);
+        try {
+          const [stdout, stderr, exitCode] = await Promise.all([
+            new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+          ]);
+          expect(timedOut).toBe(false);
+          // Preserve both gates while surfacing the child error when startup fails.
+          expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+          if (json) {
+            const parsed = JSON.parse(stdout);
+            expect(parsed.schemaVersion).toBe(1);
+            expect(Object.keys(parsed.versionSkew).sort()).toEqual(["cliVersion", "proxyVersion", "skewed", "warning"]);
+            expect(parsed.versionSkew.cliVersion).toBe(packageVersion());
+            expect(parsed.versionSkew.proxyVersion).toBe(proxyVersion ?? null);
+            expect(parsed.versionSkew.skewed).toBe(expected !== null);
+            if (expected === null) expect(parsed.versionSkew.warning).toBeNull();
+            else expect(parsed.versionSkew.warning).toContain(expected);
+          } else if (expected === null) {
+            expect(stdout).not.toContain("does not match the running proxy");
+          } else {
+            expect(stdout).toContain(expected);
+          }
+        } finally {
+          clearTimeout(timer);
+          if (child.exitCode === null) child.kill("SIGKILL");
+          await child.exited;
+        }
+      }
+      expect(existsSync(join(home, "ocx.pid"))).toBe(false);
+    } finally {
+      try {
+        await server?.stop(true);
+      } finally {
+        removeTreeWithRetry(home);
+      }
+    }
+  }, SPAWN_BUDGET_MS);
+});
+
+function withRecoveryStatusFixture(work: (fixture: {
+  home: string;
+  lockDeps: { lockPath: string };
+  tokenPath: string;
+  backupPath: string;
+  config: ReturnType<typeof recoveryStatusConfig>;
+  writeConfig: () => void;
+}) => void): void {
+  const home = mkdtempSync(join(tmpdir(), "ocx-status-recovery-"));
+  const previousHome = process.env.OPENCODEX_HOME;
+  const previousDesktop = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
+  process.env.OPENCODEX_HOME = home;
+  process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = join(home, "desktop");
+  const tokenPath = join(home, "service-api-token");
+  const config = recoveryStatusConfig();
+  const writeConfig = () => writeFileSync(join(home, "config.json"), JSON.stringify(config));
+  try {
+    writeConfig();
+    writeFileSync(tokenPath, "status-fixture-token", { mode: 0o600 });
+    work({ home, config, writeConfig, tokenPath, backupPath: `${tokenPath}.prev`,
+      lockDeps: { lockPath: join(home, "locks", "lifecycle.sqlite") } });
+  } finally {
+    if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = previousHome;
+    if (previousDesktop === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
+    else process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = previousDesktop;
+    removeTreeWithRetry(home);
+  }
+}
+
+function recoveryStatusConfig() {
+  return {
+    port: 9, defaultProvider: "openai",
+    providers: { openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" } },
+    runtimeRole: "client",
+    client: {
+      serverUrl: "https://hub.example.test", managementUrl: "https://hub.example.test",
+      managementTransport: "direct", selectedClients: ["claude"], tokenEnv: "OPENCODEX_API_AUTH_TOKEN",
+      apiKeyId: "status-fixture", tokenFingerprint: createHash("sha256").update("status-fixture-token").digest("hex"),
+      protocolVersion: 1, connectedAt: "2026-09-06T00:00:00.000Z",
+    },
+  };
+}
+
+describe("status recovery inspection is read-only unless an orphan needs cleanup", () => {
+  test.each(["clean", "disconnected", "malformed", "pending", "unsafe-backup", "unsafe-receipt", "unsafe-desktop"])(
+    "%s observation creates neither lifecycle nor config database", scenario => {
+      withRecoveryStatusFixture(f => {
+        if (scenario === "disconnected") writeFileSync(join(f.home, "config.json"), JSON.stringify({ port: 9, providers: {} }));
+        if (scenario === "malformed") writeFileSync(join(f.home, "config.json"), "{malformed");
+        if (scenario === "pending") {
+          Object.assign(f.config.client, { pendingOperation: {
+            kind: "rotate", rotationId: "fixture-rotation", newKeyIssuedAt: "2026-09-06T00:00:01.000Z", oldKeyBackupPath: f.backupPath,
+          } });
+          f.writeConfig();
+          writeFileSync(f.backupPath, "status-fixture-token", { mode: 0o600 });
+        }
+        if (scenario === "unsafe-backup") mkdirSync(f.backupPath);
+        if (scenario === "unsafe-receipt" || scenario === "unsafe-desktop") {
+          mkdirSync(join(f.home, "desktop-remote"), { mode: 0o700 });
+          writeFileSync(join(f.home, "desktop-remote", scenario === "unsafe-receipt" ? "disconnect.json" : "state.json"), "{bad", { mode: 0o600 });
+          writeFileSync(f.backupPath, "status-fixture-token", { mode: 0o600 });
+        }
+        const before = readdirSync(f.home).sort();
+        const configBefore = readFileSync(join(f.home, "config.json"), "utf8");
+        const result = inspectClientRotationRecoveryGate(undefined, f.lockDeps);
+        expect(result.kind).toBe(scenario === "pending" || scenario === "unsafe-desktop" ? "recovery-required"
+          : scenario.startsWith("unsafe-") ? "unsafe" : "clean");
+        expect(readdirSync(f.home).sort()).toEqual(before);
+        expect(readFileSync(join(f.home, "config.json"), "utf8")).toBe(configBefore);
+        expect(existsSync(join(f.home, "locks"))).toBe(false);
+        expect(existsSync(join(f.home, "config-mutation.sqlite"))).toBe(false);
+        if (scenario === "pending" || scenario.startsWith("unsafe-")) expect(existsSync(f.backupPath)).toBe(true);
+      });
+    },
+  );
+
+  test("only a proven orphan takes L/C; a held L preserves its backup", () => {
+    withRecoveryStatusFixture(f => {
+      writeFileSync(f.backupPath, "status-fixture-token", { mode: 0o600 });
+      lifecycleLock.withClientLifecycleSync(() => {
+        expect(inspectClientRotationRecoveryGate(undefined, f.lockDeps)).toEqual({ kind: "recovery-required", reason: "client_lifecycle_busy" });
+        expect(existsSync(f.backupPath)).toBe(true);
+        expect(existsSync(join(f.home, "config-mutation.sqlite"))).toBe(false);
+      }, f.lockDeps);
+      expect(inspectClientRotationRecoveryGate(undefined, f.lockDeps)).toEqual({ kind: "orphan-cleaned" });
+      expect(existsSync(f.backupPath)).toBe(false);
+      expect(existsSync(join(f.home, "config-mutation.sqlite"))).toBe(true);
+      expect(inspectClientRotationRecoveryGate(undefined, f.lockDeps)).toEqual({ kind: "clean" });
+    });
+  }, STORE_BUDGET_MS);
+
+  test.each(["rotation", "token-changed", "disconnect", "backup-removed"])(
+    "revalidates %s after acquiring L rather than using the initial observation", transition => {
+      withRecoveryStatusFixture(f => {
+        writeFileSync(f.backupPath, "status-fixture-token", { mode: 0o600 });
+        const stale = readClientConnectionState();
+        const actualLock = lifecycleLock.withClientLifecycleSync;
+        let entered = false;
+        const lock = spyOn(lifecycleLock, "withClientLifecycleSync").mockImplementation((work, deps) => actualLock(held => {
+          entered = true;
+          if (transition === "rotation") {
+            Object.assign(f.config.client, { pendingOperation: {
+              kind: "rotate", rotationId: "fixture-rotation", newKeyIssuedAt: "2026-09-06T00:00:01.000Z", oldKeyBackupPath: f.backupPath,
+            } });
+            f.writeConfig();
+          } else if (transition === "token-changed") writeFileSync(f.tokenPath, "replacement-fixture-token");
+          else if (transition === "backup-removed") unlinkSync(f.backupPath);
+          else writeDesktopDisconnectReceipt(held, null, {
+            version: 1, owner: { serverUrl: f.config.client.serverUrl, apiKeyId: f.config.client.apiKeyId, connectedAt: f.config.client.connectedAt },
+            tokenFingerprint: f.config.client.tokenFingerprint, keepCatalog: false, phase: "prepared",
+          });
+          return work(held);
+        }, deps));
+        try {
+          const result = inspectClientRotationRecoveryGate(stale, f.lockDeps);
+          expect(entered).toBe(true);
+          expect(result.kind).toBe(transition === "token-changed" ? "unsafe" : transition === "backup-removed" ? "clean" : "recovery-required");
+          expect(existsSync(f.backupPath)).toBe(transition !== "backup-removed");
+        } finally { lock.mockRestore(); }
+      });
+    }, STORE_BUDGET_MS,
+  );
+});
+
+describe("CLI status JSON", () => {
+  test("status facade preserves probe identity without exposing its health helper", () => {
+    expect(statusFacade.proxyHealthFailureReason).toBe(statusProbes.proxyHealthFailureReason);
+    expect(statusFacade.isConnectionRefused).toBe(statusProbes.isConnectionRefused);
+    expect(statusFacade.isUncleanExitEvidence).toBe(statusProbes.isUncleanExitEvidence);
+    expect(statusFacade.probeUncleanExitState).toBe(statusProbes.probeUncleanExitState);
+    expect(statusFacade).not.toHaveProperty("checkProxyHealth");
+  });
+
+  test("status --json prints valid read-only diagnostics without secrets", () => {
+    const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-status-json-"));
+    try {
+      const configPath = join(opencodexHome, "config.json");
+      writeFileSync(configPath, JSON.stringify({
+        port: 9,
+        providers: {
+          openai: {
+            adapter: "openai-responses",
+            baseUrl: "https://chatgpt.com/backend-api/codex",
+            authMode: "forward",
+            apiKey: "sk-test-secret",
+          },
+        },
+        defaultProvider: "openai",
+        codexAutoStart: false,
+      }), "utf8");
+
+      const beforeFiles = readdirSync(opencodexHome).sort();
+      const result = runStatusJson(opencodexHome);
+      const afterFiles = readdirSync(opencodexHome).sort();
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(afterFiles).toEqual(beforeFiles);
+      expect(existsSync(join(opencodexHome, "ocx.pid"))).toBe(false);
+
+      const parsed = JSON.parse(result.stdout) as {
+        schemaVersion?: unknown;
+        proxy?: { running?: unknown; pid?: unknown; health?: { ok?: unknown; url?: unknown; message?: unknown } };
+        dashboard?: { url?: unknown };
+        listen?: { port?: unknown; source?: unknown };
+        paths?: { config?: unknown; pid?: unknown; runtime?: unknown };
+        runtime?: { source?: unknown };
+        codexAutostart?: unknown;
+        startup?: {
+          status?: unknown;
+          rebootSafe?: unknown;
+          routingInjected?: unknown;
+          serviceInstalled?: unknown;
+          shimInstalled?: unknown;
+          shimHealthy?: unknown;
+          shimCoverage?: unknown;
+          serviceSupported?: unknown;
+          commands?: unknown;
+        };
+        defaultProvider?: unknown;
+        config?: { source?: unknown; error?: unknown };
+        connection?: {
+          state?: unknown;
+          serverUrl?: unknown;
+          apiKeyId?: unknown;
+          credentialFile?: unknown;
+          catalog?: unknown;
+        };
+        service?: { summary?: unknown };
+        codexShim?: { summary?: unknown };
+        codexRuntime?: {
+          path?: unknown;
+          version?: unknown;
+          source?: unknown;
+          warning?: unknown;
+          newerAvailable?: unknown;
+          catalogClamp?: { active?: unknown; removedEfforts?: unknown; runtimeVersion?: unknown };
+        };
+        codexHome?: {
+          effectiveCodexHome?: unknown;
+          appCodexHome?: unknown;
+          mismatch?: unknown;
+          warning?: unknown;
+          action?: unknown;
+        };
+      };
+
+      expect(parsed.schemaVersion).toBe(1);
+      expect(parsed.proxy?.running).toBe(false);
+      expect(parsed.proxy?.pid).toBeNull();
+      expect(parsed.proxy?.health?.ok).toBe(false);
+      expect(parsed.proxy?.health?.url).toBe("http://127.0.0.1:9/healthz");
+      expect(typeof parsed.proxy?.health?.message).toBe("string");
+      expect(parsed.dashboard?.url).toBe("http://localhost:9/");
+      expect(parsed.listen?.port).toBe(9);
+      expect(parsed.listen?.source).toBe("config");
+      expect(parsed.paths?.config).toBe(configPath);
+      expect(parsed.paths?.pid).toBe(join(opencodexHome, "ocx.pid"));
+      expect(typeof parsed.paths?.runtime).toBe("string");
+      expect(typeof parsed.runtime?.source).toBe("string");
+      expect(parsed.codexAutostart).toBe(false);
+      expect(["native", "protected", "at-risk"]).toContain(parsed.startup?.status);
+      expect(typeof parsed.startup?.rebootSafe).toBe("boolean");
+      expect(typeof parsed.startup?.routingInjected).toBe("boolean");
+      expect(typeof parsed.startup?.serviceInstalled).toBe("boolean");
+      expect(typeof parsed.startup?.shimInstalled).toBe("boolean");
+      expect(typeof parsed.startup?.shimHealthy).toBe("boolean");
+      expect(["full", "cli-only", "none"]).toContain(parsed.startup?.shimCoverage);
+      expect(typeof parsed.startup?.serviceSupported).toBe("boolean");
+      expect(typeof parsed.startup?.commands).toBe("object");
+      expect(parsed.defaultProvider).toBe("openai");
+      expect(parsed.config?.source).toBe("file");
+      expect(parsed.config?.error).toBeNull();
+      expect(typeof parsed.service?.summary).toBe("string");
+      expect(typeof parsed.codexShim?.summary).toBe("string");
+      expect(typeof parsed.codexRuntime?.path).toBe("string");
+      expect(typeof parsed.codexRuntime?.source).toBe("string");
+      expect(parsed.codexRuntime?.version === null || typeof parsed.codexRuntime?.version === "string").toBe(true);
+      expect(parsed.codexRuntime?.warning === null || typeof parsed.codexRuntime?.warning === "string").toBe(true);
+      expect(
+        parsed.codexRuntime?.newerAvailable === null
+        || (typeof parsed.codexRuntime?.newerAvailable === "object" && parsed.codexRuntime?.newerAvailable !== null),
+      ).toBe(true);
+      expect(parsed.codexRuntime?.catalogClamp?.active).toBe(false);
+      expect(Array.isArray(parsed.codexRuntime?.catalogClamp?.removedEfforts)).toBe(true);
+      expect(parsed.codexRuntime?.catalogClamp?.runtimeVersion).toBeNull();
+      expect(typeof parsed.codexHome?.effectiveCodexHome).toBe("string");
+      expect(typeof parsed.codexHome?.appCodexHome).toBe("string");
+      expect(typeof parsed.codexHome?.mismatch).toBe("boolean");
+      expect(parsed.codexHome?.warning === null || typeof parsed.codexHome?.warning === "string").toBe(true);
+      expect(parsed.connection).toMatchObject({
+        state: "disconnected",
+        credentialFile: "missing",
+      });
+      // #4207 gave a connected client a local-runtime readiness verdict. Observing that runtime
+      // spawns a Codex process, so a machine with no client connection must not carry the field
+      // at all; its absence is what keeps every ordinary `ocx status` off that probe.
+      expect(parsed.connection).not.toHaveProperty("readiness");
+      expect(parsed.connection).not.toHaveProperty("readinessReason");
+
+      const serialized = JSON.stringify(parsed).toLowerCase();
+      for (const forbidden of ["apikey", "sk-test-secret", "token", "refreshtoken", "authorization", "email"]) {
+        expect(serialized).not.toContain(forbidden);
+      }
+    } finally {
+      removeTreeWithRetry(opencodexHome);
+    }
+  });
+
+  test("status --json reports catalogClamp.runtimeVersion when clamp is active", async () => {
+    const { chmodSync } = await import("node:fs");
+    const { persistEffortClamp, resetCodexRuntimeResolveCacheForTests } = await import("../../src/codex/runtime");
+    const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-status-clamp-"));
+    try {
+      writeFileSync(join(opencodexHome, "config.json"), JSON.stringify({
+        port: 9,
+        providers: {},
+        defaultProvider: "openai",
+      }), "utf8");
+      const fakeCodex = process.platform === "win32"
+        ? join(opencodexHome, "bin", "codex.cmd")
+        : join(opencodexHome, "bin", "codex");
+      mkdirSync(join(opencodexHome, "bin"), { recursive: true });
+      if (process.platform === "win32") {
+        writeFileSync(fakeCodex, "@echo off\r\necho codex-cli 0.133.0\r\n", "utf8");
+      } else {
+        writeFileSync(fakeCodex, "#!/bin/sh\necho 'codex-cli 0.133.0'\n", "utf8");
+        chmodSync(fakeCodex, 0o755);
+      }
+      persistEffortClamp({
+        runtimePath: fakeCodex,
+        runtimeVersion: "0.133.0",
+        removedEfforts: ["xhigh"],
+        affectedModels: ["gpt-5.6-sol"],
+      }, { configDir: opencodexHome });
+      resetCodexRuntimeResolveCacheForTests();
+
+      const result = spawnSync(process.execPath, [cliPath, "status", "--json"], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          OPENCODEX_HOME: opencodexHome,
+          CODEX_CLI_PATH: fakeCodex,
+          PATH: "",
+        },
+        encoding: "utf8",
+      });
+      expect(result.status).toBe(0);
+      const parsed = JSON.parse(result.stdout) as {
+        codexRuntime?: {
+          version?: string | null;
+          catalogClamp?: { active?: boolean; removedEfforts?: string[]; runtimeVersion?: string | null };
+        };
+      };
+      expect(parsed.codexRuntime?.version).toBe("0.133.0");
+      expect(parsed.codexRuntime?.catalogClamp).toEqual({
+        active: true,
+        removedEfforts: ["xhigh"],
+        runtimeVersion: "0.133.0",
+      });
+    } finally {
+      resetCodexRuntimeResolveCacheForTests();
+      removeTreeWithRetry(opencodexHome);
+    }
+  });
+
+  test("status rejects unknown flags instead of silently printing human text", () => {
+    const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-status-json-"));
+    try {
+      writeFileSync(join(opencodexHome, "config.json"), JSON.stringify({
+        port: 9,
+        providers: {},
+        defaultProvider: "openai",
+      }), "utf8");
+
+      const result = spawnSync(process.execPath, [cliPath, "status", "--yaml"], {
+        cwd: repoRoot,
+        env: { ...process.env, OPENCODEX_HOME: opencodexHome },
+        encoding: "utf8",
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Usage: ocx status [--json]");
+      expect(result.stdout).toBe("");
+    } finally {
+      removeTreeWithRetry(opencodexHome);
+    }
+  });
+
+  test("status --json rejects additional flags", () => {
+    const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-status-json-"));
+    try {
+      writeFileSync(join(opencodexHome, "config.json"), JSON.stringify({
+        port: 9,
+        providers: {},
+        defaultProvider: "openai",
+      }), "utf8");
+
+      const result = spawnSync(process.execPath, [cliPath, "status", "--json", "--yaml"], {
+        cwd: repoRoot,
+        env: { ...process.env, OPENCODEX_HOME: opencodexHome },
+        encoding: "utf8",
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Usage: ocx status [--json]");
+      expect(result.stdout).toBe("");
+    } finally {
+      removeTreeWithRetry(opencodexHome);
+    }
+  });
+
+  test("status --json on malformed config remains read-only and secret-safe", () => {
+    const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-status-json-"));
+    try {
+      const configPath = join(opencodexHome, "config.json");
+      writeFileSync(configPath, '{ "apiKey": "sk-status-secret", invalid json', "utf8");
+      const beforeFiles = readdirSync(opencodexHome).sort();
+
+      const result = runStatusJson(opencodexHome);
+      const afterFiles = readdirSync(opencodexHome).sort();
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(afterFiles).toEqual(beforeFiles);
+      expect(afterFiles.some(name => name.startsWith("config.json.invalid-"))).toBe(false);
+
+      const parsed = JSON.parse(result.stdout) as {
+        config?: { source?: unknown; error?: unknown };
+        paths?: { config?: unknown };
+      };
+      expect(parsed.paths?.config).toBe(configPath);
+      expect(parsed.config?.source).toBe("fallback");
+      expect(parsed.config?.error).toBe("invalid_json");
+
+      const serialized = JSON.stringify(parsed);
+      expect(serialized).not.toContain("sk-status-secret");
+      expect(serialized).not.toContain("apiKey");
+    } finally {
+      removeTreeWithRetry(opencodexHome);
+    }
+  });
+
+  test("listen target prefers current runtime port metadata", () => {
+    const target = selectListenTarget(
+      { port: 10100, hostname: "0.0.0.0" },
+      123,
+      { pid: 123, port: 58195, hostname: "0.0.0.0" },
+    );
+
+    expect(target.source).toBe("runtime");
+    expect(target.port).toBe(58195);
+    expect(target.healthUrl).toBe("http://127.0.0.1:58195/healthz");
+    expect(target.dashboardUrl).toBe("http://localhost:58195/");
+  });
+
+  test("listen target keeps the loopback dashboard URL unchanged", () => {
+    const target = selectListenTarget(
+      { port: 10100, hostname: "127.0.0.1" },
+      null,
+      null,
+    );
+
+    expect(target.dashboardUrl).toBe("http://localhost:10100/");
+  });
+
+  test("hub listen target prefers its management public origin", () => {
+    const target = selectListenTarget(
+      {
+        port: 10100,
+        hostname: "100.64.0.10",
+        runtimeRole: "hub",
+        hub: { managementPublicOrigin: "https://hub.example.test" },
+      },
+      null,
+      null,
+    );
+
+    expect(target.dashboardUrl).toBe("https://hub.example.test/");
+  });
+
+  test("non-loopback listen target uses its configured hostname", () => {
+    const target = selectListenTarget(
+      { port: 10100, hostname: "100.64.0.11" },
+      null,
+      null,
+    );
+
+    expect(target.dashboardUrl).toBe("http://100.64.0.11:10100/");
+  });
+
+  test("resolveStatusPid preserves an authoritative null from live orphan checks", () => {
+    expect(resolveStatusPid({ pid: null }, 4242)).toBeNull();
+    expect(resolveStatusPid({ pid: 1111 }, 4242)).toBe(1111);
+    expect(resolveStatusPid(null, 4242)).toBe(4242);
+    expect(resolveStatusPid(null, null)).toBeNull();
+  });
+
+  test("classifies an aborted direct health probe as timed out", () => {
+    const controller = new AbortController();
+    controller.abort();
+    expect(proxyHealthFailureReason(new Error("socket closed"), controller.signal)).toBe("timed out");
+    const abortError = new Error("aborted");
+    abortError.name = "AbortError";
+    expect(proxyHealthFailureReason(abortError, new AbortController().signal)).toBe("timed out");
+    expect(proxyHealthFailureReason(new Error("connection refused"), new AbortController().signal)).toBe("unreachable");
+  });
+
+  test("listen target brackets raw IPv6 hostnames in the health URL", () => {
+    const target = selectListenTarget(
+      { port: 10100, hostname: "::1" },
+      123,
+      { pid: 123, port: 58195, hostname: "::1" },
+    );
+
+    expect(target.healthUrl).toBe("http://[::1]:58195/healthz");
+    expect(target.dashboardUrl).toBe("http://localhost:58195/");
+  });
+
+  test("listen target ignores stale runtime port metadata", () => {
+    const target = selectListenTarget(
+      { port: 10100, hostname: "127.0.0.1" },
+      123,
+      { pid: 999, port: 58195 },
+    );
+
+    expect(target.source).toBe("config");
+    expect(target.port).toBe(10100);
+    expect(target.healthUrl).toBe("http://127.0.0.1:10100/healthz");
+    expect(target.dashboardUrl).toBe("http://localhost:10100/");
+  });
+});
+
+/**
+ * #1419: an unsupervised proxy died from a native trap and every later command said
+ * only "not running". The persisted owner records are the one piece of evidence that
+ * separates a crash from a proxy that was never started, and status used to discard
+ * it. These cases pin the predicate, including the two false-positive shapes that a
+ * naive implementation gets wrong.
+ */
+/**
+ * The hub block (#4236).
+ *
+ * A hub operator's first question is "is this reachable, and can another machine join?", and the
+ * report used to answer it in four places and not at all for the data token. These tests pin the
+ * projection and the sentences, and -- the one that matters for a security boundary -- that no
+ * token VALUE is ever in either.
+ */
+describe("status hub block", () => {
+  const TOKEN = "b".repeat(64);
+
+  function withHome<T>(setup: (home: string) => void, body: () => T): T {
+    const home = mkdtempSync(join(tmpdir(), "ocx-status-hub-"));
+    const previous = process.env.OPENCODEX_HOME;
+    const previousToken = process.env.OPENCODEX_API_AUTH_TOKEN;
+    process.env.OPENCODEX_HOME = home;
+    delete process.env.OPENCODEX_API_AUTH_TOKEN;
+    try {
+      mkdirSync(join(home), { recursive: true });
+      setup(home);
+      return body();
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      if (previousToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
+      else process.env.OPENCODEX_API_AUTH_TOKEN = previousToken;
+      removeTreeWithRetry(home);
+    }
+  }
+
+  const hub = (overrides: Record<string, unknown> = {}) => ({
+    port: 10100,
+    hostname: "100.64.0.10",
+    runtimeRole: "hub" as const,
+    hub: { managementPublicOrigin: "https://hub.tailnet.ts.net", managementIngress: { enabled: true as const, port: 10101 } },
+    unauthenticatedLoopbackListener: { enabled: true as const },
+    ...overrides,
+  });
+
+  test("there is no hub block on a standalone or client machine", () => {
+    for (const role of [undefined, "standalone", "client"] as const) {
+      const config = { ...hub(), runtimeRole: role } as Parameters<typeof collectHubStatus>[0];
+      expect(collectHubStatus(config, { port: 10100, hostname: "127.0.0.1" }, {})).toBeNull();
+    }
+  });
+
+  test("the companion form is named as sharing the public port; a ported one is not", () => {
+    const companion = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100, hostname: "100.64.0.10" }, {});
+    expect(companion?.loopbackListener).toEqual({ state: "companion", port: 10100 });
+    expect(hubStatusLines(companion!).join("\n")).toContain("same port as the public listener");
+
+    const ported = collectHubStatus(
+      hub({ unauthenticatedLoopbackListener: { enabled: true, port: 10104 } }) as Parameters<typeof collectHubStatus>[0],
+      { port: 10100, hostname: "100.64.0.10" },
+      {},
+    );
+    expect(ported?.loopbackListener).toEqual({ state: "ported", port: 10104 });
+    expect(hubStatusLines(ported!).join("\n")).toContain("http://127.0.0.1:10104");
+
+    const off = collectHubStatus(
+      hub({ unauthenticatedLoopbackListener: { enabled: false } }) as Parameters<typeof collectHubStatus>[0],
+      { port: 10100, hostname: "100.64.0.10" },
+      {},
+    );
+    expect(off?.loopbackListener).toEqual({ state: "off", port: null });
+    expect(hubStatusLines(off!).join("\n")).toContain("does not route its own local");
+  });
+
+  test("the data origin prefers hub.dataPublicOrigin and says which it used", () => {
+    const derived = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100, hostname: "100.64.0.10" }, {});
+    expect(derived?.dataOrigin).toBe("http://100.64.0.10:10100");
+    expect(derived?.dataOriginConfigured).toBe(false);
+    expect(hubStatusLines(derived!).join("\n")).toContain("derived from the bind address");
+
+    const configured = collectHubStatus(
+      hub({ hub: { managementPublicOrigin: "https://hub.tailnet.ts.net", dataPublicOrigin: "https://hub.tailnet.ts.net:8443" } }) as Parameters<typeof collectHubStatus>[0],
+      { port: 10100, hostname: "100.64.0.10" },
+      {},
+    );
+    expect(configured?.dataOrigin).toBe("https://hub.tailnet.ts.net:8443");
+    expect(hubStatusLines(configured!).join("\n")).toContain("hub.dataPublicOrigin");
+  });
+
+  test("the token state is about the file the service reads, never about this shell", () => {
+    withHome(home => writeFileSync(join(home, "service-api-token"), `${TOKEN}\n`, "utf8"), () => {
+      const fromFile = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {});
+      expect(fromFile?.dataToken).toBe("present (file)");
+      expect(fromFile?.dataTokenEnvInShell).toBe(false);
+
+      // `present (env)` used to be reported here whenever the CALLING shell exported the
+      // variable -- but the launchd plist and the systemd unit overwrite it from the file
+      // before exec, so the label described the operator's terminal, not the hub.
+      const withShellVar = collectHubStatus(
+        hub() as Parameters<typeof collectHubStatus>[0],
+        { port: 10100 },
+        { OPENCODEX_API_AUTH_TOKEN: "from-the-shell" },
+      );
+      expect(withShellVar?.dataToken).toBe("present (file)");
+      expect(withShellVar?.dataTokenEnvInShell).toBe(true);
+      expect(hubStatusLines(withShellVar!).join("\n")).toContain("the installed service reads the file, not this");
+
+      for (const status of [fromFile!, withShellVar!]) {
+        const rendered = [JSON.stringify(status), ...hubStatusLines(status)].join("\n");
+        expect(rendered).not.toContain(TOKEN);
+        expect(rendered).not.toContain("from-the-shell");
+      }
+    });
+  });
+
+  test("a token file holding the ADMIN token is called out, not reported as present", () => {
+    // The #4236 incident read `present (file)` while the hub crash-looped, because the file
+    // held the MANAGEMENT token and nothing in the report compared the two.
+    const admin = `ocx_admin_${"f".repeat(43)}`;
+    withHome(home => writeFileSync(join(home, "service-api-token"), `${admin}\n`, "utf8"), () => {
+      const status = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {});
+      expect(status?.dataToken).toBe("admin-collision (file)");
+      const lines = hubStatusLines(status!).join("\n");
+      expect(lines).toContain(status!.dataTokenPath);
+      expect(lines).toContain("MANAGEMENT token");
+      expect(lines).toContain("ocx service repair");
+      expect([JSON.stringify(status), lines].join("\n")).not.toContain(admin);
+    });
+    // The same comparison doctor and the service chokepoint use: byte-equal to the configured
+    // admin token counts too, not only the minted prefix.
+    withHome(home => {
+      writeFileSync(join(home, "service-api-token"), "hand-pasted-management-key\n", "utf8");
+    }, () => {
+      const status = collectHubStatus(
+        hub() as Parameters<typeof collectHubStatus>[0],
+        { port: 10100 },
+        { OPENCODEX_ADMIN_AUTH_TOKEN: "hand-pasted-management-key" },
+      );
+      expect(status?.dataToken).toBe("admin-collision (file)");
+    });
+  });
+
+  test("a missing and an unusable token file are distinguished", () => {
+    withHome(() => {}, () => {
+      expect(collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {})?.dataToken).toBe("missing");
+    });
+    withHome(home => writeFileSync(join(home, "service-api-token"), "\n", "utf8"), () => {
+      const status = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {});
+      expect(status?.dataToken).toBe("unsafe (file)");
+      expect(hubStatusLines(status!).join("\n")).toContain(status!.dataTokenPath);
+    });
+  });
+
+  test("the block always ends with the invite hint", () => {
+    withHome(() => {}, () => {
+      const lines = hubStatusLines(collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {})!);
+      expect(lines[0]).toBe("Hub:");
+      expect(lines.at(-1)).toBe("  Invite a machine: ocx hub invite");
+    });
+  });
+});
+
+describe("unclean prior exit evidence", () => {
+  const base = {
+    live: false,
+    healthOk: false,
+    healthRefused: true,
+    ownerPidAlive: false,
+    pidRecordBefore: 4242,
+    pidRecordAfter: 4242,
+    runtimePidBefore: 4242,
+    runtimePidAfter: 4242,
+  };
+
+  test("both records outliving a dead owner is an unclean exit", () => {
+    expect(isUncleanExitEvidence(base)).toBe(true);
+  });
+
+  // Blocker 5 from the plan audit: a fixture that always writes BOTH records cannot
+  // tell an AND from an OR, so each record must be sufficient on its own.
+  test("a pid record alone is sufficient", () => {
+    expect(isUncleanExitEvidence({
+      ...base,
+      runtimePidBefore: null,
+      runtimePidAfter: null,
+    })).toBe(true);
+  });
+
+  test("a runtime-port record alone is sufficient", () => {
+    expect(isUncleanExitEvidence({
+      ...base,
+      pidRecordBefore: null,
+      pidRecordAfter: null,
+    })).toBe(true);
+  });
+
+  test("a clean home reports nothing", () => {
+    expect(isUncleanExitEvidence({
+      ...base,
+      pidRecordBefore: null,
+      pidRecordAfter: null,
+      runtimePidBefore: null,
+      runtimePidAfter: null,
+    })).toBe(false);
+  });
+
+  test("a live proxy or a healthy probe reports nothing", () => {
+    expect(isUncleanExitEvidence({ ...base, live: true })).toBe(false);
+    expect(isUncleanExitEvidence({ ...base, healthOk: true })).toBe(false);
+  });
+
+  // Re-audit blocker 2: without this case the owner-alive clause is never exercised,
+  // because every other fixture names a dead pid.
+  test("a live owner pid is a start in progress, not a crash", () => {
+    expect(isUncleanExitEvidence({ ...base, ownerPidAlive: true })).toBe(false);
+  });
+
+  // Re-audit blocker 1: `handleStart` binds the port before it publishes either
+  // record, so a start caught in that window leaves both snapshots identical. Only a
+  // refused connection proves nothing holds the port.
+  test("a held port is not a crash even when the records look stale", () => {
+    expect(isUncleanExitEvidence({ ...base, healthRefused: false })).toBe(false);
+  });
+
+  test("records published mid-probe suppress the report", () => {
+    expect(isUncleanExitEvidence({ ...base, pidRecordBefore: null })).toBe(false);
+    expect(isUncleanExitEvidence({ ...base, runtimePidAfter: 9999 })).toBe(false);
+  });
+
+  // Review blocker 2: `unreachable` covers every non-abort failure, including a socket
+  // that is ACCEPTED and then reset — which is what an in-flight bind looks like. Only a
+  // connect-phase refusal proves the port is free.
+  test("only a connect-phase refusal counts as nothing listening", () => {
+    const refused = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" });
+    expect(isConnectionRefused(refused)).toBe(true);
+
+    const nested = new Error("fetch failed", { cause: refused });
+    expect(isConnectionRefused(nested)).toBe(true);
+
+    const reset = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    expect(isConnectionRefused(reset)).toBe(false);
+
+    // A message that merely mentions refusal without the errno is not evidence.
+    expect(isConnectionRefused(new Error("connection refused by policy"))).toBe(false);
+    expect(isConnectionRefused(undefined)).toBe(false);
+  });
+});
+
+/**
+ * Command-level coverage. Review found the unit tests above were satisfiable by an
+ * implementation that never reported anything: replacing the returned
+ * `staleProcessState` with a constant `false` left every predicate test green. These
+ * drive the real CLI, so the field has to travel from disk to output.
+ */
+describe("status reports stale process records end to end", () => {
+  const seed = (home: string, opts: { pid?: number; runtime?: boolean; port: number }): void => {
+    writeFileSync(join(home, "config.json"), JSON.stringify({ port: opts.port, codexAutoStart: false }), "utf8");
+    const pid = opts.pid ?? findDeadPid();
+    if (opts.pid !== 0) writeFileSync(join(home, "ocx.pid"), String(pid), "utf8");
+    if (opts.runtime) {
+      writeFileSync(join(home, "runtime-port.json"), JSON.stringify({ pid, port: opts.port, hostname: "127.0.0.1" }), "utf8");
+    }
+  };
+
+  /**
+   * A port that is genuinely free: bind an ephemeral port, read it, release it. The
+   * discard port 9 is conventionally unused but not guaranteed, and if anything answers
+   * on it the probe is accepted rather than refused and these fixtures invert.
+   */
+  async function allocateFreePort(): Promise<number> {
+    const probe = createServer();
+    await new Promise<void>(resolve => { probe.listen(0, "127.0.0.1", () => resolve()); });
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>(resolve => { probe.close(() => resolve()); });
+    return port;
+  }
+
+  /**
+   * Prove the endpoint refuses right now.
+   *
+   * `allocateFreePort` releases the port it reports, and on a sharded runner every other
+   * test binding an ephemeral port is a candidate to take it. A fixture that assumes a
+   * released port is still refusing asserts against whatever happened to bind it.
+   */
+  async function refusesConnection(port: number): Promise<boolean> {
+    return await new Promise<boolean>(resolve => {
+      const socket = createConnection({ port, host: "127.0.0.1" });
+      const settle = (refused: boolean): void => { socket.destroy(); resolve(refused); };
+      socket.setTimeout(1_000);
+      socket.once("connect", () => settle(false));
+      socket.once("timeout", () => settle(false));
+      socket.once("error", () => settle(true));
+    });
+  }
+  let freePort: number;
+  beforeEach(async () => { freePort = await allocateFreePort(); });
+
+  test("a dead owner record surfaces in --json and in human output", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-stale-json-"));
+    try {
+      seed(home, { runtime: true, port: freePort });
+
+      const json = runStatusJson(home);
+      expect(json.status).toBe(0);
+      const parsed = JSON.parse(json.stdout) as { proxy?: { staleProcessState?: unknown } };
+      expect(parsed.proxy?.staleProcessState).toBe(true);
+
+      const human = spawnSync(process.execPath, [cliPath, "status"], {
+        cwd: repoRoot,
+        env: { ...process.env, OPENCODEX_HOME: home },
+        encoding: "utf8",
+      });
+      expect(human.stdout).toContain("may have exited unexpectedly");
+    } finally {
+      removeTreeWithRetry(home);
+    }
+  });
+
+  test("a clean home reports false and says nothing about a previous run", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-stale-clean-"));
+    try {
+      writeFileSync(join(home, "config.json"), JSON.stringify({ port: freePort, codexAutoStart: false }), "utf8");
+
+      const json = runStatusJson(home);
+      const parsed = JSON.parse(json.stdout) as { proxy?: { staleProcessState?: unknown } };
+      expect(parsed.proxy?.staleProcessState).toBe(false);
+
+      const human = spawnSync(process.execPath, [cliPath, "status"], {
+        cwd: repoRoot,
+        env: { ...process.env, OPENCODEX_HOME: home },
+        encoding: "utf8",
+      });
+      expect(human.stdout).not.toContain("may have exited unexpectedly");
+    } finally {
+      removeTreeWithRetry(home);
+    }
+  });
+
+  // Review blocker 3: a recycled pid must suppress rather than assert. This process is
+  // certainly alive, so recording it stands in for a reused pid.
+  test("a record naming a live pid is never reported as a stale exit", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-stale-livepid-"));
+    try {
+      seed(home, { pid: process.pid, runtime: true, port: freePort });
+
+      const parsed = JSON.parse(runStatusJson(home).stdout) as { proxy?: { staleProcessState?: unknown } };
+      expect(parsed.proxy?.staleProcessState).toBe(false);
+    } finally {
+      removeTreeWithRetry(home);
+    }
+  });
+
+  // Review blocker 4: status and doctor disagreed when the recorded port differed from
+  // the configured one. Both now probe the recorded port, so both must agree.
+  //
+  // The configured port must be OCCUPIED for this to discriminate: if both ports are
+  // simply free, probing either one yields the same refusal and the test cannot tell the
+  // two implementations apart. A listener that accepts and resets is what an in-flight
+  // bind looks like, so a run that probed the configured port would suppress the report.
+  test("a fallback-port record is judged on the recorded port, not the configured one", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-stale-fallback-"));
+    const occupied = createServer(socket => { socket.destroy(); });
+    await new Promise<void>(resolve => { occupied.listen(0, "127.0.0.1", () => resolve()); });
+    const occupiedPort = (occupied.address() as AddressInfo).port;
+    try {
+      const pid = findDeadPid();
+      writeFileSync(join(home, "config.json"), JSON.stringify({ port: occupiedPort, codexAutoStart: false }), "utf8");
+      writeFileSync(join(home, "ocx.pid"), String(pid), "utf8");
+
+      // The recorded port has to refuse for this to discriminate, and `allocateFreePort`
+      // hands back a port it has already released. Confirm refusal immediately before and
+      // immediately after the probe, and re-allocate when something took it in between, so
+      // a stolen port retries instead of failing an assertion it never exercised.
+      let parsed: { proxy?: { staleProcessState?: unknown } } | undefined;
+      for (let attempt = 0; attempt < 5 && parsed === undefined; attempt++) {
+        const recordedPort = await allocateFreePort();
+        if (recordedPort === occupiedPort) continue;
+        if (!await refusesConnection(recordedPort)) continue;
+        writeFileSync(join(home, "runtime-port.json"), JSON.stringify({ pid, port: recordedPort, hostname: "127.0.0.1" }), "utf8");
+        const observed = JSON.parse(runStatusJson(home).stdout) as { proxy?: { staleProcessState?: unknown } };
+        if (!await refusesConnection(recordedPort)) continue;
+        // The TCP check can refuse while the HTTP /healthz probe aborts at 800ms
+        // without an ECONNREFUSED code. That leaves staleProcessState false even
+        // though the recorded port is still empty; retry instead of treating a
+        // timed-out probe as "judged the occupied configured port".
+        if (observed?.proxy?.staleProcessState !== true) continue;
+        parsed = observed;
+      }
+
+      expect(parsed, "no allocated port stayed refused across the status probe").toBeDefined();
+      expect(parsed?.proxy?.staleProcessState).toBe(true);
+    } finally {
+      await new Promise<void>(resolve => { occupied.close(() => resolve()); });
+      removeTreeWithRetry(home);
+    }
+  });
+});

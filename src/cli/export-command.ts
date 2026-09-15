@@ -1,8 +1,10 @@
 /**
  * `ocx export --client <id>` — print a client config for the live proxy.
  *
- * Eight clients, four formats: OpenCode and Pi are JSON; OMP, Hermes, Gajae and
- * MiniMax Code are YAML; OpenClaw is JSON5; Kimi is TOML.
+ * Fourteen clients, five formats. The accepted list is `EXPORT_CLIENT_IDS`, not
+ * this comment: OpenCode, Pi, Prime, Aside, ZCode and omo are JSON; OMP,
+ * Hermes, gjc, DSH, MiniMax Code and Raycast are YAML; OpenClaw is JSON5; Kimi
+ * is TOML.
  *
  * Two consumers, one payload (devlog 260731_client_config_export/020):
  *
@@ -59,23 +61,6 @@ export interface ExportCommandDeps extends RuntimeApiDeps {
 }
 
 /**
- * `/api/models` row plus the modality list Pi consumes. The launcher's row type predates
- * the Pi exporter and stops at the fields OpenCode needs.
- */
-type ExportProxyModelRow = OpencodeProxyModelRow & {
-  inputModalities?: string[];
-  reasoningEfforts?: string[];
-  defaultReasoningEffort?: string;
-};
-
-/** Same authoritativeness rule the serializers apply, for the degraded-count line. */
-function hasContextLimit(model: ExportModel): boolean {
-  return typeof model.contextWindow === "number"
-    && Number.isFinite(model.contextWindow)
-    && model.contextWindow > 0;
-}
-
-/**
  * Export rows from proxy `/api/models` rows.
  *
  * `opencodeCatalogFromProxyRows` owns the visibility rules (drop `disabled`, drop dupes,
@@ -85,20 +70,13 @@ function hasContextLimit(model: ExportModel): boolean {
  * row as the model itself: a second lookup over the raw rows would let a hidden or disabled
  * duplicate donate its ladder to the visible entry.
  *
- * Only modalities are re-joined by `namespaced`, because the catalog type does not carry them.
+ * Modalities need no such lookup: `opencodeCatalogFromProxyRows` carries them on the catalog
+ * entry, so the clients that filter them are handed the same filtered, deduped row.
  */
 export function exportModelsFromProxyRows(
-  rows: readonly ExportProxyModelRow[],
+  rows: readonly OpencodeProxyModelRow[],
   config: OcxConfig,
 ): ExportModel[] {
-  const modalities = new Map<string, string[]>();
-  for (const row of rows) {
-    const namespaced = row.namespaced?.trim();
-    if (!namespaced || modalities.has(namespaced)) continue;
-    if (Array.isArray(row.inputModalities) && row.inputModalities.length > 0) {
-      modalities.set(namespaced, [...row.inputModalities]);
-    }
-  }
   return opencodeCatalogFromProxyRows(rows, config).map(entry => {
     const model: ExportModel = {
       namespaced: entry.namespaced,
@@ -106,14 +84,18 @@ export function exportModelsFromProxyRows(
       id: entry.id ?? entry.namespaced,
     };
     if (entry.native) model.native = true;
+    if (entry.fastRowAvailable !== undefined) model.fastRowAvailable = entry.fastRowAvailable;
     if (entry.displayName) model.displayName = entry.displayName;
     if (entry.contextWindow !== undefined) model.contextWindow = entry.contextWindow;
+    // Fork F-004: carry the authoritative output capability through to every client serializer.
+    if (entry.maxOutputTokens !== undefined) model.maxOutputTokens = entry.maxOutputTokens;
     if (entry.reasoningEfforts && entry.reasoningEfforts.length > 0) {
       model.reasoningEfforts = [...entry.reasoningEfforts];
     }
     if (entry.defaultReasoningEffort) model.defaultReasoningEffort = entry.defaultReasoningEffort;
-    const input = modalities.get(entry.namespaced);
-    if (input) model.inputModalities = [...input];
+    if (entry.inputModalities && entry.inputModalities.length > 0) {
+      model.inputModalities = [...entry.inputModalities];
+    }
     return model;
   });
 }
@@ -177,16 +159,30 @@ export async function handleExportCommand(argv: string[], deps: ExportCommandDep
     rejectArgs(args, USAGE);
 
     const spec = EXPORT_CLIENTS[client];
-    const config = (deps.configImpl ?? loadConfig)();
     const root = await runtimeBaseUrl(deps);
-    const rows = await runtimeRequest<ExportProxyModelRow[]>("/api/models", {}, { ...deps, baseUrl: root });
-    if (!Array.isArray(rows)) {
-      throw new RuntimeApiError("Management API returned an unexpected /api/models payload.", 502, rows);
+    let built: { document: unknown; text: string };
+    if (client === "raycast") {
+      // The dial address alone cannot distinguish a wildcard authenticated bind
+      // from loopback. Let the live server resolve its admission/listener policy;
+      // saved config can differ from the process serving this request.
+      const exported = await runtimeRequest<{
+        client: string; format: string; config: unknown; text: string;
+      }>("/api/client-config?client=raycast", {}, { ...deps, baseUrl: root });
+      if (!exported || exported.client !== "raycast" || exported.format !== "yaml"
+        || typeof exported.text !== "string" || exported.config === undefined) {
+        throw new RuntimeApiError("Management API returned an unexpected Raycast export payload.", 502, null);
+      }
+      built = { document: exported.config, text: exported.text };
+    } else {
+      const rows = await runtimeRequest<OpencodeProxyModelRow[]>("/api/models", {}, { ...deps, baseUrl: root });
+      if (!Array.isArray(rows)) {
+        throw new RuntimeApiError("Management API returned an unexpected /api/models payload.", 502, rows);
+      }
+      // Discovery can persist selection; preserve the existing exporters' flow.
+      const config = (deps.configImpl ?? loadConfig)();
+      const models = exportModelsFromProxyRows(rows, config);
+      built = buildClientConfigText(client, { baseUrl: proxyV1BaseUrl(root), models, config });
     }
-    const models = exportModelsFromProxyRows(rows, config);
-    // The text is the client's OWN format — YAML, TOML and JSON5 clients would
-    // otherwise receive a JSON rendering their parser reads differently.
-    const built = buildClientConfigText(client, { baseUrl: proxyV1BaseUrl(root), models, config });
     const clientConfig = built.document;
     const text = built.text;
 
@@ -195,7 +191,7 @@ export async function handleExportCommand(argv: string[], deps: ExportCommandDep
     // stderr, so `--json` stdout stays a standalone JSON document.
     if (out !== undefined && wantsJson) console.error(`Wrote ${out}`);
 
-    const degraded = models.filter(model => !hasContextLimit(model)).length;
+    const { modelCount, modelsWithoutLimits } = spec.summarize(clientConfig);
     // `--json` keeps emitting the DOCUMENT at the top level as JSON for scripts;
     // `--out` is the path that writes the selected client's native format.
     // Format metadata rides in the human lines below.
@@ -206,7 +202,7 @@ export async function handleExportCommand(argv: string[], deps: ExportCommandDep
       `Destination: ${spec.destination(process.env)}`,
       "Merge this generated configuration into that file; do not replace it.",
       `Before launching: ${spec.exportHint}`,
-      `${models.length} model${models.length === 1 ? "" : "s"}; ${degraded} omit context limits (the client applies its own defaults).`,
+      `${modelCount} model${modelCount === 1 ? "" : "s"}; ${modelsWithoutLimits} omit context limits (the client applies its own defaults).`,
     ]);
   });
 }

@@ -57,6 +57,9 @@ export const INTEGRATION_MARKS: Record<OverviewClientId, string | null> = {
   zcode: CLIENT_MARKS.zcode ?? null,
   prime: CLIENT_MARKS.prime ?? null,
   aside: CLIENT_MARKS.aside ?? null,
+  raycast: CLIENT_MARKS.raycast ?? null,
+  omo: CLIENT_MARKS.omo ?? null,
+  cline: CLIENT_MARKS.cline ?? null,
 };
 
 /**

@@ -33,6 +33,27 @@ ocx agent sidecar web --list
 ocx agent sidecar web --model gpt-5.6-luna
 ```
 
+### `ocx effort [status|set|clear]`
+
+Inspect or change main and subagent reasoning-effort caps through the live proxy, or the local
+configuration when no proxy is available. Cap values are `low`, `medium`, `high`, `xhigh`, `max`,
+and `ultra`; `-` clears the selected cap. `none` and `minimal` are not cap levels and are rejected
+before probing the proxy or submitting an update, including when another option in the same command is valid.
+They remain valid for `--injection`, which sets the separate injection effort rather than a cap.
+
+```bash
+ocx effort status --json
+ocx effort set --main high --subagent low
+ocx effort set --subagent -
+```
+
+Status preserves existing stored/runtime cap values and reports unsupported values in `warnings`
+(an empty array when none are unsupported). The same warnings appear in human output and name the
+field that is ignored with a correction command. Status never repairs or rewrites those values.
+An ignored subagent field does not remove a valid main cap. `ocx effort clear` clears both caps
+while retaining the separate injection-effort setting. See [Sub-agent surfaces](/guides/sub-agent-surface/)
+for the request surfaces where caps apply.
+
 ### `ocx v2 <status|on|off|mode <v1|default|v2>|keep-native-v1 <on|off>|threads <n>|mode-hint <text|--clear>>`
 
 Manage the Codex `multi_agent_v2` feature flag and the three-state multi-agent surface mode.
@@ -111,13 +132,20 @@ Inspect proxy requests, usage, storage, memory, and debug data. The direct alias
 | Alias | Equivalent resource |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--since <timestamp> --until <timestamp>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
 ```bash
 ocx observe usage --range 30d --json
+ocx usage --since 2026-09-01T09:00:00Z --until 2026-09-01T10:59:59.999Z --json
 ```
+
+`--since` and `--until` must be supplied together. They accept integer epoch milliseconds or
+full ISO datetimes with an explicit timezone, include both endpoints, and override `--range`.
+Invalid or reversed bounds fail before the request. Human output prints the requested interval;
+`--json` includes `customWindow`, `since`, and `until`. Existing surface/provider/model filters
+still apply. These commands query the running proxy; they do not provide offline reports.
 
 `--range today` (alias `1d`) reports the current local day. `--provider` and
 `--model` narrow the report to one upstream target — distinct from
@@ -133,6 +161,11 @@ separately, and requests with no matching price row are counted as
 ```bash
 ocx usage --range today --provider xai
 ```
+
+When some usage records cannot be included, human output warns, including when there are zero readable rows.
+Any displayed totals reflect readable records only. If a filter has no readable matches, the output shows
+the warning and guidance instead of total lines; skipped records may contain matches.
+`--json` preserves the response-level `usageIncomplete` diagnostic and reason.
 
 ### `ocx debug <provider|usage|injection|claude> <on|off|status|reset|logs [-f]>`
 
@@ -207,7 +240,7 @@ Manage and apply the Grok Build model fence.
 
 ## Client config export
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo>`
 
 Print a client config wired to the running proxy. The command serializes the
 `opencodex` provider block — base URL, model list, and the client's credential
@@ -218,7 +251,7 @@ models Codex can currently see.
 
 | Flag | Action |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside>` | Required. Selects the client config dialect. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo>` | Required. Selects the client config dialect. |
 | `--json` | Print the generated document as JSON on stdout for scripts. This is JSON even when the selected client's native format is YAML, TOML, or JSON5. |
 | `--out <path>` | Write the client's native config format to `<path>`. Refuses to replace an existing file. |
 | `--force` | Allow `--out` to replace an existing file. |
@@ -248,6 +281,8 @@ client applies its own defaults for those).
 | `zcode` | `~/.zcode/v2/config.json` (`ZCODE_DATA_DIR` wins when set; a relative value is refused) | `config.json` | none — loopback placeholder |
 | `prime` | `~/.prime/agent/models.json` (`PRIME_AGENT_CODING_AGENT_DIR` wins when set; a relative value is refused) | `prime-models.json` | none — loopback placeholder |
 | `aside` | `~/.aside/u/<account>/models.json` for the account Aside's own `accounts.json` names as current; an unreadable manifest is refused rather than defaulting to an account | `aside-models.json` | none — loopback placeholder |
+| `raycast` | `~/.config/raycast/ai/providers.yaml` on macOS and Windows alike (Raycast does not honor `XDG_CONFIG_HOME`) | `raycast-providers.yaml` | none — loopback only, no `api_keys` entry is written |
+| `omo` | `~/.omo/agent/models.json` (`OMO_CODING_AGENT_DIR`, then `SENPI_CODING_AGENT_DIR`, then `PI_CODING_AGENT_DIR` win in that order when set; a relative value is refused) | `omo-models.json` | none — loopback placeholder |
 
 The managed DSH export requires DSH 0.1.0-rc.6 or newer and owns only
 `llm-pi-ai.providers.opencodex`. DSH hot reloads that provider; the user's default model and
@@ -259,6 +294,15 @@ This is load-bearing because both clients resolve `apiKey` while building their 
 hide the whole provider when an existing config contains an unset env reference. The proxy never
 checks the generated placeholder on loopback. OMP supports provider-level headers, but this initial
 integration deliberately remains loopback-only; remote `x-opencodex-api-key` wiring is deferred.
+
+The Raycast export is a standalone `providers.yaml` document with one `id: opencodex` element
+in the `providers` sequence: `name: OpenCodex`, the proxy's `/v1` base URL, and every routed model
+with its `abilities` (`tools` and `system_message` always supported, `vision` from the catalog's
+input modalities, `reasoning_effort` when the model has an effort ladder, `temperature` off for
+reasoning models). Custom Providers is a Raycast Pro feature, and Raycast watches the file, so a
+saved change takes effect without a restart. The format is documented at
+[manual.raycast.com/ai/custom-providers](https://manual.raycast.com/ai/custom-providers). No
+`api_keys` entry is written, so this export is loopback-only and a non-loopback bind is refused.
 
 The MCode, ZCode and Prime exports are loopback-only for the same reason and likewise carry the
 `opencodex-loopback` placeholder rather than a real credential. Prime Agent reads the same
@@ -290,8 +334,8 @@ the proxy binds beyond loopback; see
 [Remote access](/reference/configuration/#remote-access) for how admission keys are issued. Keys for
 the upstream providers themselves are a separate thing entirely, configured per
 [Providers](/guides/providers/).
-Gajae is the exception: `OPENCODEX_GAJAE_API_KEY` fills its provider credential from the
-environment, but its schema cannot send the remote admission header, so the generated Gajae
+gjc is the exception: `OPENCODEX_GAJAE_API_KEY` fills its provider credential from the
+environment, but its schema cannot send the remote admission header, so the generated gjc
 integration remains loopback-only.
 
 The same payload is served by `GET /api/client-config` and rendered on the dashboard's API tab, so
@@ -302,6 +346,11 @@ the CLI, the API, and the GUI use the same bytes.
 ### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 Manage headless runtime settings, startup, sync, diagnostics, and updates.
+
+`ocx system codex-restart --yes` restarts Codex app-servers and fully quits and relaunches the
+Codex desktop app, through the same module as `ocx sync --restart-codex`. When the proxy itself
+is running inside the Codex app, the command refuses with an actionable message instead of
+promising a handoff it cannot complete.
 
 ```bash
 ocx system settings --stream-mode eager-relay
@@ -331,3 +380,9 @@ and are never classified as managed.
 
 Inspect and safely modify validated OpenCodex configuration. `show` and `get` mask secrets. Import
 validates before writing and requires `--yes`.
+
+### Usage from a connected client
+
+`ocx usage` reads the connected hub with this client's enrolled data key. Human output identifies the hub source and client-key scope; `--json` returns the same scoped data. Range, surface, provider/model filters and custom `--since`/`--until` bounds remain available. Account breakdowns and other clients' records are not shared. An old or unavailable hub produces an explicit error instead of substituting local usage; upgrade the hub if it does not support this read.
+
+The read-only data-plane endpoint is `GET /v1/usage`, using `x-opencodex-api-key` with a configured client key. Environment-wide and admin keys are refused. It accepts `range`, `surface`, `provider`, `model`, `since`, and `until`; unknown/repeated options and caller-selected key IDs are rejected. Oversized skipped rows retain the explicit incomplete-history warning.

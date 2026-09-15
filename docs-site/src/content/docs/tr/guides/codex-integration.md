@@ -262,6 +262,14 @@ fonksiyon aracı olarak kodlar, ardından akışlı fonksiyon çağrısı yaşam
 Codex görmeden önce `custom_tool_call`'a geri yükler. Yerel OpenAI iletme
 yönlendirmesi ve desteklenen `apply_patch` özel aracı değişmeden kalır.
 
+Yönlendirilen code-mode turlarına, ilk çağrıdan önce iç içe geçmiş yardımcılar için geçerli olan
+ana makine kuralları da bildirilir: `tools.apply_patch`, yalnızca yama işaretçilerinden oluşan
+satırlarla başlayan ve biten tek bir dize alır; isolate içinde `import` yoktur ve uzun süren
+komutlar `write_stdin` üzerinden yoklanır. Yerel yönlendirilmiş Responses, Kiro veya Cursor yolundaki
+bir code-mode exec sonucu hâlâ ana makinenin hata mesajlarından birini içeriyorsa opencodex,
+ilgili kuralı belirten tek satırlık bir ipucu ekler. Bu değişiklik modelin kodunu veya yama metnini
+yeniden yazmaz.
+
 Seçilen sağlayıcı fonksiyon/araç çağrısını desteklemelidir. Araç çağrısı desteği
 olmayan salt metin bir sağlayıcı `exec`, Tarayıcı veya Bilgisayar Kullanımını
 kullanamaz. Yerel OpenAI satırları yukarı akış araç modunu değiştirmeden tutar.
@@ -353,9 +361,14 @@ sırayla kontrol edin:
 2. **`disabledModels`** (üst düzey) — modelleri hem katalogdan hem de
    `/v1/models` listesinden gizler ve yalın yerel GPT slug'larını `visibility:
    "hide"` olarak değiştirir.
-3. **Boş `models` ile `liveModels: false`** — canlı keşif kapalı olduğunda ve
-   `models` boş veya atlandığında opencodex bu sağlayıcı için hiçbir
-   yönlendirilmiş model göstermez.
+3. **`liveModels: false`** — `liveModels: false` iken `models` boşsa veya atlanmışsa başlangıç listesine önce yapılandırılmış
+   `defaultModel`, ardından `retainModels` eklenir. Yinelenen kimliklerde ilk geçen korunur.
+   Açıkça belirtilmiş, boş olmayan `models` listesini ise `retainModels` izler; farklı bir `defaultModel`
+   kendiliğinden eklenmez. Bu model yine de `models` veya `retainModels` içinde açıkça belirtilebilir.
+   Bu alanların hiçbiri kimlik sağlamıyorsa başlangıç listesi boştur. Bu sıra, son seçici sırasını
+   garanti etmez. `selectedModels`, `disabledModels` ve sağlayıcının devre dışı bırakılması kuralları
+   geçerliliğini korur. `authMode: "forward"` ayrı dalında kalır ve bu yönlendirilmiş statik listeyi
+   kullanmaz. Bu kurallar canlı keşif başarısızlığındaki geri dönüş davranışını değiştirmez.
 4. **Cursor `GetUsableModels`** — Cursor adaptörü modelleri `/models` üzerinden
    değil, protobuf `GetUsableModels` RPC'si üzerinden keşfeder; bu nedenle
    Cursor tarafındaki bir değişiklik diğer sağlayıcılardan bağımsız olarak hangi
@@ -366,10 +379,11 @@ sırayla kontrol edin:
 6. **Çalışan Codex `app-server`** — uzun ömürlü bir Codex `app-server` (Desktop
    / CLI arka plan ana bilgisayarı) önceki listeyi bellekte tuttuğu sürece
    diskteki kataloğu yeniden yazmak yeterli değildir. `ocx sync` ve `ocx
-   sync-cache` bu süreçler algılandığında uyarır. Bunları `ocx sync
-   --restart-codex` ile yeniden başlatın (veya eşleşen `app-server` süreçlerini
-   kendiniz durdurun), ardından yeni listenin görünmesi için Codex'in bunları
-   yeniden oluşturmasına izin verin.
+   sync-cache` bu süreçler algılandığında uyarır. `ocx sync --restart-codex` bu
+   süreçleri yeniden başlatır ve seçicinin kataloğu yeniden okuması için Codex
+   masaüstü uygulamasını macOS, Linux ve Windows'ta tamamen kapatıp yeniden
+   başlatır. Masaüstü uygulamasını çalışır bırakmak için `--restart-app-server-only`
+   iletin veya eşleşen `app-server` süreçlerini kendiniz durdurun.
 
 :::caution[Diğer yerel yazıcılar]
 Katalog yazmaları (`opencodex-catalog.json`, `config.toml`) opencodex **içinde**
@@ -412,22 +426,36 @@ Arayüzü](/tr/guides/sub-agent-surface/) sayfasına bakın.
 
 ## Codex hesap ısınması
 
-Codex hesap havuzuna bir ChatGPT hesabı eklendiğinde opencodex, Codex Responses
-arka ucuna küçük bir akış isteği ile kalıcılıktan önce hesabı doğrular. İstek
-gerçek bir Responses öğe dizisi kullanır (`input: [{ type: "message", ... }]`),
-`response.completed` bekler ve varsayılan olarak `gpt-5.4-mini` kullanır. Bu
-model HTTP 400 döndürürse `gpt-5.5` ile yeniden dener; ham yanıt gövdelerini
-açığa çıkarmadan yapılandırılmış yukarı akış hata ayrıntıları ortaya çıkarılır.
-Arka plan yeniden doğrulaması ayrıdır ve varsayılan olarak kapalıdır; yalnızca
-Token Guardian etkinleştirildiğinde, `chatgpt` yenileme politikası `proactive`
-olduğunda ve `tokenGuardian.codexWarmupEnabled` true olduğunda çalışır.
+Hesap ekleme veya yeniden kimlik doğrulama, normalde kaydetmeden önce `response.completed` bekleyen küçük bir model isteğiyle doğrulanır. Varsayılan model `gpt-5.6-luna` olup HTTP 400 veya HTTP 404 durumunda `gpt-5.5` denenir. Genel hatalar ham yanıt gövdesi yerine sabit hata kategorilerini içerir.
 
+Yeni OAuth belirteciyle yapılan kota sorgusu 5 saatlik, haftalık veya aylık kotanın tükendiğini doğrularsa hesap model çağrısı olmadan kaydedilir ve **Doğrulama bekleniyor** gösterilir. Yeniden başlatma veya belirteç yenileme yönlendirmeyi açmaz. Kota geri geldiğinde kotaları yenileyin: kullanılabilir kapasite gösteren eksiksiz güncel veri küçük bir doğrulama isteğine izin verir. Yalnızca tamamlanan yanıt hesabı etkinleştirir. Hatalarda kısıtlama korunur. Pasif sorgulama bu isteği göndermez. İlk kayıtta bilinmeyen kota normal doğrulamayı gerektirir.
+
+`ocx account refresh openai` ve `ocx account list openai --quota --refresh` yalnızca kullanımı okur. Model doğrulaması kota tüketir ve insanın pano oturumunu gerektirir: kota yenilendikten sonra `ocx gui` açıp **Refresh quotas** düğmesine tıklayın. Grafik arayüzü olmayan bir sunucunun panosuna da tarayıcınızdan erişin; yalnızca yönetici belirteci doğrulama yetkisi vermez. Duraklatılmış hesap doğrulanabilir, ancak devam ettirilmez veya seçilmez. Model yetkilendirme hataları başarılı doğrulama veya yeniden girişe kadar görünür kalır.
+
+Arka plan doğrulaması ayrı ve varsayılan olarak kapalıdır. Token Guardian, `openai` için `proactive` yenileme ilkesi ve `tokenGuardian.codexWarmupEnabled` gerektirir; kayıt doğrulaması bekleyen hesapları atlar.
+
+### Bir hesabın istek karşılamayı bırakma nedeni
+
+Bir hesap havuz seçiminden çıktığında neden, görüntüleme için yeniden hesaplanmak yerine kararla birlikte taşınır; böylece yönlendirme hesabı dışarıda bırakırken hiçbir yüzey onu sağlıklı gösteremez. `GET /api/codex-auth/accounts` her hesapta `needsReauth` yanında `reauthReason` döndürür: kimlik bilgisi hiç kaydedilmediyse `missing_credential`, yenileme sürekli başarısızsa `refresh_failed`, kullanım sorgusunun kendisi reddedildiyse `quota_unauthorized`.
+
+Tamamlanmayan bir ana hesap yenilemesi, yeniden denemede başarılı olabileceği için hâlâ `Retry-After` ile `503` yanıtı verir. Mesaj artık kalıcı bir başarısızlığın ana hesabın yeniden kimlik doğrulaması gerektirdiğini de belirtiyor.
+
+### Sürümü düşen bir hesabı rotasyondan çıkarma
+
+`codexPool.excludedPlans`, otomatik havuz seçiminin atladığı plan anahtarlarını listeler ve her hesapta saklanan planla büyük/küçük harf gözetmeden karşılaştırır. Varsayılan olarak yoktur; mevcut bir kurulum tam olarak eskisi gibi rotasyon yapar.
+
+```bash
+ocx config set codexPool '{"excludedPlans":["free"]}'
+```
+
+Bu bir engelleme değil, seçim politikasıdır. Dışarıda bırakılan hesap kimlik bilgisini, kota geçmişini ve iş parçacığı bağını korur, hesap listesinde görünmeye devam eder ve `work/gpt-5.5` gibi açık bir seçimle hâlâ erişilebilir. Değişen tek şey, otomatik rotasyonun onu artık seçmemesidir; hesap zaten etkin olsa ya da bir iş parçacığına bağlı olsa bile. Süresi dolan bir abonelik tam olarak bu durumu bırakır.
+
+Ana Codex hesabı plan hariç tutma politikasından muaftır; yalnızca seçim yapan yönlendirme korunan yerel kimlik bilgilerini okumaz. Kullanılabilir tüm havuz hesapları hariç tutulursa otomatik seçim hesap döndürmez. Açıkça hesap belirten yollar kullanılabilir; duraklatma, kimlik doğrulama ve model yetkisi denetimleri korunur. Hesap kartı ve CLI, hariç tutulan yönlendirme planını kimlik bilgisi durumundan ayrı gösterir. Planların tam sıralaması olmadığından `minimumPlan` ayarı yoktur.
 ## Yerel Codex'i geri yükleme
 
-opencodex sizi asla tuzağa düşürmez. **`ocx stop`, yerel Codex'e tamamen geri
-dönen tek komuttur** — proxy'yi durdurur, kuruluysa arka plan servisini durdurur
-ve enjekte edilen her satırı ve yönlendirilen katalog girdisini kaldırır,
-böylece düz `codex` sanki opencodex hiç var olmamış gibi tam olarak çalışır:
+`ocx stop`, proxy'yi ve kurulu arka plan servisini durdurur, ardından yerel Codex'i geri yüklemeyi dener. OpenCodex yalnızca sahipliğini doğrulayabildiği yönlendirme öğelerini kaldırır; yapılandırma dosyaları güvenle geri yüklenemiyorsa işlemin tamamlanmadığını bildirir.
+
+Mevcut yapılandırma veya profil kayıtlı özgün içerikten farklıysa ve günlükte o dosyanın enjekte edilmiş durumunun karması yoksa otomatik kurtarma iki dosyayı ve günlüğü değiştirmeden korur. Özgün içerikle zaten aynı olan dosya yeniden yazılmaz. Yönlendirilmiş bir yapılandırmaya yeniden enjeksiyon da bu belirsiz durumu reddeder; yerel yapılandırma yeni bir anlık görüntü oluşturabilir. [Kurtarma kurallarına](/guides/codex-integration/#recovery-without-injection-hashes) bakın.
 
 ```bash
 ocx stop       # proxy'yi + servisi durdurun, yerel Codex'i geri yükleyin
@@ -439,3 +467,9 @@ opencodex yönetilen bir [arka plan servisi](/tr/reference/cli/#ocx-service)
 olarak çalıştığında `OCX_SERVICE=1` ayarlar, böylece servis odaklı bir yeniden
 başlatma Codex yapılandırmasını **bozmaz** — yalnızca açık bir `ocx stop` / `ocx
 service stop` yerel Codex'i geri yükler.
+
+## Sayfalanmış geçmiş için güvenlik reddi
+
+Etkilenen geçmiş deposu sayfalamayı destekliyorsa sağlayıcı değişimi `history_paginated_requires_native_writer` döndürebilir; legacy satırlar da buna dahildir. Bu neden artık Codex yapılandırmasını, başvuru profilini veya model kataloğunu reddetmez. `ocx sync` ve `ocx start` bu dosyaları yazmaya ve `model_catalog_json` yolunu ayarlamaya devam eder; böylece Codex model seçicisi OpenCodex üzerinden yönlendirilen her modeli göstermeyi sürdürür. Konuşma geçmişinin yeniden etiketlenmesini durduran yalnızca bu nedendir, çünkü sayfalanmış geçmiş sıra numaralarını Codex’in kendi yerel yazıcısı atar ve yeniden denemek bunu değiştirmez. Okunamayan bir durum veritabanı, kimliği değişmiş bir geçmiş veya çalıştırılamayan bir ön kontrol gibi diğer geçmiş ön kontrol nedenleri, daha sonra başarılı olabilecekleri için hâlâ tüm değişimi reddeder ve geri alır. Bu durumda OpenCodex sayfalanmış geçmiş dosyalarını veya iş parçacığı satırlarını değiştirmez. Mevcut konuşmalar zaten etiketlendikleri sağlayıcıda kalır ve taşınmaz; yeni konuşmalar proxy üzerinden normal şekilde yönlendirilir. Yeniden etiketleme durduğunda, ev dizininde zaten bulunan bir `[model_providers.opencodex]` tablosu kaldırılmaz, kök-override (loopback) biçimde bile tutulur; böylece satırları `opencodex` olarak etiketlenmiş konuşmalar hâlâ var olan bir sağlayıcı kimliğini korur. CLI şunu yazdırır: `Codex resume history: left to Codex's native writer (history_paginated_requires_native_writer)`. `ocx restore` ve Codex yapılandırmasının kaldırılması `history_paginated_requires_native_writer` nedeniyle hâlâ reddedilir. İş parçacığı satırları hâlâ ona başvuruyken `[model_providers.opencodex]` tanımını kaldırmak o konuşmaları çözülemez yapar ve geri yükleme yolu uyumluluk sağlayıcı tablosunu tutamaz. Zaten sayfalanmış bir ev dizini şu anda ürün üzerinden kaldırılamaz; bu amaçlanan davranış değil, bilinen açık iştir.
+
+Konuşmaları kendiniz taşımak için etkin sayfalanmış geçmişi veya iş parçacığı satırını yeniden yazmayın. Kurtarmadan önce konuşmayı kapatın ve özel geçmişi yayımlamadan tam hatayı ve sürümleri bildirin. Yedek veya başarılı betik görüntünün düzeldiğini kanıtlamaz; Codex’i yeniden açıp konuşmayı kontrol edin.

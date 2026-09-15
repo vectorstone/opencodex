@@ -17,9 +17,11 @@
  * Design of record: devlog/_fin/260803_integrations_toggle_all/030 (routes),
  * 011 (Claude Code), 012 (Grok).
  */
+import { join } from "node:path";
 import { loadConfig, saveConfigPreservingClaudeCode } from "../../config";
 import { readRuntimePort } from "../../config/process-state";
 import { desktopVisibleNativeSlugs, filterCatalogVisibleModels, nativeContextLimits } from "../../codex/catalog";
+import { getCodexHome } from "../../codex/paths";
 import { providerContextCap } from "../../providers/context-cap";
 import { OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { inspectDesktop3pConfigLibrary, removeDesktop3pStandardPivot, writeDesktop3pConfig } from "../../claude/desktop-3p";
@@ -399,13 +401,14 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       }
     }
     const { restoreNativeCodexAsync } = await import("../../codex/inject");
+    const { OCX_NATIVE_REPLAY_RECOVERY_NOTE } = await import("../../responses/compaction");
     const restored = await restoreNativeCodexAsync({ revalidateDesiredState: true });
     return jsonResponse({
       ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
       state: restored.success ? "absent" : "unsafe",
       desiredEnabled: enabled, mode,
       message: restored.success
-        ? "Codex restored to its native path; the proxy is still serving other clients"
+        ? `Codex restored to its native path; the proxy is still serving other clients. ${OCX_NATIVE_REPLAY_RECOVERY_NOTE}`
         : `Codex intent saved, but restoring the native path did not complete: ${restored.message}`,
       ...(restored.success
         ? (durable ? {} : { reason: "not_durable" })
@@ -717,8 +720,12 @@ export async function handleNativeIntegrationRoutes(ctx: ManagementContext): Pro
 
   if (url.pathname === "/api/native-integrations" && req.method === "GET") {
     const { getConfigPath } = await import("../../config");
+    const codexConfigPath = join(getCodexHome(), "config.toml");
     return jsonResponse({
-      clients: [claudeStatus(config, getConfigPath()), grokStatus(config), codexStatus(loadConfig(), getConfigPath()), desktopStatus(config)],
+      // Fork F-001 reads the durable switch fresh here, exactly like the other
+      // clients' status below, so a just-committed mode change is never reported
+      // from a stale server-startup snapshot. Upstream's Codex-specific path is kept.
+      clients: [claudeStatus(config, getConfigPath()), grokStatus(config), codexStatus(loadConfig(), codexConfigPath), desktopStatus(config)],
     } satisfies NativeStatusListEnvelope);
   }
 

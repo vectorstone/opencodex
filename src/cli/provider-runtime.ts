@@ -1,3 +1,4 @@
+import { modelCapabilitiesConfigError } from "../config/provider-validation";
 import {
   CliUsageError,
   csv,
@@ -19,15 +20,32 @@ interface ProviderQuotasDto {
   reports?: ProviderQuotaReportDto[];
 }
 
+interface QuotaResetEventDto {
+  kind?: string;
+  scope?: string;
+  window?: string;
+  percentBefore?: number;
+  percentAfter?: number;
+  resetAt?: number;
+  detectedAt?: number;
+}
+
+interface QuotaResetsDto {
+  enabled?: boolean;
+  events?: QuotaResetEventDto[];
+}
+
 const USAGE = `Usage:
   ocx provider edit <name> [--adapter <id>] [--base-url <url>] [--default-model <id|->]
       [--auth-mode <key|forward|oauth|local|->] [--note <text|->]
       [--api-key-transport <x-api-key|bearer|->]
       [--headers <json>] [--enabled <on|off>] [--live-models <on|off>]
-      [--retain-models <id,id|->]
+      [--retain-models <id,id|->] [--model <id> --text-only]
+      [--xai-chat <on|off>]
       [--allow-private-network <on|off>] [--json]
   ocx provider test <name> [--json]
   ocx provider quota [--refresh] [--json]
+  ocx provider resets [--limit <n>] [--json]
   ocx provider presets [--json]
   ocx provider account-mode <pool|direct> [--json]
   ocx provider selected <name> [--set <model,model...>] [--clear] [--json]
@@ -54,7 +72,21 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const enabled = takeBooleanOption(args, "--enabled");
   const liveModels = takeBooleanOption(args, "--live-models");
   const allowPrivateNetwork = takeBooleanOption(args, "--allow-private-network");
+  const xaiChat = takeBooleanOption(args, "--xai-chat");
+  const textOnly = takeFlag(args, "--text-only");
+  const capabilityModel = takeOption(args, "--model");
   rejectArgs(args, USAGE);
+  if (textOnly || capabilityModel !== undefined) {
+    if (!textOnly || capabilityModel === undefined) throw new CliUsageError("--text-only and --model must be supplied together", USAGE);
+    const declaration = { [capabilityModel]: { inputModalities: ["text"] } };
+    const error = modelCapabilitiesConfigError(declaration);
+    if (error) throw new CliUsageError(error, USAGE);
+    patch.modelCapabilities = declaration;
+  }
+  if (xaiChat !== undefined) {
+    if (name !== "xai") throw new CliUsageError("--xai-chat is valid only for provider xai", USAGE);
+    patch.xaiResponsesOptIn = !xaiChat;
+  }
   if (adapter !== undefined) patch.adapter = adapter;
   if (baseUrl !== undefined) patch.baseUrl = baseUrl;
   if (defaultModel !== undefined) patch.defaultModel = defaultModel;
@@ -132,6 +164,48 @@ async function quota(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   printData(result, wantsJson, lines);
 }
 
+
+/**
+ * Recently detected quota resets, newest first.
+ *
+ * `accountTag` is deliberately NOT rendered: it is a salted hash that means nothing to a human
+ * reading a terminal, and printing it invites treating an opaque tag as an account identifier.
+ */
+function quotaResetLine(event: QuotaResetEventDto): string {
+  const when = typeof event.detectedAt === "number"
+    ? new Date(event.detectedAt).toISOString()
+    : "unknown time";
+  const movement = typeof event.percentBefore === "number" && typeof event.percentAfter === "number"
+    ? `${event.percentBefore}% -> ${event.percentAfter}%`
+    : "usage unknown";
+  const next = typeof event.resetAt === "number"
+    ? `, next ${new Date(event.resetAt).toISOString()}`
+    : "";
+  return `${when}  ${event.scope ?? "?"} ${event.window ?? "?"} ${event.kind ?? "?"}: ${movement}${next}`;
+}
+
+async function resets(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv];
+  const wantsJson = takeFlag(args, "--json");
+  const limitRaw = takeOption(args, "--limit");
+  rejectArgs(args, USAGE);
+  if (limitRaw !== undefined && !/^\d+$/.test(limitRaw)) {
+    throw new CliUsageError("--limit must be a non-negative integer", USAGE);
+  }
+  const query = limitRaw === undefined ? "" : `?limit=${limitRaw}`;
+  const result = await runtimeRequest<QuotaResetsDto>(`/api/quota-resets${query}`, {}, deps);
+  const events = Array.isArray(result?.events) ? result.events : [];
+  // One line per event, NOT summaryLines: that helper is a depth-1 flattener and renders a
+  // non-scalar array as "N item(s)", which is what made `ocx provider quota` useless in #2565.
+  const lines = events.length > 0
+    ? events.map(quotaResetLine)
+    // An empty list is ambiguous, so say which kind of empty it is. Without this an operator
+    // cannot tell "nothing has reset yet" from "I never turned this on".
+    : [result?.enabled === true
+      ? "no resets detected yet"
+      : "quota-reset notifications are disabled (set quotaResetNotify.enabled)"];
+  printData(result, wantsJson, lines);
+}
 async function presets(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const args = [...argv];
   const wantsJson = takeFlag(args, "--json");
@@ -140,7 +214,8 @@ async function presets(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const rows = Array.isArray(result) ? result : result.providers ?? [];
   printData(result, wantsJson, rows.map(row => {
     const record = row as Record<string, unknown>;
-    return `${String(record.id ?? record.name ?? "?")}  ${String(record.label ?? record.adapter ?? "")}`.trimEnd();
+    const sponsor = record.sponsor ? `  (sponsor: ${String(record.sponsor)})` : "";
+    return `${String(record.id ?? record.name ?? "?")}  ${String(record.label ?? record.adapter ?? "")}${sponsor}`.trimEnd();
   }));
 }
 
@@ -210,6 +285,7 @@ export async function handleProviderRuntimeCommand(sub: string, argv: string[], 
     update: edit,
     test: testProvider,
     quota,
+    resets,
     presets,
     "account-mode": accountMode,
     selected,

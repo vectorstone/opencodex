@@ -1,5 +1,13 @@
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { DEFAULT_CATALOG_PATH } from "../codex/paths";
+import { codexSupportedReasoningEfforts } from "../codex/catalog/effort";
+import { resolveCodexRuntime } from "../codex/runtime";
+import {
+  inspectClientCatalogReadiness,
+  type CatalogCompatibilityDeps,
+  type ClientCatalogFileState,
+  type ClientCatalogReadiness,
+} from "../client/catalog-compatibility";
 import {
   disconnectClient,
   revokeConnectedClientKey,
@@ -8,6 +16,8 @@ import {
 } from "../client/connect";
 import { inspectClientRotationRecoveryGate, readClientConnectionState } from "../client/state";
 import { readServiceApiTokenState } from "../lib/service-secrets";
+import type { ClientLifecycleLockDeps } from "../client/lifecycle-lock";
+import { inspectRemoteDesktopStore } from "../claude/desktop-remote-store";
 import type { OcxConnectedClientId } from "../types";
 import {
   CliUsageError,
@@ -19,8 +29,29 @@ import {
   takeFlag,
   takeIntegerOption,
   takeOption,
+  terminalSafeError,
+  terminalSafeText,
   type RuntimeApiDeps,
 } from "./runtime-api";
+
+export interface ClientCommandDeps extends RuntimeApiDeps {
+  lifecycleLockDeps?: ClientLifecycleLockDeps;
+  catalogProbeDeps?: ClientCatalogProbeDeps;
+}
+
+export interface ClientCatalogProbeDeps extends CatalogCompatibilityDeps {
+  /** Injected in tests; defaults to reading the materialized client catalog off disk. */
+  readCatalogBody?: () => string | null;
+  /**
+   * A Codex command the caller already resolved, handed over so readiness skips resolving it
+   * again. General `ocx status` resolves the full runtime for its diagnostics block; the resolver
+   * memo is keyed by discovery scope and holds one entry, so a priority-only readiness resolve
+   * and the full one miss each other and re-probe the same command with `--version` — up to eight
+   * seconds apiece. Passing the command across adds no cache state, and it cannot disagree with
+   * what status prints because it is the selection status is printing.
+   */
+  selectedCodexCommand?: string;
+}
 
 export const CONNECT_USAGE = `Usage:
   ocx connect <url> [--management-url <url>]
@@ -50,21 +81,101 @@ export type ClientConnectionStatus = {
   catalog: "present" | "missing" | "unsafe";
   token: "owned" | "missing" | "changed" | "unsafe";
   rotation: "clean" | "orphan-cleaned" | "recovery-required" | "unsafe";
+  /**
+   * Whether the selected local Codex CLI can actually launch against this connection (#4207).
+   *
+   * `state: "connected"` proves the hub answered and the credential works. It never proved the
+   * local runtime could consume what was downloaded, which is how a connection kept reporting
+   * itself healthy while `codex exec` exited on `unknown variant` before its first request.
+   *
+   * Reported only while connected, and reported as its own field rather than as a fourth
+   * `catalog` value: the status JSON is documented additive-only, so widening an existing
+   * field's value domain would change what `catalog: "present"` means for every consumer that
+   * already reads it.
+   */
+  readiness?: ClientCatalogReadiness["kind"];
+  /** Present whenever readiness is not `ready`; names the fault and the way out. */
+  readinessReason?: string;
 };
 
-export function collectClientConnectionStatus(now = Date.now()): ClientConnectionStatus {
+function readInstalledCatalogBody(): string | null {
+  try {
+    return readFileSync(DEFAULT_CATALOG_PATH, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The ladder the selected Codex CLI accepts, observed without persisting anything.
+ *
+ * `codexSupportedReasoningEfforts()` with no deps reaches `resolveAndPersistCodexRuntime`, which
+ * writes codex-runtime.json. `ocx status` deliberately resolves without persisting, and a
+ * read-only diagnostics command should not start writing runtime selection state because a
+ * readiness check was added to it. Stop at the first valid runtime, then hand only that command
+ * to the catalog probe: readiness does not consume alternative-runtime diagnostics. The resolver
+ * keeps this priority-only cache separate from the full discovery used by `ocx status`.
+ *
+ * A caller that has already resolved passes its selection in through `selectedCodexCommand` rather
+ * than paying for a second `--version` probe of the command it just resolved.
+ */
+function observeLocalCodexEffortLadder(selected?: string): ReadonlySet<string> | null {
+  const command = selected ?? resolveCodexRuntime({ discoverAlternatives: false }).runtime.command;
+  return codexSupportedReasoningEfforts({ commandCandidates: () => [command] });
+}
+
+/**
+ * One observer per command, for the write-time gate and the readiness check alike. Built even
+ * when nothing was injected, so production does not silently fall back to the default inside
+ * {@link assertClientCatalogCompatible} — that default persists runtime selection state and
+ * would run its own probe, which is how the two checks could disagree about the ladder within
+ * a single `ocx connect`.
+ */
+function catalogObserver(deps: ClientCatalogProbeDeps | undefined): CatalogCompatibilityDeps {
+  const selected = deps?.selectedCodexCommand;
+  return { supportedEfforts: deps?.supportedEfforts ?? (() => observeLocalCodexEffortLadder(selected)) };
+}
+
+/** The stat half of the catalog verdict, shared by the status collector and `ocx connect`. */
+function installedCatalogFileState(): ClientCatalogFileState {
+  if (!existsSync(DEFAULT_CATALOG_PATH)) return "missing";
+  try {
+    const stat = lstatSync(DEFAULT_CATALOG_PATH);
+    return !stat.isSymbolicLink() && stat.isFile() ? "present" : "unsafe";
+  } catch {
+    return "unsafe";
+  }
+}
+
+/**
+ * Observing the runtime spawns `codex debug models`, so this runs only for a connected client —
+ * the one configuration that installs hub bytes the local clamp never touched. A standalone or
+ * hub install pays nothing for it.
+ *
+ * Never throws. A status command that dies because a Codex probe failed would replace one wrong
+ * answer with a worse one.
+ */
+function inspectInstalledCatalogReadiness(
+  file: ClientCatalogFileState,
+  deps: ClientCatalogProbeDeps,
+): ClientCatalogReadiness {
+  try {
+    const read = deps.readCatalogBody ?? readInstalledCatalogBody;
+    return inspectClientCatalogReadiness(file, file === "present" ? read() : null, catalogObserver(deps));
+  } catch {
+    return { kind: "unverified", reason: "the selected local Codex runtime could not be inspected" };
+  }
+}
+
+export function collectClientConnectionStatus(
+  now = Date.now(),
+  lifecycleLockDeps?: ClientLifecycleLockDeps,
+  catalogProbeDeps: ClientCatalogProbeDeps = {},
+): ClientConnectionStatus {
   const state = readClientConnectionState();
   const tokenState = readServiceApiTokenState();
-  const rotation = inspectClientRotationRecoveryGate(state).kind;
-  let catalog: ClientConnectionStatus["catalog"] = "missing";
-  if (existsSync(DEFAULT_CATALOG_PATH)) {
-    try {
-      const stat = lstatSync(DEFAULT_CATALOG_PATH);
-      catalog = !stat.isSymbolicLink() && stat.isFile() ? "present" : "unsafe";
-    } catch {
-      catalog = "unsafe";
-    }
-  }
+  const rotation = inspectClientRotationRecoveryGate(state, lifecycleLockDeps).kind;
+  const catalog = installedCatalogFileState();
   if (state.kind !== "connected") {
     return {
       state: state.kind,
@@ -82,6 +193,7 @@ export function collectClientConnectionStatus(now = Date.now()): ClientConnectio
     : tokenState.kind === "unsafe"
       ? "unsafe"
       : tokenState.fingerprint === state.value.tokenFingerprint ? "owned" : "changed";
+  const readiness = inspectInstalledCatalogReadiness(catalog, catalogProbeDeps);
   return {
     state: "connected",
     serverUrl: state.value.serverUrl,
@@ -96,6 +208,8 @@ export function collectClientConnectionStatus(now = Date.now()): ClientConnectio
     catalog,
     token,
     rotation,
+    readiness: readiness.kind,
+    ...(readiness.kind === "ready" ? {} : { readinessReason: readiness.reason }),
   };
 }
 
@@ -107,12 +221,75 @@ function parseClients(raw: string | undefined): OcxConnectedClientId[] {
   return values as OcxConnectedClientId[];
 }
 
+/** Reads as a verdict, not a field dump: "ready" is the only word that means the client works. */
+function readinessLine(status: ClientConnectionStatus): string {
+  const label = status.readiness === "ready"
+    ? "ready"
+    : status.readiness === "incompatible"
+      ? "not ready"
+      : "unverified";
+  return `Local Codex CLI: ${label}${status.readinessReason ? ` (${terminalSafeText(status.readinessReason)})` : ""}`;
+}
+
+export type ConnectCompletionReport = {
+  readonly lines: readonly string[];
+  /** Non-null when `ocx connect` must exit non-zero rather than report success. */
+  readonly failure: string | null;
+};
+
+/**
+ * What `ocx connect` says once the hub and the credential are settled, and whether the command
+ * still fails (#4207).
+ *
+ * Pure so the fail-closed decision can be exercised without a hub. Two rules it encodes:
+ *
+ * On a proven incompatibility the verdict is printed FIRST and the `Connected to …` line is
+ * withheld, because a caller grepping for that phrase would otherwise read a catalog the local
+ * CLI cannot parse as a success. The connection really was saved, so the replacement line says
+ * where to see it.
+ *
+ * And that failure applies only when this connection selected Codex. A Claude-only connection
+ * never launches the Codex CLI, so an old binary somewhere on PATH is not a reason to fail the
+ * operator's Claude Desktop setup — it is still worth saying, which is why the line survives
+ * without the exit code.
+ */
+export function connectCompletionReport(
+  connection: { serverUrl: string; apiKeyId: string },
+  selectedClients: readonly OcxConnectedClientId[],
+  readiness: ClientCatalogReadiness,
+): ConnectCompletionReport {
+  const connected = `Connected to ${connection.serverUrl} as key ${connection.apiKeyId}.`;
+  if (readiness.kind === "ready") {
+    return { lines: [connected, "Local Codex CLI: ready (it accepts every reasoning level in the installed catalog)."], failure: null };
+  }
+  if (readiness.kind === "unverified") {
+    // Not a failure. A client with no observable Codex CLI is a working configuration, and the
+    // write-time gate deliberately lets it through; saying so is the honest middle report.
+    return { lines: [connected, `Local Codex CLI: unverified (${terminalSafeText(readiness.reason)}).`], failure: null };
+  }
+  const safeReason = terminalSafeText(readiness.reason);
+  const verdict = `Local Codex CLI: not ready (${safeReason})`;
+  if (!selectedClients.includes("codex")) {
+    return {
+      lines: [connected, `${verdict} This connection selected ${selectedClients.join(", ")}, so nothing here launches Codex.`],
+      failure: null,
+    };
+  }
+  return {
+    lines: [verdict, `The connection to ${connection.serverUrl} as key ${connection.apiKeyId} was saved; run 'ocx connect status' to see it.`],
+    failure: `client_not_ready: ${safeReason}`,
+  };
+}
+
 function statusLines(status: ClientConnectionStatus): string[] {
   if (status.state !== "connected") {
     return [`Connection: ${status.state}${status.reason ? ` (${status.reason})` : ""}`];
   }
   return [
     "Connection: connected",
+    // Second line on purpose. The whole of #4207 is that a reader stopped at "connected" and
+    // believed the client was usable, so the local verdict has to arrive before the hub detail.
+    readinessLine(status),
     `Hub: ${status.serverUrl}`,
     `Management: ${status.managementUrl} (${status.managementTransport})`,
     `Protocol: ${status.protocolVersion}`,
@@ -124,7 +301,7 @@ function statusLines(status: ClientConnectionStatus): string[] {
   ];
 }
 
-async function runRotate(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+async function runRotate(argv: string[], deps: ClientCommandDeps): Promise<void> {
   const args = [...argv];
   const wantsJson = takeFlag(args, "--json");
   const pairing = takeFlag(args, "--pairing-code-stdin");
@@ -136,13 +313,17 @@ async function runRotate(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const value = new TextEncoder().encode(await readSecretLine(deps, pairing ? "pairing code" : "admin token"));
   const connection = await rotateConnectedClientKey({
     credential: { kind: pairing ? "pairing-grant" : "admin", value },
-  }, { fetchImpl: deps.fetchImpl });
-  printData({ apiKeyId: connection.apiKeyId, rotation: "committed" }, wantsJson, [
-    `Rotated connected API key ${connection.apiKeyId}; the previous key is no longer admitted.`,
+  }, { fetchImpl: deps.fetchImpl, lifecycleLockDeps: deps.lifecycleLockDeps });
+  const restartRequired = inspectRemoteDesktopStore({ serverUrl: connection.serverUrl, apiKeyId: connection.apiKeyId, connectedAt: connection.connectedAt }).kind !== "absent";
+  printData({ apiKeyId: connection.apiKeyId, rotation: connection.rotationOutcome, restartRequired }, wantsJson, [
+    connection.rotationOutcome === "committed"
+      ? `Rotated connected API key ${connection.apiKeyId}; the previous key is no longer admitted.`
+      : `Rotation rolled back for API key ${connection.apiKeyId}; the previous key was retained or restored.`,
+    ...(restartRequired ? ["Fully quit and reopen Claude Desktop; a running app may still hold the previous credential."] : []),
   ]);
 }
 
-async function runConnect(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+async function runConnect(argv: string[], deps: ClientCommandDeps): Promise<void> {
   const args = [...argv];
   const serverUrl = args.shift();
   if (!serverUrl || serverUrl.startsWith("--")) throw new CliUsageError("hub URL is required", CONNECT_USAGE);
@@ -173,28 +354,45 @@ async function runConnect(argv: string[], deps: RuntimeApiDeps): Promise<void> {
     managementTransport,
     noSync,
     ...(catalogTimeoutSeconds === undefined ? {} : { catalogTimeoutMs: catalogTimeoutSeconds * 1_000 }),
-  }, { fetchImpl: deps.fetchImpl });
-  console.log(`Connected to ${connection.serverUrl} as key ${connection.apiKeyId}.`);
+  }, {
+    fetchImpl: deps.fetchImpl,
+    lifecycleLockDeps: deps.lifecycleLockDeps,
+    // Same observer the readiness check below uses. Passed unconditionally: leaving it out in
+    // production would let the gate fall back to its own probing, persisting default, so one
+    // command could run two probes and act on two different ladders.
+    catalogCompatibility: catalogObserver(deps.catalogProbeDeps),
+  }).catch((error: unknown) => {
+    // Compatibility refusals happen before the completion report and reach stderr.
+    // Keep the domain error untouched; render its message only at the CLI boundary.
+    throw terminalSafeError(error);
+  });
+  // The hub and the credential are proven at this point; the local runtime is not. Reporting
+  // only the first half is what #4207 was filed for, so the catalog now on disk is checked
+  // against the Codex CLI that will read it.
+  const readiness = inspectInstalledCatalogReadiness(installedCatalogFileState(), deps.catalogProbeDeps ?? {});
+  const report = connectCompletionReport(connection, clients, readiness);
+  for (const line of report.lines) console.log(line);
+  if (report.failure) throw new Error(report.failure);
 }
 
-async function runRevoke(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+async function runRevoke(argv: string[], deps: ClientCommandDeps): Promise<void> {
   const args = [...argv];
   const wantsJson = takeFlag(args, "--json");
   const admin = takeFlag(args, "--admin-token-stdin");
   if (!admin) throw new CliUsageError("revoke requires --admin-token-stdin", CONNECT_USAGE);
   rejectArgs(args, CONNECT_USAGE, { redactValues: true });
   const value = new TextEncoder().encode(await readSecretLine(deps, "admin token"));
-  const result = await revokeConnectedClientKey({ kind: "admin", value }, { fetchImpl: deps.fetchImpl });
+  const result = await revokeConnectedClientKey({ kind: "admin", value }, { fetchImpl: deps.fetchImpl, lifecycleLockDeps: deps.lifecycleLockDeps });
   printData(result, wantsJson, [`Revoked connected API key ${result.apiKeyId}. Disconnect this client next.`]);
 }
 
-export async function handleConnectCommand(argv: string[], deps: RuntimeApiDeps = {}): Promise<number> {
+export async function handleConnectCommand(argv: string[], deps: ClientCommandDeps = {}): Promise<number> {
   return runCliAction(async () => {
     if (argv[0] === "status") {
       const args = argv.slice(1);
       const wantsJson = takeFlag(args, "--json");
       rejectArgs(args, CONNECT_USAGE, { redactValues: true });
-      const status = collectClientConnectionStatus();
+      const status = collectClientConnectionStatus(Date.now(), deps.lifecycleLockDeps, deps.catalogProbeDeps ?? {});
       printData(status, wantsJson, statusLines(status));
       return;
     }
@@ -210,13 +408,13 @@ export async function handleConnectCommand(argv: string[], deps: RuntimeApiDeps 
   });
 }
 
-export async function handleDisconnectCommand(argv: string[]): Promise<number> {
+export async function handleDisconnectCommand(argv: string[], deps: Pick<ClientCommandDeps, "lifecycleLockDeps"> = {}): Promise<number> {
   return runCliAction(async () => {
     const args = [...argv];
     const keepCatalog = takeFlag(args, "--keep-catalog");
     const wantsJson = takeFlag(args, "--json");
     rejectArgs(args, DISCONNECT_USAGE, { redactValues: true });
-    const result = await disconnectClient({ keepCatalog });
+    const result = await disconnectClient({ keepCatalog }, deps);
     const payload = {
       ...result,
       revoke: {
@@ -226,6 +424,9 @@ export async function handleDisconnectCommand(argv: string[]): Promise<number> {
     };
     printData(payload, wantsJson, [
       "Disconnected locally; native Codex state was restored.",
+      ...(result.desktopRestoration === "standard_fallback"
+        ? ["Previous Desktop settings were not recorded; the managed profile was switched to standard mode."] : []),
+      ...(result.restartRequired ? ["Fully quit and reopen Claude Desktop; local cleanup cannot revoke an in-memory credential."] : []),
       `The hub key ${result.apiKeyId} is still valid. Revoke it from Integrations → API Keys.`,
     ]);
   });

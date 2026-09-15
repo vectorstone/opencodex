@@ -15,7 +15,7 @@ yardımcı özellikleri nasıl çalıştıracağını kontrol eder.
 | `hostname?` | `string` | `"127.0.0.1"` | Bağlama adresi. Geri döngü olmayan bağlamalar `OPENCODEX_API_AUTH_TOKEN` gerektirir. |
 | `proxy?` | `string` | — | Giden HTTP(S) proxy URL'si veya `${ENV_VAR}`. Yalnızca bu değişkenler ayarlanmadığında `HTTP_PROXY` / `HTTPS_PROXY`'ye uygulanır; geri döngü `NO_PROXY` içinde kalır. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Metin veya araç çağrısı içermeyen bir Responses tamamlamasını aynı istekle bir kez yeniden denemeyi açıkça etkinleştirir. Yeniden deneme ücretlendirilebilir. `OCX_EMPTY_COMPLETION_RETRY=0`, yapılandırmayı değiştirmeden devre dışı bırakır; combo ve routed-compaction turları hariçtir. |
-| `stallTimeoutSec?` | `number` | `300` | `response.incomplete` öncesinde yukarı akış verisi olmadan geçen saniye. Minimum 1. |
+| `stallTimeoutSec?` | `number` | `300` | Responses ve yerel Chat için anlamlı üst sunucu ilerlemesi olmadan geçen saniye. En az 1. |
 | `connectTimeoutMs?` | `number` | `200000` | Deneme başına DNS/TCP/TLS/nihai başlık son tarihi; gövde üretiminden önce biter. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Aktif turlar iptal edilmeden önce zarif boşaltma süresi sınırı. |
 | `websockets?` | `boolean` | `false` | Responses WebSocket yolu için `supports_websockets` bildirin. False, HTTP/SSE'yi tutar. |
@@ -35,6 +35,10 @@ Daha eski bir geliştirme derlemesi yedekleme desteği var olmadan önce devam
 geçmişi meta verilerini değiştirdiyse yerel sağlayıcı kurtarmasını zorlamak için
 `ocx recover-history --legacy-openai --yes` çalıştırın.
 Komut, geçerli dedicated-provider geçmişi de dahil olmak üzere kullanıcı iletisi bulunan tüm `opencodex` satırlarını yeniden etiketler; çalıştırmadan önce lifecycle başvurusundaki tam kapsam uyarısını okuyun.
+
+### Yerel Chat zaman aşımı ve tamamlanma
+
+Yerel Chat de üst sunucu çıktısını beklerken `stallTimeoutSec` kullanır. Boş olmayan metin, akıl yürütme, ret içeriği, araç güncellemeleri ve bitiş olayları süreyi yeniler; bağlantıyı canlı tutan yorumlar, yalnızca rol ve yalnızca kullanım bilgileri yenilemez. Yavaş istemcinin okumasını beklemek süreyi duraklatır. Zaman aşımı `upstream_stall_timeout` üretir: akış istemcileri hata olayı, akışsız istemciler HTTP 502 alır. Sonuç tamamlanmadan iptal edilen istek, başarılı bir kısmi yanıt yerine iptal hatası döndürür. Akışsız Chat, LF ve CRLF ayraçlarını ve çok satırlı data alanlarını destekler.
 
 ## Uzaktan erişim
 
@@ -267,7 +271,7 @@ hareketsizlik korumasıdır, toplam bir üretim süresi sınırı değildir.
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana görsel açıklama anahtarı. |
 | `backend?` | `"openai" \| "anthropic"` | auto | Açık değer önceliklidir; ayarlanmadığında kullanılabilir kayıtlı bir Anthropic OAuth kimlik bilgisi tercih edilir, aksi halde `openai` kullanılır. |
-| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.4-mini` veya Anthropic için `claude-sonnet-5`. |
+| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna` veya Anthropic için `claude-sonnet-5`. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | Ana tur başına kabul edilen yeni açıklama önbellek ıskalamaları. `0` çağrıları devre dışı bırakır; geçersiz değerler varsayılanı kullanır. |
 | `timeoutMs?` | `number` | `45000` | Sidecar getirme zaman aşımı. Tamsayı 1–2147483647. |
 
@@ -288,3 +292,7 @@ yeniden kullanır. Hedeflenen hesap ve iş yükünü kapsamlı bir şekilde test
 `runtimeRole` varsayılan olarak `standalone` değerindedir. Hub; `hub.managementPublicOrigin`, yalnız loopback `hub.managementIngress` (yokken `enabled:false`) ve tam `remoteGui.allowedTailscaleUsers` (yokken boş) kullanır. İstemci anahtarı `config.json` yerine `service-api-token` içinde kalır; döndürme sırasında `service-api-token.prev` geçici olarak bulunabilir. Kullanım kayıtları yansıtılmaz.
 
 `remoteGui.allowInsecureHttp`, yalnızca eski strict-schema yapılandırmalarının yüklenebilmesi için tutulan, kullanımdan kaldırılmış bir no-op'tur. Yapılandırmadan silin: pairing grant'leri yalnız loopback veya kimliği doğrulanmış HTTPS üzerinden kabul edilir ve `true` değeri düz HTTP pairing'i yeniden açmaz.
+
+## Codex kota ağı tanılaması
+
+Ana Codex hesabının satırındaki `quotaRefresh`, kalan kotayı veya model erişim yetkisini değil, kota sorgusunun sonucunu açıklar. Önbellek kullanıldığında ya da sorgu yapılmadığında alan bulunmayabilir. Sorgu, etkileşimli terminalin değil çalışan proxy servisinin ortamını kullanır. `proxy` ayarlanmazsa mevcut ortam korunur; `"auto"` yalnızca başlangıçta Windows’un statik proxy ayarlarını okur. PAC/WPAD, yalnızca SOCKS ayarları ve çalışma sırasındaki değişiklikler otomatik uygulanmaz. TUN ile başarı, HTTP proxy yolunun da çalıştığını tek başına göstermez. [Komutlar ve durumlar için İngilizce bölüme](/reference/configuration/server/#codex-quota-network-diagnostics) bakın.

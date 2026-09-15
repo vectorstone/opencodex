@@ -10,12 +10,14 @@
  * Intentionally narrower than the Codex pool: no mid-session quota rotation,
  * soft-avoid ladders, or probe leases. Anthropic OAuth is ToS-sensitive.
  *
- * Affinity is process-local (lost on restart). Cooldown uses Retry-After when present,
- * otherwise a default backoff. 401/403 credential failures should set needsReauth on the
- * store (existing OAuth path) so the account is excluded from eligibility.
+ * Affinity is process-local (lost on restart). Cooldown uses Retry-After when present, else
+ * the reset time of whichever rate-limit window upstream reports as rejected, else a default
+ * backoff. 401/403 credential failures should set needsReauth on the store (existing OAuth
+ * path) so the account is excluded from eligibility.
  */
 import { createHash } from "node:crypto";
-import { setActiveAccount, getAccountSet, getAccountCredential } from "./store";
+import { captureOAuthAccountSelection, commitOAuthAccountSelection, credentialGeneration, getAccountSet, getAccountCredential, getAccountCredentialWithStatus } from "./store";
+import type { OAuthAccessSnapshot } from "./index";
 import { getCachedProviderAccountQuota } from "../providers/quota";
 import { fallbackCodexAccountLogLabel } from "../codex/account-label";
 import {
@@ -24,6 +26,7 @@ import {
   notePoolRotationFailure,
   notePoolRotationSuccess,
   pickRoundRobinAccount,
+  peekRoundRobinAccount,
   POOL_KEY_ANTHROPIC,
   seedPoolRotationAccount,
 } from "../codex/pool-rotation";
@@ -31,9 +34,16 @@ import type { OcxAccountPoolQuotaWindow, OcxAccountPoolRotationStrategy, OcxConf
 import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
 import { retainedUtf8Bytes } from "../lib/admission";
 
+/**
+ * The read side of a `Headers` object, so a caller can pass the live upstream response's
+ * headers without this module importing anything from the server layer -- and so a test can
+ * hand it a plain `new Headers({...})`.
+ */
+export type AnthropicRateLimitHeaders = Pick<Headers, "get">;
+
 const PROVIDER = "anthropic";
+/** Backoff only when upstream supplies no usable deadline. */
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 15 * 60_000;
 const AFFINITY_IDLE_TTL_MS = 24 * 60 * 60_000;
 const MAX_AFFINITY_ENTRIES = 2_000;
 const MAX_AFFINITY_COMPONENT_BYTES = 512;
@@ -56,9 +66,19 @@ export interface AnthropicAccountPoolConfig {
   quotaWindow?: OcxAccountPoolQuotaWindow;
 }
 
+/**
+ * Where a cooldown's length came from. Same vocabulary as `CodexCooldownSource`, because it
+ * answers the same question for the same reason: `retry-after` is upstream answering THIS
+ * refusal, `reset-derived` is upstream stating when the spent window reopens, and `default`
+ * is our own guess. The dashboard renders the first as a rate limit and the rest as quota,
+ * which is exactly the distinction a reset-derived cooldown carries -- collapsing it into
+ * `retry-after` would report a drained five-hour window as request-rate throttling.
+ */
+type AnthropicCooldownSource = "retry-after" | "reset-derived" | "default";
+
 interface AccountHealth {
   cooldownUntil: number;
-  cooldownSource: "retry-after" | "default";
+  cooldownSource: AnthropicCooldownSource;
 }
 
 interface AffinityEntry {
@@ -68,6 +88,10 @@ interface AffinityEntry {
 
 const upstreamHealth = new Map<string, AccountHealth>();
 const sessionAffinity = new Map<string, AffinityEntry>();
+type OAuthAccountSelection = NonNullable<ReturnType<typeof captureOAuthAccountSelection>>;
+// Undefined means this runtime has not admitted a selection yet; null means consumed.
+// The startup baseline comes from the authoritative store, never a second persisted pin.
+let manualPreference: OAuthAccountSelection | null | undefined;
 
 function normalizeAffinityComponent(value: string | null | undefined): string {
   const normalized = value?.trim() ?? "";
@@ -106,19 +130,38 @@ export function anthropicQuotaWindow(config: AnthropicAccountPoolConfig): OcxAcc
   return normalizeAccountPoolQuotaWindow(config.quotaWindow);
 }
 
+/** Accept upstream deadlines within the runtime's date range, without a policy ceiling. */
+function delayUntil(timestamp: number, now: number): number | undefined {
+  const delay = timestamp - now;
+  return Number.isFinite(new Date(timestamp).getTime()) && Number.isFinite(delay) && delay > 0
+    ? delay : undefined;
+}
+
 function parseRetryAfterMs(value: string | null | undefined, now: number): number | undefined {
   const text = value?.trim();
   if (!text) return undefined;
   if (/^\d+(?:\.\d+)?$/.test(text)) {
     const seconds = Number(text);
-    if (Number.isFinite(seconds) && seconds > 0) {
-      return Math.min(Math.max(Math.ceil(seconds * 1000), 1), MAX_COOLDOWN_MS);
-    }
+    if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+    return delayUntil(now + Math.max(Math.ceil(seconds * 1000), 1), now);
   }
-  const timestamp = Date.parse(text);
-  if (!Number.isFinite(timestamp)) return undefined;
-  const delay = timestamp - now;
-  return delay > 0 ? Math.min(delay, MAX_COOLDOWN_MS) : undefined;
+  return delayUntil(Date.parse(text), now);
+}
+
+/** Only rejected windows constrain recovery; all must reopen, so take the latest reset. */
+function parseRateLimitResetMs(headers: AnthropicRateLimitHeaders | null | undefined, now: number): number | undefined {
+  if (!headers) return undefined;
+  let latest: number | undefined;
+  for (const window of ["5h", "7d"] as const) {
+    if (headers.get(`anthropic-ratelimit-unified-${window}-status`)?.trim() !== "rejected") continue;
+    const resetSeconds = Number(headers.get(`anthropic-ratelimit-unified-${window}-reset`)?.trim());
+    if (!Number.isFinite(resetSeconds) || resetSeconds <= 0) continue;
+    const resetAt = resetSeconds * 1000;
+    if (delayUntil(resetAt, now) === undefined) continue;
+    if (latest === undefined || resetAt > latest) latest = resetAt;
+  }
+  if (latest === undefined) return undefined;
+  return latest - now;
 }
 
 export function getAnthropicAccountHealthSnapshot(
@@ -152,6 +195,8 @@ export function sweepExpiredAnthropicRoutingHealth(now = Date.now()): number {
 export function clearAnthropicAccountPoolState(): void {
   upstreamHealth.clear();
   sessionAffinity.clear();
+  manualPreference = undefined;
+  quorumCache = null;
 }
 
 export function anthropicSessionAffinitySizeForTests(): number {
@@ -234,6 +279,79 @@ export function getEligibleAnthropicAccounts(now = Date.now()): string[] {
       && !isCooled(account.id, now)
       && isPoolCredentialUsable(account.id, now))
     .map(account => account.id);
+}
+
+/**
+ * How long a quorum answer may be reused before the store is consulted again.
+ *
+ * This predicate now runs on the INITIAL resolution of every Anthropic request, not just after a
+ * 429, so an uncached implementation puts a synchronous file read in front of ordinary traffic:
+ * `getAccountSet` goes through `loadAuthStore`, which has no cache of its own and chmods the
+ * config dir, chmods the secret, reads the whole file and normalizes it on every call.
+ *
+ * Two seconds matches the generic module's `PRESENCE_CACHE_TTL_MS` for the same reason: short
+ * enough that a login in another window is visible before the operator can switch back and send a
+ * prompt, long enough that a burst of requests shares one read. The cache holds a BOOLEAN derived
+ * from a count — never a credential, never an account id.
+ *
+ * Staleness is bounded by consequence, not only by the TTL. Explicit invalidation covers the
+ * roster mutations this module can see (rotation, pool-state reset, affinity clear on account
+ * removal, manual selection), but not one it cannot: a 401 elsewhere flagging an account
+ * `needsReauth` drops the real quorum to one while a cached `true` survives for up to 2s.
+ *
+ * That window is harmless in both directions, which is why it is left rather than plumbed
+ * through the store. A stale `true` only lets the caller ASK for an alternate;
+ * `pickAlternateAnthropicAccount` re-reads the roster through `getEligibleAnthropicAccounts`,
+ * skips the reauth-flagged account and returns `null`, so the 429 surfaces exactly as it would
+ * have. A stale `false` costs one un-rotated 429 and self-corrects on the next read. Neither
+ * can dispatch on an unusable credential, which is the only outcome worth adding a store hook
+ * to prevent.
+ */
+const QUORUM_CACHE_TTL_MS = 2_000;
+
+let quorumCache: { value: boolean; readAt: number } | null = null;
+
+/**
+ * Whether a 429 has somewhere to go: two or more accounts that could serve traffic if asked.
+ *
+ * Reactive failover is a safety net, not a routing policy. It runs only AFTER upstream refused,
+ * it cannot spread load across a healthy session, and it cannot fire at all unless the operator
+ * deliberately logged in twice. So it activates on presence, exactly like an `apiKeyPool` of two
+ * keys does in `providers/key-failover.ts` -- and unlike the PROACTIVE pool (affinity,
+ * quota-ranked new-session picks, `autoSwitchThreshold`, `strategy`), which changes which
+ * account serves a healthy request and therefore stays behind `anthropicAccountPool.enabled`.
+ *
+ * Cooldowns are deliberately ignored here. They are transient and per-request, while this
+ * answers the durable question "did the operator store a second account". Counting a cooled
+ * account as absent would switch the feature off for the length of the cooldown -- precisely
+ * when it is needed.
+ *
+ * `isPoolCredentialUsable` is still applied, so the fail-closed background `local-cli` rule
+ * holds: an expired background slot is not a quorum and cannot be adopted.
+ */
+export function hasAnthropicFailoverQuorum(now = Date.now()): boolean {
+  // Monotonic guard: a caller-supplied `now` that predates the cached read (tests pass explicit
+  // clocks) must not be served from a future entry.
+  if (quorumCache && now >= quorumCache.readAt && now - quorumCache.readAt < QUORUM_CACHE_TTL_MS) {
+    return quorumCache.value;
+  }
+  const set = getAccountSet(PROVIDER);
+  let value = false;
+  if (set) {
+    let usable = 0;
+    for (const account of set.accounts) {
+      if (account.needsReauth === true) continue;
+      if (!isPoolCredentialUsable(account.id, now)) continue;
+      if (++usable >= 2) { value = true; break; }
+    }
+  }
+  quorumCache = { value, readAt: now };
+  return value;
+}
+
+/** Test seam and manual-recovery hook: force the next quorum question to re-read the store. */
+export function forgetAnthropicFailoverQuorum(): void {
+  quorumCache = null;
 }
 
 /** Earliest remaining cooldown among cooled Anthropic accounts, for client Retry-After. */
@@ -335,7 +453,7 @@ function pickAlternateAnthropicAccount(
   const strategy = anthropicPoolStrategy(config);
   const eligible = getEligibleAnthropicAccounts(now).filter(id => id !== excludeId);
   if (strategy === "round-robin") {
-    return pickRoundRobinAccount(POOL_KEY_ANTHROPIC, eligible, stickyLimitForPool(config));
+    return peekRoundRobinAccount(POOL_KEY_ANTHROPIC, eligible, stickyLimitForPool(config));
   }
   if (strategy === "fill-first") {
     return pickNextFillFirstAnthropicAccount(config, excludeId, eligible);
@@ -360,6 +478,7 @@ export type AnthropicAccountSelectionReason =
   | "lowest-usage"
   | "only-eligible"
   | "round-robin"
+  | "manual"
   | "fill-first"
   | "none"
   | "all-cooled";
@@ -426,9 +545,8 @@ function pickUnboundStrategyAccount(
   if (strategy === "round-robin") {
     const eligible = getEligibleAnthropicAccounts(now);
     const limit = stickyLimitForPool(config);
-    const picked = pickRoundRobinAccount(POOL_KEY_ANTHROPIC, eligible, limit);
+    const picked = peekRoundRobinAccount(POOL_KEY_ANTHROPIC, eligible, limit);
     if (!picked) return null;
-    notePoolRotationSuccess(POOL_KEY_ANTHROPIC, picked, limit);
     return { accountId: picked, reason: "round-robin" };
   }
 
@@ -454,8 +572,31 @@ export function resolveAnthropicAccountForSession(
   const set = getAccountSet(PROVIDER);
   if (!set || set.accounts.length === 0) return { accountId: null, reason: "none" };
 
+  if (manualPreference === undefined) {
+    manualPreference = set.selectionRevision !== undefined
+      ? { accountId: set.activeAccountId, revision: set.selectionRevision }
+      : null;
+  }
+
   if (!isAnthropicAccountPoolEnabled(config)) {
     return { accountId: set.activeAccountId, reason: "pool-disabled" };
+  }
+
+  // A manual choice is a one-dispatch preference, not a lower-priority quota hint.
+  // Consume it only after admission commits, so a failed token lookup cannot spend it.
+  if (manualPreference) {
+    if (manualPreference.accountId !== set.activeAccountId || manualPreference.revision !== set.selectionRevision) {
+      manualPreference = null;
+    } else {
+      const chosen = manualPreference.accountId;
+      const quota = getCachedProviderAccountQuota(PROVIDER, chosen);
+      const exhausted = [quota?.fiveHourPercent, quota?.weeklyPercent, quota?.monthlyPercent,
+        ...(quota?.customWindows ?? []).map(window => window.percent)]
+        .some(percent => typeof percent === "number" && percent >= 100);
+      if (!exhausted && getEligibleAnthropicAccounts(now).includes(chosen)) {
+        return { accountId: chosen, reason: "manual" };
+      }
+    }
   }
 
   const key = normalizeAffinityComponent(sessionKey);
@@ -464,7 +605,6 @@ export function resolveAnthropicAccountForSession(
     if (affined && now - affined.lastUsedAt <= AFFINITY_IDLE_TTL_MS) {
       const stillThere = set.accounts.some(a => a.id === affined.accountId && a.needsReauth !== true);
       if (stillThere && !isCooled(affined.accountId, now) && isPoolCredentialUsable(affined.accountId, now)) {
-        affined.lastUsedAt = now;
         return { accountId: affined.accountId, reason: "affinity" };
       }
       sessionAffinity.delete(key);
@@ -486,12 +626,6 @@ export function resolveAnthropicAccountForSession(
 
   const strategyPick = pickUnboundStrategyAccount(config, now);
   if (strategyPick) {
-    // Do not promote active here — token validation may still fail. Callers
-    // (responses/core) promote after getAnthropicPoolAccessToken succeeds.
-    if (key && normalizeAffinityComponent(strategyPick.accountId)) {
-      sessionAffinity.set(key, { accountId: strategyPick.accountId, lastUsedAt: now });
-      pruneExpiredAffinity(now);
-    }
     return { accountId: strategyPick.accountId, reason: strategyPick.reason };
   }
 
@@ -537,10 +671,6 @@ export function resolveAnthropicAccountForSession(
     return { accountId: null, reason: anyCooled ? "all-cooled" : "none" };
   }
 
-  if (key && normalizeAffinityComponent(accountId)) {
-    sessionAffinity.set(key, { accountId, lastUsedAt: now });
-    pruneExpiredAffinity(now);
-  }
   return { accountId, reason };
 }
 
@@ -559,6 +689,10 @@ export function clearAnthropicSessionAffinityForAccount(accountId: string): void
   for (const [key, entry] of sessionAffinity) {
     if (entry.accountId === accountId) sessionAffinity.delete(key);
   }
+  // The roster just lost or changed a member. This is the account-removal path, so the next
+  // activation question must re-read rather than answer from a count taken while the account
+  // was still present -- otherwise a delete leaves a stale quorum for the length of the TTL.
+  quorumCache = null;
 }
 
 /**
@@ -572,39 +706,99 @@ export function rotateAnthropicAccountOn429(
   retryAfterHeader: string | null | undefined,
   sessionKey?: string | null,
   now = Date.now(),
+  rateLimitHeaders?: AnthropicRateLimitHeaders | null,
 ): string | null {
-  if (!isAnthropicAccountPoolEnabled(config)) return null;
+  // Reactive 429 failover is NOT gated on the pool flag. That flag buys PROACTIVE routing --
+  // session affinity, quota-ranked new-session selection, autoSwitchThreshold, strategy -- all
+  // of which move a HEALTHY request and stay opt-in. Rotating away from an account upstream has
+  // just rate-limited is a different thing: it only ever runs after a refusal, and stranding a
+  // 429 while a second logged-in account sits idle is a defect, not a configuration choice.
+  // Presence is the activation rule, the same one an apiKeyPool of two keys already uses.
+  if (!isAnthropicAccountPoolEnabled(config) && !hasAnthropicFailoverQuorum(now)) return null;
 
+  // Retry-After first: it is the header written FOR this decision. The rejected window's
+  // reset is the fallback, because a 429 that omits Retry-After still carries it -- and
+  // without that fallback such a refusal cools for the 60s default and the exhausted
+  // account is back in the rotation a minute later.
   const parsedRetry = parseRetryAfterMs(retryAfterHeader, now);
-  const cooldownMs = parsedRetry ?? DEFAULT_COOLDOWN_MS;
+  const resetDerived = parsedRetry === undefined ? parseRateLimitResetMs(rateLimitHeaders, now) : undefined;
+  const cooldownMs = parsedRetry ?? resetDerived ?? DEFAULT_COOLDOWN_MS;
   upstreamHealth.set(failedAccountId, {
     cooldownUntil: now + cooldownMs,
-    cooldownSource: parsedRetry ? "retry-after" : "default",
+    cooldownSource: parsedRetry !== undefined
+      ? "retry-after"
+      : resetDerived !== undefined ? "reset-derived" : "default",
   });
   sweepExpiredOnWrite(now);
   clearAnthropicSessionAffinityForAccount(failedAccountId);
   notePoolRotationFailure(POOL_KEY_ANTHROPIC, failedAccountId);
+  // A rotation means the roster in use just changed; do not answer the next activation question
+  // from a count read taken before the failure.
+  quorumCache = null;
 
-  const next = pickAlternateAnthropicAccount(config, failedAccountId, now);
+  // The pool's strategy is a PROACTIVE policy. When the pool is disabled, reactive
+  // presence-only recovery must not silently reactivate round-robin/fill-first merely
+  // because those dormant values remain in config. The quota picker is the neutral
+  // recovery policy already used by the default strategy.
+  const next = isAnthropicAccountPoolEnabled(config)
+    ? pickAlternateAnthropicAccount(config, failedAccountId, now)
+    : pickLowestUsage(config, failedAccountId, now);
   if (!next) {
     console.warn("[anthropic-pool] all eligible Anthropic OAuth accounts are in cooldown; returning 429");
     return null;
   }
 
-  const affinityKey = normalizeAffinityComponent(sessionKey);
-  if (affinityKey && normalizeAffinityComponent(next)) {
-    sessionAffinity.set(affinityKey, { accountId: next, lastUsedAt: now });
-    pruneExpiredAffinity(now);
-  }
   console.warn(
     `[anthropic-pool] 429 on ${formatAnthropicAccountOrdinal(failedAccountId)}; failing over to ${formatAnthropicAccountOrdinal(next)}`,
   );
   return next;
 }
 
-/** Promote dashboard active account after a validated failover target is usable. */
-export function promoteAnthropicActiveAccount(accountId: string): void {
-  void setActiveAccount(PROVIDER, accountId).catch(() => { /* best-effort */ });
+export interface AnthropicSelectionRoutingOptions {
+  config: OcxConfig;
+  sessionKey?: string | null;
+  reason?: AnthropicAccountSelectionReason;
+  expectedCredentialGeneration?: string;
+}
+
+/** Commit the selected account before dispatch; rejected proposals have no routing side effects. */
+export async function promoteAnthropicActiveAccount(
+  accountId: string,
+  expectedSelection: OAuthAccountSelection | null,
+  options: AnthropicSelectionRoutingOptions,
+): Promise<OAuthAccountSelection | null> {
+  if (!expectedSelection || !isPoolCredentialUsable(accountId, Date.now()) || isCooled(accountId, Date.now())) return null;
+  const committed = await commitOAuthAccountSelection(PROVIDER, accountId, {
+    expectedSelection,
+    expectedCredentialGeneration: options.expectedCredentialGeneration,
+    requireUsableAccount: true,
+  });
+  if (!committed) return null;
+  return commitAnthropicSelectionRouting(accountId, expectedSelection, committed, options) ? committed : null;
+}
+
+/** Main's shared selection owner calls this only after its authoritative commit succeeds. */
+export function commitAnthropicSelectionRouting(
+  accountId: string,
+  expectedSelection: OAuthAccountSelection,
+  committed: OAuthAccountSelection,
+  options: AnthropicSelectionRoutingOptions,
+): boolean {
+  if (committed.accountId !== accountId) return false;
+  const current = captureOAuthAccountSelection(PROVIDER);
+  if (current?.accountId !== committed.accountId || current.revision !== committed.revision) return false;
+  if (isAnthropicAccountPoolEnabled(options.config)) {
+    if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity") {
+      const limit = stickyLimitForPool(options.config);
+      const picked = pickRoundRobinAccount(POOL_KEY_ANTHROPIC, getEligibleAnthropicAccounts(), limit);
+      if (picked !== accountId) seedPoolRotationAccount(POOL_KEY_ANTHROPIC, accountId);
+      notePoolRotationSuccess(POOL_KEY_ANTHROPIC, accountId, limit);
+    }
+    bindAnthropicSessionAffinity(options.sessionKey, accountId);
+  }
+  if (manualPreference === undefined || (manualPreference?.accountId === expectedSelection.accountId
+    && manualPreference.revision === expectedSelection.revision)) manualPreference = null;
+  return true;
 }
 
 /**
@@ -613,7 +807,11 @@ export function promoteAnthropicActiveAccount(accountId: string): void {
  */
 export function resetAnthropicRoutingForManualSelection(accountId: string): void {
   sessionAffinity.clear();
+  manualPreference = captureOAuthAccountSelection(PROVIDER);
   seedPoolRotationAccount(POOL_KEY_ANTHROPIC, accountId);
+  // A manual account selection is an operator statement about the roster; do not answer the
+  // next activation question from a count read before it.
+  quorumCache = null;
 }
 
 /**
@@ -633,6 +831,17 @@ export async function getAnthropicPoolAccessToken(accountId: string): Promise<st
   }
   const { getValidAccessTokenForAccount } = await import("./index");
   return getValidAccessTokenForAccount(PROVIDER, accountId);
+}
+
+/** Resolve through the pool's local-CLI restrictions, then bind the exact returned generation. */
+export async function getAnthropicPoolAccessSnapshot(accountId: string): Promise<OAuthAccessSnapshot> {
+  const accessToken = await getAnthropicPoolAccessToken(accountId);
+  const row = getAccountCredentialWithStatus(PROVIDER, accountId);
+  if (!row || row.needsReauth || row.credential.access !== accessToken
+    || row.credential.expires <= Date.now()) {
+    throw new Error("Anthropic pool credential changed during account selection");
+  }
+  return { provider: PROVIDER, accountId, accessToken, generation: credentialGeneration(row.credential) };
 }
 
 /**

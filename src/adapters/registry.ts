@@ -2,8 +2,11 @@ import { createAnthropicAdapter } from "./anthropic";
 import { createAzureAdapter } from "./azure";
 import type { ProviderAdapter } from "./base";
 import { withClinePassDeepSeekV4ToolReplayCompatibility } from "./cline-pass-deepseek-v4-tool-replay";
+import { createCodeBuddyAdapter } from "./codebuddy/adapter";
+import { createQoderAdapter } from "./qoder/adapter";
 import { createCommandCodeAdapter } from "./command-code";
 import { createCursorAdapter } from "./cursor";
+import { createDevinAdapter } from "./devin";
 import { createGoogleAdapter } from "./google";
 import { createKiroAdapter } from "./kiro";
 import { createMimoFreeAdapter } from "./mimo-free";
@@ -12,14 +15,26 @@ import { createOllamaNativeAdapter } from "./ollama-native";
 import { createResponsesPassthroughAdapter } from "./openai-responses";
 import type { OcxProviderConfig } from "../types";
 import { createAdapterTierMetadata } from "../providers/fastwire";
+import { withInputMediaGuard } from "./input-media-guard";
 
 export type AdapterCacheRetention = "none" | "short" | "long";
 
 export interface AdapterFactoryContext {
   cacheRetention?: AdapterCacheRetention;
+  /**
+   * The configured provider row this adapter serves.
+   *
+   * Needed when one adapter backs two provider ids whose credentials differ:
+   * `devin` and `devin-cli` share a transport and a token format but sign in to
+   * different accounts and can sit on different Cognition tenants, and the tenant
+   * is recorded on the credential rather than in the registry. Optional, and
+   * every other adapter ignores it.
+   */
+  providerId?: string;
 }
 
 export type AdapterWire =
+  | "codebuddy"
   | "command-code"
   | "openai-chat"
   | "ollama-native"
@@ -27,7 +42,8 @@ export type AdapterWire =
   | "openai-responses"
   | "google"
   | "kiro"
-  | "cursor";
+  | "cursor"
+  | "devin";
 
 export type AdapterMutationContract =
   | "codex-owned"
@@ -53,6 +69,11 @@ type InheritedAdapterDefinition = {
 type AdapterDefinition = DirectAdapterDefinition | InheritedAdapterDefinition;
 
 export const ADAPTER_REGISTRY = {
+  codebuddy: {
+    wire: "codebuddy",
+    mutation: "codex-owned",
+    create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createCodeBuddyAdapter(provider),
+  },
   "command-code": {
     wire: "command-code",
     mutation: "codex-owned",
@@ -104,9 +125,18 @@ export const ADAPTER_REGISTRY = {
     mutation: "codex-owned-with-gated-native-fallback",
     create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createCursorAdapter(provider),
   },
+  devin: {
+    wire: "devin",
+    mutation: "codex-owned",
+    create: (provider: OcxProviderConfig, context: AdapterFactoryContext) => createDevinAdapter(provider, context),
+  },
   "mimo-free": {
     contractParent: "openai-chat",
     create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createMimoFreeAdapter(provider),
+  },
+  qoder: {
+    contractParent: "codebuddy",
+    create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createQoderAdapter(provider),
   },
 } as const satisfies Record<string, AdapterDefinition>;
 
@@ -151,6 +181,9 @@ export function createRegisteredAdapter(
   const definition = getAdapterDefinition(provider.adapter);
   if (!definition) throw new Error(`Unknown adapter: ${provider.adapter}`);
   const adapter = definition.create(provider, context);
+  if (effectiveAdapterContract(provider.adapter).wire !== "openai-responses") {
+    withInputMediaGuard(adapter);
+  }
   const buildRequest = adapter.buildRequest.bind(adapter);
   adapter.buildRequest = (parsed, incoming) => {
     const attachTierMetadata = (request: Awaited<ReturnType<ProviderAdapter["buildRequest"]>>) => {

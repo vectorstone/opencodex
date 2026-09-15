@@ -39,10 +39,12 @@ import type {
   OpencodeProviderBlocks,
   OpencodeV2ProviderBlock,
 } from "../clients/config-export";
-import { visibleNativeSlugs } from "../codex/catalog";
+import { filterCatalogVisibleModels, visibleNativeSlugs } from "../codex/catalog";
 import { commandInvocation } from "../lib/win-exec";
-import { loadServiceTokenFromFile, serviceApiTokenFilePath } from "../lib/service-secrets";
 import { configuredAdminToken } from "../lib/admin-secrets";
+import { localManagementOrigin } from "../lib/local-destinations";
+import { directLocalHttpFetch } from "../server/direct-local-http";
+import { loadServiceTokenFromFile, serviceApiTokenFilePath } from "../lib/service-secrets";
 import { providerCodexAccountMode } from "../providers/registry";
 import { findLiveProxy, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
@@ -90,6 +92,8 @@ export interface OpencodeRoutedModel {
 
 /** Row shape from authenticated GET /api/models on the running proxy. */
 export interface OpencodeProxyModelRow {
+  /** Hub-resolved availability, independent of the launcher's local Fast setting. */
+  fastRowAvailable?: boolean;
   provider?: string;
   id?: string;
   namespaced?: string;
@@ -98,7 +102,9 @@ export interface OpencodeProxyModelRow {
   displayName?: string;
   displayNameSource?: "operator" | "provider" | "fallback";
   contextWindow?: number;
+  /** Fork F-004: authoritative per-model output limit from `/api/models`. */
   maxOutputTokens?: number;
+  /** Declared input modalities from `/api/models`; carried into opencode model capabilities. */
   inputModalities?: string[];
   /** Declared effort ladder from `/api/models`; carried into opencode model variants. */
   reasoningEfforts?: string[];
@@ -307,17 +313,38 @@ function opencodeBlocks(
 /** Default deadline for authenticated GET /api/models during `ocx opencode` launch. */
 export const OPENCODE_PROXY_MODELS_TIMEOUT_MS = 8_000;
 
+function opencodeManagementOrigin(live: LiveProxy, override?: string): string {
+  if (!override && (!Number.isInteger(live.port) || live.port < 1 || live.port > 65535)) {
+    throw new Error("The local management port is invalid.");
+  }
+  let url: URL;
+  try { url = new URL(override ?? `http://${probeHostname(live.hostname)}:${live.port}`); }
+  catch { throw new Error("The local management address is invalid."); }
+  if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+    throw new Error("The catalog requires a local HTTP management origin without credentials or a path.");
+  }
+  const host = url.hostname.toLowerCase();
+  if (["localhost", "localhost.", "127.0.0.1", "0.0.0.0", "[::]"].includes(host)) url.hostname = "127.0.0.1";
+  else if (host !== "[::1]") {
+    throw new Error("The catalog requires a loopback management listener. On a hub, enable hub.managementIngress.");
+  }
+  const port = Number(url.port || 80);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("The local management port is invalid.");
+  return url.origin;
+}
+
 /** Fetch the live model catalog from a running proxy's management API. */
 export async function fetchOpencodeProxyModels(
   live: LiveProxy,
-  apiKey: string,
-  deps: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+  managementToken: string,
+  deps: { fetchImpl?: typeof fetch; timeoutMs?: number; managementOrigin?: string } = {},
 ): Promise<OpencodeProxyModelRow[]> {
-  const baseUrl = `http://${probeHostname(live.hostname)}:${live.port}`;
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const baseUrl = opencodeManagementOrigin(live, deps.managementOrigin);
+  const fetchImpl = deps.fetchImpl ?? directLocalHttpFetch;
   const headers = new Headers({ Accept: "application/json" });
-  const token = apiKey.trim();
-  if (token) headers.set("X-OpenCodex-API-Key", token);
+  const token = managementToken.trim();
+  if (!token) throw new Error("No local admin token is available for the model catalog.");
+  headers.set("X-OpenCodex-API-Key", token);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), deps.timeoutMs ?? OPENCODE_PROXY_MODELS_TIMEOUT_MS);
   const abortIfTimedOut = (): Promise<never> => new Promise((_, reject) => {
@@ -338,10 +365,16 @@ export async function fetchOpencodeProxyModels(
     response = await Promise.race([
       fetchImpl(`${baseUrl}/api/models`, {
         headers,
+        redirect: "error",
+        cache: "no-store",
         signal: controller.signal,
       }),
       abortIfTimedOut(),
     ]);
+    if (response.status >= 300 && response.status < 400) {
+      void response.body?.cancel().catch(() => {});
+      throw new Error("Management catalog redirects are refused.");
+    }
     text = await Promise.race([response.text(), abortIfTimedOut()]);
   } catch (error) {
     const timedOut = error instanceof Error && error.name === "AbortError";
@@ -379,12 +412,17 @@ export function opencodeCatalogFromProxyRows(
   config: OcxConfig,
 ): OpencodeCatalogModel[] {
   const omitNative = providerCodexAccountMode("openai", config.providers?.openai) === "direct";
+  const routedRows = rows.filter((row): row is OpencodeProxyModelRow & { provider: string; id: string } =>
+    row.native !== true && typeof row.provider === "string" && typeof row.id === "string");
+  const visibleRouted = new Set<OpencodeProxyModelRow>(filterCatalogVisibleModels(routedRows, config));
   const seen = new Set<string>();
   const catalog: OpencodeCatalogModel[] = [];
   for (const row of rows) {
     const namespaced = row.namespaced?.trim();
     if (!namespaced || row.disabled === true) continue;
     if (omitNative && row.native === true) continue;
+    if (row.native !== true && typeof row.provider === "string" && typeof row.id === "string"
+      && !visibleRouted.has(row)) continue;
     if (seen.has(namespaced)) continue;
     seen.add(namespaced);
     catalog.push({
@@ -396,8 +434,9 @@ export function opencodeCatalogFromProxyRows(
       maxOutputTokens: row.maxOutputTokens,
       displayName: row.displayNameSource === "fallback" ? undefined : row.displayName,
       ...(Array.isArray(row.inputModalities) && row.inputModalities.length > 0
-        ? { inputModalities: row.inputModalities }
+        ? { inputModalities: [...row.inputModalities] }
         : {}),
+      ...(typeof row.fastRowAvailable === "boolean" ? { fastRowAvailable: row.fastRowAvailable } : {}),
       ...(Array.isArray(row.reasoningEfforts) && row.reasoningEfforts.length > 0
         ? { reasoningEfforts: [...row.reasoningEfforts] }
         : {}),
@@ -580,7 +619,7 @@ export function buildOpencodeEnv(
   const runtimeConfig = mergeOpencodeRuntimeConfig(base[OPENCODE_CONFIG_CONTENT_ENV], blocks);
   if (isOpencodeRuntimeConfigError(runtimeConfig)) return runtimeConfig;
   return {
-    ...base,
+    ...Object.fromEntries(Object.entries(base).filter(([name]) => name.toUpperCase() !== "OPENCODEX_ADMIN_AUTH_TOKEN")),
     [OPENCODE_CONFIG_CONTENT_ENV]: serializeOpencodeRuntimeConfig(runtimeConfig),
     [OPENCODE_API_KEY_ENV]: apiKey,
   };
@@ -646,37 +685,36 @@ export function requireOpencodeManagementToken(
 }
 
 export async function cmdOpencode(args: string[]): Promise<number> {
-  const config = loadConfig();
-  const live = await ensureProxyForOpencode(config);
+  const startupConfig = loadConfig();
+  const live = await ensureProxyForOpencode(startupConfig);
   if (!live) {
     console.error("❌ Proxy did not become healthy after starting.");
     return 1;
   }
 
-  const apiKey = opencodeApiKey(config);
-  // `/api/models` is a management endpoint — it requires the admin token, not the
-  // data-plane admission key. The proxy is already running at this point so
-  // configuredAdminToken() finds the same token the server initialized with.
-  let managementToken: string;
-  try {
-    managementToken = requireOpencodeManagementToken();
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    console.error(`❌ Could not fetch the model catalog from the proxy: ${reason}`);
-    return 1;
-  }
+  const apiKey = opencodeApiKey(startupConfig);
+  // Fork F-003: `/api/models` is a management endpoint — it requires the admin
+  // token, not the data-plane admission key. The proxy is already running at this
+  // point, so `requireOpencodeManagementToken()` sees the same token the server
+  // initialized with, and a missing token fails loudly instead of producing a
+  // partial or misleading model catalog.
   let proxyModels: OpencodeProxyModelRow[];
   try {
-    proxyModels = await fetchOpencodeProxyModels(live, managementToken);
+    const managementToken = requireOpencodeManagementToken();
+    proxyModels = await fetchOpencodeProxyModels(live, managementToken, {
+      managementOrigin: localManagementOrigin({ ...startupConfig, hostname: live.hostname }, live.port),
+    });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     console.error(`❌ Could not fetch the model catalog from the proxy: ${reason}`);
     return 1;
   }
+  // /api/models may have completed and persisted initial provider selection.
+  const config = loadConfig();
   const catalog = opencodeCatalogFromProxyRows(proxyModels, config);
   const blocks = buildOpencodeProviderBlocksFromCatalog(live.port, catalog, live.hostname, config);
   const baseUrl = blocks.v1.options.baseURL;
-  const modelCount = catalog.length;
+  const modelCount = Object.keys(blocks.v1.models).length;
   console.error(`✅ opencode wired to ${baseUrl} — ${modelCount} model(s) under provider \`${OPENCODE_PROVIDER_ID}\`.`);
   console.error("   Your existing opencode config files are left untouched; only the runtime provider blocks are injected.");
   const providerOverride = opencodeProviderOverridePath(process.cwd());

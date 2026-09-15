@@ -6,6 +6,21 @@ description: Sağlayıcı girdileri, kimlik doğrulama, uç noktalar, model kata
 Bir sağlayıcı, opencodex'e bir modelin nerede yaşadığını, hangi hat adaptörünü
 konuştuğunu ve isteklerin nasıl doğrulandığını söyler.
 
+## İlk kayıtta model seçimi
+
+Yeni OAuth dışı bağlantılar, modelleri göstermeden önce güvenilir bir model listesini bekler. Models sekmesinde en az 20 benzersiz model satırı varsa tüm model anahtarları başlangıçta OFF olur; sağlayıcının kendisi ACTIVE kalır. Gerçekte OAuth veya ChatGPT girişi kullanan bağlantılar varsayılanlarını korur.
+
+Bu kural yalnızca yeni sağlayıcı kaydında uygulanır. Güncellemeler, yeniden giriş ve anahtar değişimi mevcut seçimleri sıfırlamaz. İlk ayardan sonra gerekli modelleri Models üzerinden veya aşağıdaki CLI komutlarıyla açın. Sonradan gelen yeni modellerin ayrı politikası değişmez. `<model-id>` yerine listedeki bir ID yazın.
+
+```sh
+ocx models live --provider openrouter
+ocx models enable '<model-id>'
+ocx models disable '<model-id>'
+ocx models provider openrouter on
+```
+
+Arayüzde kayıt veya OAuth girişi tamamlanınca Models sayfasını açan bir bilgilendirme penceresi gösterilir. CLI model yönetimi komutlarını yazdırır; JSON sonraki adımları içerir. `--no-wait` tamamlanmış değil, bekleyen girişi bildirir. Canlı model komutlarından önce proxy’yi `ocx start` ile başlatın.
+
 ## Sağlayıcı ile ilgili üst düzey alanlar
 
 | Alan | Tip | Varsayılan | Anlamı |
@@ -13,8 +28,9 @@ konuştuğunu ve isteklerin nasıl doğrulandığını söyler.
 | `providers` | `Record<string, OcxProviderConfig>` | — | Sağlayıcı adından sağlayıcı yapılandırmasına eşleme haritası. |
 | `openaiProviderTierVersion?` | `2` | geçiş tarafından ayarlanır | Tek seçenek duyarlı OpenAI projeksiyonunu tamamlandı olarak işaretler. |
 | `disabledModels?` | `string[]` | — | Codex kataloğundan ve `/v1/models` listesinden gizlenen, ancak doğrudan proxy çağrılarından engellenmeyen modeller. Yönlendirilen bir kimlik listelerden kaldırılır. Hesap nitelikli bir yerel kimlik yalnızca o seçici satırını gizler; yalın bir yerel GPT kimliği, yalın satırı ve o model için her hesap seçici satırını gizler. Kontrol paneli Modeller sayfası yalnızca yönlendirilen ve yalın yerel satırları gösterir; seçici nitelikli bir satırı gizlemek için doğrudan bu yapılandırma alanını kullanın. |
-| `providerContextCaps?` | `Record<string, number>` | `{}` | Sağlayıcı başına Codex tarafından görülebilen bağlam sınırları. Bir sınır yalnızca bilinen bir bağlam penceresini düşürür. |
-| `contextCapValue?` | `number` | `350000` | Kontrol paneli bağlam sınırı kontrolleri tarafından kullanılan varsayılan değer. Değiştirilmesi, yalnızca "tüm yönlendirilen sağlayıcılara uygula" açık olduğunda değeri mevcut bir `providerContextCaps` girdisi olmayan sağlayıcılar da dahil olmak üzere yönlendirilen her sağlayıcıya uygular; aksi takdirde her sağlayıcı kendi sınırını korur. |
+| `providerContextCaps?` | `Record<string, number>` | `{}` | Sağlayıcı başına etkin bağlam sınırları. Normal pencereler küçültülür; uzun pencereyi destekleyen yerel modeller yalnızca kendi desteklenen üst sınırlarına kadar genişletilebilir. |
+| `providerContextCapValues?` | `Record<string, number>` | `{}` | Sağlayıcı başına son seçilen sınırlar; devre dışı bırakıldığında da saklanır. Bu değerler tek başına sınırı etkinleştirmez. Etkin değer, saklanan değerden önceliklidir. |
+| `contextCapValue?` | `number` | `350000` | İlk etkinleştirmede kullanılan varsayılan değer. Sonraki etkinleştirmelerde sağlayıcının seçimi geri yüklenir. Genel değeri `setAll: true` ile güncellemek yalnızca etkin sınırları değiştirir; değer olmadan `setAll: true`, yapılandırılmış tüm sağlayıcıların sınırlarını geçerli genel değerle etkinleştirir. |
 | `codexAccounts?` | `CodexAccount[]` | `[]` | Codex Auth tarafından yönetilen ChatGPT/Codex havuz hesabı meta verileri. Sırlar ayrı olarak `codex-accounts.json` içinde yer alır. |
 | `pausedCodexAccountIds?` | `string[]` | `[]` | Duraklatıldığında ana `__main__` hesabı da dahil olmak üzere, devam ettirilene kadar Havuz seçiminden hariç tutulan hesaplar. |
 | `codexAccountNamespaces?` | `Record<string, string>` | — | İsteğe bağlı olarak rastgele bir genel model seçiciden saklanan bir Codex hesap hedefine eşleme. Hesap nitelikli seçici satırları etkinleştirildiğinde, hedefi mevcut olan her seçici, Codex seçicisine ayrı `<seçici>/<yerel-openai-modeli>` satırları ekler; her satır yalnızca o hesabı kullanır. Herhangi bir seçici etkinken, yalın yerel satırlar seçicide gizlenir, ancak açıkça devre dışı bırakılmadıkça kimlikleri yönlendirilebilir kalır ve ham `/v1/models` tarafından listelenir. |
@@ -22,8 +38,9 @@ konuştuğunu ve isteklerin nasıl doğrulandığını söyler.
 | `activeCodexAccountId?` | `string` | — | Sonraki istek için manuel olarak seçilen Havuz hesabı. Seçim iş parçacığı bağlılığını temizler; devam eden istekler yakalanan kimlik bilgilerini korur. |
 | `codexAccountPriorities?` | `Record<string, number>` | — | Codex havuzu için hesap başına seçim sırası: hesap kimliği → `-100` ile `100` arası tam sayı, **daha yüksek olan daha önce kullanılır**, yoksa `0` anlamına gelir. Bu bir öncelik sırası sınırıdır, bir uygunluk sınırı değildir: seçim, zaten uygun olan hesapları hala kota payı bulunan en yüksek katmana daraltır ve `accountPoolStrategy` daha sonra bu katman içinde seçim yapar. Bir katman, yalnızca her üye `autoSwitchThreshold` üzerinde olduğunda, soğumada olduğunda, yumuşak kaçınıldığında, duraklatıldığında veya yeniden kimlik doğrulama gerektiğinde atlanır — bilinmeyen kota asla bir katmanı boşaltmaz. Sıralama asla uygun olmayan bir hesabı seçilebilir yapmaz ve zaten bir hesabı olan bir iş parçacığını asla yeniden bağlamaz. Ana `__main__` hesap eşit şartlarda katılır, bu sayede Codex Desktop girişi en son tükenecek şekilde ayarlanabilir. Hiçbir girdi olmadığında havuz tam olarak eskisi gibi davranır. Hatalı biçimlendirilmiş bir harita bir konsol uyarısıyla yok sayılır (sıralama kapalı, yapılandırma onarımı yok). `ocx account priority` ve Codex Auth sayfası tarafından yönetilir. |
 | `activeCodexAccountPinned?` | `string` | — | Operatörün en son elle seçtiği hesap kimliği. Ayarlandığı sürece, pin tükenme, hariç tutma, silme veya açık bir yük devretme/yükseltme ile serbest bırakılana kadar daha yüksek bir `codexAccountPriorities` katmanı onu öncelikleyemez. Sınırlı katman içindeki sıradan round-robin hareketi onu serbest bırakmaz. Herhangi bir `codexAccountPriorities` girdisi yazmak da pini serbest bırakır, böylece bir sıra var olmadan önce yapılan bir pin daha sonra ayarlanan bir pinin önüne geçemez. `GET /api/codex-auth/active`, hem geçerli hesabın sabitlenip sabitlenmediğini (`pinned`) hem de tavanı taşıyan hesabı (`pinnedAccountId`) bildirir. |
-| `autoSwitchThreshold?` | `number` | `80` | Proaktif geçiş için kullanım eşiği. `quota`, bir sonraki isteklerinde hem bağlı hem de bağımsız görevleri yeniden değerlendirebilir; `fill-first` bunu yalnızca bağımsız atama için tükenme noktası olarak kullanır; normal `round-robin` seçimi bunu kullanmaz. Puan, bilinen en sıcak 5 saatlik, haftalık veya 30 günlük kota penceresini kullanır. `0`, yalnızca kullanıma dayalı proaktif geçişi devre dışı bırakır, bağımsız atamayı veya arıza kurtarmayı devre dışı bırakmaz. |
-| `accountPoolStrategy?` | `"quota" \| "round-robin" \| "fill-first"` | `"quota"` | Yeni/bağımsız Codex istekleri için atama stratejisi. Bir istek, canlı (üst iş parçacığı kimliği, kota kapsamı) bağlılığı olmadığında bağımsızdır; görünür mevcut bir görev, proxy yeniden başlatmasından veya bağlılık sıfırlamasından sonra bağımsız hale gelebilir. `quota`, aktif bir hesap olmadığında en düşük kullanımlı uygun hesabı seçer, `autoSwitchThreshold` altında uygun bir aktif hesabı tutar ve eşikten sonra bağımsız bir isteği taşıyabilir veya bağlı bir görevi proaktif olarak daha düşük kullanımlı uygun bir hesaba yeniden bağlayabilir. `round-robin`, bağımsız istekleri eşit olarak dağıtır; `fill-first`, soğuma, kullanılamama veya yapılandırılmış tükenme eşiğine kadar bağımsız istekleri aktif hesaba atamaya devam eder. |
+| `autoSwitchThreshold?` | `number` | `80` | Proaktif geçiş için kullanım eşiği. `quota`, bağımsız görevlerin bir sonraki isteğini yeniden değerlendirebilir. Bağlı görevler varsayılan olarak (`pool.cacheAffinity`) eşiğin ötesinde hesabını korur; hesap tükenene veya hizmet veremez hale gelene kadar kalır ve o zaman yalnızca kullanımı kesin olarak daha düşük ve gerçek kota payı olan bir hesaba geçer. `pool.cacheAffinity: false` ile bağlı görevler de bu eşikte yeniden değerlendirilir. `fill-first` bunu yalnızca bağımsız atama için tükenme noktası olarak kullanır; normal `round-robin` seçimi bunu kullanmaz. Puan, bilinen en sıcak 5 saatlik, haftalık veya 30 günlük kota penceresini kullanır. `0`, yalnızca kullanıma dayalı proaktif geçişi devre dışı bırakır, bağımsız atamayı veya arıza kurtarmayı devre dışı bırakmaz. |
+| `accountPoolStrategy?` | `"quota" \| "round-robin" \| "fill-first" \| "reset-first"` | `"quota"` | Yeni/bağımsız Codex istekleri için atama stratejisi. Bir istek, canlı (üst iş parçacığı kimliği, kota kapsamı) bağlılığı olmadığında bağımsızdır; görünür mevcut bir görev, proxy yeniden başlatmasından veya bağlılık sıfırlamasından sonra bağımsız hale gelebilir. `quota`, aktif bir hesap olmadığında en düşük kullanımlı uygun hesabı seçer, `autoSwitchThreshold` altında uygun bir aktif hesabı tutar ve eşikten sonra bağımsız bir isteği taşıyabilir. Bağlı görevler `pool.cacheAffinity`'yi izler (varsayılan açık): hesap tükenene (bilinen kullanım %100) veya hizmet veremez hale gelene kadar kalır ve o zaman yalnızca kullanımı kesin olarak daha düşük ve gerçek kota payı olan bir hesaba geçer. Bayrağı `false` yapınca bağlı bir görev eşiğinde proaktif olarak daha düşük kullanımlı uygun bir hesaba yeniden bağlanabilir; hedef kısıtı yine geçerlidir. `round-robin`, bağımsız istekleri eşit olarak dağıtır; `fill-first`, soğuma, kullanılamama veya yapılandırılmış tükenme eşiğine kadar bağımsız istekleri aktif hesaba atamaya devam eder.  `reset-first`: Eşiğin altındaki hesaplar arasından sonraki 5 saatlik veya haftalık sıfırlaması en yakın olanı seçer. Bağlı görevler yapılandırılmış bağlılık politikasını izler. Bağımsız model kotaları kullanıma göre sıralanır. Aylık sıfırlamalar bu sıralamayı belirlemez. |
+| `pool.cacheAffinity?` | `boolean` | `true` | Bağlı Codex iş parçacıkları için önbellek bağlılığı sıralaması; `pool.kernel`'dan bağımsızdır. Varsayılan olarak açıktır; anahtarı atlamak veya `true` vermek bağlamayı korur ve `false` dışındaki bir değer açık okunur. Canlı bağlama kota payından öndedir: `quota`, kullanımın `autoSwitchThreshold`'u geçmesi nedeniyle iş parçacığını taşımaz, çünkü canlı bir konuşmayı taşımak hesaba özel istem önbelleğini atar. Hesap duraklatılmış, kullanılamaz, plandan dışlanmış, kimlik bilgisi geçersiz, generation değişmiş, TTL dolmuş, 429/402 kota reddi almış veya gerçekten tükenmişse (bilinen kullanım %100) iş parçacığı yine ayrılır ve yalnızca kullanımı kesin olarak daha düşük ve gerçek kota payı olan bir hesaba geçer. Kullanımı bilinmeyen bir hesap bağlı bir görev için hedef olarak asla seçilmez. Tüm hesaplar eşiğin üzerindeyse bağlı görev yerinde kalır; daha iyi bir hedef yoktur. `false` eşiğe göre yeniden bağlamayı geri getirir; hedef kısıtı yine geçerlidir. Bağlılık bir sabitleme değil yeniden sıralamadır. |
 | `accountPoolStickyLimit?` | `number` | `1` | İlerlemeden önce bir round-robin seçiminde tutulan yeni/bağımsız görev atamaları; sayaç yukarı akış başarısından sonra değil, bir görev bağlandığında ilerler. Aralık 1–100. |
 | `upstreamFailoverThreshold?` | `number` | `3` | Gelecekteki yeni oturumların yük devretmesinden önceki ardışık geçici arızalar. Devre dışı bırakmak için `0` ayarlayın. Düzenli Responses ve yerel sıkıştırma gönderimleri için kanıtlanmış bağlantı öncesi DNS/TCP erişilebilirlik arızaları sağlayıcı-ana bilgisayar düzeyinde izlenir: hesap sağlığını, hesap soğuma sürelerini, iş parçacığı/oturum bağlılığını, aktif hesap seçimini veya Havuz yönlendirmesini asla etkilemez ve bu eşiğe asla sayılmaz. |
 | `upstreamHostCircuitThreshold?` | `number` | `0` | Yerel OpenAI iletme Responses ve sıkıştırma gönderimlerinde kanıtlanmış bağlantı öncesi DNS/TCP arızaları için isteğe bağlı devre eşiği. `0` devre dışı bırakır; `1`–`20`, bu kadar terminal mantıksal istekten sonra 30 saniyelik bir sağlayıcı-kaynak soğuma süresi açar. Açıkken istekler, hesap seçiminden veya yukarı akış gönderiminden önce `Retry-After` ile `503` alır; soğuma süresinden sonra bir yarı açık isteğe izin verilir. Zaman aşımları ve HTTP yanıtları asla sayılmaz ve herhangi bir HTTP yanıtı devreyi kapatır. Yalnızca sabitlenmiş hesabı olmayan Codex Havuz yönlendirmesi için geçerlidir; `codexAccountMode: "direct"` ve hesap nitelikli seçiciler için etkisizdir. |
@@ -85,7 +102,7 @@ alanlı seçilmiş kimlikleri yalın kimliklere yeniden yazar.
 | `apiKeyTransport?` | `"x-api-key" \| "bearer"` | Anthropic anahtar başlığı stili. Varsayılan olarak yerel `x-api-key`; yalnızca anahtar kimlik doğrulamalı `anthropic` sağlayıcıları için geçerlidir. |
 | `apiKeyPool?` | `ApiKeyPoolEntry[]` | Çoklu anahtar havuzu. `apiKey` aktif girdiyi yansıtır; her öğe `id`, `key`, isteğe bağlı `label` ve isteğe bağlı sayısal `addedAt` değerine sahiptir. |
 | `defaultModel?` | `string` | Bu sağlayıcı açık bir model olmadan seçildiğinde kullanılan model. |
-| `models?` | `string[]` | Tohum/geri dönüş model listesi. `liveModels: false` olduğunda bunlar keşfedilen tek modellerdir. |
+| `models?` | `string[]` | Başlangıç/geri dönüş model listesi. `liveModels: false` iken boş olmayan `models` listesini `retainModels` izler; `models` boşsa veya atlanmışsa önce yapılandırılmış `defaultModel`, sonra `retainModels` kullanılır. Yinelenen kimliklerin yalnızca ilk geçtiği konum korunur. |
 | `liveModels?` | `boolean` | Başlatmada/senkronizasyonda canlı kataloğu getirin (varsayılan `true`). Özel sağlayıcılar `${baseUrl}/models` kullanır; yerleşikler bir kayıt defteri URL'si ve filtresi kullanabilir. |
 | `selectedModels?` | `string[]` | Keşiften sonra katalog izin listesi. Boş olmaması yalnızca bu kimlikleri gösterir; boş veya atlanmış olması keşfedilen tüm modelleri gösterir. |
 | `contextWindow?` | `number` | Yukarı akış meta verileri olmadığında sağlayıcı genelinde bağlam geri dönüşü; aksi takdirde daha küçük canlı meta verileri koruyan bir sınır. Modeller kontrol paneli bunu `providerContextCaps` alanından ayrı olarak gösterir. |
@@ -95,7 +112,7 @@ alanlı seçilmiş kimlikleri yalın kimliklere yeniden yazar.
 | `modelAutoCompactTokenLimits?` | `Record<string, number>` | Model başına pozitif güvenli tamsayı biçiminde yumuşak otomatik sıkıştırma bütçeleri. Değerler yalnızca bağlamın veya maksimum girdinin etkin %90 zarfını düşürebilir ve yetkili bir bağlam penceresi bilinmiyorsa yayımlanmaz. Canonical `openai` için anahtarlar, sağlayıcı veya hesap seçici öneki olmadan desteklenen tam yerel model kimlikleri olmalıdır. Sağlayıcı PATCH girdileri birleştirir; bir anahtarı `null` yapmak o anahtarı siler, alanın tamamını `null` yapmak haritayı temizler. Bu `null` silme işaretleri yalnızca PATCH içindir. |
 | `defaultMaxOutputTokens?` | `number` | İstemci `max_output_tokens` değerini atladığında sağlayıcı genelinde `openai-chat` geri dönüşü. |
 | `modelMaxOutputTokens?` | `Record<string, number>` | Pozitif model başına `openai-chat` geri dönüş bütçeleri; tam/kalıp eşleşmeleri sağlayıcı varsayılanını yener. |
-| `modelCosts?` | `Record<string, Cost4>` | Sağlayıcının tam yukarı akış model kimliğine göre anahtarlanan model başına görüntüleme fiyatları (1M token başına USD) — bir sağlayıcı tanımlayıcısı veya yönlendirilen `provider/model` etiketi değil, örn. `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`. Herhangi bir model kimliği geçerli bir anahtardır — özel sağlayıcılar `openai-chat` adaptörü aracılığıyla herhangi bir OpenAI uyumlu uç noktayı hedefleyebilir ve yerel veya dahili sağlayıcı kimlikleri yerleşik kataloglarda bulunmasalar bile çalışır. Kullanıcı tarafından yapılandırılan fiyatlar Günlükler `~$` ve Kullanım tahminlerinde yerleşik katalogları yener; geçmiş girdiler geçerli katmandan yeniden fiyatlandırılır, bu nedenle bir fiyatı düzenlemek geçmiş toplamları değiştirebilir. Geri dönüş sırası: kullanıcı `modelCosts` → jawcode kataloğu → beklenen fiyat katmanı → model düzeyinde satıcı geri dönüşü ve tamamen sıfır bir girdi bu dizideki bir sonraki kaynağa düşer. Her oran en fazla 1.000.000 (1M token başına USD) olan negatif olmayan sonlu bir sayı olmalıdır; aralık dışı satırlar yönetim sınırı tarafından reddedilir ve yükleme sırasında bırakılır. Yalnızca görüntüleme zamanı tahmini: katmanlar yönlendirmeyi, hesap seçimini, kotaları veya faturalandırmayı asla etkilemez. |
+| `modelCosts?` | `Record<string, Cost4>` | Sağlayıcının tam yukarı akış model kimliğine göre anahtarlanan model başına görüntüleme fiyatları (1M token başına USD) — bir sağlayıcı tanımlayıcısı veya yönlendirilen `provider/model` etiketi değil, örn. `{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`. Herhangi bir model kimliği geçerli bir anahtardır — özel sağlayıcılar `openai-chat` adaptörü aracılığıyla herhangi bir OpenAI uyumlu uç noktayı hedefleyebilir ve yerel veya dahili sağlayıcı kimlikleri yerleşik kataloglarda bulunmasalar bile çalışır. Kullanıcı tarafından yapılandırılan fiyatlar Günlükler `~$` ve Kullanım tahminlerinde yerleşik katalogları yener; geçmiş girdiler geçerli katmandan yeniden fiyatlandırılır, bu nedenle bir fiyatı düzenlemek geçmiş toplamları değiştirebilir. Geri dönüş sırası: kullanıcı `modelCosts` → jawcode kataloğu → beklenen fiyat katmanı → model düzeyinde satıcı geri dönüşü ve kullanıcının açıkça sıfır olarak belirlediği oranlar bilinen sıfır maliyetli bir tahmin üretir; otomatik fiyatlandırmaya dönmek için model girdisini silin. Tamamen sıfır katalog fiyatları bir sonraki kaynağa geçmeye devam eder. Her oran en fazla 1.000.000 (1M token başına USD) olan negatif olmayan sonlu bir sayı olmalıdır; aralık dışı satırlar yönetim sınırı tarafından reddedilir ve yükleme sırasında bırakılır. Yalnızca görüntüleme zamanı tahmini: katmanlar yönlendirmeyi, hesap seçimini, kotaları veya faturalandırmayı asla etkilemez. |
 | `headers?` | `Record<string, string>` | Ek yukarı akış başlıkları. Yetkilendirme, çerezler, API anahtarı başlıkları, gömülü yeni satırlar ve geçersiz adlar reddedilir. |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | Varsayılan OpenRouter `order`, `only` ve `allowFallbacks` tercihleri; yalnızca `openai-chat` ile kurallı OpenRouter için geçerlidir. |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | Sağlayıcı genelindeki OpenRouter tercihinin yerini alan tam model kimliği geçersiz kılmaları. |
@@ -107,19 +124,20 @@ alanlı seçilmiş kimlikleri yalın kimliklere yeniden yazar.
 | `modelReasoningEfforts?` | `Record<string, string[]>` | Model başına etiketler. Boş bir liste çaba denetimini gizler. `reasoningEfforts`'ta olduğu gibi, yapılandırılmış her `google` adaptör merdiveni `thinkingLevel` yeteneğini iddia eder; doğrudan ve Vertex görsel olmayan istekleri düz Gemini yolunu kullanırken, Cloud Code Assist bunu istek zarfı altında gönderir. |
 | `modelSupportsReasoningSummaries?` | `Record<string, boolean>` | Özetlerin bildirilmesini durdurmak ve özet teslim alanlarını kaldırmak için bir modeli `false` olarak ayarlayın. |
 | `modelReasoningSummaryDelivery?` | `Record<string, "sequential" \| "sequential_cutoff" \| "concurrent" \| "concurrent_cutoff">` | Model başına Responses teslim enum'ı; mevcut bir teslim alanını yeniden yazar. |
-| `modelAdapters?` | `Record<string, string>` | Karışık hatlı ağ geçitleri için model başına `openai-chat` veya `openai-responses` hat geçersiz kılma. Açık girdiler kayıt defteri varsayılanlarını yener. OpenCode Go önayarı, kardeş modelleri belgelenmiş hatlarında bırakırken `gpt-5.6-luna` için Responses'ı seçer; DeepSeek, `deepseek-v4-flash` için yerel Responses seçebilir; ve GitHub Copilot, GPT-5 ailesi (`gpt-5.3-codex`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) için yalnızca Responses varsayılanlarını bildirir çünkü bu modeller ajan trafiği için `/chat/completions`'ı reddeder. Yerleşik varsayılanı olmayan modeller (örneğin `gpt-5.4-nano`) burada dahil edilebilir. Tek hatlı yukarı akış pinleri ve kurallı ChatGPT iletme geçersiz kılmaları reddeder. |
+| `modelAdapters?` | `Record<string, string>` | Karışık hatlı ağ geçitleri için model başına `openai-chat` veya `openai-responses` hat geçersiz kılma. Açık girdiler kayıt defteri varsayılanlarını yener. OpenCode Go önayarı, kardeş modelleri belgelenmiş hatlarında bırakırken `gpt-5.6-luna` için Responses'ı seçer; DeepSeek, `deepseek-v4-flash` için yerel Responses seçebilir; ve GitHub Copilot, modeller (`gpt-5.3-codex`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`) için yalnızca Responses varsayılanlarını bildirir çünkü bu modeller ajan trafiği için `/chat/completions`'ı reddeder. Yerleşik varsayılanı olmayan modeller (örneğin `gpt-5.4-nano`) burada dahil edilebilir. Tek hatlı yukarı akış pinleri ve kurallı ChatGPT iletme geçersiz kılmaları reddeder. |
 | xAI Responses katılımı (panel) | anahtar | Yalnızca `xai` için `grok-4.5` ve `grok-4.6` `modelAdapters` girdilerini atomik olarak ayarlar veya temizler. Tek girdi, sonraki anahtar yazımı ikisini eşitleyene kadar karma durum olarak görünür. Diğer geçersiz kılmalar ve katman davranışı değişmez. |
 | `xaiResponsesXSearch?` | `boolean` | Varsayılan olarak devre dışıdır. Bir xAI Responses hedefinde, yalnızca canlı bir `web_search` aracı son istek normalleştirmesinden sağ çıktığında sağlayıcı tarafından barındırılan `x_search` bildirimini ekler. Mevcut bildirimler yinelenmez, çağıranın `tool_choice`/`allowed_tools` seçicileri hiçbir zaman genişletilmez ve bu, web araması yardımcı hizmetinin `search.xSearch` seçeneklerinden ayrıdır. |
 | `modelPreferHostedTools?` | `Record<string,string[]>` | Barındırılan bir araç ad alanı ayıran iletme harici Responses ağ geçitleri için tam model dahil etme. Şu anda yalnızca `["image_generation"]` kabul eder; eşleşen bir model `openai-responses` hattını kullanmalı ve bu barındırılan aracı desteklemelidir. Çakışan istemci `image_gen` bildirimlerini kaldırır ve arayan araç seçimini korumak için seçicilerini yeniden yazar. OpenAI API sanal `-pro` modelleri için önce seçilen genel kimlik eşleştirilir ve çözümlenen temel hat model kimliği bir geri dönüştür. `modelAdapters` önce genel kimliği, ardından temel kimliği çözer; ikinci çözümleme son hattı belirler. Diğer modeller normal takma ad davranışını korur. |
 | `annotateEmptyToolOutputs?` | `boolean` | Mevcut fakat boş bir araç sonucunu modele ulaşmadan önce kısa bir işaretle değiştirir; böylece boş sonuç eksik sonuç olarak yorumlanmaz. Boş dizelere ve yalnızca metin parçalarından oluşan dizilere uygulanır; görsel, dosya ve şifrelenmiş parçalara hiçbir zaman dokunulmaz. Yerleşik kayıt defterindeki DeepSeek için varsayılan değer `true`dur; diğer durumlarda ayarlanmamıştır. Bir sağlayıcıyı kapsam dışında bırakmak için `false` olarak ayarlayın — açık bir `false` değeri, alanı içermeyen sonraki düzenlemelerde korunur. `PATCH /api/providers?name=<provider>`, geçersiz kılmayı temizleyip kayıt defteri varsayılanı davranışına dönmek üzere `true`, `false` veya `null` kabul eder. |
-| `reasoningEffortMap?` | `Record<string, string>` | Akıl yürütme etiketleri için sağlayıcı genelinde hat takma adları. |
-| `modelReasoningEffortMap?` | `Record<string, Record<string, string>>` | Akıl yürütme etiketleri için model başına hat takma adları. |
+| `reasoningEffortMap?` | `Record<string, string>` | Akıl yürütme etiketleri için sağlayıcı genelinde hat takma adları. Bir etiketi `"__omit__"` olarak eşlemek, akıl yürütme alanını yukarı akış isteğinden tamamen çıkarır (örneğin derin mod için `reasoning_effort` alanının atlanmasını gerektiren Ollama modelleri için). |
+| `modelReasoningEffortMap?` | `Record<string, Record<string, string>>` | Akıl yürütme etiketleri için model başına hat takma adları. Bir etiketi `"__omit__"` olarak eşlemek, akıl yürütme alanını yukarı akış isteğinden tamamen çıkarır. |
 | `reasoningWireFormat?` | `"gateway-object"` | `reasoning_effort` yerine `reasoning: { enabled, effort }` kabul eden OpenAI uyumlu ağ geçitleri için. ClinePass önayarı bunu otomatik olarak ayarlar. |
 | `noReasoningModels?` | `string[]` | Akıl yürütme/düşünme parametrelerini reddeden modeller. |
 | `noTemperatureModels?` | `string[]` | Arayan tarafından belirtilen `temperature` değerini reddeden modeller. |
 | `noTopPModels?` | `string[]` | Arayan tarafından belirtilen `top_p` değerini reddeden modeller. |
 | `noPenaltyModels?` | `string[]` | Varlık/frekans cezalarını reddeden modeller. |
 | `noStructuredOutputModels?` | `string[]` | `openai-chat` uç noktası `response_format`'ı reddeden tam model kimlikleri. Yalnızca tam bir istenen model eşleşmesi alanı atlar; yapılandırılmış çıktı çevirisi diğer her `openai-chat` modeli için etkin kalır. |
+| `noJsonSchemaModels?` | `string[]` | `openai-chat` uç noktası `json_schema` biçimini reddeden ama `json_object` kabul eden tam model kimlikleri. Böyle bir istek atılmak yerine `json_object` seviyesine düşürülür, böylece JSON isteyen çağıran yine JSON alır. Bir model her iki listede de varsa `noStructuredOutputModels` kazanır. `opencode go`, `opencode zen` ve `opencode free` hazır ayarları bunu DeepSeek rotaları için getirir. |
 | `parallelToolCalls?` | `boolean` | Paralel araç çağrılarını açıp kapatın. OpenAI Chat varsayılan olarak açıktır; sohbet harici adaptörler yalnızca açık `true` durumunda bildirir. |
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` | Tam yer tutucu kimlikleri, eksik terminal kimlikleri ve (`repairInvalidIds` ile) kurallı `msg_`/`rs_` öneki eksik olan mesaj/akıl yürütme kimlikleri için varsayılan olarak devre dışı bırakılmış aşağı akış SSE onarımı. Fonksiyon çağrısı kimlikleri asla yeniden yazılmaz. Yerleşik DeepSeek son ikisini varsayılan olarak etkinleştirir. |
 | `responsesSnapshotRepair?` | `boolean` | SSE ve JSON'daki seyrek Responses yaşam döngüsü anlık görüntüleri için varsayılan olarak devre dışı bırakılmış istemciye yönelik onarım. Ham inceleme ve kalıcılık değişmeden kalırken eksik kurallı durumu, çıktıyı ve araç meta verilerini doldurur. |
@@ -171,16 +189,17 @@ hedefleri engellenmiş olarak kalır. Teşhis istekleri yönlendirmeleri reddede
 kimlik bilgisi kaldırılmış bir hedef bildirir. Sıradan sağlayıcı isteği yeniden
 yönlendirme incelemesi bu teşhis korumasından ayrı kalır.
 
+Clash / Surge / Mihomo kullanıcıları için iki fake-IP DNS istisnası vardır ve ikisi de yalnızca DNS *yanıtlarına* uygulanır; URL'deki literal adres yine reddedilir. IANA benchmark aralığı `198.18.0.0/15` (IPv4-mapped IPv6 yazımları dahil), ana bilgisayara bir giden proxy uygulandığında kabul edilir. Mihomo'nun varsayılan IPv6 fake-IP aralığı `fdfe:dcba:9876::/48` daha sıkı bir koşulla kabul edilir: URL şemasıyla eşleşen proxy değişkeni (`https:` için `HTTPS_PROXY`, `http:` için `HTTP_PROXY`; `ALL_PROXY` sayılmaz) ayarlı olmalı, ana bilgisayar `NO_PROXY` ile eşleşmemeli ve istek daha sonra açıkça o proxy'ye bağlanır. Diğer tüm ULA'lar, komşu önekler veya gerçek bir özel yanıtla karışık fake-IP yanıtları hâlâ `allowPrivateNetwork: true` gerektirir. Sağlayıcı kaydetme zamanı doğrulaması IPv6 istisnasını hiçbir zaman uygulamaz.
+
 ## Codex hesap havuzu
 
 Havuz hesapları eklemek ve kotaları yenilemek için kontrol panelinde **Codex
 Auth** kullanın. `config.json` gizli olmayan meta verileri saklar; erişim ve
 yenileme belirteçleri güçlendirilmiş kimlik bilgisi deposunu kullanır. Havuz
 yönlendirmesi yeni/bağımsız atamayı, kullanıma dayalı proaktif geçişi ve arıza
-kurtarmayı ayırır. Bağlı bir görev normalde bağlılığı korur, ancak `quota`,
-kullanım eşiği aşıldıktan sonraki bir sonraki isteğinde onu yeniden
-bağlayabilir; duraklatma, soğuma, yeniden kimlik doğrulama ve arıza işleme ise
-yönlendirmeyi bağımsız olarak temizleyebilir veya taşıyabilir. Bağımsız bir
+kurtarmayı ayırır. Bağlı bir görev normalde bağlılığı korur. Varsayılan olarak
+(`pool.cacheAffinity`) bu yeniden bağlama, bağlı hesap tükenene veya
+hizmet veremez hale gelene kadar bekler ve o zaman yalnızca kullanımı kesin olarak daha düşük ve gerçek kota payı olan bir hesaba geçer. `pool.cacheAffinity: false` ile `quota`, kullanım eşiği aşıldıktan sonraki isteğinde onu yeniden bağlayabilir; hedef kısıtı yine geçerlidir. 429/402 kota reddi, duraklatma, kimlik bilgisi geçersizliği ve TTL dolması bağlamayı hemen serbest bırakır; geçici arıza serisi (5xx ve diğer kota dışı arızalar) isteği başka bir hesapta sunar ama canlı bağlamayı silmez. Bağımsız bir
 isteğin canlı hesap bağlaması yoktur; bu, proxy yeniden başlatmasından veya
 bağlılık sıfırlamasından sonra mevcut görünür bir görevi içerebilir. Akış öncesi
 bir 429 veya 402, kullanıma dayalı proaktif geçiş kapalı olsa bile aynı istekte
@@ -208,7 +227,7 @@ kalır.
 
 | Strateji | Davranış |
 | --- | --- |
-| `quota` (varsayılan) | Aktif bir hesap yoksa 5 saatlik, haftalık ve 30 günlük pencerelerde en düşük kullanımlı uygun hesabı seçin. Aksi takdirde `autoSwitchThreshold` altında uygun bir aktif hesabı tutun; eşiği aştıktan sonra bağımsız bir istek veya bağlı bir görevin bir sonraki isteği daha düşük kullanımlı uygun bir hesaba geçebilir. `0`, bu kullanım odaklı yeniden değerlendirmeyi devre dışı bırakır, arıza kurtarmayı devre dışı bırakmaz. |
+| `quota` (varsayılan) | Aktif bir hesap yoksa 5 saatlik, haftalık ve 30 günlük pencerelerde en düşük kullanımlı uygun hesabı seçin. Aksi takdirde `autoSwitchThreshold` altında uygun bir aktif hesabı tutun; eşiği aştıktan sonra bağımsız bir istek daha düşük kullanımlı uygun bir hesaba geçebilir. Bağlı görevler varsayılan olarak önbellek bağlılığını korur ve hesap tükenene (bilinen kullanım %100) veya hizmet veremez hale gelene (duraklatılmış, kullanılamaz) kadar kalır; bir geçiş o zaman hedefte gerçek kota payı ve kesin olarak daha düşük kullanım ister. `pool.cacheAffinity: false` ile bağlı bir görevin bir sonraki isteği eşikte hareket edebilir, yine yalnızca gerçek kota payı olan daha düşük kullanımlı uygun bir hesaba. `0`, bu kullanım odaklı yeniden değerlendirmeyi devre dışı bırakır, arıza kurtarmayı devre dışı bırakmaz. |
 | `round-robin` | Bağımsız istekleri uygun hesaplar arasında eşit olarak atayın. `autoSwitchThreshold` normal round-robin seçimini değiştirmez. `accountPoolStickyLimit` (1–100), başarılı yukarı akış yanıtlarını değil, bir seçimdeki atamaları sayar. |
 | `fill-first` | Bağımsız istekleri soğuma, yeniden kimlik doğrulama veya yapılandırılmış tükenme eşiğine kadar aktif hesaba atayın; bilinmeyen kullanım geçişe zorlamaz. Sağlıklı bağlı görevler bağlılığı korur. |
 
@@ -224,7 +243,7 @@ ve otomatik rotasyon sağlayıcı kısıtlamalarını tetikleyebilir.
 
 | Anahtar | Tip | Varsayılan | Açıklama |
 | --- | --- | --- | --- |
-| `anthropicAccountPool.enabled?` | `boolean` | `false` | Yapışkan bağlılığı ve 429 soğuma yük devretmesini etkinleştirin. |
+| `anthropicAccountPool.enabled?` | `boolean` | `false` | Yapışkan oturum bağlılığını ve kullanıma dayalı yeni oturum seçimini etkinleştirir. **429 yük devretmesi buradan kontrol edilmez**: iki veya daha fazla kullanılabilir hesap saklandığında, diğer çok kimlikli sağlayıcılarda olduğu gibi devreye girer ve kapatılamaz. |
 | `anthropicAccountPool.autoSwitchThreshold?` | `number` | `80` | Yeni oturumlarda etkin hesap bu eşiğe ulaştığında, yapılandırılan penceredeki bilinen en düşük önbelleğe alınmış kullanımı seçin. `0` kota seçimini devre dışı bırakır. |
 | `anthropicAccountPool.strategy?` | `"quota" \| "round-robin" \| "fill-first"` | `"quota"` | Yeni oturum stratejisi; `quota`, `quotaWindow` ile belirlenen pencereye (varsayılan 5 saatlik çubuklar) göre hesapları sıralar ve `fill-first` de tükenme eşiğini aynı pencerede değerlendirir. |
 | `anthropicAccountPool.quotaWindow?` | `"five-hour" \| "weekly" \| "max-utilization"` | `"five-hour"` | Kullanıma dayalı hesap seçiminde kullanılan, sağlayıcının bildirdiği önbelleğe alınmış kullanım çubuğu. `five-hour` mevcut davranışı korur. `weekly` haftalık çubuğu kullanır ve başka uygun hesap kaldığı sürece 5 saatlik çubuğu tükenmiş hesapları atlar; hiçbiri kalmazsa bu hesaplara geri döner. `max-utilization` bilinen en yüksek değeri kullanır; haftalık değer henüz yokken 5 saatlik değeri kullanabilir, ikisi de bilinmiyorsa hesap unknown kullanım sırasını izler. Bilinen kullanım unknown değerlerden önce gelir; tüm uygun hesaplar unknown olsa bile uygun sıradaki bir hesap seçilir. Belgelenen daha düşük 5 saatlik kullanım eşitlik bozmasından sonra tam eşitlikte de uygun sıra korunur. Sağlıklı affinity oturumları önceden yeniden dengelenmez. Yeni oturum ataması ve uygun bir 429 yedeğine geçildikten sonraki yönlendirme kurtarmasında `quota`, uygun adayları doğrudan bu pencereye göre sıralar; `fill-first`, bu pencerenin eşik ve tükenme kurallarıyla kararlı sırada ilerler; `round-robin` ayarı yok sayar. Cooldown, yük devretme sınırları ve yeniden kimlik doğrulama uygunluğu ayrı yerel durum olarak kalır. Hesap başına haftalık çubuklar ancak dashboard Sağlayıcılar sayfasında sorgulandıktan sonra bilinir. |
@@ -262,7 +281,7 @@ yönetilir.
 | `failureBackoffMaxSeconds?` | `number` | `3600` | Geri çekilme tavanı ve kalıcı arıza gecikmesi. |
 | `codexWarmupEnabled?` | `boolean` | `false` | Sentetik Codex havuz hesabı doğrulamasına dahil olun. |
 | `codexWarmupMaxAgeSeconds?` | `number` | `691200` | 8 gün sonra bir hesabı yeniden doğrulayın. |
-| `codexWarmupModel?` | `string` | `gpt-5.4-mini` | İsteğe bağlı ısınma için kullanılan yerel model. |
+| `codexWarmupModel?` | `string` | `gpt-5.6-luna` | İsteğe bağlı ısınma için kullanılan yerel model. |
 
 ## Sabit sağlayıcı uç noktaları
 
@@ -459,8 +478,16 @@ uygulamadan önce yerel `zai/glm-5.2` kimliğini geri yükler. Aynı eşleme yer
 
 ## Statik model izin listeleri
 
-Yalnızca `models`'ı göstermek için `liveModels: false` ayarlayın. `models` boşsa
-veya atlanırsa sağlayıcı yönlendirilen hiçbir modeli göstermez. Canlı keşif,
+`liveModels: false` iken `models` boşsa veya atlanmışsa başlangıç listesine önce yapılandırılmış
+`defaultModel`, ardından `retainModels` eklenir. Yinelenen kimliklerde ilk geçen korunur.
+Açıkça belirtilmiş, boş olmayan `models` listesini ise `retainModels` izler; farklı bir `defaultModel`
+kendiliğinden eklenmez. Bu model yine de `models` veya `retainModels` içinde açıkça belirtilebilir.
+Bu alanların hiçbiri kimlik sağlamıyorsa başlangıç listesi boştur. Bu sıra, son seçici sırasını
+garanti etmez. `selectedModels`, `disabledModels` ve sağlayıcının devre dışı bırakılması kuralları
+geçerliliğini korur. `authMode: "forward"` ayrı dalında kalır ve bu yönlendirilmiş statik listeyi
+kullanmaz. Bu kurallar canlı keşif başarısızlığındaki geri dönüş davranışını değiştirmez.
+
+Canlı keşif,
 önbelleğe almadan önce 4 MiB'den veya 2.000 ham model satırından fazlasını
 reddeder; yerleşik önayarlar daha düşük sınırlar kullanabilir ve sohbete uygun
 satırlara filtre uygulayabilir. Büyük boyutlu veya hatalı biçimlendirilmiş
@@ -492,6 +519,23 @@ bildirir; senkronize edilen katalog `xhigh`'ı ayrı tutarken `max` bildirir.
 }
 ```
 
+## Model görünen adı düzenleyicisi
+
+Kontrol panelindeki **Models**, keşfedilen modeller için okunabilir adları kalıcı olarak kaydetmenizi sağlar. Sağlayıcıyı genişletin, keşfedilen
+bir modeli bulun ve **Name** seçeneğini seçin. Okunabilir bir etiket kaydederken iletişim kutusu
+tam `provider/model` seçicisini görünür tutar. Sağlayıcı meta verilerine veya varsayılan seçici
+gösterimine dönmek için **Reset name** seçeneğini seçin. **Name** yalnızca görünümü değiştirir;
+ayrı takma ad kalemi kısa yönlendirme takma adını değiştirir ve bir görünen ad düzenleyicisi
+değildir. Yerel OpenAI ve özel model satırları mevcut kontrollerini korur.
+
+Değişiklik kaydedildiği halde yenileme başarısız olursa iletişim kutusu kaydedilen geçersiz kılma
+değerini yansıtır ve **Retry** kullanılabilir kalır. Sunucu katalog yakınsamasının başarısız
+olduğunu bildirdiyse Retry bu işlemi tekrarlar; yalnızca liste isteği başarısız olduysa listeyi
+yeniden yükler. Sıfırlama sonrası kurtarma, sıfırlama işlemini korur ve eski adı geri getirmez.
+İsteklerin, yazma işlemini ve ardından gelen liste yenilemesini kapsayan 60 saniyelik bir süresi
+vardır. Zaman aşımı yazma işlemini geri almaz: başka bir değişiklik yapmadan önce **Retry** ile
+geçerli adı kontrol edin.
+
 ## Tam örnek
 
 ```json
@@ -514,7 +558,7 @@ bildirir; senkronize edilen katalog `xhigh`'ı ayrı tutarken `max` bildirir.
       "baseUrl": "https://ollama.com/v1",
       "apiKey": "${OLLAMA_API_KEY}",
       "defaultModel": "glm-5.2",
-      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
+      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-flash"]
     }
   },
   "subagentModels": ["anthropic/claude-opus-5", "ollama-cloud/glm-5.2"],

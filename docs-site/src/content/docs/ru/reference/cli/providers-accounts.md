@@ -15,7 +15,7 @@ pool'ами и контролируют каталог моделей, кото�
 
 | Подкоманда | Поддерживаемые флаги | Действие |
 | --- | --- | --- |
-| `list` | `--json` | Показать настроенных провайдеров и оставшиеся записи registry. |
+| `list` | `--json`, `--jsonl` | Показать настроенных провайдеров и оставшиеся записи registry. `--jsonl` выводит по одному JSON-объекту настроенного провайдера на строку. |
 | `add <name>` | `--adapter <adapter>`, `--base-url <url>`, `--api-key <key>`, `--default-model <model>`, `--set-default`, `--force`, `--json`, `--sync` | Добавить registry/custom-провайдера. `--force` перезаписывает; `--sync` обновляет живой прокси в human-output mode. |
 | `edit <name>` | provider field flags, `--headers <json>`, `--json` | Изменить валидированные live-поля провайдера, не заменяя key-pool'ы. `--headers` объединяет пользовательские request-header'ы; передайте `{}` или `-`, чтобы очистить их. |
 | `test <name>` | `--json` | Пробный запрос к реальному upstream model-endpoint'у. |
@@ -29,6 +29,7 @@ pool'ами и контролируют каталог моделей, кото�
 
 ```bash
 ocx provider list --json
+ocx provider list --jsonl
 ocx provider test ark
 ocx provider add anthropic --api-key sk-ant-... --set-default --sync
 ocx provider add local-dev --adapter openai-chat --base-url http://localhost:11434/v1
@@ -36,6 +37,8 @@ ocx provider show anthropic --json
 ocx models --provider anthropic --json
 ocx models live --provider ark --json
 ```
+
+`--jsonl` выводит только настроенных провайдеров: один JSON-объект на строку. Поля каждого объекта совпадают с полями элемента массива `configured` в `--json`; сводка `registryCount` не включается. Скрипты могут обрабатывать объекты построчно. Флаги `--json` и `--jsonl` нельзя использовать вместе.
 
 :::caution[Пользовательские заголовки — не канал для учётных данных]
 `--headers` предназначен для несекретных метаданных запроса — подсказок
@@ -68,9 +71,11 @@ API-key-провайдеров.
 
 Ту же команду используйте и для **reauthentication**, когда `ocx status` / `ocx doctor`
 сообщают, что нужна переавторизация или refresh завершился терминальной ошибкой (либо используйте
-Reauthenticate в дашборде). Аккаунты пула Codex не являются публичным провайдером для `ocx login`
-— переавторизовать их нужно либо через пул аккаунтов Codex в дашборде, либо через headless-flow
-`ocx account reauth`.
+Reauthenticate в дашборде). Аккаунты пула Codex не входят в список OAuth- и API-key-провайдеров выше,
+но `ocx login codex` до них доходит: команда направляется во вход пула аккаунтов, поэтому
+`ocx login codex --reauth` — это то же самое, что `ocx account reauth codex`. Пул аккаунтов Codex в
+дашборде (Reauthenticate) делает то же. Этот маршрут работает внутри прокси, поэтому ему нужен
+запущенный прокси.
 
 ```bash
 ocx login xai
@@ -89,7 +94,7 @@ ocx login anthropic
 Поставляемая help-surface выглядит так:
 
 ```text
-Usage: ocx account <list|current|use|refresh|auto-switch|priority|login|reauth|code|cancel|remove|add-key|reset-credits> ...
+Usage: ocx account <list|current|use|refresh|auto-switch|priority|login|reauth|code|cancel|remove|add-key|reset-credits|grok-reset-coupons> ...
 
 list [provider]     Codex account pool, OAuth accounts and API keys (identifiers shown masked as the API returns them).
 current <provider>  Show the active account or key.
@@ -101,6 +106,7 @@ remove <provider> <id> --yes  Remove a stored account or key after an existence 
 add-key <provider> [--label <label>]  Add a key read only from piped stdin.
 login/reauth/code/cancel  Run browser or manual-code auth from a headless shell.
 reset-credits <id|main> [--consume --yes]  Inspect or consume Codex reset credits.
+grok-reset-coupons [<id>] [--consume --yes] [--token-id <token-id>] [--operation-id <uuid>]  Inspect or redeem Grok reset coupons.
 Codex pool selection applies to the next request after clearing existing affinity; in-flight requests keep their captured account.
 ```
 
@@ -138,7 +144,7 @@ label и masked key.
 Пустые провайдеры пропускаются, если не задан `--all`. С провайдером выводится только это
 семейство credential'ов. Human-output использует формат
 `PROVIDER TYPE ID PLAN/LABEL PRIORITY STATUS`; строка Codex, выбранная вручную, помечается `selected`.
-При наличии двух или более подходящих сохранённых аккаунтов Kiro по умолчанию ответ 429 автоматически переключает запрос на другой аккаунт, предпочитая аккаунт с наибольшим известным остатком лимита; ротация включается самим наличием аккаунтов и отключается через `oauthAccountFailover.enabled: false`; `ocx account login kiro` добавляет аккаунты в пул по одному. Пустой результат всё равно считается успехом.
+При наличии двух или более подходящих сохранённых аккаунтов Kiro по умолчанию ответ 429 автоматически переключает запрос на другой аккаунт, предпочитая аккаунт с наибольшим известным остатком лимита; ротация включается самим наличием аккаунтов и не отключается — `oauthAccountFailover.enabled: false` отклоняет предварительный выбор аккаунта, а не восстановление после 429; `ocx account login kiro` добавляет аккаунты в пул по одному. Пустой результат всё равно считается успехом.
 `--json` возвращает:
 
 ```text
@@ -187,12 +193,11 @@ quota-bar'ов дашборда.
 
 ### `ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]`
 
-Управляет только пулом аккаунтов Codex `openai`. `on` ставит 80%, `off` — 0%, `status` читает
-текущее значение, а `threshold <n>` принимает целое число от 0 до 100. Для других провайдеров и
-некорректных значений команда завершается кодом 1. `--json` возвращает:
+Управляет порогом пула Codex `openai` или сохраняет порог общего пула OAuth. `on` сохраняет 80 %, `off` — 0 %, а `threshold <n>` принимает 0–100. Порог общего пула влияет на выбор только при включённом `pool.kernel` и `strategy: "fill-first"`; при выключенном флаге сохранение не включает переключение по порогу. В обоих случаях оно не меняет настройку включения провайдера и не отключает ротацию после ошибки 429. Для общего пула результат чтения и изменения берётся из подтверждённого ответа сервера. Для общего пула `poolEnabled` — сохранённая настройка провайдера (`null` означает отсутствие настройки), а не итоговое унаследованное состояние. `inert: true` означает, что порог сохранён, но не применяется, а `inert: false` — что пул его применяет. Отсутствие `inert` означает неизвестную возможность, которая также не даёт `enabled: true`. Провайдеры с ключом API, Anthropic и неверные значения отклоняются.
 
 ```text
-{ provider, autoSwitchThreshold: number, enabled: boolean }
+openai: { provider, autoSwitchThreshold: number, enabled: boolean }
+generic OAuth: { provider, autoSwitchThreshold: number | null, enabled: boolean, poolEnabled: boolean | null, inert: boolean | null }
 ```
 
 ### `ocx account priority <provider> <account-id|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]`
@@ -211,7 +216,7 @@ quota-bar'ов дашборда.
 него аккаунт выбирает `accountPoolStrategy`. Пауза, cooldown и повторная аутентификация не
 затрагиваются. Изменения действуют начиная со **следующего непривязанного запроса**, а не только для новых сессий:
 как только у более высокого порядка снова появляется запас, preemption сразу поднимает непривязанный
-запрос. Потоки, уже привязанные к аккаунту, обычно сохраняют его до исчерпания, но ошибка повторной аутентификации, cooldown по квоте или серия временных сбоев снимают привязку раньше.
+запрос. Потоки, уже привязанные к аккаунту, обычно сохраняют его до исчерпания; ошибка повторной аутентификации или cooldown по квоте по-прежнему снимают привязку раньше. Серия временных сбоев (5xx и другие не-квотные ошибки, достигшие `upstreamFailoverThreshold`, по умолчанию 3) живую привязку не удаляет: запрос обслуживается на другом аккаунте, и поток возвращается, как только свой аккаунт снова может обслуживать; если аккаунт всё ещё сбоит через 10 минут, привязка снимается обычным образом.
 Любая принятая запись также снимает ручное закрепление "использовать этот аккаунт сейчас" с того аккаунта, на котором оно стояло. Это касается и записи того же порядка, который уже был установлен. Такой способ — единственный, который снимает закрепление, сохранив выбранный аккаунт. Сброс активного аккаунта через management API тоже снимает закрепление, но вместе с самим выбором. Недоступный прокси, неизвестный id аккаунта или значение вне допустимого набора завершаются
 с кодом 1. `--json` возвращает:
 
@@ -268,6 +273,26 @@ security find-generic-password -w openrouter | ocx account add-key openrouter --
 Проверить reset-credit'ы Codex для аккаунта. Расходование кредита разрушительно и требует сразу
 оба флага: и `--consume`, и `--yes`.
 
+### `ocx account grok-reset-coupons [<account-id>] [--consume --yes [--token-id <id>] [--operation-id <uuid>]] [--json]`
+
+Показывает оставшиеся купоны сброса или обменивает один для аккаунта xAI / Grok.
+
+Без `--consume` команда возвращает доступные токены купонов и окна их действия:
+
+```bash
+ocx account grok-reset-coupons
+ocx account grok-reset-coupons acc_xai_01 --json
+```
+
+Обмен купона сброса изменяет платежное состояние и безвозвратно расходует один токен купона. Для `--consume` строго требуется `--yes`:
+
+```bash
+ocx account grok-reset-coupons --consume --yes
+ocx account grok-reset-coupons --consume --yes --token-id <token-id>
+```
+
+Передайте `--operation-id <uuid>` (должен быть корректным UUIDv4), чтобы гарантировать идемпотентное завершение. При обрыве сети или повторном запуске команды одинаковые идентификаторы операции воспроизводят сохраненный результат вместо расходования второго купона.
+
 ### `ocx account main <subcommand>`
 
 Управлять именованными профилями нативного основного логина Codex, не изменяя маршрутизацию пула аккаунтов OpenCodex.
@@ -277,6 +302,9 @@ ocx account main doctor [--json]
 ocx account main list [--json]
 ocx account main register <label> [--json]
 ocx account main add <label>
+ocx account main reauth --device [--no-wait] [--json]
+ocx account main reauth status --flow <id> [--json]
+ocx account main reauth cancel --flow <id> [--json]
 ocx account main switch <profile-id-or-label> --yes [--json]
 ocx account main recover [--rollback --yes] [--json]
 ```

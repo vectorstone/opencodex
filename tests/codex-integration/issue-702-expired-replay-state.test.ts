@@ -1,0 +1,865 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { saveConfig } from "../../src/config";
+import {
+  resetSubagentModelFallbackStateForTests,
+  setSubagentQuotaPrimeForTests,
+} from "../../src/codex/subagent-model-fallback";
+import {
+  clearResponseStateForTests,
+  clearResponseStateMemoryForTests,
+  flushPendingResponseSpillsForTests,
+  rememberResponseState,
+  responseStateMetrics,
+  RESPONSE_TTL_MS,
+  setResponseStateByteCapForTests,
+  type ResponseStateMetrics,
+} from "../../src/responses/state";
+import { responseSpillDirectory } from "../../src/responses/spill-store";
+import { startServer } from "../../src/server";
+import type { OcxConfig } from "../../src/types";
+import { fakeChatGptJwt } from "../helpers/fake-chatgpt-jwt";
+import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
+import { INTERNAL_DEADLINE_MS, SERVER_BUDGET_MS } from "../helpers/test-budget";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+const originalFetch = globalThis.fetch;
+const previousOpencodexHome = process.env.OPENCODEX_HOME;
+const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
+const REPLAY_TTL_MS = RESPONSE_TTL_MS;
+const EXPIRED_AGE_MS = REPLAY_TTL_MS + 60 * 60 * 1_000;
+const FIRST_RESPONSE_ID = "resp_issue_702_first";
+const HISTORICAL_USER_SENTINEL = "issue-702 historical user context";
+const HISTORICAL_ASSISTANT_SENTINEL = "issue-702 historical assistant context";
+const CURRENT_USER_SENTINEL = "issue-702 current continuation delta";
+
+let testHome = "";
+let isolatedCodexHome: IsolatedCodexHome | null = null;
+
+interface CapturedUpstreamRequest {
+  path: string;
+  body: Record<string, unknown>;
+}
+
+interface ForwardScenario {
+  firstStatus: number;
+  secondStatus: number;
+  secondResponseText: string;
+  stateBeforeResume: ResponseStateMetrics;
+  upstreamRequests: CapturedUpstreamRequest[];
+}
+
+type ForwardScenarioMode = "expired" | "fresh" | "ordinary";
+
+function forwardConfig(): OcxConfig {
+  return {
+    port: 0,
+    hostname: "127.0.0.1",
+    defaultProvider: "openai",
+    openaiProviderTierVersion: 2,
+    providers: {
+      openai: {
+        adapter: "openai-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authMode: "forward",
+        codexAccountMode: "direct",
+      },
+    },
+  } as OcxConfig;
+}
+
+function inputMessage(text: string): Record<string, unknown> {
+  return {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text }],
+  };
+}
+
+function completedSse(responseId: string, text: string): string {
+  const item = {
+    id: `msg_${responseId}`,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  };
+  return [
+    "event: response.output_item.done",
+    `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item })}`,
+    "",
+    "event: response.completed",
+    `data: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: responseId,
+        status: "completed",
+        model: "gpt-5.5",
+        output: [item],
+      },
+    })}`,
+    "",
+    "",
+  ].join("\n");
+}
+
+async function openResponseSocket(url: URL, headers: Record<string, string>): Promise<WebSocket> {
+  const target = new URL("/v1/responses", url);
+  target.protocol = "ws:";
+  const socket = new WebSocket(target, { headers } as unknown as string[]);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.close();
+      reject(new Error("response socket did not open"));
+    }, INTERNAL_DEADLINE_MS);
+    socket.onopen = () => { clearTimeout(timer); resolve(); };
+    socket.onerror = () => { clearTimeout(timer); reject(new Error("response socket failed to open")); };
+  });
+  return socket;
+}
+
+async function sendSocketTurn(socket: WebSocket, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const finish = (error?: Error, frame?: Record<string, unknown>) => {
+      clearTimeout(timer);
+      socket.onmessage = socket.onclose = socket.onerror = null;
+      if (error) reject(error);
+      else resolve(frame!);
+    };
+    const timer = setTimeout(() => finish(new Error("response socket did not reach a terminal event")), INTERNAL_DEADLINE_MS);
+    socket.onclose = () => finish(new Error("response socket closed before its terminal event"));
+    socket.onerror = () => finish(new Error("response socket failed"));
+    socket.onmessage = event => {
+      try {
+        const frame = JSON.parse(String(event.data));
+        if (["error", "response.completed", "response.failed", "response.incomplete"].includes(frame.type)) {
+          finish(undefined, frame);
+        }
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    socket.send(JSON.stringify({ type: "response.create", ...body }));
+  });
+}
+
+async function waitForRecordedResponseState(): Promise<ResponseStateMetrics> {
+  const deadline = performance.now() + 1_000;
+  while (performance.now() < deadline) {
+    const metrics = responseStateMetrics();
+    if (metrics.count === 1) return metrics;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  throw new Error("first forward response was not recorded in local replay state");
+}
+
+async function runForwardScenario(
+  mode: ForwardScenarioMode,
+  resumeHeaders: Record<string, string> = {},
+): Promise<ForwardScenario> {
+  const upstreamRequests: CapturedUpstreamRequest[] = [];
+  const realNow = Date.now;
+  let upstream: ReturnType<typeof Bun.serve> | null = null;
+  let server: ReturnType<typeof startServer> | null = null;
+
+  try {
+    upstream = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        const body = await request.json() as Record<string, unknown>;
+        upstreamRequests.push({ path, body });
+        const attempt = upstreamRequests.length;
+        const responseId = attempt === 1 ? FIRST_RESPONSE_ID : "resp_issue_702_resumed";
+        const text = attempt === 1 ? HISTORICAL_ASSISTANT_SENTINEL : "resumed without prior context";
+        return new Response(completedSse(responseId, text), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+    const upstreamUrl = upstream.url;
+
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = input instanceof Request ? input.url : String(input);
+      const url = new URL(raw);
+      const prefix = "/backend-api/codex";
+      if (url.hostname === "chatgpt.com" && url.pathname.startsWith(prefix)) {
+        const target = new URL(`${url.pathname.slice(prefix.length)}${url.search}`, upstreamUrl);
+        return originalFetch(target, init);
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    saveConfig(forwardConfig());
+    server = startServer(0);
+    const token = fakeChatGptJwt({ chatgpt_account_id: "acct-issue-702" });
+    const requestHeaders = {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+      "chatgpt-account-id": "acct-issue-702",
+    };
+
+    let firstStatus = 0;
+    try {
+      if (mode === "expired") Date.now = () => realNow() - EXPIRED_AGE_MS;
+      const firstResponse = await originalFetch(new URL("/v1/responses", server.url), {
+        method: "POST",
+        headers: requestHeaders,
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          input: [inputMessage(HISTORICAL_USER_SENTINEL)],
+          stream: true,
+          store: false,
+        }),
+      });
+      firstStatus = firstResponse.status;
+      await firstResponse.text();
+      if (mode !== "ordinary") await waitForRecordedResponseState();
+    } finally {
+      Date.now = realNow;
+    }
+
+    const stateBeforeResume = responseStateMetrics();
+    if (mode === "ordinary") {
+      return {
+        firstStatus,
+        secondStatus: 0,
+        secondResponseText: "",
+        stateBeforeResume,
+        upstreamRequests,
+      };
+    }
+    const secondResponse = await originalFetch(new URL("/v1/responses", server.url), {
+      method: "POST",
+      headers: { ...requestHeaders, ...resumeHeaders },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        previous_response_id: FIRST_RESPONSE_ID,
+        input: [inputMessage(CURRENT_USER_SENTINEL)],
+        stream: true,
+        store: false,
+      }),
+    });
+    const secondStatus = secondResponse.status;
+    const secondResponseText = await secondResponse.text();
+
+    return {
+      firstStatus,
+      secondStatus,
+      secondResponseText,
+      stateBeforeResume,
+      upstreamRequests,
+    };
+  } finally {
+    Date.now = realNow;
+    globalThis.fetch = originalFetch;
+    try {
+      await server?.stop(true);
+    } finally {
+      await upstream?.stop(true);
+    }
+  }
+}
+
+beforeEach(() => {
+  testHome = mkdtempSync(join(tmpdir(), "ocx-issue-702-"));
+  process.env.OPENCODEX_HOME = testHome;
+  delete process.env.OPENCODEX_API_AUTH_TOKEN;
+  clearResponseStateMemoryForTests();
+  resetSubagentModelFallbackStateForTests();
+  isolatedCodexHome = installIsolatedCodexHome("ocx-issue-702-codex-");
+});
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  clearResponseStateForTests();
+  setResponseStateByteCapForTests(null);
+  resetSubagentModelFallbackStateForTests();
+  isolatedCodexHome?.restore();
+  isolatedCodexHome = null;
+  if (testHome) removeTreeWithRetry(testHome);
+  testHome = "";
+  if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
+  else process.env.OPENCODEX_HOME = previousOpencodexHome;
+  if (previousApiToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
+  else process.env.OPENCODEX_API_AUTH_TOKEN = previousApiToken;
+});
+
+describe("routed replay recovery", () => {
+  test.each([
+    { stateless: true, custom: false, expired: false },
+    { stateless: true, custom: false, expired: true },
+    { stateless: false, custom: true, expired: false },
+    { stateless: false, custom: true, expired: true },
+    { stateless: false, custom: true, expired: false, authMode: "forward" },
+    { stateless: true, custom: false, expired: false, adapter: "openai-chat" },
+  ] as const)("recovers missing history without orphaning tool results: %j", async scenario => {
+    const { stateless, custom, expired } = scenario;
+    const upstreamRequests: Record<string, unknown>[] = [];
+    const realNow = Date.now;
+    const toolCall = custom
+      ? { type: "custom_tool_call", call_id: "call_replay", name: "exec", input: "text(1)", status: "completed" }
+      : { type: "function_call", call_id: "call_replay", name: "lookup", arguments: "{}", status: "completed" };
+    const toolResult = {
+      type: custom ? "custom_tool_call_output" : "function_call_output",
+      call_id: "call_replay", output: "1",
+    };
+    const reasoning = { type: "reasoning", content: [{ type: "reasoning_text", text: "Use the lookup result." }] };
+    const history = [inputMessage(HISTORICAL_USER_SENTINEL), reasoning, toolCall];
+    const tools = custom
+      ? [{ type: "custom", name: "exec", description: "Run JavaScript", format: { type: "text" } }]
+      : [{ type: "function", name: "lookup", parameters: { type: "object", properties: {} } }];
+    const upstream = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const body = await request.json() as Record<string, unknown>;
+        upstreamRequests.push(body);
+        const items = body.input as Array<Record<string, unknown>>;
+        // A strict upstream cannot resolve a tool result without its matching function call.
+        if (!items.some(item => item.type === "function_call" && item.call_id === "call_replay")
+          || !items.some(item => item.type === "function_call_output" && item.call_id === "call_replay")) {
+          return Response.json({ error: { type: "invalid_request_error", message: "No matching tool call" } }, { status: 400 });
+        }
+        return new Response(completedSse("resp_routed_recovered", "recovered"), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+    let server: ReturnType<typeof startServer> | null = null;
+    let socket: WebSocket | null = null;
+    try {
+      if (expired) {
+        Date.now = () => realNow() - EXPIRED_AGE_MS;
+        rememberResponseState(
+          { input: [history[0]], tools, store: false },
+          { id: FIRST_RESPONSE_ID, status: "completed", output: [reasoning, toolCall] },
+          undefined, { force: true },
+        );
+        Date.now = realNow;
+      }
+      saveConfig({
+        port: 0, hostname: "127.0.0.1", websockets: true, defaultProvider: "routed-test",
+        providers: {
+          "routed-test": {
+            adapter: "adapter" in scenario ? scenario.adapter : "openai-responses",
+            modelAdapters: { "test-model": "openai-responses" },
+            baseUrl: upstream.url.toString(), allowPrivateNetwork: true,
+            authMode: "authMode" in scenario ? scenario.authMode : "key", apiKey: "synthetic-key", defaultModel: "test-model",
+            statelessResponses: stateless, preserveResponsesReasoningContent: true,
+          },
+        },
+      } as OcxConfig);
+      server = startServer(0);
+      const deltaRequest = {
+        model: "routed-test/test-model", previous_response_id: FIRST_RESPONSE_ID,
+        input: [toolResult], tools, store: false,
+      };
+      const httpRejected = await originalFetch(new URL("/v1/responses", server.url), {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(deltaRequest),
+      });
+      expect(httpRejected.status).toBe(400);
+      expect(await httpRejected.json()).toMatchObject({ error: { code: "previous_response_not_found" } });
+      expect(upstreamRequests).toHaveLength(0);
+      socket = await openResponseSocket(server.url, {});
+      const rejected = await sendSocketTurn(socket, deltaRequest);
+      expect(rejected).toMatchObject({
+        type: "error", status: 400,
+        error: { type: "invalid_request_error", code: "previous_response_not_found" },
+      });
+      expect(upstreamRequests).toHaveLength(0);
+
+      socket.close();
+      socket = await openResponseSocket(server.url, {});
+      const recovered = await sendSocketTurn(socket, {
+        model: "routed-test/test-model", input: [...history, toolResult], tools, store: false,
+      });
+      expect(recovered.type).toBe("response.completed");
+      expect(upstreamRequests).toHaveLength(1);
+      expect(upstreamRequests[0]!.previous_response_id).toBeUndefined();
+      expect(upstreamRequests[0]!.input).toEqual([
+        history[0],
+        // The client replayed this reasoning item with no `summary`; the reasoning sanitizer
+        // supplies the empty array the Responses API requires on a reasoning input item, so the
+        // forwarded item is the replayed one plus that field.
+        { ...reasoning, summary: [] },
+        { type: "function_call", call_id: "call_replay", name: custom ? "exec" : "lookup",
+          arguments: custom ? JSON.stringify({ input: "text(1)" }) : "{}", status: "completed" },
+        { ...toolResult, type: "function_call_output" },
+      ]);
+      await waitForRecordedResponseState();
+
+      // Recovery must seed complete local history so the next delta does not repeat the miss.
+      const continued = await sendSocketTurn(socket, {
+        model: "routed-test/test-model", previous_response_id: "resp_routed_recovered",
+        input: [inputMessage(CURRENT_USER_SENTINEL)], tools, store: false,
+      });
+      expect(continued.type).toBe("response.completed");
+      expect(upstreamRequests).toHaveLength(2);
+      expect(upstreamRequests[1]!.previous_response_id).toBeUndefined();
+      const items = upstreamRequests[1]!.input as Array<Record<string, unknown>>;
+      expect(items.filter(item => item.call_id === "call_replay")).toHaveLength(2);
+      expect(items.at(-1)).toEqual(inputMessage(CURRENT_USER_SENTINEL));
+    } finally {
+      Date.now = realNow;
+      socket?.close();
+      await server?.stop(true);
+      await upstream.stop(true);
+    }
+  }, SERVER_BUDGET_MS);
+
+  test("a translated wire refuses an expired continuation instead of sending the delta alone", async () => {
+    // The reported symptom: Codex chained by previous_response_id, a gap longer than retention,
+    // and a Chat-wire destination that rebuilds the conversation from this request's input. The
+    // expansion misses, the id is stripped, and what reaches the model is the single line the
+    // user just typed -- with a normal 200 hiding it. Refuse, so the client resends everything.
+    const upstreamRequests: Record<string, unknown>[] = [];
+    const realNow = Date.now;
+    let server: ReturnType<typeof startServer> | null = null;
+    const chunk = (delta: Record<string, unknown>, finish: string | null) =>
+      `data: ${JSON.stringify({
+        id: "chatcmpl-routed", object: "chat.completion.chunk", created: 1, model: "test-model",
+        choices: [{ index: 0, delta, finish_reason: finish }],
+      })}\n\n`;
+    const upstream = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        upstreamRequests.push(await request.json() as Record<string, unknown>);
+        return new Response(
+          chunk({ role: "assistant", content: "recovered" }, null) + chunk({}, "stop") + "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+
+    try {
+      Date.now = () => realNow() - EXPIRED_AGE_MS;
+      rememberResponseState(
+        { input: [inputMessage(HISTORICAL_USER_SENTINEL)], store: false },
+        {
+          id: FIRST_RESPONSE_ID,
+          status: "completed",
+          output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: HISTORICAL_ASSISTANT_SENTINEL }] }],
+        },
+        undefined,
+        { force: true },
+      );
+      Date.now = realNow;
+      expect(responseStateMetrics().oldestAgeMs).toBeGreaterThan(REPLAY_TTL_MS);
+
+      saveConfig({
+        port: 0,
+        hostname: "127.0.0.1",
+        defaultProvider: "chat-test",
+        providers: {
+          "chat-test": {
+            adapter: "openai-chat",
+            baseUrl: `${upstream.url.toString().replace(/\/$/, "")}/v1`,
+            allowPrivateNetwork: true,
+            authMode: "key",
+            apiKey: "synthetic-key",
+            defaultModel: "test-model",
+            models: ["test-model"],
+          },
+        },
+      } as OcxConfig);
+      server = startServer(0);
+
+      const refused = await originalFetch(new URL("/v1/responses", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "chat-test/test-model",
+          previous_response_id: FIRST_RESPONSE_ID,
+          input: [inputMessage(CURRENT_USER_SENTINEL)],
+          stream: true,
+        }),
+      });
+      expect(refused.status).toBe(400);
+      expect(await refused.json()).toMatchObject({
+        error: { type: "invalid_request_error", code: "previous_response_not_found" },
+      });
+      expect(upstreamRequests).toHaveLength(0);
+
+      // What the client does next: resend the whole conversation without the id.
+      const recovered = await originalFetch(new URL("/v1/responses", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "chat-test/test-model",
+          input: [inputMessage(HISTORICAL_USER_SENTINEL), inputMessage(CURRENT_USER_SENTINEL)],
+          stream: true,
+        }),
+      });
+      expect(recovered.status).toBe(200);
+      await recovered.text();
+      expect(upstreamRequests).toHaveLength(1);
+      const forwarded = JSON.stringify(upstreamRequests[0]);
+      expect(forwarded).toContain(HISTORICAL_USER_SENTINEL);
+      expect(forwarded).toContain(CURRENT_USER_SENTINEL);
+    } finally {
+      Date.now = realNow;
+      await server?.stop(true);
+      await upstream.stop(true);
+    }
+  }, SERVER_BUDGET_MS);
+
+  test.each(["kiro", "cursor", "devin", "anthropic"] as const)(
+    "%s refuses an expired continuation: none of these can resolve the omitted prefix upstream",
+    async adapter => {
+      // The three provider-session wires look stateful and are not. devin re-sends the whole
+      // conversation each turn, cursor's checkpointRef is read from the store that just expired
+      // and falls back to full replay, and kiro rebuilds conversationState.history from the turns
+      // it was handed. So the refusal is not limited to the obviously translated wires.
+      const realNow = Date.now;
+      let server: ReturnType<typeof startServer> | null = null;
+      let upstreamCalls = 0;
+      try {
+        Date.now = () => realNow() - EXPIRED_AGE_MS;
+        rememberResponseState(
+          { input: [inputMessage(HISTORICAL_USER_SENTINEL)], store: false },
+          { id: FIRST_RESPONSE_ID, status: "completed", output: [] },
+          undefined,
+          { force: true },
+        );
+        Date.now = realNow;
+        globalThis.fetch = (async () => {
+          upstreamCalls += 1;
+          throw new Error("upstream must not be called");
+        }) as typeof fetch;
+        saveConfig({
+          port: 0,
+          hostname: "127.0.0.1",
+          defaultProvider: "wire-test",
+          providers: {
+            "wire-test": {
+              adapter,
+              baseUrl: "https://example.invalid/v1",
+              authMode: "key",
+              apiKey: "synthetic-key",
+              defaultModel: "test-model",
+              models: ["test-model"],
+            },
+          },
+        } as OcxConfig);
+        server = startServer(0);
+        const response = await originalFetch(new URL("/v1/responses", server.url), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "wire-test/test-model",
+            previous_response_id: FIRST_RESPONSE_ID,
+            input: [inputMessage(CURRENT_USER_SENTINEL)],
+            stream: true,
+          }),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          error: { type: "invalid_request_error", code: "previous_response_not_found" },
+        });
+        expect(upstreamCalls).toBe(0);
+      } finally {
+        Date.now = realNow;
+        globalThis.fetch = originalFetch;
+        await server?.stop(true);
+      }
+    },
+    SERVER_BUDGET_MS,
+  );
+});
+
+describe("Issue #702 expired forward replay state", () => {
+  test("known continuation spill failure returns terminal structured previous_response_not_found before upstream I/O", async () => {
+    const responseId = "resp_issue_702_missing_spill";
+    setResponseStateByteCapForTests(1_024);
+    rememberResponseState(
+      { model: "openai/gpt-5.5", input: "x".repeat(8_000), store: false },
+      { id: responseId, status: "completed", output: [{ role: "assistant", content: "done" }] },
+      undefined,
+      { force: true },
+    );
+    // Windows publishes spills asynchronously; the case is about a spill that later goes
+    // MISSING, so let the publication settle before deleting it.
+    await flushPendingResponseSpillsForTests();
+    const spillDir = responseSpillDirectory(testHome);
+    const spill = readdirSync(spillDir).find(name => name.endsWith(".spill.json"));
+    expect(spill).toBeDefined();
+    unlinkSync(join(spillDir, spill!));
+
+    let upstreamCalls = 0;
+    globalThis.fetch = (async () => {
+      upstreamCalls += 1;
+      throw new Error("upstream must not be called");
+    }) as typeof fetch;
+    const routeClasses: Array<{ config: OcxConfig; model: string }> = [
+      { config: forwardConfig(), model: "gpt-5.5" },
+      {
+        config: {
+          port: 0,
+          hostname: "127.0.0.1",
+          openaiProviderTierVersion: 2,
+          defaultProvider: "kiro-test",
+          providers: {
+            "kiro-test": {
+              adapter: "kiro",
+              baseUrl: "https://runtime.us-east-1.kiro.dev",
+              authMode: "key",
+              apiKey: "synthetic-token",
+              models: ["gpt-5.5"],
+            },
+          },
+        } as OcxConfig,
+        model: "kiro-test/gpt-5.5",
+      },
+      {
+        config: {
+          port: 0,
+          hostname: "127.0.0.1",
+          openaiProviderTierVersion: 2,
+          defaultProvider: "test-openai",
+          providers: {
+            "test-openai": {
+              adapter: "openai-responses",
+              baseUrl: "https://api.openai.com/v1",
+              authMode: "key",
+              apiKey: "provider-key",
+              models: ["gpt-5.5"],
+            },
+          },
+        } as OcxConfig,
+        model: "test-openai/gpt-5.5",
+      },
+    ];
+
+    try {
+      for (const routeClass of routeClasses) {
+        saveConfig(routeClass.config);
+        const server = startServer(0);
+        try {
+          const response = await originalFetch(new URL("/v1/responses", server.url), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              model: routeClass.model,
+              previous_response_id: responseId,
+              input: [inputMessage(CURRENT_USER_SENTINEL)],
+              stream: true,
+            }),
+          });
+          expect(response.status).toBe(400);
+          expect(await response.json()).toEqual({
+            error: {
+              message: "Continuation state is unavailable or corrupt; resend the full conversation without previous_response_id.",
+              type: "invalid_request_error",
+              code: "previous_response_not_found",
+            },
+          });
+        } finally {
+          await server.stop(true);
+        }
+      }
+      expect(upstreamCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    // Three route classes, each binding a real proxy: the per-class servers ARE the
+    // assertion that no route reaches upstream, and they measured ~6s against Bun's
+    // 5s default.
+  }, SERVER_BUDGET_MS);
+
+  test("forward mode fails closed when previous response replay state has expired", async () => {
+    let quotaPrimeCalls = 0;
+    setSubagentQuotaPrimeForTests(async () => {
+      quotaPrimeCalls += 1;
+    });
+    const scenario = await runForwardScenario("expired", {
+      "x-openai-subagent": "collab_spawn",
+    });
+
+    expect(scenario.firstStatus).toBe(200);
+    expect(scenario.stateBeforeResume.count).toBe(1);
+    expect(scenario.stateBeforeResume.oldestAgeMs).toBeGreaterThan(REPLAY_TTL_MS);
+    expect(quotaPrimeCalls).toBe(0);
+    expect(scenario.upstreamRequests).toHaveLength(1);
+    expect(scenario.secondStatus).toBe(400);
+    expect(JSON.parse(scenario.secondResponseText)).toMatchObject({
+      error: {
+        message: expect.stringMatching(/continuation state.*expired/i),
+        type: "invalid_request_error",
+        code: "previous_response_not_found",
+      },
+    });
+  });
+
+  test.each(["expired", "missing"] as const)("%s forward state lets a WebSocket client reconnect and replay full tool history", async mode => {
+    const upstreamRequests: Record<string, unknown>[] = [];
+    const realNow = Date.now;
+    let server: ReturnType<typeof startServer> | null = null;
+    let socket: WebSocket | null = null;
+    const toolCall = {
+      type: "function_call", id: "fc_issue_702", call_id: "call_issue_702",
+      name: "lookup", arguments: '{"key":"historical"}', status: "completed",
+    };
+    const toolResult = {
+      type: "function_call_output", call_id: "call_issue_702", output: "historical tool result",
+    };
+    const history = [inputMessage(HISTORICAL_USER_SENTINEL), toolCall];
+    const delta = [toolResult, inputMessage(CURRENT_USER_SENTINEL)];
+    try {
+      if (mode === "expired") {
+        Date.now = () => realNow() - EXPIRED_AGE_MS;
+        rememberResponseState(
+          { input: [history[0]], store: false },
+          { id: FIRST_RESPONSE_ID, status: "completed", output: [toolCall] },
+          undefined,
+          { force: true },
+        );
+        Date.now = realNow;
+        expect(responseStateMetrics().oldestAgeMs).toBeGreaterThan(REPLAY_TTL_MS);
+      }
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (url.hostname === "chatgpt.com" && url.pathname === "/backend-api/codex/responses") {
+          upstreamRequests.push(JSON.parse(String(init?.body)));
+          return new Response(completedSse("resp_issue_702_recovered", "recovered with full history"), {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        return originalFetch(input, init);
+      }) as typeof fetch;
+      saveConfig({ ...forwardConfig(), websockets: true });
+      server = startServer(0);
+      const headers = {
+        authorization: `Bearer ${fakeChatGptJwt({ chatgpt_account_id: "acct-issue-702" })}`,
+        "chatgpt-account-id": "acct-issue-702",
+      };
+      socket = await openResponseSocket(server.url, headers);
+      const rejected = await sendSocketTurn(socket, {
+        model: "gpt-5.5", previous_response_id: FIRST_RESPONSE_ID, input: delta, store: false,
+      });
+      expect(rejected).toMatchObject({
+        type: "error", status: 400,
+        error: { type: "invalid_request_error", code: "previous_response_not_found" },
+      });
+      expect(upstreamRequests).toHaveLength(0);
+
+      // Codex recognizes this code, discards its incremental socket state, and reconnects
+      // with its complete input. The rejected delta must never be forwarded on its own.
+      socket.close();
+      socket = await openResponseSocket(server.url, headers);
+      const recovered = await sendSocketTurn(socket, {
+        model: "gpt-5.5", input: [...history, ...delta], store: false,
+        tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
+      });
+      expect(recovered).toMatchObject({ type: "response.completed", response: { id: "resp_issue_702_recovered" } });
+      expect(upstreamRequests).toHaveLength(1);
+      expect(upstreamRequests[0]!.previous_response_id).toBeUndefined();
+      // The canonical forward adapter removes item ids, but must preserve the call/result
+      // identity and every input item exactly once when the client supplies full history.
+      const { id: _itemId, ...forwardedToolCall } = toolCall;
+      expect(upstreamRequests[0]!.input).toEqual([history[0], forwardedToolCall, ...delta]);
+    } finally {
+      Date.now = realNow;
+      globalThis.fetch = originalFetch;
+      socket?.close();
+      await server?.stop(true);
+    }
+  }, SERVER_BUDGET_MS);
+
+  test("forward mode expands fresh replay state before continuing upstream", async () => {
+    const scenario = await runForwardScenario("fresh");
+
+    expect(scenario.firstStatus).toBe(200);
+    expect(scenario.stateBeforeResume.count).toBe(1);
+    expect(scenario.stateBeforeResume.oldestAgeMs).toBeLessThan(REPLAY_TTL_MS);
+    expect(scenario.secondStatus).toBe(200);
+    expect(scenario.upstreamRequests).toHaveLength(2);
+
+    const resumedRequest = scenario.upstreamRequests[1]!;
+    const serialized = JSON.stringify(resumedRequest.body);
+    expect(resumedRequest.path).toBe("/responses");
+    expect(resumedRequest.body.previous_response_id).toBeUndefined();
+    expect(serialized).toContain(HISTORICAL_USER_SENTINEL);
+    expect(serialized).toContain(HISTORICAL_ASSISTANT_SENTINEL);
+    expect(serialized).toContain(CURRENT_USER_SENTINEL);
+  });
+
+  test("forward mode still sends an ordinary request without previous_response_id", async () => {
+    const scenario = await runForwardScenario("ordinary");
+
+    expect(scenario.firstStatus).toBe(200);
+    expect(scenario.upstreamRequests).toHaveLength(1);
+    expect(scenario.upstreamRequests[0]!.path).toBe("/responses");
+    expect(scenario.upstreamRequests[0]!.body.previous_response_id).toBeUndefined();
+    expect(JSON.stringify(scenario.upstreamRequests[0]!.body)).toContain(HISTORICAL_USER_SENTINEL);
+  });
+
+  test.each(["message", "function", "custom"] as const)("API-key Responses providers can still forward native %s continuation state", async kind => {
+    const upstreamRequests: Record<string, unknown>[] = [];
+    const realNow = Date.now;
+    let upstream: ReturnType<typeof Bun.serve> | null = null;
+    let server: ReturnType<typeof startServer> | null = null;
+
+    try {
+      upstream = Bun.serve({
+        port: 0,
+        async fetch(request) {
+          upstreamRequests.push(await request.json() as Record<string, unknown>);
+          return new Response(completedSse("resp_issue_702_native", "native continuation"), {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+      });
+      saveConfig({
+        port: 0,
+        hostname: "127.0.0.1",
+        defaultProvider: "test-openai",
+        providers: {
+          "test-openai": {
+            adapter: "openai-responses",
+            baseUrl: `${upstream.url.toString().replace(/\/$/, "")}/v1`,
+            allowPrivateNetwork: true,
+            apiKey: "provider-key",
+            defaultModel: "gpt-5.5",
+            statelessResponses: false,
+          },
+        },
+      } as OcxConfig);
+      server = startServer(0);
+
+      const response = await originalFetch(new URL("/v1/responses", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "test-openai/gpt-5.5",
+          previous_response_id: "resp_upstream_native_state",
+          input: [inputMessage(CURRENT_USER_SENTINEL)],
+          ...(kind === "message" ? {} : {
+            tools: [kind === "custom"
+              ? { type: "custom", name: "apply_patch", description: "Apply patch", format: { type: "text" } }
+              : { type: "function", name: "lookup", parameters: { type: "object", properties: {} } }],
+            input: [{ type: kind === "custom" ? "custom_tool_call_output" : "function_call_output", call_id: "call_native", output: "done" }],
+          }),
+          stream: true,
+        }),
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(upstreamRequests).toHaveLength(1);
+      expect(upstreamRequests[0]!.previous_response_id).toBe("resp_upstream_native_state");
+      if (kind !== "message") expect(upstreamRequests[0]!.input).toEqual([
+        { type: kind === "custom" ? "custom_tool_call_output" : "function_call_output", call_id: "call_native", output: "done" },
+      ]);
+    } finally {
+      Date.now = realNow;
+      globalThis.fetch = originalFetch;
+      try {
+        await server?.stop(true);
+      } finally {
+        await upstream?.stop(true);
+      }
+    }
+  });
+});

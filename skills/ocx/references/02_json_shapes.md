@@ -38,6 +38,7 @@ One row per line. The fields worth branching on:
 |---|---|
 | `requestId` | pass to `ocx logs explain` |
 | `conversationId` | groups a conversation; also printed as `conv=<id>` in human output |
+| `accountLogLabel` | which account served it (`main`, `p<hex6>`, `o<hex6>`); also printed as `acct=<label>` in human output |
 | `provider` / `model` | what actually served it |
 | `requestedModel` / `requestedAlias` | what the client asked for |
 | `status` / `durationMs` | outcome |
@@ -51,6 +52,11 @@ to `requestedModel` is how you get a wrong answer about which provider served it
 `usageStatus: "estimated"` means the numbers are derived, not reported by the provider.
 `displayMetrics.cost.estimate.estimateReasons` lists why — for example `usage_estimated`,
 `cache_detail_missing`, `expected_price_overlay`.
+
+## `ocx provider list --jsonl`
+
+One configured provider per line. Each object has the same fields as an item in the
+`configured` array from `ocx provider list --json`; the `registryCount` summary is omitted.
 
 ## `ocx logs explain <request-id>`
 
@@ -122,4 +128,3 @@ hint: <what to do>
 Branch on `reason` in those stderr lines, never on the message prose. `--json` does **not** wrap
 API failures in `{error:{type,code,message}}`; `runCliAction` still prints the three-liner on
 stderr and returns 4/5/1. Do not parse stdout for an error envelope that is not there.
-

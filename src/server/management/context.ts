@@ -6,6 +6,7 @@ import type { StartupHealth } from "../../codex/autostart-health";
 import type { StartupInstallAction } from "../startup-action-control";
 import type { ManagementPrincipal, ManagementSessionControl } from "../management-auth";
 import type { CatalogModel } from "../../codex/catalog";
+import type { refreshOwnedCatalogIntegrations } from "../../integrations/catalog-refresh";
 import type { Paths as CodexPromptPaths } from "../../codex/prompt-layers";
 import type { injectGrokConfig } from "../../grok/inject";
 import type { removeDesktop3pStandardPivot, writeDesktop3pConfig } from "../../claude/desktop-3p";
@@ -20,7 +21,24 @@ import type {
 } from "../../codex/app-server-restart-service";
 import type { syncModelsToCodex } from "../../codex/sync";
 
+import type { RemoteWorkspaceHub } from "../../remote-control/workspace-hub";
+import type { RemoteWorkspaceSessionService } from "../../remote-control/workspace-sessions";
+
+export type RemoteWorkspaceHubApi = Pick<RemoteWorkspaceHub,
+  "identity" | "createPairingGrant" | "assertPairingSourceAllowed" | "pairDevice"
+  | "authenticateDeviceToken" | "attachConnection" | "updateDeviceCapabilities"
+  | "detachConnection" | "listDevices" | "revokeDevice" | "closeAllConnections">;
+export type RemoteWorkspaceSessionsApi = Pick<RemoteWorkspaceSessionService,
+  "availability" | "list" | "create" | "prompt" | "submitPrompt" | "stop" | "shutdown">;
+
 export interface ManagementApiDeps {
+  remoteWorkspaceHub?: RemoteWorkspaceHubApi;
+  remoteWorkspaceSessions?: RemoteWorkspaceSessionsApi;
+  /** The listener retains and awaits teardown only after this optional subsystem activates. */
+  remoteWorkspaceStopping?: () => boolean;
+  onRemoteWorkspaceShutdown?: (shutdown: () => Promise<void>) => void;
+  /** Isolates automatic owned-client writes in route tests. */
+  refreshOwnedCatalogIntegrations?: typeof refreshOwnedCatalogIntegrations;
   /** Platform seam for capability projections; does not alter host-level startup behavior. */
   platform?: NodeJS.Platform;
   toggleCodexMultiAgentV2?: (enabled: boolean) => void;

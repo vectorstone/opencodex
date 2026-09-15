@@ -15,10 +15,11 @@ import {
   resolveMetadataProvider,
 } from "../generated/model-metadata";
 import type { AttemptTierOutcome, OcxUsage } from "../types";
-import { baseProviderLabel, canonicalUsageProviderLabel } from "../providers/label";
+import { canonicalFastTierMarker } from "../providers/fastwire";
+import { baseProviderLabel } from "../providers/label";
 import type { PersistedUsageAttempt, UsageStatus } from "./log";
 import { canonicalAntigravityUsageModel } from "../providers/antigravity-models";
-import { activeConfiguredProviders, activeUserCostOverlays, userCostOverlayVersion } from "./user-cost-overlays";
+import { activeAccountPricingProviders, activeConfiguredProviders, activeUserCostOverlays, userCostOverlayVersion } from "./user-cost-overlays";
 import {
   EXPECTED_PRICE_OVERLAYS,
   findExpectedPriceOverlay,
@@ -34,12 +35,18 @@ import {
 /** Published long-context pricing band (#908). */
 export type ContextTierName = "long";
 
+export interface PriceResolutionOptions {
+  /** False for unresolved slash selectors; exact provider/user rates still apply. */
+  allowModelLevelFallback?: boolean;
+}
+
+type AttemptCostInput = Pick<PersistedUsageAttempt, "ordinal" | "provider" | "model" | "usage" | "usageStatus" | "tierOutcome"> & PriceResolutionOptions;
+
 /**
  * Service-tier provenance. `effectiveServiceTier()` collapses these with `??`,
- * but long-context exclusivity needs to know WHICH source supplied "priority":
- * OpenAI does not serve long context in Fast mode, so a >272k request that was
- * merely TAGGED priority was necessarily downgraded and must still be priced at
- * the long rate. Only a response-confirmed Fast tier suppresses the context tier.
+ * but provider-specific long-context rules need to know WHICH source supplied Fast.
+ * Current API rows stack Fast and long rates; legacy exclusive rows and unknown
+ * vendor combinations still require response-confirmed provenance.
  */
 export interface ServiceTierContext {
   responseServiceTier?: string;
@@ -170,30 +177,28 @@ export function calculateCost(tokens: CostTokens, cost4: Cost4): CostBreakdown {
  * bundle) nonzero -> overlay verified -> overlay verified-derived -> jawcode
  * model-level vendor price (cross-provider fallback: a model follows its official
  * vendor price — WP5 policy, e.g. kiro/claude-opus-4-6 uses the anthropic price)
- * -> null. All-zero rows are overlay candidates (zero is "not billable here",
- * not "free").
+ * -> null. An explicit all-zero user override means free; all-zero catalog
+ * rows remain overlay candidates rather than evidence of free pricing.
  */
 export function resolveMatchedPrice(
   provider: string,
   modelId: string,
   overlays: readonly ExpectedPriceOverlay[] = EXPECTED_PRICE_OVERLAYS,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
+  options: PriceResolutionOptions = {},
 ): MatchedPrice | null {
-  // User-configured overlays are keyed by the EXACT configured provider name.
-  // A provider that literally exists in config.providers keeps its own pricing
-  // namespace: a real custom provider can legitimately end with a label-shaped
-  // suffix (e.g. acme-pabcdef) and must not inherit the base provider's user
-  // overlay. Only NON-configured names (generated account log labels) collapse
-  // to their label base. chatgpt/openai-multi are the same OpenAI usage surface
-  // and always canonicalize to openai.
-  const collapsed = baseProviderLabel(provider);
-  if (collapsed !== provider && (canonicalUsageProviderLabel(provider) !== provider || !activeConfiguredProviders().has(provider))) {
+  // Literal configured providers win over account identities. Only then use
+  // config-owned Codex identities, followed by the existing historical suffix
+  // grammar. Never infer an account by stripping an arbitrary suffix.
+  const namespace = activeConfiguredProviders().has(provider)
+    ? provider
+    : activeAccountPricingProviders().get(provider) ?? baseProviderLabel(provider);
+  if (namespace !== provider) {
+    // An exact override (including caller-supplied rows) owns its namespace.
+    // Unchanged names use the memoized inner lookup's existing user-first order.
     const exactUserOverlay = userOverlayMatch(provider, modelId, userOverlays);
     if (exactUserOverlay) return exactUserOverlay;
-    // Pool/account log suffixes (e.g. google-antigravity-p442fff) must collapse
-    // before the compiled/overlay lookup; configured providers keep their own
-    // namespace above.
-    provider = collapsed;
+    provider = namespace;
   }
   // Memoize by (provider, model): usage summaries iterate hundreds of thousands of
   // rows that share a handful of provider/model keys, so resolving each time would
@@ -201,14 +206,14 @@ export function resolveMatchedPrice(
   // user overlays get a NEW array identity + version bump on every config refresh,
   // so memoized rows never go stale.
   if (overlays === EXPECTED_PRICE_OVERLAYS && userOverlays === activeUserCostOverlays()) {
-    const cacheKey = `${userCostOverlayVersion()} ${provider} ${modelId}`;
+    const cacheKey = `${userCostOverlayVersion()} ${options.allowModelLevelFallback !== false} ${provider} ${modelId}`;
     if (!priceMemo.has(cacheKey)) {
       if (priceMemo.size >= 512) priceMemo.clear();
-      priceMemo.set(cacheKey, resolveMatchedPriceInner(provider, modelId, overlays, userOverlays));
+      priceMemo.set(cacheKey, resolveMatchedPriceInner(provider, modelId, overlays, userOverlays, options));
     }
     return priceMemo.get(cacheKey)!;
   }
-  return resolveMatchedPriceInner(provider, modelId, overlays, userOverlays);
+  return resolveMatchedPriceInner(provider, modelId, overlays, userOverlays, options);
 }
 
 const priceMemo = new Map<string, MatchedPrice | null>();
@@ -223,14 +228,15 @@ function resolveMatchedPriceInner(
   modelId: string,
   overlays: readonly ExpectedPriceOverlay[],
   userOverlays: readonly ExpectedPriceOverlay[],
+  options: PriceResolutionOptions,
 ): MatchedPrice | null {
-  const direct = resolveMatchedPriceExact(provider, modelId, overlays, userOverlays);
+  const direct = resolveMatchedPriceExact(provider, modelId, overlays, userOverlays, options);
   if (direct) return direct;
   // Antigravity historical/wire ids often lack an exact overlay; fall back to the
   // picker/call base model so collapsed usage rows still get a price.
   if (provider === "google-antigravity" || provider.startsWith("google-antigravity")) {
     const base = canonicalAntigravityUsageModel(modelId);
-    if (base !== modelId) return resolveMatchedPriceExact(provider, base, overlays, userOverlays);
+    if (base !== modelId) return resolveMatchedPriceExact(provider, base, overlays, userOverlays, options);
   }
   return null;
 }
@@ -238,13 +244,14 @@ function resolveMatchedPriceInner(
 /**
  * Exact provider/model price lookup: user-configured `modelCosts` first, then
  * an exact official correction, the jawcode provider bundle, the expected-price overlay, then the
- * model-level vendor fallback. All-zero rows fall through ("not billable").
+ * model-level vendor fallback. All-zero catalog rows fall through; user zeros win.
  */
 function resolveMatchedPriceExact(
   provider: string,
   modelId: string,
   overlays: readonly ExpectedPriceOverlay[],
   userOverlays: readonly ExpectedPriceOverlay[],
+  options: PriceResolutionOptions,
 ): MatchedPrice | null {
   // User-configured provider overlay wins over every compiled catalog: the
   // operator's explicit price is authoritative for the ~$ estimate.
@@ -253,7 +260,7 @@ function resolveMatchedPriceExact(
   const verifiedOverride = overlays === EXPECTED_PRICE_OVERLAYS
     ? findVerifiedPriceOverride(provider, modelId)
     : undefined;
-  if (verifiedOverride && validCost4(verifiedOverride.cost4) && hasNonZeroCost(verifiedOverride.cost4)) {
+  if (verifiedOverride && verifiedOverride.status !== "unverified" && validCost4(verifiedOverride.cost4) && hasNonZeroCost(verifiedOverride.cost4)) {
     return {
       provider,
       modelId,
@@ -261,7 +268,7 @@ function resolveMatchedPriceExact(
       source: "expected",
       sourceRef: verifiedOverride.source,
       verifiedAt: verifiedOverride.verifiedAt,
-      status: "verified",
+      status: verifiedOverride.status,
     };
   }
   const metadataProvider = resolveMetadataProvider(provider);
@@ -280,7 +287,7 @@ function resolveMatchedPriceExact(
   }
   const overlay = findExpectedPriceOverlay(provider, modelId, overlays);
   if (!overlay || !validCost4(overlay.cost4) || !hasNonZeroCost(overlay.cost4)) {
-    return resolveModelLevelPrice(provider, modelId);
+    return options.allowModelLevelFallback === false ? null : resolveModelLevelPrice(provider, modelId);
   }
   if (overlay.status === "unverified") return null;
   return {
@@ -295,14 +302,14 @@ function resolveMatchedPriceExact(
   };
 }
 
-/** User-configured overlay match (all-zero rows fall through like any other source). */
+/** User-configured overlay match; explicit zero rates are authoritative too. */
 function userOverlayMatch(
   provider: string,
   modelId: string,
   userOverlays: readonly ExpectedPriceOverlay[],
 ): MatchedPrice | null {
   const overlay = findExpectedPriceOverlay(provider, modelId, userOverlays);
-  if (!overlay || !validCost4(overlay.cost4) || !hasNonZeroCost(overlay.cost4)) return null;
+  if (!overlay || !validCost4(overlay.cost4)) return null;
   return {
     provider,
     modelId,
@@ -433,7 +440,7 @@ function tierScalar(tier?: ServiceTierInput): string | undefined {
 
 /** True only when the UPSTREAM RESPONSE confirmed the Fast tier (see ServiceTierContext). */
 function isConfirmedFast(tier?: ServiceTierInput): boolean {
-  return typeof tier === "object" && tier.responseServiceTier === "priority";
+  return typeof tier === "object" && canonicalFastTierMarker(tier.responseServiceTier) === "priority";
 }
 
 /**
@@ -445,7 +452,7 @@ function isConfirmedFast(tier?: ServiceTierInput): boolean {
  * cache-heavy long prompt would fall below the boundary and under-bill.
  *
  * A provider's declaration decides how a response-confirmed priority tier relates to this band.
- * OpenAI declares the bands exclusive. xAI publishes neither a combined rate nor an exclusion,
+ * API rows can stack the bands. xAI publishes neither a combined rate nor an exclusion,
  * so its long-context rate remains the known lower bound instead of inventing a stacked multiplier.
  */
 function applyContextTier(
@@ -456,7 +463,7 @@ function applyContextTier(
   tier?: ServiceTierInput,
 ): [Cost4, ContextTierName | undefined, boolean] {
   if (rawInputTokens === undefined) return [cost4, undefined, false];
-  const rule = findContextTier(baseProviderLabel(provider), modelId);
+  const rule = findContextTier(provider, modelId);
   if (!rule || !isLongContext(rule, rawInputTokens)) return [cost4, undefined, false];
   const confirmedFast = isConfirmedFast(tier);
   if (confirmedFast && rule.confirmedPriorityRelation === "exclusive") {
@@ -481,10 +488,11 @@ function applyPriorityMultiplier(
   provider: string,
   modelId: string,
   serviceTier?: ServiceTierInput,
+  contextTier?: ContextTierName,
 ): [Cost4, number] {
-  if (tierScalar(serviceTier) !== "priority") return [cost4, 1];
-  const base = baseProviderLabel(provider);
-  const rule = findPriorityPricingRule(base, modelId);
+  if (canonicalFastTierMarker(tierScalar(serviceTier)) !== "priority") return [cost4, 1];
+  if (contextTier && findContextTier(provider, modelId)?.confirmedPriorityRelation !== "stack") return [cost4, 1];
+  const rule = findPriorityPricingRule(provider, modelId);
   if (rule?.requiresResponseConfirmation && !isConfirmedFast(serviceTier)) return [cost4, 1];
   const multiplier = rule?.multiplier ?? 1;
   if (multiplier === 1) return [cost4, 1];
@@ -512,7 +520,7 @@ function isOpenRouterPriorityLowerBound(
   provider: string,
   outcome: AttemptTierOutcome | undefined,
 ): boolean {
-  return baseProviderLabel(provider) === "openrouter"
+  return provider === "openrouter"
     && outcome?.canonical === "priority"
     && outcome.fastOutcome === "applied"
     && (outcome.confirmation === "confirmed" || outcome.confirmation === "assumed");
@@ -524,7 +532,7 @@ function isOpenRouterPriorityLowerBound(
  * missing so combos can fail closed.
  */
 export function estimateAttemptCost(
-  attempt: Pick<PersistedUsageAttempt, "ordinal" | "provider" | "model" | "usage" | "usageStatus" | "tierOutcome">,
+  attempt: AttemptCostInput,
   overlays: readonly ExpectedPriceOverlay[] = EXPECTED_PRICE_OVERLAYS,
   serviceTier?: ServiceTierInput,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
@@ -532,22 +540,19 @@ export function estimateAttemptCost(
   if (!attempt.usage) return null;
   const tokens = normalizeCostTokens(attempt.usage);
   if (!tokens) return null;
-  const price = resolveMatchedPrice(attempt.provider, attempt.model, overlays, userOverlays);
+  const price = resolveMatchedPrice(attempt.provider, attempt.model, overlays, userOverlays, attempt);
   if (!price) return null;
   const attemptServiceTier = attempt.tierOutcome
     ? serviceTierContextFromOutcome(attempt.tierOutcome)
     : serviceTier;
   const [tieredCost4, contextTier, contextPriorityLowerBound] = applyContextTier(
-    price.cost4, attempt.provider, attempt.model, attempt.usage.inputTokens, attemptServiceTier,
+    price.cost4, price.provider, attempt.model, attempt.usage.inputTokens, attemptServiceTier,
   );
-  // A published long-context row owns the numeric estimate. OpenAI declares that band
-  // exclusive with Fast; xAI's confirmed combination is deliberately left unmultiplied
-  // and marked as a lower bound because no combined price has been published.
-  const [effectiveCost4, multiplier] = contextTier
-    ? [tieredCost4, 1] as const
-    : applyPriorityMultiplier(tieredCost4, attempt.provider, attempt.model, attemptServiceTier);
+  const [effectiveCost4, multiplier] = applyPriorityMultiplier(
+    tieredCost4, price.provider, attempt.model, attemptServiceTier, contextTier,
+  );
   const priorityLowerBound = contextPriorityLowerBound
-    || isOpenRouterPriorityLowerBound(attempt.provider, attempt.tierOutcome);
+    || isOpenRouterPriorityLowerBound(price.provider, attempt.tierOutcome);
   return {
     ordinal: attempt.ordinal,
     provider: attempt.provider,
@@ -567,7 +572,7 @@ export function estimateAttemptCost(
  * attempt is unpriced or unnormalizable, return null rather than a partial sum.
  */
 export function estimateComboCost(
-  attempts: readonly Pick<PersistedUsageAttempt, "ordinal" | "provider" | "model" | "usage" | "usageStatus" | "tierOutcome">[],
+  attempts: readonly AttemptCostInput[],
   overlays: readonly ExpectedPriceOverlay[] = EXPECTED_PRICE_OVERLAYS,
   serviceTier?: ServiceTierInput,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
@@ -615,6 +620,7 @@ export function estimateRequestCost(
     usage?: OcxUsage;
     usageStatus: UsageStatus;
     serviceTier?: ServiceTierInput;
+    allowModelLevelFallback?: boolean;
   },
   overlays: readonly ExpectedPriceOverlay[] = EXPECTED_PRICE_OVERLAYS,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
@@ -622,16 +628,16 @@ export function estimateRequestCost(
   if (!input.usage) return null;
   const tokens = normalizeCostTokens(input.usage);
   if (!tokens) return null;
-  const price = resolveMatchedPrice(input.provider, input.model, overlays, userOverlays);
+  const price = resolveMatchedPrice(input.provider, input.model, overlays, userOverlays, input);
   if (!price) return null;
   const [tieredCost4, contextTier, contextPriorityLowerBound] = applyContextTier(
-    price.cost4, input.provider, input.model, input.usage.inputTokens, input.serviceTier,
+    price.cost4, price.provider, input.model, input.usage.inputTokens, input.serviceTier,
   );
-  const [effectiveCost4, multiplier] = contextTier
-    ? [tieredCost4, 1] as const
-    : applyPriorityMultiplier(tieredCost4, input.provider, input.model, input.serviceTier);
+  const [effectiveCost4, multiplier] = applyPriorityMultiplier(
+    tieredCost4, price.provider, input.model, input.serviceTier, contextTier,
+  );
   const priorityLowerBound = contextPriorityLowerBound || isOpenRouterPriorityLowerBound(
-    input.provider,
+    price.provider,
     typeof input.serviceTier === "object" ? input.serviceTier.tierOutcome : undefined,
   );
   return {

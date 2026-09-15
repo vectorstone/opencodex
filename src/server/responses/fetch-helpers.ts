@@ -9,6 +9,7 @@ import type { OcxProviderConfig } from "../../types";
 import type { WsData } from "../ws-bridge";
 import { waitForProviderRequestSlot } from "../../providers/request-pacing";
 import { withUpstreamHttpVersion } from "../../lib/upstream-http-version";
+import type { CodexWsQuotaObserver } from "./codex-ws-metadata";
 
 export { withUpstreamHttpVersion };
 
@@ -56,6 +57,12 @@ export interface ProviderFetchOptions {
   modelId?: string;
   /** One pacing slot was acquired immediately before this fetch wrapper was created. */
   pacingSlotAcquired?: boolean;
+  /** Captured selected-account observer, attached before the native WS send. */
+  onCodexWsQuota?: CodexWsQuotaObserver;
+  /** Synchronous admission at actual credential dispatch, after pacing/backoff. */
+  beforeDispatch?: (headers: Headers) => void;
+  /** Revalidate/rebuild a queued request at its physical send boundary, after pacing. */
+  dispatchOverride?: (input: Parameters<typeof globalThis.fetch>[0], init: RequestInit, execute: typeof globalThis.fetch) => Promise<Response>;
 }
 
 export function providerFetch(
@@ -67,9 +74,21 @@ export function providerFetch(
   const preconnect = (...args: Parameters<typeof globalThis.fetch.preconnect>): void => {
     base.preconnect?.(...args);
   };
-  const httpFetch = Object.assign(
+  // Rebuilt dispatches must use the same physical-send boundary as ordinary HTTP sends.
+  // Return the original 3xx so the response owner retains its retry/health/relay contract.
+  const dispatch = Object.assign(
     (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
-      base(input, { ...withUpstreamHttpVersion(input, init, provider), timeout: 0 }),
+      base(input, { ...init, redirect: "manual" }),
+    { preconnect },
+  ) as typeof globalThis.fetch;
+  const httpFetch = Object.assign(
+    async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      options.beforeDispatch?.(new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)));
+      const dispatchInit = { ...withUpstreamHttpVersion(input, init, provider), timeout: 0 };
+      return options.dispatchOverride
+        ? options.dispatchOverride(input, dispatchInit, dispatch)
+        : dispatch(input, dispatchInit);
+    },
     { preconnect },
   ) as typeof globalThis.fetch;
   // ChatGPT Codex backend: streaming turns ride the responses_websockets
@@ -82,7 +101,7 @@ export function providerFetch(
       // used, protocol pin included: a WS turn that falls back is serving the
       // request over HTTP, and dropping the provider's `upstreamHttpVersion`
       // there would silently negotiate a transport the operator ruled out.
-      return codexWsUpstreamFetch(input, init, httpFetch, runtime);
+      return codexWsUpstreamFetch(input, init, httpFetch, runtime, options.onCodexWsQuota, options.beforeDispatch);
     }
     return httpFetch(input, init);
   };
@@ -151,6 +170,10 @@ export function storedPoolReplayDispatchNotifier(
   }) as ProviderFetch;
 }
 
+/**
+ * Fetch through the header deadline with redirects always manual.
+ * @param _manualRedirect Ignored; retained for call compatibility. Even false uses manual.
+ */
 export async function fetchWithHeaderTimeout(
   url: string,
   init: Omit<RequestInit, "signal">,
@@ -158,7 +181,8 @@ export async function fetchWithHeaderTimeout(
   timeoutMs: number,
   preferIdentityEncoding = false,
   executor: typeof globalThis.fetch = globalThis.fetch,
-  manualRedirect = false,
+  // Retained for existing callers; credential-bearing transport no longer opts out.
+  _manualRedirect = false,
 ): Promise<Response> {
   const pacing = executor as ProviderFetch;
   await pacing.waitForPacing?.(abortSignal);
@@ -177,10 +201,9 @@ export async function fetchWithHeaderTimeout(
     return await fetchExecutor(url, {
       ...init,
       headers,
-      // Credential-bearing sends opt into manual redirects so a 3xx is relayed
-      // as a Response instead of being followed into a rejection that is
-      // indistinguishable from a pre-connection failure (#914).
-      ...(manualRedirect ? { redirect: "manual" as const } : {}),
+      // Never replay provider credentials or request bodies to a redirect destination.
+      // Preserve the 3xx for the owner's existing response/health policy (#914, #1471).
+      redirect: "manual",
       signal: AbortSignal.any([abortSignal, timeout.signal]),
       timeout: 0,
     });

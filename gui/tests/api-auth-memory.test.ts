@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { configureApiTargets, installApiAuthFetch, installApiSessionFromHtml, resetApiAuthFetchForTests } from "../src/api";
+import { configureApiTargets, fetchAudioUpload, installApiAuthFetch, installApiSessionFromHtml, resetApiAuthFetchForTests } from "../src/api";
 import { targetsFromMachineStatus, type MachineStatusV1 } from "../src/api-targets";
 
 const LEGACY_TOKEN_KEY = "opencodex-api-token";
@@ -53,6 +53,20 @@ async function installMockAuthFetch(handler: typeof fetch): Promise<void> {
   Object.defineProperty(globalThis, "fetch", { configurable: true, value: window.fetch });
 }
 
+/**
+ * Declare a bind that requires a typed credential, as `serveGuiFile` does from
+ * `isApiAuthRequired`. The admin-token prompt only exists for a non-loopback bind: a
+ * loopback dashboard mints its own session, so a refusal there is a Host/Origin
+ * misconfiguration no typed token can repair (#3353). A test that wants to observe the
+ * prompt fallback has to say it is that kind of deployment.
+ */
+function declareManagementAuthRequired(): void {
+  const meta = document.createElement("meta");
+  meta.setAttribute("name", "opencodex-management-auth-required");
+  meta.setAttribute("content", "1");
+  document.head.append(meta);
+}
+
 test("installApiAuthFetch deletes legacy sessionStorage token without reading it", () => {
   sessionStorage.setItem(LEGACY_TOKEN_KEY, "legacy-secret");
   let getItemCalls = 0;
@@ -72,7 +86,31 @@ test("installApiAuthFetch deletes legacy sessionStorage token without reading it
   }
 });
 
+test("audio uploads bypass connected management interception and 401 recovery", async () => {
+  injectSessionMeta("ocx_session_audio_machine", "audio-csrf", "http://localhost");
+  const seen: Array<{ url: string; headers: Headers }> = [];
+  const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    seen.push({ url: String(input), headers: new Headers(init?.headers) });
+    return new Response("rejected", { status: 401 });
+  }) as typeof fetch;
+  await installMockAuthFetch(mockFetch);
+  configureApiTargets({
+    connected: true,
+    machine: { id: "machine", baseUrl: "http://localhost", serverOrigin: "http://localhost", bootstrapPath: "/opencodex-session", transport: "same-origin" },
+    shared: { id: "shared", baseUrl: "https://hub.example.test", serverOrigin: "https://hub.example.test", bootstrapPath: "https://hub.example.test/opencodex-session", transport: "relay" },
+  });
+  const key = "ocx_data_audio_wrapper_fixture";
+  const response = await fetchAudioUpload("https://hub.example.test/v1/audio/transcriptions", { method: "POST", headers: { "X-OpenCodex-API-Key": key }, body: new FormData() });
+  expect(response.status).toBe(401);
+  expect(seen).toHaveLength(1);
+  expect([...seen[0]!.headers]).toEqual([["x-opencodex-api-key", key]]);
+  expect(sessionStorage.length).toBe(0);
+  await expect(fetchAudioUpload("https://hub.example.test/api/config", { method: "POST" })).rejects.toThrow();
+  expect(seen).toHaveLength(1);
+});
+
 test("prompted API tokens stay memory-only and are not written to sessionStorage", async () => {
+  declareManagementAuthRequired();
   sessionStorage.setItem(LEGACY_TOKEN_KEY, "legacy-secret");
 
   let authorized = false;
@@ -96,6 +134,7 @@ test("prompted API tokens stay memory-only and are not written to sessionStorage
 });
 
 test("validates prompted tokens with a safe read before retrying the failed request", async () => {
+  declareManagementAuthRequired();
   const validationResults: string[] = [];
   const seenRequests: Array<[string, string | null]> = [];
   resetApiAuthFetchForTests(async (verifyToken) => {
@@ -127,6 +166,7 @@ test("validates prompted tokens with a safe read before retrying the failed requ
 });
 
 test("cross-origin /api/* requests do not receive the API key or token prompt", async () => {
+  declareManagementAuthRequired();
   let promptCalls = 0;
   let phase: "seed" | "cross" = "seed";
   const seenHeaders: Array<string | null> = [];
@@ -158,6 +198,7 @@ test("cross-origin /api/* requests do not receive the API key or token prompt", 
 });
 
 test("concurrent 401s share one token prompt and all retry with the stored token", async () => {
+  declareManagementAuthRequired();
   // Repro for #647: many /api/* requests start without a token (dashboard fan-out).
   // Delivering 401s one-by-one after each auth cycle finishes matches the browser case where
   // window.prompt blocks the main thread: each continuation still holds a captured null token
@@ -227,6 +268,7 @@ test("concurrent 401s share one token prompt and all retry with the stored token
 });
 
 test("stale concurrent 401 does not clear a token refreshed by another request", async () => {
+  declareManagementAuthRequired();
   // Codex/CodeRabbit race: request A prompts and stores T2; request B still holding stale T1
   // must not wipe T2 (clearTokenIfCurrent) before its re-read / shared gate join.
   let promptCalls = 0;
@@ -285,6 +327,7 @@ test("stale concurrent 401 does not clear a token refreshed by another request",
 });
 
 test("canceling the token prompt once does not reopen it for the rest of the 401 fan-out", async () => {
+  declareManagementAuthRequired();
   let promptCalls = 0;
   const release401: Array<() => void> = [];
   const mockFetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -439,6 +482,7 @@ test("expired session silently re-bootstraps from the served document without pr
 });
 
 test("a session minted for another origin is rejected and the prompt fallback stays", async () => {
+  declareManagementAuthRequired();
   // Non-loopback dashboards never get server-minted sessions; a re-bootstrap document whose
   // origin does not match must not be trusted, and the operator-only prompt remains.
   let promptCalls = 0;

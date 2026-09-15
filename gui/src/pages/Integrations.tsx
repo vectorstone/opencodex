@@ -9,6 +9,7 @@ import Grok from "./Grok";
 import CodexIntegrationPage from "./integrations/CodexIntegrationPage";
 import CursorIntegrationPage from "./integrations/CursorIntegrationPage";
 import IntegrationsOverview from "./integrations/IntegrationsOverview";
+import AsideProfilesPage from "./integrations/AsideProfilesPage";
 import FileIntegrationPage, {
   type FileIntegrationClientId,
 } from "./integrations/FileIntegrationPage";
@@ -188,7 +189,7 @@ export default function Integrations({ apiBase, machineApiBase = apiBase, connec
             {definition.id === "grok" && <Grok apiBase={apiBase} active={active} />}
             {definition.id === "cursor" && <CursorIntegrationPage apiBase={apiBase} active={active} />}
             {FILE_CLIENTS.has(definition.id as FileIntegrationClientId) && (
-              <FileIntegrationPage
+              definition.id === "aside" ? <AsideProfilesPage apiBase={apiBase} active={active} /> : <FileIntegrationPage
                 apiBase={apiBase}
                 client={definition.id as FileIntegrationClientId}
                 active={active}

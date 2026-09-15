@@ -86,6 +86,7 @@ export default defineConfig({
           translations: { fr: "Guides", ko: "가이드", "zh-CN": "指南", "zh-TW": "指南", ru: "Руководства", ja: "ガイド", tr: "Kılavuzlar" },
           items: [
             { label: "Remote Hub Deployment", translations: { fr: "Déploiement Remote Hub", ko: "Remote Hub 배포", "zh-CN": "Remote Hub 部署", "zh-TW": "Remote Hub 部署", ru: "Развёртывание Remote Hub", ja: "Remote Hub のデプロイ", tr: "Remote Hub Dağıtımı" }, slug: "guides/remote-hub" },
+            { label: "Remote Workspace", translations: { fr: "Espace de travail distant", ko: "원격 워크스페이스", "zh-CN": "远程工作区", "zh-TW": "遠端工作區", ru: "Удалённая рабочая область", ja: "リモートワークスペース", tr: "Uzak Çalışma Alanı" }, slug: "guides/remote-workspace" },
             { label: "Providers", translations: { fr: "Fournisseurs", ko: "프로바이더", "zh-CN": "提供商", "zh-TW": "供應商", ru: "Провайдеры", ja: "プロバイダー", tr: "Sağlayıcılar" }, slug: "guides/providers" },
             { label: "Factory Droid Bridge", translations: { fr: "Pont Factory Droid", ko: "Factory Droid 브리지" }, slug: "guides/factory-droid" },
             { label: "Cursor Private Inference", translations: { ko: "Cursor Private Inference" }, slug: "guides/cursor-private-inference" },
@@ -106,6 +107,7 @@ export default defineConfig({
             { label: "Video Bridge", translations: { fr: "Pont vidéo", ko: "비디오 브릿지", "zh-CN": "视频桥接", "zh-TW": "影片橋接", ru: "Video Bridge", ja: "動画ブリッジ", tr: "Video Bridge" }, slug: "guides/video-bridge" },
             { label: "Web Dashboard", translations: { fr: "Tableau de bord web", ko: "웹 대시보드", "zh-CN": "网页控制台", "zh-TW": "網頁儀表板", ru: "Веб-дашборд", ja: "ウェブダッシュボード", tr: "Web Kontrol Paneli" }, slug: "guides/web-dashboard" },
             { label: "Sub-agent Surface", translations: { fr: "Interface des sous-agents", ko: "서브에이전트 서피스", "zh-CN": "子代理界面", "zh-TW": "子代理介面", ru: "Интерфейс подагентов", ja: "サブエージェントサーフェス", tr: "Alt Ajan Arayüzü" }, slug: "guides/sub-agent-surface" },
+            { label: "Why v1 Is the Default", translations: { fr: "Pourquoi v1 est la valeur par défaut", ko: "v1이 기본값인 이유", "zh-CN": "为什么默认是 v1", "zh-TW": "為什麼預設是 v1", ru: "Почему v1 по умолчанию", ja: "v1 がデフォルトである理由", tr: "Neden varsayılan v1" }, slug: "guides/subagent-v1-default" },
           ],
         },
         {
@@ -148,6 +150,7 @@ export default defineConfig({
             },
             { label: "Adapters", translations: { fr: "Adaptateurs", ko: "어댑터", "zh-CN": "适配器", "zh-TW": "適配器", ru: "Адаптеры", ja: "アダプター", tr: "Adaptörler" }, slug: "reference/adapters" },
             { label: "Architecture", translations: { fr: "Architecture", ko: "아키텍처", "zh-CN": "架构", "zh-TW": "架構", ru: "Архитектура", ja: "アーキテクチャ", tr: "Mimari" }, slug: "reference/architecture" },
+            { label: "Platform Support", translations: { fr: "Prise en charge des plateformes", ko: "플랫폼 지원", "zh-CN": "平台支持", "zh-TW": "平台支援", ru: "Поддержка платформ", ja: "プラットフォーム対応", tr: "Platform Desteği" }, link: `${SITE_URL}/reference/platform-support` },
             { label: "Proxy API Formats", translations: { fr: "Formats de l’API proxy", ko: "프록시 API 형식", "zh-CN": "代理 API 格式", "zh-TW": "代理 API 格式", ru: "Форматы API прокси", ja: "プロキシAPI形式", tr: "Proxy API Formatları" }, slug: "reference/proxy-formats" },
             { label: "Management API", translations: { fr: "API de gestion", ko: "관리 API", "zh-CN": "管理 API", "zh-TW": "管理 API", ru: "API управления", ja: "管理API", tr: "Yönetim API'si" }, slug: "reference/management-api" },
           ],

@@ -64,12 +64,30 @@ Authorization: Bearer <admin-token>
 | `GET /api/grok` | 读取 Grok 托管配置状态和候选模型 | 400 状态读取失败 |
 | `PUT /api/grok/selection` | 持久化被排除的 Grok 模型 | 400 选择无效或超出大小限制 |
 | `POST /api/grok/apply` | 通过托管同步应用已持久化的 Grok 配置 | 409 `grok_apply_busy`；400/500 应用失败 |
+| `GET /api/grok/reset-coupons?accountId=...` | 读取活跃或指定 xAI 账号剩余的 Grok 计费重置 token 及有效期窗口 | 400 缺少账号；401 未认证；502 上游 gRPC-Web 错误 |
+| `POST /api/grok/reset-coupons/consume` | 兑换一个符合条件的重置优惠券。请求体为 `{ accountId?, tokenId?, operationId? }`。可选的 `operationId`（UUIDv4）让兑换具备幂等性：重复相同 id 会重放持久化结果，而不会重复兑换。 | 400 无效的 JSON/UUID；401 未认证；409 `identity_mismatch`；502 上游错误；503 ledger 容量 |
 | `GET, PUT /api/claude-desktop` | 读取或持久化 Claude Desktop 的路由/原生配置文件 | 400 分配无效或不可用 |
 | `POST /api/claude-desktop/apply` | 将已保存的配置文件写入 Claude Desktop 的托管配置 | 400/500 写入失败 |
 | `GET /api/claude-desktop/status` | 检查已保存与已应用的配置文件以及 Desktop 健康状态 | 400 状态读取失败 |
 | `GET, PUT /api/claude-code` | 读取或更新 Claude Code 的网关、认证模式、模型映射、上下文、代理和 sidecar 设置 | 400 字段或结构无效 |
 
+仪表板从 **Providers > xAI Grok > Accounts** 驱动这两条优惠券路径：每个已登录账号行
+都带有显示剩余优惠券数量的票据徽章，该徽章会打开一个对话框，列出有效期窗口并兑换
+最接近到期的优惠券。该对话框会发送客户端生成的 `operationId`，并在超时后停止发送而不是
+重试，因为 journal 记录仍处于打开状态的兑换会再次执行。`ocx account grok-reset-coupons`
+仍然是对应的终端命令。
+
 关于模型名录和加密工作任务行为的概念，请参见 [子代理界面](/guides/sub-agent-surface/)。
+
+### 客户端集成回滚日志
+
+| 方法和路径 | 用途 | 主要错误 |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | 列出回滚操作，也可限定为单个客户端。每一项都包含由服务器计算的 `deletable` 字段。 | 400 客户端无效 |
+| `DELETE /api/client-integrations/journal?opId=...` | 停用一条较旧的回滚操作，并在可能时删除其快照。成功响应中的 `snapshotRemoved: false` 表示清理任务已保留，等待维护重试。 | 400 缺少 `opId`；404 操作不存在或已停用；409 该客户端的最新操作 |
+
+删除操作会追加墓碑记录，而不会重写日志。服务器会保护每个客户端的最新操作，
+以保留当前的撤销点。
 
 ### Combos
 
@@ -120,6 +138,8 @@ Authorization: Bearer <admin-token>
 | `POST /api/storage/cleanup-policy/run` | 启动一次手动清理策略运行 | 409 `already_running`；500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | 仅测试用的策略流钩子 | 不可用时返回 404 `not_found` |
 
+如果某行超过现有解析器的大小限制，`GET /api/usage` 和 `GET /api/keys` 会保留可读取行的汇总，并在响应级别添加 `usageIncomplete: true` 和 `usageIncompleteReason: "oversized_rows"`。缓存和增量追加会保留该诊断，即使结果为空或没有筛选匹配；重建时会重新计算。不会缩短供应商、模型或 API 密钥标识来容纳该行。没有此标记不代表所有记录均有效。它与 `historyTruncated`、`entriesTruncated` 及 token 测量覆盖率相互独立。
+
 `models`、`providers` 和 `days[].models` 中的记录也带有 `cacheHitRate`：它表示由提供方提示缓存提供的输入 token 比例，并限制在 `[0, 1]` 范围内。当提供方未报告缓存遥测数据或该记录没有输入 token 时，其值为 `null`，绝不会是 `0`，因为“没有缓存数据”与“实际命中率为 0%”是不同的事实，将两者显示为相同结果的图表会产生误导。
 
 :::caution
@@ -134,10 +154,16 @@ Authorization: Bearer <admin-token>
 | `GET /api/models` | 返回仪表板/CLI 模型行 | 收集饱和时返回 `catalog_busy` |
 | `GET /api/client-config?client=...` | 为任意支持的文件集成构建只读客户端配置 | 400 不支持的客户端；503 目录不可用 |
 | `PUT /api/disabled-models` | 替换共享的禁用模型列表 | 400 无效 JSON |
-| `PUT /api/model-visibility` | 原子性地更改 provider 级或 model 级可见性 | 400 provider、scope、target 或请求体无效 |
+| `PUT /api/model-visibility` | 原子性地更改 provider 级或 model 级可见性 | 400 provider、scope、target 或请求体无效; 409 `initial_model_selection_pending` (刷新模型列表后重试。) |
 | `GET, POST /api/custom-models` | 列出自定义模型或添加一个 | 400 字段无效；404 provider 缺失；409 模型重复 |
 | `PUT, DELETE /api/custom-models/{id}` | 编辑或删除一个自定义模型 | 400 id/字段无效；404 未找到；409 模型重复 |
-| `GET, PUT /api/selected-models` | 读取 provider 允许列表和可用性，或替换一个允许列表 | 400 缺少 provider/请求体；404 未知 provider |
+| `GET, PUT /api/selected-models` | 读取 provider 允许列表和可用性，或替换一个允许列表 | 400 缺少 provider/请求体；404 未知 provider; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | 读取预设信息或选择 preset/all/custom 模式 | 400 模式无效或不支持该预设；404 未知提供者; PUT 409 `initial_model_selection_pending` |
+
+手动模型会替换 Models 仪表板中 provider 和 model ID 相同的行。OpenAI 手动行保留 `openai/<model>`，并支持可见性控制。删除手动行后，不带账户限定符的原生行会恢复。带账户限定符的原生行仍单独保留。原生路由和账户权限不会改变。非原生 OpenAI 可见性目标必须匹配已配置的手动模型。
+
+
+可靠的初始模型列表尚未确认时，有效的 `PUT /api/selected-models` 和 `PUT /api/model-presets` 请求也会返回 HTTP 409 和代码 `initial_model_selection_pending`。请使用 `GET /api/models` 等方式刷新模型列表，成功后再重试。
 
 ### OAuth 账户、provider 密钥和数据平面密钥
 
@@ -174,6 +200,14 @@ Authorization: Bearer <admin-token>
 | `GET /api/provider-quotas` | 读取 provider 配额报告；`refresh=1` 会强制刷新 | — |
 | `GET, PUT /api/provider-context-caps` | 读取或更新全局、全部 provider，或单个 provider 的上下文上限 | 400 请求无效；404 未知 provider |
 | `GET /api/provider-presets` | 返回从运行时注册表派生的 GUI provider 预设 | — |
+
+上下文上限响应包含 `caps`（当前有效的上限）和 `values`（关闭后仍保留的最后选择值）。
+开启提供商的上限时，如果未指定 `value`，则恢复其选择值；首次开启时使用全局 `contextCapValue`。
+OpenAI 也遵循此规则：开关不会选择特殊的 922k 模式。有效上限约束每个原生窗口；支持长上下文的模型
+只能扩展到该模型支持的上限。
+`{ "value": 600000, "setAll": true }` 修改全局值，并且只更新已开启的上限；上限已关闭的提供商保留
+自己的选择值，供之后开启时恢复。不带 `value` 的 `{ "setAll": true }` 会按当前全局值开启所有
+已配置提供商的上限，并替换保存的选择值。关闭上限不会清除选择值，重新加载后仍保留，但不会将其作为限制应用。
 
 `provider_has_dependent_combos` 是一个安全屏障：在删除 provider 之前，先移除或编辑依赖它的 combos。
 
@@ -221,7 +255,7 @@ Authorization: Bearer <admin-token>
 | `PUT /api/codex-auth/failover` | 设置账户故障转移阈值 | 400 阈值无效 |
 | `GET /api/codex-auth/quota` | 按账户读取缓存的配额状态 | — |
 | `GET /api/codex-auth/reset-credits` | 检查某个账户是否具备 reset-credit 资格 | 400 缺少账户 id；上游状态透传；500 查询失败 |
-| `POST /api/codex-auth/reset-credits/consume` | 消耗一个符合条件的 reset credit | 400 缺少账户 id；上游状态透传；503 `server_busy`；500 消耗失败 |
+| `POST /api/codex-auth/reset-credits/consume` | 消耗一个符合条件的 reset credit。可选的 `operationId`（UUIDv4）让兑换具备幂等性：相同 id 会重放同一条持久化结果，而不会再消耗一个 credit。 | 400 缺少账户 id 或无效的 `operationId`；若该 id 属于其他账户则 409 `identity_mismatch`；上游状态透传；503 `server_busy`、`capacity` 或 `unavailable`；500 消耗失败 |
 | `POST /api/codex-auth/login` | 启动 Codex 登录或重新认证 | 400 请求无效；登录状态冲突/忙碌 |
 | `POST /api/codex-auth/login/code` | 为 Codex 登录流程提交手动代码 | 400 流程/代码无效 |
 | `POST /api/codex-auth/login/cancel` | 取消一个 Codex 登录流程 | — |

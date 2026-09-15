@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   acquireTestRunLock,
   resolveWrappedTestRunLockPath,
@@ -322,16 +322,21 @@ export function resolveBunTestArgs(
   return args;
 }
 
+// Paths relative to tests/. An entry moves with its file (scripts/test-layout/move.ts rewrites
+// it); the lane label, the ignore glob, and the timeout table all key on the basename.
 export const SERIAL_FULL_SUITE_FILES = [
-  "codex-shim.test.ts",
-  "cursor-native-exec-shell.test.ts",
-  "issue-452-empty-503.test.ts",
-  "openai-provider-option-e2e.test.ts",
-  "release-helper.test.ts",
-  "update-stop-first.test.ts",
+  "codex-integration/codex-shim.test.ts",
+  "providers/cursor/cursor-native-exec-shell.test.ts",
+  "codex-integration/issue-452-empty-503.test.ts",
+  "adapters/openai/openai-provider-option-e2e.test.ts",
+  "ci-workflows/release-helper.test.ts",
+  "update/update-stop-first.test.ts",
 ] as const;
 
-const SERIAL_LANE_TIMEOUT_MS: Partial<Record<(typeof SERIAL_FULL_SUITE_FILES)[number], number>> = {
+type SerialLaneBasename = (typeof SERIAL_FULL_SUITE_FILES)[number] extends infer P
+  ? P extends `${string}/${infer B}` ? B : P
+  : never;
+const SERIAL_LANE_TIMEOUT_MS: Partial<Record<SerialLaneBasename, number>> = {
   // This file intentionally exercises 33 complete release-script subprocess trees.
   // It is ~90s on an idle machine and measured at ~170s under unrelated host load.
   "release-helper.test.ts": 5 * 60 * 1000,
@@ -360,15 +365,15 @@ export function resolveBunTestPlan(requested: string[], comparisonCommit?: strin
 
   const mainArgs = resolveBunTestArgs(requested, comparisonCommit);
   const rootIndex = mainArgs.lastIndexOf("./tests/");
-  const ignores = SERIAL_FULL_SUITE_FILES.flatMap(file => ["--path-ignore-patterns", `**/${file}`]);
+  const ignores = SERIAL_FULL_SUITE_FILES.flatMap(file => ["--path-ignore-patterns", `**/${basename(file)}`]);
   mainArgs.splice(rootIndex === -1 ? mainArgs.length : rootIndex, 0, ...ignores);
   const serialRequested = withoutParallelOverride(requested);
   return [
     { label: "parallel suite", args: mainArgs, timeoutMs: 15 * 60 * 1000 },
     ...SERIAL_FULL_SUITE_FILES.map(file => ({
-      label: file,
+      label: basename(file),
       args: resolveBunTestArgs(["--parallel=1", ...serialRequested, `./tests/${file}`]),
-      timeoutMs: SERIAL_LANE_TIMEOUT_MS[file] ?? 3 * 60 * 1000,
+      timeoutMs: SERIAL_LANE_TIMEOUT_MS[basename(file) as SerialLaneBasename] ?? 3 * 60 * 1000,
     })),
   ];
 }
@@ -389,11 +394,78 @@ function waitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T |
   });
 }
 
-async function runTestLane(
+/** Read continuously so a timeout can still report output received before EOF. */
+export function captureTestOutput(
+  stdout: ReadableStream<Uint8Array>,
+  stderr: ReadableStream<Uint8Array>,
+) {
+  const collect = (stream: ReadableStream<Uint8Array>) => {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    let reading = true;
+    let complete = false;
+    const done = (async () => {
+      try {
+        while (reading) {
+          const chunk = await reader.read();
+          if (!reading) break;
+          if (chunk.done) {
+            complete = true;
+            break;
+          }
+          text += decoder.decode(chunk.value, { stream: true });
+        }
+      } catch {
+        // Retain the prefix without turning a pipe error into an unhandled rejection.
+      } finally {
+        if (reading) text += decoder.decode();
+        reading = false;
+        reader.releaseLock();
+      }
+    })();
+    return {
+      done,
+      snapshot: () => ({ text, complete }),
+      cancel() {
+        if (!reading) return;
+        reading = false;
+        text += decoder.decode();
+        // A descendant may own a pipe, or a stream's cancellation may never settle.
+        // Cancellation is best effort; neither it nor EOF may extend the drain bound.
+        void reader.cancel().catch(() => {});
+      },
+    };
+  };
+  const out = collect(stdout);
+  const err = collect(stderr);
+  return {
+    async finish(timeoutMs: number) {
+      const drained = await waitWithTimeout(Promise.all([out.done, err.done]), timeoutMs);
+      if (drained === null) {
+        out.cancel();
+        err.cancel();
+      }
+      const stdout = out.snapshot();
+      const stderr = err.snapshot();
+      return {
+        stdout: stdout.text,
+        stderr: stderr.text,
+        complete: drained !== null && stdout.complete && stderr.complete,
+      };
+    },
+  };
+}
+
+export async function runTestLane(
   lane: BunTestLane,
   runId: string,
   inheritedLock: { lockPath: string; ownerToken: string } | undefined,
   capture = false,
+  writers = {
+    stdout: (value: string) => { process.stdout.write(value); },
+    stderr: (value: string) => { process.stderr.write(value); },
+  },
 ): Promise<{ exitCode: number; output: string }> {
   const isolated = createIsolatedTestEnvironment({
     ...process.env,
@@ -413,8 +485,7 @@ async function runTestLane(
     stdout: capture ? "pipe" : "inherit",
     stderr: capture ? "pipe" : "inherit",
   });
-  const stdoutP = capture ? new Response(child.stdout).text() : Promise.resolve("");
-  const stderrP = capture ? new Response(child.stderr).text() : Promise.resolve("");
+  const captured = capture ? captureTestOutput(child.stdout!, child.stderr!) : undefined;
   const forward = (signal: NodeJS.Signals) => {
     interrupted = signal;
     try { child.kill(signal); } catch { /* child already exited */ }
@@ -426,7 +497,7 @@ async function runTestLane(
 
   const exited = child.exited;
   try {
-    const exitCode = await waitWithTimeout(exited, lane.timeoutMs);
+    let exitCode = await waitWithTimeout(exited, lane.timeoutMs);
     if (exitCode === null) {
       console.error(`[test] ${lane.label} exceeded ${Math.round(lane.timeoutMs / 1000)}s; terminating pid ${child.pid}.`);
       try { child.kill("SIGTERM"); } catch { /* child already exited */ }
@@ -435,12 +506,19 @@ async function runTestLane(
         try { child.kill("SIGKILL"); } catch { /* child already exited */ }
         await waitWithTimeout(exited, 2_000);
       }
-      return { exitCode: 124, output: "" };
     }
-    const [stdout, stderr] = await Promise.all([stdoutP, stderrP]);
-    if (stdout) process.stdout.write(stdout);
-    if (stderr) process.stderr.write(stderr);
+    // Process exit does not guarantee EOF when a descendant inherited the pipe.
+    const result = await captured?.finish(1_000);
+    const stdout = result?.stdout ?? "";
+    const stderr = result?.stderr ?? "";
+    if (stdout) writers.stdout(stdout);
+    if (stderr) writers.stderr(stderr);
     const output = stdout + "\n" + stderr;
+    if (result && !result.complete) {
+      console.error("[test] captured output is incomplete; collected output is shown above.");
+      if (exitCode === 0) exitCode = 1;
+    }
+    if (exitCode === null) return { exitCode: 124, output };
     if (interrupted === "SIGINT") return { exitCode: 130, output };
     if (interrupted === "SIGTERM") return { exitCode: 143, output };
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -455,7 +533,7 @@ async function runTestLane(
 
 /**
  * `gui` is not a workspace of the root package and declares React only in `gui/package.json`, so a
- * root `bun install` never creates `gui/node_modules`. Twenty-five files under `tests/` import
+ * root `bun install` never creates `gui/node_modules`. Twenty-six files under `tests/` import
  * modules from `gui/src`, which makes those tests fail on a fresh clone or worktree with
  * `Cannot find package 'react'` — reported as an "Unhandled error between tests" that names no
  * test, so the cause is not obvious from the output.

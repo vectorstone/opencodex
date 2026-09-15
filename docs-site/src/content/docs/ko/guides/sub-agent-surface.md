@@ -56,7 +56,9 @@ v2 로스터의 경우 적합성은 세 가지 상태로 나뉩니다. `"v2"`로
 
 내장 v2 가이드는 700자 예산을 가집니다. 이 한도를 넘기면 opencodex는 핵심 스폰 지시를 자르는 대신 로스터를 먼저 제거합니다. 내장 가이드는 선호 모델, 적합한 로스터 또는 폴백 체인이 해석될 때만 발화합니다. 사용자 정의 프롬프트는 `injectionModel`만 설정되어 있어도 발화하며, 선택자가 없는 값을 하나로 해석할 수 없으면 `{{model}}`은 빈 문자열로 치환됩니다.
 
-v1에서는 opencodex가 `max` 또는 `ultra` 추론 강도에서만 업스트림 스타일의 능동 위임 가이드만 주입합니다. v1에는 선호 모델, 로스터, 폴백 목록, 사용자 정의 프롬프트를 추가하지 않습니다.
+v1에서는 opencodex가 `max` 또는 `ultra` 추론 강도에서만 v2 권장 프리셋과 같은 능동 위임 가이드를 주입합니다.
+별도의 위임 요청이 필요하지 않도록 시작 조건만 바꾸며, 사용자 지시와 권한·작업 범위·협업 도구 규칙은 계속 적용됩니다.
+v1에는 선호 모델, 로스터, 폴백 목록, 사용자 정의 프롬프트를 추가하지 않습니다.
 
 기본값이 꺼진 `syncCodexSubagentDefaults` 옵션은 가이드와 별개입니다. opencodex가 활성 Codex 라우팅을 소유하는 경우, 동기화나 재시작 시 선택한 값을 Codex TOML의 표식이 붙은 `[agents] default_subagent_model` 및 `default_subagent_reasoning_effort` 항목으로 쓸 수 있습니다. opencodex는 자신이 붙인 표식이 있는 필드만 갱신하거나 제거합니다. 대상 필드 중 하나라도 사용자 소유라면 부분 쓰기는 하지 않고 쌍을 그대로 둡니다. 애매한 TOML은 쓰기 없이 거부합니다. 외부 프로바이더 관리자와 사용자 소유 루트 라우팅도 여전히 최종 권한을 가집니다.
 
@@ -72,7 +74,7 @@ v1에서는 opencodex가 `max` 또는 `ultra` 추론 강도에서만 업스트�
 
 중복 모델 id는 첫 번째 출현을 유지한 채 제거합니다. 선택 과정에서 opencodex는 비활성화된 후보, 라우팅 불가 후보, 비활성화된 프로바이더가 받쳐주는 후보, unhealthy로 표시된 후보, cooldown 중인 후보, 사용할 수 있는 pooled Codex 계정이 없는 후보, 또는 설정된 quota 임계치를 넘는 후보를 건너뜁니다. 가용성 프로브는 기본값 60초인 `subagentModelFallbackPollMs` 동안 캐시됩니다.
 
-폴백이 호환되지 않는 암호화 작업을 읽을 수 있게 만들어 주지는 않습니다. 자식 작업이 ChatGPT용으로 암호화되어 있으면, 체인 앞쪽에 외부 모델이 있더라도 선택은 정규 네이티브 ChatGPT 대상만 허용됩니다.
+폴백이 호환되지 않는 암호화 작업을 읽을 수 있게 만들어 주지는 않습니다. 자식 작업이 ChatGPT용으로 암호화되어 있으면, 체인 앞쪽에 다른 외부 모델이 있더라도 정규 네이티브 ChatGPT 대상과 `allowEncryptedV2AgentTasks: true`로 명시적으로 신뢰한 직접 키 인증 Responses 라우트만 선택합니다. 콤보는 계속 정규 네이티브 대상만 사용합니다.
 
 ## 암호화된 v2 작업 전달
 
@@ -80,7 +82,7 @@ Codex는 v2 네이티브→라우팅 자식 작업을 백엔드 암호화된 `en
 
 opencodex는 읽을 수 없거나 빈 작업을 그대로 넘기지 않고 안전하게 실패합니다.
 
-- 비네이티브 직접 라우팅은 HTTP 400과 `error.code = "unreadable_encrypted_agent_task"`를 반환하며, 암호문을 에코하지 않습니다.
+- 비네이티브 직접 라우팅은 키 인증 Responses 프로바이더가 `allowEncryptedV2AgentTasks: true`로 명시적으로 허용한 경우가 아니면 HTTP 400과 `error.code = "unreadable_encrypted_agent_task"`를 반환하며, 암호문을 에코하지 않습니다.
 - 콤보는 해당 작업에 대해 재시도를 포함해 정규 네이티브 ChatGPT 대상만 고려합니다. 사용할 수 있는 대상이 없으면 같은 400 오류를 반환합니다.
 - 읽을 수 있는 평문 작업은 정상 라우트와 폴백 동작을 그대로 유지합니다.
 
@@ -115,7 +117,7 @@ ocx v2 threads 8
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
-ocx agent fallback set gpt-5.4-mini,xai/grok-4.5 --poll-ms 60000
+ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx agent effort set --subagent max
 ```
 

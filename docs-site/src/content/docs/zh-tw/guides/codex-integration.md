@@ -201,6 +201,12 @@ metadata，使用 Codex 的 `low | medium | high | xhigh | max | ultra` 檔位�
 歷史編碼成上游 function tool，再於 Codex 看見前將串流 function-call lifecycle 還原成
 `custom_tool_call`。原生 OpenAI forward 路由與受支援的 `apply_patch` custom tool 維持不變。
 
+路由的 code-mode 回合也會在首次呼叫前收到主機對巢狀輔助工具的規則：`tools.apply_patch`
+接收一個字串，開頭與結尾必須是沒有額外包裝的獨立補丁標記行；isolate 中沒有 `import`，長時間執行的
+命令透過 `write_stdin` 輪詢。如果原生路由 Responses、Kiro 或 Cursor 路徑上的 code-mode exec
+結果仍包含主機的某則失敗訊息，opencodex 會附加一行提示，指出對應規則。這項變更不會重寫模型的
+程式碼或補丁文字。
+
 所選 provider 必須支援 function/tool calling。不支援 tool call 的純文字 provider 無法使用 `exec`、
 Browser 或 Computer Use。原生 OpenAI 列保留上游 tool mode 不變。
 
@@ -266,16 +272,21 @@ OpenCodex 直接注入路由，請先將 Codex 切回內建 `openai` provider，
    已發現模型。不在 allowlist 中的 id 永遠不會進入目錄。
 2. **`disabledModels`（頂層）**：會同時從目錄與 `/v1/models` 隱藏模型，並把裸原生 GPT slug 設為
    `visibility: "hide"`。
-3. **`liveModels: false` 且 `models` 為空**：當即時探索關閉，且 `models` 為空或省略時，opencodex
-   不會為該 provider 暴露任何路由模型。
+3. **`liveModels: false`** — `liveModels: false` 時，若 `models` 為空或省略，初始列表先加入已設定的 `defaultModel`，
+   再加入 `retainModels`，重複 ID 僅保留首次出現的位置。若明確設定了非空 `models`，則按
+   `models`、`retainModels` 順序建立，不會自動加入另一個 `defaultModel`；仍可將該模型明確寫入
+   `models` 或 `retainModels`。這些欄位均未提供 ID 時，初始列表為空。此順序不保證最終選擇器的顯示順序。
+   `selectedModels`、`disabledModels` 與供應商停用規則仍然適用。`authMode: "forward"` 保留原有獨立分支，
+   不使用此靜態路由列表。這些規則不改變即時探索失敗時的後備行為。
 4. **Cursor `GetUsableModels`**：Cursor adapter 透過 protobuf `GetUsableModels` RPC 探索模型，而不是
    `/models`，所以 Cursor 端變更可獨立改變可見 id。
 5. **cache 與 `ocx sync`**：即時目錄約快取五分鐘（`modelCacheTtlMs`，預設 `300000`）。執行
    `ocx sync` 可強制重新抓取並立即重寫目錄。
 6. **正在執行的 Codex `app-server`**：長時間執行的 Codex `app-server`（Desktop／CLI 背景 host）可能
    仍在記憶體保留舊列表，因此只重寫磁碟目錄還不夠。`ocx sync` 與 `ocx sync-cache` 偵測到這些
-   process 時會警告。可執行 `ocx sync --restart-codex` 重新啟動，或自行停止對應的 `app-server`
-   process，再讓 Codex 重新建立它們，讓新列表出現。
+   process 時會警告。`ocx sync --restart-codex` 會重啟這些 process，並在 macOS、Linux 與 Windows
+   上完全結束再重新啟動 Codex 桌面應用程式，讓選擇器重新讀取目錄。若要讓桌面應用程式繼續執行，請傳入
+   `--restart-app-server-only`，或自行停止對應的 `app-server` process。
 
 :::caution[其他本機寫入者]
 目錄寫入（`opencodex-catalog.json`、`config.toml`）在 opencodex **內部**是原子的；這只避免兩個
@@ -309,18 +320,36 @@ ocx service install    # 常駐：登入時自動啟動，崩潰後自動重新�
 
 ## Codex 帳號預熱
 
-向 Codex 帳號池新增 ChatGPT 帳號時，opencodex 會先用一個小型 streaming 請求向 Codex Responses
-backend 驗證，成功後才持久化。請求使用真正的 Responses item 陣列
-（`input: [{ type: "message", ... }]`），等待 `response.completed`，預設模型為 `gpt-5.4-mini`。若該
-模型回傳 HTTP 400，則改用 `gpt-5.5` 重試；結構化上游錯誤細節會呈現給使用者，但不暴露原始 response
-body。背景重新驗證是獨立功能，預設關閉；只有啟用 Token Guardian、將 `chatgpt` refresh policy 設為
-`proactive`，並把 `tokenGuardian.codexWarmupEnabled` 設為 true 時才會執行。
+新增或重新驗證帳號時，通常會在儲存前傳送小型模型請求並等待 `response.completed`。預設使用 `gpt-5.6-luna`，HTTP 400 或 HTTP 404 時改用 `gpt-5.5` 重試。公開錯誤僅包含固定分類，不包含原始回應本文。
 
+若新 OAuth 憑證的已驗證用量查詢確認5小時、每週或每月額度耗盡，則不呼叫模型而直接儲存帳號，顯示**等待驗證**。重新啟動或更新權杖也不會使其可用。額度恢復後重新整理額度：只有完整的最新用量顯示有餘額，才會傳送小型驗證請求；請求完成後帳號才可用於路由。查詢或驗證失敗將保留等待狀態。一般狀態輪詢不會傳送該請求。首次註冊時用量未知仍需一般預熱驗證。
+
+`ocx account refresh openai` 和 `ocx account list openai --quota --refresh` 僅查詢用量。模型驗證會消耗配額，因此需要使用者的儀表板工作階段：配額恢復後，開啟 `ocx gui` 並點選 **Refresh quotas**。無介面主機也需要透過瀏覽器存取其儀表板；僅憑管理員權杖無法授權驗證。暫停的帳號可以完成驗證，但不會因此恢復或被選取。模型授權錯誤會持續顯示，直到驗證或重新登入成功。
+
+背景重新驗證是獨立功能，預設關閉。它需要 Token Guardian、`openai` 的 `proactive` 更新政策及 `tokenGuardian.codexWarmupEnabled`，並略過等待註冊驗證的帳號。
+
+### 帳號停止處理請求的原因
+
+帳號退出帳號池選擇時，原因會隨判定一起傳遞，而不是為了顯示重新計算，因此介面不會在路由已排除該帳號時仍顯示正常。`GET /api/codex-auth/accounts` 會在每個帳號的 `needsReauth` 旁回傳 `reauthReason`：從未儲存憑證為 `missing_credential`，更新持續失敗為 `refresh_failed`，用量查詢本身遭拒為 `quota_unauthorized`。
+
+主帳號更新未完成時仍回傳帶 `Retry-After` 的 `503`，因為重試仍可能成功。訊息現在補充說明：若持續失敗，代表主帳號需要重新認證，而不只是再試一次。
+
+### 讓降級的帳號退出輪換
+
+`codexPool.excludedPlans` 列出自動帳號池選擇要略過的方案鍵，與每個帳號上儲存的方案不分大小寫比對。預設不存在，因此既有安裝的輪換完全不變。
+
+```bash
+ocx config set codexPool '{"excludedPlans":["free"]}'
+```
+
+這是選擇策略，不是封鎖。被排除的帳號保留憑證、用量紀錄與執行緒親和性，仍顯示在帳號清單中，也仍可透過 `work/gpt-5.5` 這類明確選擇使用。改變的只是自動輪換不再挑它，包括它已經是使用中帳號或已綁定執行緒的情況——訂閱到期後留下的正是這種狀態。
+
+主 Codex 帳號不受方案排除策略影響；僅選擇模式不會讀取受保護的原生憑證。如果所有可用的池帳號都被排除，自動選取不會回傳帳號。明確指定帳號的路由仍可使用，並繼續檢查暫停、認證及模型權限。帳號卡片與 CLI 將被排除的路由方案與憑證健康狀態分開顯示。方案沒有全序關係，因此不提供 `minimumPlan` 設定。
 ## 恢復原生 Codex
 
-opencodex 絕不會把你困住。**`ocx stop` 是完整恢復原生 Codex 的單一命令**。它會停止 proxy、停止
-背景服務（若已安裝），並移除所有注入行與路由目錄條目，讓普通的 `codex` 就像從未安裝 opencodex 一樣
-運作：
+`ocx stop` 會停止 proxy 與已安裝的背景服務，然後嘗試恢復原生 Codex。OpenCodex 只移除能確認歸屬的路由設定；若無法安全恢復設定檔，會回報恢復未完成。
+
+若目前的 config 或 profile 與儲存的原始內容不同，且日誌缺少該檔案注入狀態的雜湊值，自動快照恢復會保留兩個檔案及日誌，不做修改。已與原始內容相同的檔案不會重新寫入。對已路由設定再次注入時，也會拒絕使用這種未確認的基準；原生設定可以建立新的快照。詳見[恢復規則](/guides/codex-integration/#recovery-without-injection-hashes)。
 
 ```bash
 ocx stop       # 停止 proxy + service，恢復原生 Codex
@@ -331,3 +360,9 @@ ocx restore back # 讓普通 Codex 再次指向仍在執行的 proxy
 當 opencodex 作為受管的 [背景服務](/zh-tw/reference/cli/#ocx-service) 執行時，會設定 `OCX_SERVICE=1`，
 因此 service 驅動的 restart **不會**反覆改寫 Codex 設定；只有明確執行 `ocx stop` 或
 `ocx service stop` 才會恢復原生 Codex。
+
+## 分頁歷史記錄安全拒絕
+
+如果受影響的歷史儲存區支援分頁，提供者切換可能傳回 `history_paginated_requires_native_writer`。此原因不再拒絕寫入 Codex 設定、參考設定檔與模型目錄。`ocx sync` 與 `ocx start` 仍會寫入這些檔案並設定 `model_catalog_json`，因此 Codex 模型選擇器會繼續顯示所有經 OpenCodex 路由的模型。只有這一條原因會讓對話歷史的重新標記停手，因為分頁歷史序號由 Codex 自己的寫入器分配，重試也不會改變。無法讀取的狀態資料庫、身分已變的歷史檔案、未能執行的預檢等其他歷史預檢原因仍會拒絕整個切換並回復，因為那些情況以後可能成功。在此狀態下，OpenCodex 不會修改分頁歷史檔案或執行緒列。既有對話保留已標記的提供者，不會被遷移；新對話仍正常經代理路由。重新標記停手時，家目錄裡既有的 `[model_providers.opencodex]` 表會保留而不是撤下，即便是 root-override（loopback）形式也一樣，這樣列上標記為 `opencodex` 的對話仍能對應到還存在的提供者 id。可遷移儲存區中的 legacy 記錄也適用。CLI 會印出 `Codex resume history: left to Codex's native writer (history_paginated_requires_native_writer)`。`ocx restore` 與移除 Codex 設定仍會因 `history_paginated_requires_native_writer` 被拒絕。執行緒列仍在參照時撤掉 `[model_providers.opencodex]` 定義會使這些對話無法解析，而復原路徑沒有辦法留下相容提供者表。已經分頁的家目錄目前無法透過產品解除安裝；這是已知的未完成工作，而非預期行為。
+
+請勿改寫使用中的分頁歷史檔案或執行緒列來自行遷移這些對話。復原前關閉相關對話，只回報確切錯誤與版本，不要公開私人歷史。備份或指令碼成功不能證明顯示已復原；重新開啟 Codex 後確認對話。

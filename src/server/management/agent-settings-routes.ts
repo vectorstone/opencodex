@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { CatalogModel } from "../../codex/catalog";
-import { catalogModelSlug, invalidateCodexModelsCache, nativeContextLimits, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
+import { catalogModelSlug, filterCatalogVisibleModels, invalidateCodexModelsCache, nativeContextLimits, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
+import { mergeModelPinnedEfforts, modelPinnedEffortsConfigError } from "../../config/provider-validation";
+import { MULTI_AGENT_SURFACE_ADVISORY_VERSION, multiAgentSurfaceAdvisory, resolveMultiAgentMode } from "../../config/multi-agent-surface";
+import { captureConfigTopLevelRollback, parsedConfigRebaseDeletionKeys, projectConfigRebaseProvenance } from "../../config/rebase-provenance";
 import {
   DEFAULT_SUBAGENT_MODELS,
   codexAutoStartEnabled,
@@ -15,6 +18,7 @@ import {
   providerHeadersConfigError,
   saveConfigPreservingClaudeCode,
   subagentDefaultSyncEffective,
+  validateConfigCandidate,
 } from "../../config";
 import {
   clearLoginState,
@@ -37,6 +41,7 @@ import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
 import { resolveCodexHomeDir } from "../../codex/home";
+import { MULTI_AGENT_MODE_HINT_RECOMMENDATION } from "../../codex/multi-agent-mode-policy";
 import { readUsageEntries } from "../../usage/log";
 import { getUsageDebugLogEntries } from "../../usage/debug";
 import { parseRange, parseUsageSurface, summarizeUsage } from "../../usage/summary";
@@ -70,7 +75,7 @@ import type { PersistedUsageAttempt } from "../../usage/log";
 import { isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "../auth-cors";
 import { applySystemEnvToggle } from "../system-env";
 
-import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchAllModels, fetchGrokCandidateModels, buildClaudeDesktopState } from "./shared";
+import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchInitializedModels as fetchAllModels, fetchGrokCandidateModels, buildClaudeDesktopState } from "./shared";
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
 import { readManagementJsonBody, readOptionalManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 
@@ -239,12 +244,16 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       enabled,
       agentsMaxThreadsConflict: enabled && hasAgentsMaxThreads(),
       maxConcurrentThreadsPerSession: getLogicalMaxThreads(),
-      multiAgentMode: config.multiAgentMode ?? "default",
+      // Resolved, not raw: a hand-edited unsupported value survives config parsing, and the
+      // advisory below already reports the resolved surface. Two answers would disagree.
+      multiAgentMode: resolveMultiAgentMode(config),
+      multiAgentSurfaceAdvisory: multiAgentSurfaceAdvisory(config),
       keepNativeChatGptOnV1: config.keepNativeChatGptOnV1 === true,
       agentsEnabled: getAgentsEnabled(),
       agentsMaxDepth: getAgentsMaxDepth(),
       subagentDeveloperInstructions: getSubagentDeveloperInstructions(),
       multiAgentModeHintText: getMultiAgentModeHintText(),
+      multiAgentModeHintRecommendation: MULTI_AGENT_MODE_HINT_RECOMMENDATION,
       // max_depth is V1-only upstream; this is the global-flag statement, derived
       // server-side so no client can present it as an effective V2 limit.
       agentsMaxDepthAppliesWhenV2Disabled: !enabled,
@@ -260,6 +269,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       agentsMaxDepth?: unknown;
       subagentDeveloperInstructions?: unknown;
       multiAgentModeHintText?: unknown;
+      multiAgentSurfaceAdvisoryAcknowledged?: unknown;
     };
     try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     const wantsFlag = body.enabled !== undefined;
@@ -270,8 +280,9 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     const wantsMaxDepth = body.agentsMaxDepth !== undefined;
     const wantsSubagentInstructions = body.subagentDeveloperInstructions !== undefined;
     const wantsModeHintText = body.multiAgentModeHintText !== undefined;
-    if (!wantsFlag && !wantsThreads && !wantsMode && !wantsKeepNative && !wantsAgentsEnabled && !wantsMaxDepth && !wantsSubagentInstructions && !wantsModeHintText) {
-      return jsonResponse({ error: "body must set enabled, multiAgentMode, keepNativeChatGptOnV1, maxConcurrentThreadsPerSession, agentsEnabled, agentsMaxDepth, subagentDeveloperInstructions, and/or multiAgentModeHintText" }, 400);
+    const wantsAdvisoryAck = body.multiAgentSurfaceAdvisoryAcknowledged !== undefined;
+    if (!wantsFlag && !wantsThreads && !wantsMode && !wantsKeepNative && !wantsAgentsEnabled && !wantsMaxDepth && !wantsSubagentInstructions && !wantsModeHintText && !wantsAdvisoryAck) {
+      return jsonResponse({ error: "body must set enabled, multiAgentMode, keepNativeChatGptOnV1, maxConcurrentThreadsPerSession, agentsEnabled, agentsMaxDepth, subagentDeveloperInstructions, multiAgentModeHintText, and/or multiAgentSurfaceAdvisoryAcknowledged" }, 400);
     }
     if (wantsFlag && typeof body.enabled !== "boolean") return jsonResponse({ error: "body.enabled must be a boolean" }, 400);
     if (wantsMode && body.multiAgentMode !== "v1" && body.multiAgentMode !== "default" && body.multiAgentMode !== "v2") {
@@ -305,6 +316,11 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     if (wantsModeHintText && body.multiAgentModeHintText !== null
         && (typeof body.multiAgentModeHintText !== "string" || body.multiAgentModeHintText.trim().length === 0)) {
       return jsonResponse({ error: "body.multiAgentModeHintText must be a non-empty string or null" }, 400);
+    }
+    // A boolean, and only `true` acknowledges. `false` is an explicit no-op so a client
+    // that always sends the field cannot un-answer an advisory it already dismissed.
+    if (wantsAdvisoryAck && typeof body.multiAgentSurfaceAdvisoryAcknowledged !== "boolean") {
+      return jsonResponse({ error: "body.multiAgentSurfaceAdvisoryAcknowledged must be a boolean" }, 400);
     }
     const mode = wantsMode ? body.multiAgentMode as "v1" | "default" | "v2" : undefined;
     const effectiveMode = mode ?? config.multiAgentMode ?? "default";
@@ -373,11 +389,20 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
           : "keepNativeChatGptOnV1 is stored but inactive until multi-agent mode is v2. Applies to new sessions.")
         : "ChatGPT-native models follow the selected v1/v2/base surface. Applies to new sessions.");
     }
+    // Written after the mode, so a landed acknowledgement implies the mode write it was
+    // sent with already landed. The converse does not hold: this writer throws rather than
+    // reporting, exactly as the mode write above it does, so a failure here surfaces the
+    // mode change with the advisory still raised. That is the benign direction — the
+    // operator is asked again — and it is why this is not claimed as a transaction.
+    if (wantsAdvisoryAck && body.multiAgentSurfaceAdvisoryAcknowledged === true) {
+      config.multiAgentSurfaceAdvisoryVersion = MULTI_AGENT_SURFACE_ADVISORY_VERSION;
+      saveConfigPreservingClaudeCode(config);
+    }
     // New-key scalar writes: each writer is individually atomic, so apply them in
     // sequence after the transition. A failure here is a persistence failure (the
     // writers' ok:false result or a throw from the underlying atomic write helper),
     // reported as 502 naming the failed key plus the writes that already landed.
-    // NOTE: do not name that helper literally here — tests/grok-writer-boundary.test.ts
+    // NOTE: do not name that helper literally here — tests/providers/xai/grok-writer-boundary.test.ts
     // asserts this route file contains no direct write primitive, and matches on the
     // symbol name even inside a comment.
     const scalarWrites: Array<{ field: string; run: () => { ok: true; changed: boolean } | { ok: false; error: string } }> = [];
@@ -412,12 +437,14 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       enabled,
       agentsMaxThreadsConflict: enabled && hasAgentsMaxThreads(),
       maxConcurrentThreadsPerSession: getLogicalMaxThreads(),
-      multiAgentMode: config.multiAgentMode ?? "default",
+      multiAgentMode: resolveMultiAgentMode(config),
+      multiAgentSurfaceAdvisory: multiAgentSurfaceAdvisory(config),
       keepNativeChatGptOnV1: config.keepNativeChatGptOnV1 === true,
       agentsEnabled: getAgentsEnabled(),
       agentsMaxDepth: getAgentsMaxDepth(),
       subagentDeveloperInstructions: getSubagentDeveloperInstructions(),
       multiAgentModeHintText: getMultiAgentModeHintText(),
+      multiAgentModeHintRecommendation: MULTI_AGENT_MODE_HINT_RECOMMENDATION,
       agentsMaxDepthAppliesWhenV2Disabled: !enabled,
       warnings,
       catalogRefresh,
@@ -602,30 +629,69 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     return jsonResponse({
       effortCap: config.effortCap ?? null,
       subagentEffortCap: config.subagentEffortCap ?? null,
+      modelPinnedEfforts: config.modelPinnedEfforts ?? {},
       efforts: CODEX_REASONING_LEVELS.map(l => l.effort),
     });
   }
   if (url.pathname === "/api/effort-caps" && req.method === "PUT") {
-    let body: { effortCap?: unknown; subagentEffortCap?: unknown };
+    let body: unknown;
     try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
-    const { isCodexReasoningEffort } = await import("../../reasoning-effort");
-    for (const key of ["effortCap", "subagentEffortCap"] as const) {
-      if (!(key in body)) continue;
-      const value = body[key];
-      if (value === null || value === "") { deleteConfigTopLevelKey(config, key); continue; }
-      if (typeof value !== "string" || !isCodexReasoningEffort(value)) {
-        return jsonResponse({ error: `unknown reasoning effort "${String(value)}"` }, 400);
-      }
-      config[key] = value;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return jsonResponse({ error: "effort caps body must be a plain object" }, 400);
     }
-    saveConfigPreservingClaudeCode(config);
-    return jsonResponse({ ok: true, effortCap: config.effortCap ?? null, subagentEffortCap: config.subagentEffortCap ?? null });
+    const patch = body as Record<string, unknown>;
+    const { isCodexReasoningEffort } = await import("../../reasoning-effort");
+    const draft = { ...projectConfigRebaseProvenance(config) };
+    const touched: (keyof OcxConfig)[] = [];
+    for (const key of ["effortCap", "subagentEffortCap"] as const) {
+      if (!Object.hasOwn(patch, key)) continue;
+      const value = patch[key];
+      if (value === null || value === "") deleteConfigTopLevelKey(draft, key);
+      else if (typeof value === "string" && isCodexReasoningEffort(value)) draft[key] = value;
+      else return jsonResponse({ error: "caps must be valid reasoning efforts or null" }, 400);
+      touched.push(key);
+    }
+    if (Object.hasOwn(patch, "modelPinnedEfforts")) {
+      const error = modelPinnedEffortsConfigError(patch.modelPinnedEfforts, "modelPinnedEfforts", true);
+      if (error) return jsonResponse({ error }, 400);
+      const pins = mergeModelPinnedEfforts(config.modelPinnedEfforts, patch.modelPinnedEfforts);
+      if (pins) draft.modelPinnedEfforts = pins;
+      else deleteConfigTopLevelKey(draft, "modelPinnedEfforts");
+      touched.push("modelPinnedEfforts");
+    }
+    const validation = validateConfigCandidate(draft);
+    if (!validation.ok) return jsonResponse({ error: validation.error }, 400);
+    if (touched.some(key => !Object.hasOwn(draft, key)) && config.configRebaseProvenance !== undefined
+      && parsedConfigRebaseDeletionKeys(config) === null) {
+      return jsonResponse({ error: "unsupported config deletion provenance" }, 409);
+    }
+    const projected = projectConfigRebaseProvenance(draft);
+    touched.push("configRebaseProvenance");
+    const rollback = captureConfigTopLevelRollback(config, touched);
+    try {
+      for (const key of touched) {
+        if (Object.hasOwn(projected, key)) Object.defineProperty(config, key, {
+          value: projected[key], writable: true, enumerable: true, configurable: true,
+        });
+        else deleteConfigTopLevelKey(config, key);
+      }
+      (deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode)(config);
+    } catch (error) {
+      rollback();
+      throw error;
+    }
+    return jsonResponse({
+      ok: true,
+      effortCap: config.effortCap ?? null,
+      subagentEffortCap: config.subagentEffortCap ?? null,
+      ...(config.modelPinnedEfforts ? { modelPinnedEfforts: config.modelPinnedEfforts } : {}),
+    });
   }
 
-  // Subagent model picker: which ≤5 routed models Codex's spawn_agent advertises (it shows the
-  // first 5 routed catalog entries). PUT reorders the injected catalog so the chosen ones lead.
+  // Featured roster and saved picker order are separate settings. Native Codex advertises
+  // the first five eligible visible rows by display priority; OCX guidance uses natural ranks.
   if (url.pathname === "/api/subagent-models" && req.method === "GET") {
-    const models = await fetchAllModels(config);
+    const models = await (deps.fetchAllModels ?? fetchAllModels)(config);
     const disabled = new Set(config.disabledModels ?? []);
     // Native gpt (passthrough) are also valid subagent picks — they're picker-visible models in the
     // catalog, just buried by priority. List them first so the user can feature them over routed.
@@ -657,19 +723,105 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     // in-memory catalog than the one on disk.
     const { collectCodexAppServerCatalogState } = await import("../../codex/app-server-processes");
     const catalogState = collectCodexAppServerCatalogState();
-    return jsonResponse({ chosen, available, catalogState });
+    return jsonResponse({
+      chosen, available, catalogState,
+      pickerAvailable: [...new Set(filterCatalogVisibleModels(models, config).map(catalogModelSlug).filter(slug => slug.includes("/")))],
+      pickerOrder: config.modelPickerOrder ?? [],
+      pickerOrderMode: config.modelPickerOrderMode ?? null,
+    });
   }
   if (url.pathname === "/api/subagent-models" && req.method === "PUT") {
-    let body: { models?: unknown };
-    try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
-    const chosen = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === "string").slice(0, 5) : [];
-    config.subagentModels = chosen;
-    const { saveConfigPreservingClaudeCode: save } = await import("../../config");
-    save(config);
+    let rawBody: unknown;
+    try { rawBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(rawBody)) return jsonResponse({ error: "JSON body must be an object" }, 400);
+    const body = rawBody as { models?: unknown; pickerOrder?: unknown; pickerOrderMode?: unknown };
+    const updatesRoster = body.models !== undefined;
+    const updatesPicker = body.pickerOrder !== undefined;
+    if (!updatesRoster && !updatesPicker) return jsonResponse({ error: "models or pickerOrder is required" }, 400);
+    let chosen: string[] | undefined;
+    if (updatesRoster) {
+      if (!Array.isArray(body.models) || body.models.some(model => typeof model !== "string")) {
+        return jsonResponse({ error: "models must be an array of strings" }, 400);
+      }
+      // Keep the original valid roster contract: no discovery validation, trimming or deduping.
+      chosen = body.models.slice(0, 5);
+    }
+    const mode = body.pickerOrderMode;
+    if (mode !== undefined && (!updatesPicker || (mode !== null
+      && mode !== "alphabetical" && mode !== "provider" && mode !== "most-used"))) {
+      return jsonResponse({ error: "pickerOrderMode requires pickerOrder and must be alphabetical, provider, most-used, or null" }, 400);
+    }
+    let pickerOrder: string[] | undefined;
+    if (updatesPicker) {
+      if (body.pickerOrder !== null && (!Array.isArray(body.pickerOrder)
+        || body.pickerOrder.some(model => typeof model !== "string" || model.trim() === ""))) {
+        return jsonResponse({ error: "pickerOrder must be an array of non-empty routed model ids, or null" }, 400);
+      }
+      pickerOrder = body.pickerOrder === null ? [] : (body.pickerOrder as string[]).map(model => model.trim());
+      if (new Set(pickerOrder).size !== pickerOrder.length) {
+        return jsonResponse({ error: "pickerOrder must not contain duplicate ids" }, 400);
+      }
+      if (pickerOrder.length > 0) {
+        const models = await (deps.fetchAllModels ?? fetchAllModels)(config);
+        // Evaluate visibility AFTER discovery: a concurrent visibility write may have completed.
+        const visible = new Set(filterCatalogVisibleModels(models, config).map(catalogModelSlug).filter(slug => slug.includes("/")));
+        if (pickerOrder.some(model => !visible.has(model))) {
+          return jsonResponse({ error: "pickerOrder must contain each visible routed model at most once" }, 400);
+        }
+      }
+    }
+
+    // Everything above can await. From this snapshot through persistence there is no yield.
+    // Stage deletion intent before adopting the touched fields through the canonical
+    // live deletion owner. A failed save restores both fields and pending intent.
+    if (updatesPicker && config.configRebaseProvenance !== undefined
+      && parsedConfigRebaseDeletionKeys(config) === null) {
+      // A newer provenance format must not silently discard this clear's intent on rebase.
+      return jsonResponse({ error: "unsupported config deletion provenance" }, 409);
+    }
+    const draft = { ...projectConfigRebaseProvenance(config) };
+    if (chosen !== undefined) draft.subagentModels = chosen;
+    if (pickerOrder !== undefined) {
+      if (pickerOrder.length === 0) {
+        deleteConfigTopLevelKey(draft, "modelPickerOrder");
+        deleteConfigTopLevelKey(draft, "modelPickerOrderMode");
+      } else {
+        draft.modelPickerOrder = pickerOrder;
+        if (mode === "alphabetical" || mode === "provider" || mode === "most-used") draft.modelPickerOrderMode = mode;
+        else deleteConfigTopLevelKey(draft, "modelPickerOrderMode");
+      }
+    }
+    const projected = projectConfigRebaseProvenance(draft);
+    const touched = [
+      ...(updatesRoster ? ["subagentModels" as const] : []),
+      ...(updatesPicker ? ["modelPickerOrder" as const, "modelPickerOrderMode" as const] : []),
+      "configRebaseProvenance" as const,
+    ];
+    const rollback = captureConfigTopLevelRollback(config, touched);
+    try {
+      for (const key of touched) {
+        if (Object.hasOwn(projected, key)) Object.defineProperty(config, key, {
+          value: projected[key], writable: true, enumerable: true, configurable: true,
+        });
+        else deleteConfigTopLevelKey(config, key);
+      }
+      (deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode)(config);
+    } catch (error) {
+      rollback();
+      throw error;
+    }
+    // Capture the result before convergence yields to another settings mutation.
+    const saved = {
+      applied: [...(config.subagentModels ?? [])],
+      pickerOrder: [...(config.modelPickerOrder ?? [])],
+      pickerOrderMode: config.modelPickerOrderMode ?? null,
+    };
     const catalogRefresh = await convergeCodexCatalog();
-    await syncClaudeAgentDefsBestEffort();
-    await autoApplyDesktopBestEffort();
-    return jsonResponse({ ok: true, applied: chosen, catalogRefresh });
+    if (updatesRoster) {
+      await syncClaudeAgentDefsBestEffort();
+      await autoApplyDesktopBestEffort();
+    }
+    return jsonResponse({ ok: true, ...saved, catalogRefresh });
   }
 
   // Priority-ordered subagent model fallback chain for quota-aware spawn routing.
@@ -817,10 +969,16 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       const { parseDesktopProfile, reconcileDesktopProfile } = await import("../../claude/desktop-profile");
       const parsed = parseDesktopProfile(body.profile);
       const current = await buildClaudeDesktopState(config);
+      const availableRoutes = new Set(current.models.filter(item => item.available).map(item => item.route));
+      for (const route of Object.keys(parsed.assignments)) {
+        if (!current.profile.assignments[route] && !availableRoutes.has(route)) {
+          throw new Error(`현재 사용할 수 없는 모델은 추가할 수 없습니다: ${route}`);
+        }
+      }
       for (const model of current.models.filter(item => !item.available)) {
         const before = current.profile.assignments[model.route];
         const after = parsed.assignments[model.route];
-        if (JSON.stringify(before) !== JSON.stringify(after)) {
+        if (after !== undefined && JSON.stringify(before) !== JSON.stringify(after)) {
           throw new Error(`현재 사용할 수 없는 모델은 옮길 수 없습니다: ${model.route}`);
         }
       }

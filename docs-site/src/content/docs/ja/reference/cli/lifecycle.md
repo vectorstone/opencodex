@@ -40,6 +40,10 @@ ocx start --port 8080
 
 プロキシを停止せずに**ネイティブ Codex を復元します。挿入された設定行とルーティングされたカタログ エントリを削除し、プレーンな `codex` が再びネイティブに動作するようにします。 `eject` は `restore` の別名です。
 
+復元後のカタログでは、`gpt-5.3-codex-spark` など提供終了したネイティブモデルの bare ID と
+信頼済みのアカウント修飾エントリを除外します。バックアップの有無にかかわらず適用され、
+元のバックアップとユーザーが保存した過去のモデル選択設定は保持します。
+
 プロキシのライフサイクルを変更せずに、既に実行されているプロキシでプレーン `codex` を再指定するには、`back` をどちらかのスペルに渡します。
 
 ```bash
@@ -52,6 +56,10 @@ ocx eject back
 可逆バックアップ サポートが存在する前に Codex App 履歴を再マップした古い開発ビルドの明示的なリカバリ。履歴データベースがロックされている場合は、まず Codex を閉じてください。
 
 これは広範囲で破壊的な再ラベル付けです。ユーザーメッセージを持ち、現在 `opencodex` とタグ付けされているすべてのスレッドを `openai` に変更し、`exec` を `cli` に正規化してイベントマーカーを設定します。正当な専用プロバイダー履歴も対象です。状態をバックアップし、この全範囲を意図する場合にのみ実行してください。
+
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+ルーティングされたプロバイダーで圧縮されたタスクをネイティブ Codex で再開する前に、その履歴を修復します。このコマンドは UUID で 1 つのタスクだけを選択し、非公開のバイト単位バックアップを保存してから、OpenCodeX 所有の `ocx1:` 圧縮状態だけをネイティブ Codex が再生できる通常の要約に変換します。ネイティブの暗号化コンテンツと他のタスクは変更しません。実行前に対象タスクを閉じてください。処理中に rollout が変更された場合、ファイルを置き換えずに修復を中止します。
 
 ### `ocx uninstall`・`ocx remove`
 
@@ -140,21 +148,48 @@ ocx status --json
 
 ## カタログの同期
 
-### `ocx sync [--restart-codex]`
+### `ocx sync [--restart-codex] [--restart-app-server-only]`
 
 構成されているすべてのプロバイダーからライブ モデル リストを取得し、マージされたカタログを Codex に再挿入します。プロバイダーを追加した後、または利用可能なモデルを更新するために実行します。
 
-存続期間の長い Codex `app-server` プロセスがまだ実行されている場合、`ocx sync` は、`opencodex-catalog.json` / `models_cache.json` が更新されても、以前のメモリ内モデル リストを提供し続ける可能性があることを警告します。現在のユーザーが所有する一致する `codex … app-server` および `codex-code-mode-host` プロセスにのみ `SIGTERM` を送信するには、`--restart-codex` を渡します (アクティブなターンが中断される可能性があります)。広範な `pkill -f codex` 一致は意図的に回避されます。
+存続期間の長い Codex `app-server` プロセスがまだ実行されている場合、`ocx sync` は、`opencodex-catalog.json` / `models_cache.json` が更新されても、以前のメモリ内モデル リストを提供し続ける可能性があることを警告します。`--restart-codex` を渡すと、一致する `codex … app-server` および `codex-code-mode-host` プロセスを再起動し、さらに macOS、Linux、Windows で Codex デスクトップ アプリを完全に終了して再起動します。モデル ピッカーがカタログを読み直すためです。進行中の会話は終了します。広範な `pkill -f codex` 一致は意図的に回避されます。
 
-### `ocx sync-cache [--restart-codex]`
+`--restart-desktop-app` は `--restart-codex` の非推奨エイリアスです。引き続き動作し、非推奨の案内を出力し、Windows 専用ではありません。
 
-Codex のローカル モデル ピッカー キャッシュを無効にし、アクティブな opencodex カタログから再構築されるようにします。 `ocx sync` と同じ、古い `app-server` 警告とオプションの `--restart-codex` 動作が適用されます。
+`--restart-app-server-only` は以前の狭い動作を復元します。現在のユーザーが所有する一致する app-server / code-mode-host プロセスにのみ `SIGTERM` を送り、デスクトップ アプリは起動したままにします (アクティブなターンは中断される可能性があります)。`--restart-codex` または `--restart-desktop-app` と同時に指定した場合は狭い範囲が優先されます。進行中の会話を失うことは取り返しがつかず、古いピッカーはそうではないからです。
+
+コマンドを Codex アプリ内から実行すると、再起動は切り離されたヘルパーに引き渡され、このセッションはアプリとともに終了します。
+
+### `ocx sync-cache [--restart-codex] [--restart-app-server-only]`
+
+Codex のローカル モデル ピッカー キャッシュを無効にし、アクティブな opencodex カタログから再構築されるようにします。 `ocx sync` と同じ、古い `app-server` 警告とオプションの再起動フラグが適用されます。
+
+### `ocx catalog pull <https-url> [--auth-env <NAME>] [--json] [--restart-codex] [--restart-app-server-only]`
+
+別の OpenCodex インスタンスの `/v1/catalog` エンドポイントが提供する完全なカタログをインストール
+し、続いて `models_cache.json` を同期します。URL は HTTPS が必須で、HTTP はループバックのみ許可
+されます。URL 埋め込み資格情報、クエリ、フラグメント、リダイレクト、サイズ超過の応答、不正な
+カタログは、ローカル書き込みの前に拒否されます。認証は任意で、環境変数参照 (`--auth-env`) から
+のみ読み取られ、argv からは読み取られません。
+
+カタログとキャッシュは共有の Codex カタログロックの下で書き込まれ、失敗時は last-known-good の
+ファイルが保持されます。バイトが同一の場合は mtime を保持する no-op です。`--restart-codex`、
+`--restart-app-server-only`、非推奨エイリアス `--restart-desktop-app` は、実際の書き込みの後に
+のみ適用され、`ocx sync` および `ocx sync-cache` と同じ意味です。`ETag` 条件付きリクエストは
+このコマンドには含まれません。`--json` エンベロープと終了コードの詳細は
+[英語版リファレンス](/reference/cli/lifecycle/)を参照してください。
 
 ## バックグラウンドサービス
 
 ### `ocx service [install|repair|restart|start|stop|status|uninstall|remove]`
 
 opencodex を、ログイン時に自動起動し、クラッシュ時に自動再起動するログイン管理バックグラウンド サービス (macOS **launchd**、Linux **systemd ユーザー ユニット**、Windows **タスク スケジューラ**) として実行します。サービスは `OCX_SERVICE=1` を設定して実行されるため、再起動によって Codex 設定が変更されることはありません。
+
+Windows タスク スケジューラでインストールするサービスは、通常のプロセス優先度（`Priority=4`）を使用します。
+以前のバックグラウンド優先度（`7`。省略時もスケジューラの既定値は `7`）では、CPU の競合により
+ヘルスチェックへの応答が遅れ、プロセスが動作中でもトレイに Offline と表示されることがあります。
+アップグレード後に `ocx service repair` を実行すると、この登録済み優先度を移行してサービスを再起動します。
+移行時に UAC の承認が必要になる場合があります。すでに通常または高優先度の場合、優先度だけを理由に再登録しません。
 
 |サブコマンド |アクション |
 | --- | --- |
@@ -206,9 +241,27 @@ ocx codex-shim status
 ocx codex-shim uninstall
 ```
 
+:::note[Windows のトークン環境]
+新しく生成される Windows CMD と PowerShell のシムは、実行後に呼び出し元の `OPENCODEX_API_AUTH_TOKEN` を元の状態に戻します。Codex とその子プロセスには、引き続きトークンが継承される可能性があります。
+
+OpenCodex の更新後、既存の Windows シムにこの動作を適用するには、`ocx codex-shim uninstall`、続いて `ocx codex-shim install` を実行して再作成してください。通常の更新では、正常な Windows シムは書き換えられません。
+:::
+
 :::tip[サービス vs シム]
 常時オンのバックグラウンド プロキシには `ocx service` を使用します (推奨)。デーモンを使用しない軽量のオンデマンド起動には、`ocx codex-shim` を使用します。プロキシは、`codex` が起動された場合にのみ起動します。
 :::
+
+#### Codex へのトークン注入
+
+非ループバックアドレスにバインドする場合、注入されるプロバイダーには `env_key = "OPENCODEX_API_AUTH_TOKEN"` が含まれます。この行は、読み取る変数を Codex に指定するだけで、変数を作成するものではありません。変数が存在しない場合、Codex はリクエストの開始を拒否し（`Missing environment variable: OPENCODEX_API_AUTH_TOKEN`）、プロキシには到達しません。値は `$OPENCODEX_HOME/service-api-token` に保存されており、起動元のプロセスが Codex の環境にその値を渡す必要があります。
+
+`ocx codex-shim install` でインストールされる、保守対象のシムを使用してください。起動コンテキストでこのシムが選択されると、シムは OpenCodex が作成したトークンファイルを読み取り、変数を Codex に渡します。デスクトップ、cron、サービスから起動する場合は、このシムが選択される PATH またはランチャーパスを使用する必要があります。インストールによって、それらの環境が自動的に設定されるわけではありません。Codex 自身の子プロセスにも、トークンが継承される可能性があります。
+
+この Bearer トークンをシェルの起動ファイルからエクスポートしたり、`config.toml` にコピーしたりしないでください。`service-api-token` ファイルに含まれるのは `NAME=value` 形式の代入ではなくトークンそのものなので、systemd の `EnvironmentFile=` として直接使用することはできません。
+
+`opencodex-proxy.service` の `EnvironmentFile=` または `OCX_API_TOKEN_FILE` は、プロキシプロセスだけを設定するものであり、独立して起動された `codex exec` に渡されることはありません。
+
+ランチャーを置き換える Codex のアップグレードによって、シムは削除されます。次に通常の `ocx` コマンドを実行すると復元されますが（上記参照）、その前に実行された `codex exec` は失敗します。`ocx doctor` は、この状態（env_key が設定済み、変数が未設定、シムが存在しないか正常でない、トークンファイルは存在する）を修復コマンドとともに "Codex env_key launch readiness" の項目で報告し、トークンを表示することはありません。トークンファイルの読み取りは、注入された `env_key` の契約には含まれません。起動元のプロセスがその変数を渡す必要があります。
 
 ### `ocx tray <install|start|stop|status|uninstall|remove> [--json] [--no-start]`
 
@@ -218,7 +271,7 @@ Windows ステータス トレイ アイコンをインストールして制御�
 
 ### `ocx gui`
 
-`http://localhost:<port>` で [ウェブダッシュボード](/guides/web-dashboard/) を開き、プロキシが実行されていない場合は自動起動します。
+`http://localhost:<port>` で [ウェブダッシュボード](/guides/web-dashboard/) を開き、プロキシが実行されていない場合は自動起動します。ハブで管理イングレスが有効な場合は `http://127.0.0.1:<管理ポート>` を開きます。
 
 ## 更新
 

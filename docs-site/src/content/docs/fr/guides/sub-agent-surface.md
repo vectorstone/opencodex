@@ -84,8 +84,9 @@ lorsqu'un modèle préféré, une liste éligible ou une chaîne de secours est 
 est suffisant pour afficher une invite personnalisée ; si une valeur non qualifiée ne peut pas être résolue de manière unique, `{{model}}`
 se développe en une chaîne vide.
 
-Sur la v1, opencodex injecte uniquement les conseils de délégation proactive de style amont à `max` ou `ultra`
-effort. Il n’ajoute aucun modèle préféré, aucune liste, aucune chaîne de repli ni aucune invite personnalisée en v1.
+Sur la v1, opencodex injecte le même texte de délégation proactive que le préréglage recommandé de la v2, uniquement aux niveaux d’effort `max` ou `ultra`.
+Seule la condition de déclenchement change : aucune demande de délégation distincte n’est nécessaire ; les instructions de l’utilisateur, les autorisations, le périmètre de la tâche et les règles des outils de collaboration restent applicables.
+Il n’ajoute aucun modèle préféré, aucune liste, aucune chaîne de repli ni aucune invite personnalisée en v1.
 
 L'option `syncCodexSubagentDefaults` désactivée par défaut est distincte du guidage. Quand opencodex possède
 le routage Codex actif, la synchronisation ou le redémarrage peut écrire les valeurs sélectionnées en tant que propriété du marqueur
@@ -116,8 +117,9 @@ pendant un temps de recharge, il manque un compte Codex poolé utilisable ou au-
 Les sondes de disponibilité sont mises en cache pendant `subagentModelFallbackPollMs` (60 secondes par défaut).
 
 La solution de secours ne rend pas lisibles les tâches chiffrées incompatibles. Lorsque la tâche enfant est chiffrée pour
-ChatGPT, la sélection est restreinte aux cibles ChatGPT natives canoniques même si un modèle externe
-apparaît plus tôt dans la chaîne.
+ChatGPT, la sélection est restreinte aux cibles ChatGPT natives canoniques et aux routes Responses directes avec authentification
+par clé explicitement approuvées via `allowEncryptedV2AgentTasks: true`, même si un autre modèle externe apparaît plus tôt dans
+la chaîne. Les combos restent limités aux cibles natives canoniques.
 
 ## Livraison de tâches v2 cryptées
 
@@ -127,15 +129,17 @@ limitation connue [#92](https://github.com/lidge-jun/opencodex/issues/92).
 
 opencodex échoue en toute sécurité au lieu de transférer une tâche vide ou illisible :
 
-- Une route directe non native renvoie HTTP 400 avec
-  `error.code = "unreadable_encrypted_agent_task"` et ne fait pas écho au texte chiffré.
+- Une route directe non native inéligible renvoie HTTP 400 avec
+  `error.code = "unreadable_encrypted_agent_task"` et ne fait pas écho au texte chiffré. Un
+  fournisseur Responses direct à authentification par clé qui active explicitement
+  `allowEncryptedV2AgentTasks: true` reçoit à la place le texte chiffré opaque et évite cette erreur.
 - Un combo considère uniquement les cibles ChatGPT natives canoniques pour cette tâche, y compris les tentatives. Si aucun
   est disponible, il renvoie la même erreur 400.
 - Une tâche lisible en texte clair conserve la route normale et le comportement de repli.
 
-Les options de récupération consistent à sélectionner un enfant ChatGPT natif, à ajouter une cible ChatGPT native au combo, à utiliser
-v1 pour la délégation de fournisseurs hétérogènes, ou renvoyer la tâche en texte brut v2 `agent_message`
-contenu lorsque vous contrôlez l’appelant.
+Les options de récupération consistent à sélectionner un enfant ChatGPT natif, à approuver explicitement un relais Responses direct à
+authentification par clé capable de consommer la charge utile opaque, à ajouter une cible ChatGPT native au combo, à utiliser v1 pour la
+délégation de fournisseurs hétérogènes, ou à renvoyer la tâche comme contenu `agent_message` v2 en texte brut lorsque vous contrôlez l’appelant.
 
 L’option expérimentale `agentTaskRecovery`, désactivée par défaut, peut récupérer cette forme précise de
 tâche native envoyée vers une route externe. Elle utilise un transfert Responses brut vers le point de
@@ -187,7 +191,7 @@ Utilisez `ocx agent` pour les paramètres de délégation, de liste, de plafond 
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
-ocx agent fallback set gpt-5.4-mini,xai/grok-4.5 --poll-ms 60000
+ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx agent effort set --subagent max
 ```
 

@@ -10,12 +10,13 @@ import Storage from "./pages/Storage";
 import CodexSet from "./pages/CodexSet";
 import Integrations from "./pages/Integrations";
 import Startup from "./pages/Startup";
+import RemoteWorkspace from "./pages/RemoteWorkspace";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { SidebarGithubRow } from "./components/sidebar-github-row";
-import { IconGrid, IconServer, IconBoxes, IconBot, IconList, IconActivity, IconHardDrive, IconKey, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconX, IconRefresh} from "./icons";
+import { IconGrid, IconServer, IconBoxes, IconBot, IconList, IconActivity, IconHardDrive, IconCodex, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconX, IconRefresh} from "./icons";
 import { useI18n, useT, LOCALES, localeDisplayName, type Locale, type TKey } from "./i18n/shared";
 import { Select } from "./ui";
-import { configureApiTargets, hasApiSession, installApiAuthFetch, installApiSessionFromHtml, logoutApiSession } from "./api";
+import { configureApiTargets, hasApiSession, installApiAuthFetch, installApiSessionFromHtml, logoutApiSession, SESSION_UNAVAILABLE_EVENT } from "./api";
 import { apiBaseForPlane, discoverApiTargets, isConnectedRuntime, standaloneApiTargets, type ApiTargets } from "./api-targets";
 import { ConnectPairingForm } from "./connect-pairing";
 import { type Page } from "./app-routing";
@@ -35,6 +36,7 @@ const PAGE_TKEY: Record<Page, TKey> = {
   logs: "nav.logs",
   usage: "nav.usage",
   storage: "nav.storage",
+  remote: "nav.remote",
   "codex-set": "nav.codexSet",
   integrations: "nav.integrations",
 };
@@ -61,13 +63,14 @@ type NavEntry = {
 
 const NAV: NavEntry[] = [
   { id: "dashboard", tkey: "nav.dashboard", Icon: IconGrid },
-  { id: "codex-set", tkey: "nav.codexSet", Icon: IconKey },
+  { id: "codex-set", tkey: "nav.codexSet", Icon: IconCodex },
   { id: "providers", tkey: "nav.providers", Icon: IconServer },
   { id: "models", tkey: "nav.models", Icon: IconBoxes },
   { id: "subagents", tkey: "nav.subagents", Icon: IconBot },
   { id: "logs", tkey: "nav.logs", Icon: IconList },
   { id: "usage", tkey: "nav.usage", Icon: IconActivity },
   { id: "storage", tkey: "nav.storage", Icon: IconHardDrive },
+  { id: "remote", tkey: "nav.remote", Icon: IconMonitor },
   { id: "integrations", tkey: "nav.integrations", Icon: IconGlobe },
 ];
 
@@ -111,7 +114,18 @@ export default function App() {
   const [targetsSettled, setTargetsSettled] = useState(() => !isConnectedRuntime());
   const [targetError, setTargetError] = useState(false);
   const [sharedSessionReady, setSharedSessionReady] = useState(() => hasApiSession("shared"));
+  const [sharedSessionEpoch, setSharedSessionEpoch] = useState(0);
   const [sessionLoggingOut, setSessionLoggingOut] = useState(false);
+
+  useEffect(() => {
+    const unavailable = (event: Event) => {
+      if ((event as CustomEvent<{ plane?: string }>).detail?.plane === "shared" && !hasApiSession("shared")) {
+        setSharedSessionReady(false);
+      }
+    };
+    window.addEventListener(SESSION_UNAVAILABLE_EVENT, unavailable);
+    return () => window.removeEventListener(SESSION_UNAVAILABLE_EVENT, unavailable);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -243,12 +257,30 @@ export default function App() {
     else alert(t("connection.sessionLogoutFailed"));
   };
 
+  /*
+   * The brand is the control users reach for first when they want out of a deep page,
+   * and it used to be an inert <div>: clicking the logo did nothing, so a user on
+   * #providers had no obvious way back to the first screen. It is a button now.
+   *
+   * One node, two mount points (mobile topbar and drawer head), so both become
+   * interactive from this single definition. `navigateToPage` is the deliberate-
+   * navigation helper the nav rows use — it pushes a history entry, so Back still
+   * returns to where the user came from — and closing the drawer is required because
+   * the second mount lives inside it.
+   */
   const brand = (
-    <div className="brand">
+    <button
+      type="button"
+      className="brand brand-home"
+      onClick={() => { navigateToPage("dashboard"); setNavOpen(false); }}
+      aria-label={t("nav.goHome")}
+      title={t("nav.goHome")}
+      {...(page === "dashboard" ? { "aria-current": "page" as const } : {})}
+    >
       <span className="brand-logo" role="img" aria-label={t("app.logoAria")} />
       <span className="name">opencodex</span>
-      <span className="ver">v{displayedVersion}</span>
-    </div>
+      <span className="ver" title={displayedVersion}>v{displayedVersion}</span>
+    </button>
   );
 
   return (
@@ -404,9 +436,13 @@ export default function App() {
                   <div className="alert alert-err" role="alert">{t("connection.machineUnavailable")}</div>
                 )}
                 {targets.connected && !sharedSessionReady && (
-                  <ConnectPairingForm target={targets.shared} onConnected={() => setSharedSessionReady(true)} />
+                  <ConnectPairingForm key={`${targets.shared.serverOrigin}:${targets.shared.bootstrapPath}`} target={targets.shared} onConnected={() => {
+                    setSharedSessionReady(true);
+                    setSharedSessionEpoch(epoch => epoch + 1);
+                  }} />
                 )}
-                {page === "dashboard" && <Dashboard apiBase={sharedBase} />}
+                {page === "dashboard" && <Dashboard apiBase={sharedBase} connected={targets.connected}
+                  authenticationPending={targets.connected && !sharedSessionReady} refreshEpoch={sharedSessionEpoch} />}
                 {page === "startup" && <Startup apiBase={sharedBase} machineApiBase={machineBase} connected={targets.connected} />}
                 {page === "providers" && <Providers apiBase={sharedBase} />}
                 {page === "models" && <Models key={sharedBase} apiBase={sharedBase} restartEpoch={codexRestartEpoch} />}
@@ -414,6 +450,7 @@ export default function App() {
                 {page === "logs" && <Logs apiBase={sharedBase} />}
                 {page === "usage" && <Usage apiBase={sharedBase} connected={targets.connected} apiKeyId={targets.apiKeyId} />}
                 {page === "storage" && <Storage apiBase={sharedBase} />}
+                {page === "remote" && <RemoteWorkspace apiBase={sharedBase} hubOrigin={targets.shared.serverOrigin} />}
                 {page === "codex-set" && <CodexSet apiBase={sharedBase} />}
                 {page === "integrations" && <Integrations apiBase={sharedBase} machineApiBase={machineBase} connected={targets.connected} />}
               </>

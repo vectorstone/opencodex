@@ -24,6 +24,7 @@
 @import "./styles-apikeys-workspace.css";
 @import "./styles-codex-set.css";
 @import "./styles-compatibility-matrix.css";
+@import "./styles-remote-workspace.css";
 
 :root {
   /* default: follow the OS; [data-theme] below pins color-scheme so light-dark() obeys it */
@@ -254,15 +255,32 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   -webkit-backdrop-filter: var(--glass-blur);
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 6px 8px 14px; }
+/* The brand is a <button> (go home), and this stylesheet has no global button reset —
+   every control resets itself locally, the way .nav-item does. Without this the UA
+   defaults land: a grey buttonface plate, a 2px border that breaks the measured 320px
+   topbar row budget, a non-inheriting font, buttontext instead of --text on .name,
+   center text-align that shows up once .name ellipsizes, and -webkit-appearance:button
+   overriding the first two in WebKit. Layout stays with .brand; this rule only undoes
+   what the element type added. */
+.brand-home {
+  appearance: none; -webkit-appearance: none;
+  background: none; border: none;
+  font: inherit; color: inherit; text-align: left;
+  cursor: pointer;
+}
 /* logo is a white-on-transparent silhouette → recolor via mask with the theme text color so it
    stays visible in BOTH light and dark (a plain <img> was invisible white-on-white in light). */
 .brand-logo { width: 26px; height: 26px; flex-shrink: 0; background: var(--text);
   -webkit-mask: url(/logo.png) center / contain no-repeat; mask: url(/logo.png) center / contain no-repeat; }
-.brand .name { font-weight: var(--weight-semibold); font-size: var(--text-subtitle); letter-spacing: 0; line-height: 26px; }
+.brand .name { flex-shrink: 0; font-weight: var(--weight-semibold); font-size: var(--text-subtitle); letter-spacing: 0; line-height: 26px; }
 .brand .ver {
   font-family: var(--font-code); font-size: var(--text-micro); color: var(--muted); line-height: var(--leading-tight);
   background: var(--raised); border: 1px solid var(--border); padding: 2px 6px; border-radius: var(--radius-pill);
   align-self: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* [Decision Log]
@@ -1291,7 +1309,17 @@ select.input { appearance: none; }
 .empty svg { width: 30px; height: 30px; color: var(--faint); margin-bottom: 12px; }
 .empty .title { color: var(--text); font-weight: var(--weight-semibold); margin-bottom: 6px; }
 
-.notice { font-size: var(--text-control); line-height: var(--leading-body); padding: 9px 12px; border-radius: var(--radius-sm); margin-bottom: 14px; display: flex; align-items: center; gap: 8px; max-width: var(--prose-measure); }
+/*
+ `:not([hidden])`, not a bare `display: flex` — same cascade trap the combos panels hit.
+
+ The admin-token dialog mounts its error notice up front and hides it with the `hidden`
+ attribute until a token is actually rejected. `[hidden] { display: none }` is a
+ USER-AGENT rule, so an author `display: flex` here beat it and painted an empty red
+ bordered box the moment the dialog opened (#3483). Specificity never got a vote; origin
+ decided it. Scoping the display to `:not([hidden])` lets the UA rule win again.
+*/
+.notice:not([hidden]) { display: flex; }
+.notice { font-size: var(--text-control); line-height: var(--leading-body); padding: 9px 12px; border-radius: var(--radius-sm); margin-bottom: 14px; align-items: center; gap: 8px; max-width: var(--prose-measure); }
 .notice svg { width: 15px; height: 15px; flex-shrink: 0; }
 
 /* Portaled status toast — out of document flow so Providers (etc.) do not reflow. */
@@ -1605,6 +1633,13 @@ dialog.modal-overlay::backdrop {
 .codex-request-user-input-controls > .toggle { margin-left: auto; }
 .codex-request-user-input-feedback { flex: 1 0 100%; margin-top: -8px; color: var(--muted); font-size: var(--text-label); line-height: var(--leading-body); text-align: right; }
 .codex-request-user-input-feedback.is-error { color: var(--red); }
+/* Ultra Fast opt-in: same card-row idiom as the picker and request-user-input switches. */
+.codex-ultrafast-card { gap: 16px; flex-wrap: wrap; }
+.codex-ultrafast-copy { flex: 1 1 auto; min-width: 0; }
+.codex-ultrafast-copy .card-sub { padding: 2px 0 0; }
+.codex-ultrafast-controls { display: flex; align-items: flex-end; gap: 12px; flex: 0 0 auto; margin-left: auto; }
+.codex-ultrafast-feedback { flex: 1 0 100%; margin-top: -8px; color: var(--muted); font-size: var(--text-label); line-height: var(--leading-body); text-align: right; }
+.codex-ultrafast-feedback.is-error { color: var(--red); }
 .codex-account-picker-card { gap: 16px; flex-wrap: wrap; margin-top: 16px; }
 .codex-auth-advanced { margin-top: 8px; }
 .codex-auth-advanced__toggle {
@@ -1763,26 +1798,37 @@ dialog.modal-overlay::backdrop {
   z-index: 1;
 }
 
-.codex-auth-page-head { align-items: flex-start; }
+/* Let feedback wrap below the standalone page title when a translated message is
+   wider than the available row. Account actions use their own wrapping row below. */
+.codex-auth-page-head { align-items: flex-start; flex-wrap: wrap; row-gap: 8px; }
 .codex-auth-page-head__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 10px;
   min-width: 0;
 }
-/* Spark visibility switch: a labelled toggle, not a bare knob. An unlabelled switch sitting
-   between two labelled buttons is a guessing game, and this one changes what every card in the
-   page renders. The label carries the meaning; the toggle carries the state. */
-.codex-auth-spark-toggle {
-  display: inline-flex;
+/* Once the cluster owns its own line the title no longer competes for width, so it
+   takes the full row rather than wrapping "Codex Auth" onto two lines. */
+.codex-auth-page-head > .page-title { flex: 1 1 auto; }
+/* The pause/refresh pair after it moved out of the page head. Right-aligned so it still
+   reads as chrome for the account list below rather than a heading of its own, and it
+   wraps because both labels grow substantially in several locales. */
+.codex-auth-actions-row {
+  display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
-  white-space: nowrap;
+  margin-bottom: 10px;
 }
-.codex-auth-spark-toggle__label {
-  font-size: 12px;
-  color: var(--muted);
-}
+
+.codex-quota-activation { gap: var(--space-4); flex-wrap: wrap; }
+.codex-quota-activation__copy { flex: 1 1 240px; min-width: 0; word-break: keep-all; }
+.codex-quota-activation__controls { display: flex; align-items: center; gap: var(--space-3); min-height: 44px; }
+.codex-quota-activation .is-error { color: var(--red); }
+.codex-quota-activation .toggle[aria-pressed="mixed"] .toggle-knob { transform: translateX(8px); }
 /* Account actions (pause / copy doctor / pause-exhausted): clearer hover than plain
    btn-ghost on card surface — same raised-hover + faint border as icon/list cues. */
 .codex-auth-action-btn:hover:not(:disabled) {
@@ -1906,12 +1952,13 @@ dialog.modal-overlay::backdrop {
   background: light-dark(#fffbeb, color-mix(in oklab, var(--amber) 20%, var(--surface)));
   color: light-dark(#92400e, #fef3c7);
   border: 1px solid color-mix(in srgb, var(--amber) 32%, transparent);
-  display: flex;
   align-items: center;
   gap: 6px;
   margin-bottom: 12px;
   max-width: var(--prose-measure);
 }
+/* Same UA-vs-author `[hidden]` rule as `.notice` above: `.notice-warn` is used on its own. */
+.notice-warn:not([hidden]) { display: flex; }
 .notice-warn svg { width: 14px; height: 14px; flex-shrink: 0; color: var(--amber); }
 
 .startup-runtime-notice__text,
@@ -1954,8 +2001,10 @@ dialog.modal-overlay::backdrop {
   box-sizing: border-box;
 }
 /* Message above, command+copy below. */
-.notice.notice-warn.startup-runtime-notice {
+.notice.notice-warn.startup-runtime-notice:not([hidden]) {
   display: flex;
+}
+.notice.notice-warn.startup-runtime-notice {
   flex-direction: column;
   align-items: stretch;
   gap: 8px;
@@ -2086,6 +2135,13 @@ table.logs-table {
   gap: var(--space-2);
   margin-bottom: var(--space-3);
 }
+.logs-filter-status { display: inline-flex; align-items: center; gap: var(--space-2); margin-left: auto; }
+.logs-toolbar-secondary { margin-top: calc(var(--space-1) * -1); }
+.logs-filter-container { min-width: 0; }
+.logs-filter-container .logs-filter-field { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+.logs-filter-container .logs-filter-field .input { min-width: 0; max-width: 100%; }
+.logs-filter-container .logs-filter-status { flex-wrap: wrap; max-width: 100%; }
+.logs-filter-container .logs-segmented { max-width: 100%; flex-wrap: wrap; }
 
 .logs-segmented {
   display: inline-flex;
@@ -2351,7 +2407,7 @@ button.prov-account-row.active { cursor: default; }
   .mobile-topbar .brand .name {
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .mobile-topbar .brand .ver { flex-shrink: 0; }
+  .mobile-topbar .brand .ver { flex-shrink: 1; }
   .mobile-topbar .stop-toggle { width: auto; min-width: 44px; min-height: 44px; justify-content: center; padding: 8px; }
   /* Both orbs keep the 44x44 touch target the single stop button had; a bare 28px
      .sidebar-orb would be a regression on the surface where it matters most. */
@@ -2434,6 +2490,45 @@ button.prov-account-row.active { cursor: default; }
 /* Top-align with Storage: centering against the taller filter chips dropped the "Usage" title. */
 .usage-head { flex-wrap: wrap; align-items: flex-start; }
 .usage-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+/* Custom range: a disclosure, not a second filter row. It reuses the chip language of the
+   segmented presets above it so the page reads as one control area, and the panel is
+   `width: max-content` because a four-control form stretched to 1200px is what made the old
+   flex-end row look like a stray band across the page. */
+.usage-range { display: grid; justify-items: start; gap: 8px; margin: 10px 0 4px; }
+.usage-range-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; max-width: 100%; }
+.usage-range-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: var(--control-sm); padding: 4px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+  background: var(--surface); color: var(--muted);
+  font: inherit; font-size: var(--text-label); font-weight: var(--weight-medium);
+  white-space: nowrap; cursor: pointer;
+  transition: color var(--motion-fast), background var(--motion-fast), border-color var(--motion-fast);
+}
+.usage-range-toggle:hover { background: var(--raised); color: var(--text); }
+.usage-range-toggle[aria-expanded="true"] { color: var(--text); }
+.usage-range-toggle.is-active { border-color: var(--accent); color: var(--text); }
+.usage-range-chevron { flex: 0 0 auto; transition: transform var(--motion-fast); }
+.usage-range-toggle[aria-expanded="true"] .usage-range-chevron { transform: rotate(90deg); }
+.usage-range-applied { margin: 0; min-width: 0; }
+.usage-range-panel {
+  display: grid; gap: 10px; width: max-content; max-width: 100%;
+  padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+/* `align-items: end` is the fix for the old row: a label+input stack is twice the height of a
+   `btn-sm`, so centering left Apply and Clear floating beside the middle of the fields.
+   Every track is `auto` on purpose. A fixed 200px cap does not survive contact with a
+   `datetime-local` control: its intrinsic minimum is about 206px in Chrome at this font size,
+   and it grows again for locales whose date format is longer than `mm/dd/yyyy`. The fields
+   then overflow their tracks and eat the gap, which is the exact rhythm defect this block
+   exists to fix. */
+.usage-range-fields { display: grid; grid-template-columns: repeat(4, auto); justify-content: start; align-items: end; gap: 8px; }
+.usage-range-field { display: grid; gap: 4px; min-width: 0; }
+.usage-range-field .field-label { margin: 0; }
+.usage-range-fields .input { height: var(--control-md); padding-block: 0; }
+.usage-range-action { min-height: var(--control-md); }
+.usage-range-panel > p { margin: 0; }
 .usage-segmented { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 2px; gap: 2px; background: var(--surface); }
 .usage-segmented-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: none; background: transparent; color: var(--muted); padding: 4px 12px; border-radius: var(--radius-pill); cursor: pointer; font: inherit; white-space: nowrap; }
 .usage-segmented-btn.active { background: var(--raised); color: var(--text); font-weight: var(--weight-semibold); }
@@ -2455,6 +2550,11 @@ button.prov-account-row.active { cursor: default; }
 
 @media (max-width: 640px) {
   .usage-source-btn .usage-source-label-collapsible { display: none; }
+  /* Two 200px columns plus both actions stop fitting a phone content width; the panel takes
+     the full row and every control keeps the same height it has on desktop. */
+  .usage-range-panel { width: 100%; }
+  .usage-range-fields { grid-template-columns: minmax(0, 1fr); }
+  .usage-range-action { width: 100%; }
 }
 
 @media (max-width: 360px) {
@@ -2565,6 +2665,53 @@ button.prov-account-row.active { cursor: default; }
 
 /* ---- model row hover tooltip ---- */
 .model-row-wrap { position: relative; }
+.models-model-identity {
+  display: inline-flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+.models-model-friendly {
+  max-width: min(42vw, 420px);
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.models-display-name-trigger { flex-shrink: 0; }
+.model-display-name-dialog { max-width: 460px; }
+.model-display-name-identity,
+.model-display-name-current {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 16px;
+}
+.model-display-name-identity code {
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+.model-display-name-current {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+.model-display-name-current > .text-label { grid-column: 1 / -1; }
+.model-display-name-current strong { min-width: 0; overflow-wrap: anywhere; }
+.model-display-name-dialog > .input { margin-bottom: 6px; }
+.model-display-name-dialog > .small { text-wrap: balance; }
+.model-display-name-error {
+  margin-top: 8px;
+  color: var(--red);
+  font-size: var(--text-label);
+  line-height: var(--leading-body);
+}
+@media (max-width: 560px) {
+  .models-model-friendly { max-width: 58vw; }
+  .model-display-name-current { grid-template-columns: 1fr; }
+  .model-display-name-current > .text-label { grid-column: auto; }
+  .model-display-name-dialog .modal-actions { align-items: stretch; flex-direction: column; }
+  .model-display-name-dialog .modal-actions .btn { width: 100%; }
+}
 .model-tip {
   z-index: 10;
   background: var(--surface);

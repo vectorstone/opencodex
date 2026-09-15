@@ -64,12 +64,26 @@ Authorization: Bearer <admin-token>
 | `GET /api/grok` | Grok 管理対象設定のステータスと候補モデルを読む | 400 ステータス読み取り失敗 |
 | `PUT /api/grok/selection` |除外された Grok モデルを永続化します。 400 個の無効な選択またはサイズが大きすぎる選択 |
 | `POST /api/grok/apply` |管理された同期を通じて永続的な Grok 設定を適用する | 409 `grok_apply_busy`; 400/500 適用失敗 |
+| `GET /api/grok/reset-coupons?accountId=...` | アクティブまたは指定された xAI アカウントの残り Grok 請求リセット トークンと有効期限ウィンドウを読む | 400 アカウントがありません; 401 未認証; 502 上流 gRPC-Web エラー |
+| `POST /api/grok/reset-coupons/consume` | 対象となるリセット クーポンを換金します。本文は `{ accountId?, tokenId?, operationId? }`。任意の `operationId`（UUIDv4）により換金は冪等になります: 同じ ID を繰り返すと、二重換金せずに永続化された結果を再生します。 | 400 無効な JSON/UUID; 401 未認証; 409 `identity_mismatch`; 502 上流エラー; 503 台帳容量 |
 | `GET, PUT /api/claude-desktop` | Claude Desktop のルーティング/ネイティブ プロファイルを読み取るか永続化する | 400 無効または使用できない割り当て |
 | `POST /api/claude-desktop/apply` |保存したプロファイルを Claude Desktop の管理対象設定に書き込みます。 400/500 書き込み失敗 |
 | `GET /api/claude-desktop/status` |保存済みプロファイルと適用済みプロファイルおよびデスクトップの健全性を検査する | 400 ステータス読み取り失敗 |
 | `GET, PUT /api/claude-code` |クロード コードのゲートウェイ、認証モード、モデル マップ、コンテキスト、エージェント、サイドカー設定の読み取りまたは更新 | 400 無効なフィールドまたは図形 |
 
+ダッシュボードは **Providers > xAI Grok > Accounts** から両方のクーポン パスを操作します。サインイン済みの各アカウント行には残りのクーポン数を示すチケット バッジがあり、バッジは有効期限ウィンドウを一覧し、期限が最も近いクーポンを換金するダイアログを開きます。ダイアログはクライアントが発行した `operationId` を送り、再試行せずタイムアウト後に送信を止めます。ジャーナル記録がまだ開いている換金は再実行されてしまうためです。`ocx account grok-reset-coupons` はターミナル側の同等コマンドです。
+
 モデルロスターと暗号化されたワーカータスクの動作の背後にある概念については、「[サブエージェントサーフェス](/guides/sub-agent-surface/)」を参照してください。
+
+### クライアント統合のロールバックジャーナル
+
+| メソッドとパス | 目的 | 主なエラー |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | ロールバック操作を一覧表示します。任意でクライアントを指定でき、各行にはサーバー計算の `deletable` が含まれます。 | 400 無効なクライアント |
+| `DELETE /api/client-integrations/journal?opId=...` | 古いロールバック操作を廃止し、可能ならスナップショットも削除します。成功時の `snapshotRemoved` が `false` の場合、保守処理で再試行されます。 | 400 `opId` なし、404 存在しないか廃止済み、409 そのクライアントの最新操作 |
+
+削除時はジャーナルを書き換えず、トゥームストーンを追記します。現在の取り消し地点を
+残すため、各クライアントの最新操作はサーバー側で保護されます。
 
 ### コンボ
 
@@ -120,6 +134,8 @@ Authorization: Bearer <admin-token>
 | `POST /api/storage/cleanup-policy/run` |手動クリーンアップ ポリシーの実行を開始します。 409 `already_running`; 500`cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` |テスト専用ポリシー ストリーム フック | 404 `not_found` 利用できない場合 |
 
+行が既存のパーサーのサイズ上限を超えた場合、`GET /api/usage` と `GET /api/keys` は読み取れる行の集計を維持し、応答全体に `usageIncomplete: true` と `usageIncompleteReason: "oversized_rows"` を追加します。この診断はキャッシュや増分追記後も維持され、結果が空または一致なしでも返されます。再構築時には再計算されます。プロバイダー、モデル、API キーの識別子は短縮しません。フラグがないことは全行が有効だった証明にはなりません。`historyTruncated`、`entriesTruncated`、トークン測定カバレッジとは別の情報です。
+
 `models`、`providers`、および `days[].models` の各行にも `cacheHitRate` が含まれます。これは、プロバイダーのプロンプト キャッシュから供給された入力トークンの割合で、`[0, 1]` の範囲に制限されます。プロバイダーがキャッシュ テレメトリを報告しなかった場合、または行に入力トークンがない場合は、`0` ではなく `null` になります。「キャッシュ データなし」と「実際のヒット率 0%」は異なる事実であり、それらを同じように描画するチャートは誤解を招くためです。
 
 :::caution
@@ -134,10 +150,16 @@ Authorization: Bearer <admin-token>
 | `GET /api/models` |ダッシュボード/CLI モデルの行を返す |収集が飽和したときの `catalog_busy` |
 | `GET /api/client-config?client=...` |サポートされているファイル連携の読み取り専用クライアント設定を作成する | 400 クライアントがサポートされていません。 503 カタログは利用できません |
 | `PUT /api/disabled-models` |共有の無効モデル リストを置き換える | 400 無効な JSON |
-| `PUT /api/model-visibility` |プロバイダーレベルまたはモデルレベルの可視性をアトミックに変更 | 400 プロバイダー、スコープ、ターゲット、または本文が無効です。
+| `PUT /api/model-visibility` |プロバイダーレベルまたはモデルレベルの可視性をアトミックに変更 | 400 プロバイダー、スコープ、ターゲット、または本文が無効です。; 409 `initial_model_selection_pending` (モデル一覧を更新してから再試行してください。) |
 | `GET, POST /api/custom-models` |カスタム モデルをリストするか追加する | 400 個の無効なフィールド。 404 プロバイダーがありません。 409 複製モデル |
 | `PUT, DELETE /api/custom-models/{id}` | 1 つのカスタム モデルを編集または削除する | 400 個の無効な ID/フィールド。 404 が見つかりません。 409 複製モデル |
-| `GET, PUT /api/selected-models` |プロバイダーのホワイトリストと可用性を読み取るか、1 つのホワイトリストを置き換えます。 400 のプロバイダー/本体が欠落しています。 404 不明なプロバイダ |
+| `GET, PUT /api/selected-models` | プロバイダーの許可リストと可用性を読む、または許可リストを置き換える | 400 プロバイダー/本文の不足; 404 不明なプロバイダー; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | プリセット情報を読む、または preset/all/custom モードを選ぶ | 400 不正なモードまたは未提供のプリセット; 404 不明なプロバイダー; PUT 409 `initial_model_selection_pending` |
+
+手動モデルは、Models ダッシュボードで provider と model ID が一致する行を置き換えます。OpenAI の手動行は `openai/<model>` を維持し、表示状態を変更できます。削除すると、アカウント修飾子のないネイティブ行が復元されます。アカウント修飾付きのネイティブ行は別に保持されます。ネイティブルートやアカウントの権限は変更しません。OpenAI の非ネイティブ表示対象は、設定済みの手動モデルと一致する必要があります。
+
+
+信頼できる初回モデル一覧が確定するまで、有効な `PUT /api/selected-models` と `PUT /api/model-presets` も HTTP 409 とコード `initial_model_selection_pending` を返します。`GET /api/models` などでモデル一覧を更新し、取得に成功してから再試行してください。
 
 ### OAuth アカウント、プロバイダー キー、およびデータプレーン キー
 
@@ -174,6 +196,16 @@ Authorization: Bearer <admin-token>
 | `GET /api/provider-quotas` |プロバイダー クォータ レポートを読む。 `refresh=1` 強制更新 | — |
 | `GET, PUT /api/provider-context-caps` |グローバル、全プロバイダー、または 1 つのプロバイダーのコンテキスト キャップを読み取りまたは更新します。 400 無効なリクエスト。 404 不明なプロバイダ |
 | `GET /api/provider-presets` |ランタイム レジストリから派生した GUI プロバイダー プリセットを返します。 — |
+
+コンテキスト上限のレスポンスには `caps`（有効な上限）と `values`（無効化後も保持される最後の選択値）が
+含まれます。`value` を指定せずにプロバイダーの上限を有効にすると選択値を復元し、初回はグローバルの
+`contextCapValue` を使います。OpenAI でも同様で、スイッチが特別な 922k モードを選ぶことはありません。
+有効な上限はすべてのネイティブウィンドウに適用されます。長いコンテキストに対応したモデルは、
+そのモデルが対応する上限まで拡張できます。
+`{ "value": 600000, "setAll": true }` はグローバル値と有効な上限だけを更新します。
+上限が無効なプロバイダーは選択値を保持し、後で有効にすると復元します。
+`value` なしの `{ "setAll": true }` は、設定済みの全プロバイダーの上限を現在のグローバル値で有効にし、
+保存された選択値も置き換えます。無効化しても選択値は再読み込み後まで保持されますが、制限としては適用されません。
 
 `provider_has_dependent_combos` は安全バリアです。プロバイダーを削除する前に、依存するコンボを削除または編集してください。
 
@@ -219,7 +251,7 @@ Authorization: Bearer <admin-token>
 | `PUT /api/codex-auth/failover` |アカウントのフェイルオーバーしきい値を設定する | 400 無効なしきい値 |
 | `GET /api/codex-auth/quota` |キャッシュされたクォータ状態をアカウントごとに読み取る | — |
 | `GET /api/codex-auth/reset-credits` |アカウントのリセット クレジット資格を検査する | 400 アカウント ID がありません。アップストリームステータスパススルー。 500 検索失敗 |
-| `POST /api/codex-auth/reset-credits/consume` |対象となるリセット クレジットを消費する | 400 アカウント ID がありません。アップストリームステータスパススルー。 503 `server_busy`; 500 消費失敗 |
+| `POST /api/codex-auth/reset-credits/consume` |対象となるリセット クレジットを消費する。任意の `operationId`（UUIDv4）を指定すると消費が冪等になります。同じ id は 2 つ目のクレジットを消費せず、保存済みの結果を 1 回再生します。 | 400 アカウント ID がありません、または `operationId` が不正です。id が別のアカウントに属する場合は 409 `identity_mismatch`。アップストリームステータスパススルー。 503 `server_busy`、`capacity`、`unavailable`; 500 消費失敗 |
 | `POST /api/codex-auth/login` | Codex のログインまたは再認証を開始する | 400 無効なリクエスト。競合/ビジー ログイン状態 |
 | `POST /api/codex-auth/login/code` | Codex ログイン フローの手動コードを送信する | 400 無効なフロー/コード |
 | `POST /api/codex-auth/login/cancel` | Codex ログイン フローをキャンセルする | — |

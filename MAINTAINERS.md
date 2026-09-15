@@ -54,9 +54,17 @@ when a maintainer steps down.
   Authors with repository push permission skip the ancestry heuristic only. As
   with the approval requirement above, this part is enforced by convention;
   the ruleset does not check ancestry (see the note under the change log).
-- A pull request requires approval from at least one maintainer and successful required CI checks
-  before merge.
-- Authors do not approve their own pull requests.
+- Pull requests require successful required CI checks before merge. Contributor pull requests
+  normally require approval from at least one maintainer other than the author.
+- A current maintainer with GitHub `maintain` or `admin` access may explicitly integrate a pull
+  request into `dev` without another maintainer's approval, including their own pull request.
+  Record that choice and the exact-head verification in the pull-request description or comment.
+  This is maintainer integration, not a self-approval or an independent review. Outstanding
+  maintainer change requests must still be resolved or explicitly withdrawn. Technical review,
+  attribution, documentation and security-review duties remain in force.
+- The maintainer-integration exception applies only to `dev`. It does not change review rules
+  for `main` or `preview`, grant contributor authors approval authority, or permit direct pushes,
+  force-pushes or branch deletion. Authors do not submit approving reviews of their own work.
 - Authentication, credential handling, GitHub Actions, release automation, dependency installation,
   and other security-boundary changes require explicit security review.
 - A new or promoted provider preset is a credential-destination change. Before merge it needs the
@@ -70,24 +78,32 @@ when a maintainer steps down.
   canonical registry entry.
 - Security-sensitive and release-related changes should be reviewed by both maintainers when
   practical.
-- Direct pushes are reserved for maintainer-owned integration work, urgent repairs, or incident
-  recovery. The same CI and documentation requirements still apply.
+- Integration uses pull requests, including urgent maintainer repairs. The PR-only ruleset
+  bypass does not authorize direct pushes; incident changes to branch protection require a
+  separate owner decision.
 - Promotion from `dev` to `main` and npm releases is maintainer-controlled.
-- **Closing out a release includes moving `dev`'s version line forward.** A published
-  release leaves `dev` carrying a version at or behind it, and
-  `tests/release-version-line.test.ts` then fails on `dev` and on every pull request
-  opened against it — red that contributors inherit and cannot fix from their own diff.
-  This was repaired by hand four times (`32529c2b2`, `e4a85d134`, `076ad3036`,
-  `befcac3e1`) before it was automated.
+- **Opening a release starts by moving `dev`'s version line forward.** Before cutting
+  a release, `dev` must already outrank the version being released; `release.yml`
+  asserts this and refuses to publish otherwise. Dispatch
+  `.github/workflows/dev-version-bump.yml` with the intended version, merge the pull
+  request it opens, then promote and release. When `dev` already outranks the target
+  — a preview cut, or a stable hotfix below `dev`'s line — no move is needed and the
+  workflow reports `changed=false`.
 
-  `.github/workflows/dev-version-bump.yml` now opens that bump as a pull request when a
-  release publishes. Merging it is part of closing the release; a bot cannot, because
-  `Protect dev` requires an approving review and code-owner sign-off. Two caveats worth
-  knowing: the workflow runs from the DEFAULT branch, so it only fires once it has been
-  promoted to `main`; and a pull request opened with `GITHUB_TOKEN` does not start
-  `pull_request` workflows, so the bump pull request arrives without CI. To re-drive a
-  missed run by hand: `bun scripts/bump-dev-version.ts <released-version> package.json`,
-  then open the pull request normally.
+  Opening a preview for the next core ends the current patch line. After
+  `vX.Y.0-preview.*` is tagged, a fix ships as part of `X.Y.0`, not as
+  `X.(Y-1).(Z+1)`. The release helper refuses such a bump rather than producing a
+  version the repository would reject. This is a deliberate policy restriction, not
+  a claim that lower stable patches were historically unused.
+
+  Done after the publish, as this repository did for ten releases (`32529c2b2`,
+  `e4a85d134`, `076ad3036`, `befcac3e1`, then #3045, #3076, #3127, #3265, #3354,
+  #3434), it leaves `dev` and every open pull request carrying a failure contributors
+  cannot fix from their own diff. The pull request itself does not go away — `Protect
+  dev` requires a reviewed merge. If the pre-move is missed and publication somehow
+  succeeds, dispatch `dev-version-bump.yml` from the default branch with the released
+  version and `mode=repair`, then merge the repair pull request. Design:
+  `devlog/_plan/260904_release_version_line/`.
 
 ## The retired `dev2-go` line
 
@@ -121,6 +137,19 @@ Adding or removing a maintainer requires:
 3. updates to this file and [`.github/CODEOWNERS`](./.github/CODEOWNERS).
 
 ### Change log
+
+- 2026-09-06 — The owner authorized explicit maintainer integration into `dev` without a second
+  maintainer approval. Both current maintainers have `admin` access. The dev-only PR bypass
+  includes GitHub's `admin` and `maintain` roles; `write` access alone is insufficient. Contributor
+  review remains the default and the `main`/`preview` rules are unchanged. The optional
+  `scripts/ci/assert-mergeable-review.sh --maintainer-integration <pr-number> [repo]` path checks
+  the authenticated actor against the trusted `dev` roster and live repository permissions,
+  preserves outstanding maintainer objections, and binds its result to the current head and base.
+  The helper emits a validation snapshot, not a ready-to-run privileged merge command: head
+  matching does not pin a PR's base, which may change after inspection. Revalidate the current
+  actor and `dev` base before a separately authorized merge. The helper is not proof of CI or
+  security review and not a barrier against an administrator bypassing it. Repository settings
+  remain authoritative for actual permissions.
 
 - 2026-08-19 — [@Wibias](https://github.com/Wibias) stepped down as a maintainer
   and is now a contributor. This follows his own decision to stop developing
@@ -169,12 +198,11 @@ Adding or removing a maintainer requires:
   changes, and it blocks deletion and non-fast-forward pushes. Allowed merge
   methods are merge and squash; rebase merges are off.
 
-  The one carve-out is that the `maintain`/`admin` repository role holds a
-  `pull_request` bypass, so an owner can merge without the approval the rules
-  otherwise require. That is a bypass, not an exemption: "Authors do not approve
-  their own pull requests" above still governs, and an owner who uses the bypass
-  should record it on the pull request rather than leave it to be inferred from
-  a merge timestamp. Widening the security boundary is a separate decision.
+  At that time, the actual PR bypass covered `admin`; the earlier wording that
+  included `maintain` was inaccurate. The 2026-09-06 policy above adds the explicit
+  maintainer-integration exception for `dev` and the corresponding `maintain` role.
+  Both roles bypass through pull requests only. Force-push and deletion protections
+  remain in place, and the integrating maintainer records the decision and evidence.
 
 ## Security reports
 

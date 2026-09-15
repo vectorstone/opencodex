@@ -1,0 +1,860 @@
+import { describe, expect, spyOn, test } from "bun:test";
+import { CLI_COMMANDS } from "../../src/cli/registry";
+import { DISPATCH_ALIASES, DISPATCH_COMMANDS, dispatchCommand, resolveDispatchCommand, decideStartWithLiveOwner, selectDefaultGuiUrl } from "../../src/cli/dispatch";
+import type { CliDispatchDeps } from "../../src/cli/dispatch";
+import type { OcxConfig } from "../../src/types";
+import { runGuiCommand } from "../../src/cli/gui";
+import { isCodexAccountLoginName } from "../../src/cli/account-auth";
+import { listOAuthProviders } from "../../src/oauth";
+import { isKeyLoginProvider } from "../../src/oauth/key-providers";
+import { loginUsageMessage } from "../../src/oauth/login-cli";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getConfigDir } from "../../src/config";
+import { getAccountSet, removeCredential, saveCredential } from "../../src/oauth/store";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { repoPath } from "../helpers/repo-root";
+import type { OcxConfig } from "../../src/types";
+
+/** Minimal fake deps. dispatchCommand only touches deps for real command
+ * runners, which these tests never invoke, so an empty object is enough. */
+const fakeDeps = {} as unknown as CliDispatchDeps;
+
+describe("CLI dispatch command coverage", () => {
+  test("every non-hidden registry command is dispatchable", () => {
+    const aliasResolved = new Set([...DISPATCH_COMMANDS, ...DISPATCH_ALIASES.keys()]);
+    const missing = CLI_COMMANDS.filter(entry => {
+      if (entry.hidden) return false;
+      // A visible command counts as dispatchable when it is a direct runner
+      // key or an alias that resolves to one (setup/eject/remove/model).
+      return !aliasResolved.has(entry.name);
+    }).map(entry => entry.name);
+    expect(missing).toEqual([]);
+  });
+
+  test("every dispatch alias resolves to a dispatchable command", () => {
+    for (const [alias, target] of DISPATCH_ALIASES) {
+      expect(DISPATCH_COMMANDS).toContain(target);
+      expect(alias).not.toBe(target);
+    }
+  });
+});
+
+describe("CLI dispatch aliases", () => {
+  test("canonical alias pairs resolve to their command", () => {
+    expect(DISPATCH_ALIASES.get("setup")).toBe("init");
+    expect(DISPATCH_ALIASES.get("eject")).toBe("restore");
+    expect(DISPATCH_ALIASES.get("remove")).toBe("uninstall");
+    expect(DISPATCH_ALIASES.get("model")).toBe("models");
+  });
+
+  test("resolveDispatchCommand maps each alias to its canonical runner key", () => {
+    // The same resolver dispatchCommand uses for runner selection, exercised
+    // at the resolution level so a regression in the lookup is caught.
+    expect(resolveDispatchCommand("setup")).toBe("init");
+    expect(resolveDispatchCommand("eject")).toBe("restore");
+    expect(resolveDispatchCommand("remove")).toBe("uninstall");
+    expect(resolveDispatchCommand("model")).toBe("models");
+    // Canonical names resolve to themselves; unknown names resolve undefined.
+    expect(resolveDispatchCommand("init")).toBe("init");
+    expect(resolveDispatchCommand("definitely-not-a-command")).toBeUndefined();
+    expect(resolveDispatchCommand(undefined)).toBeUndefined();
+  });
+
+  test("resolveDispatchCommand rejects inherited Object property names", () => {
+    // commandRunners is a normal object; inherited names (__proto__,
+    // constructor, toString) must not resolve as valid commands.
+    expect(resolveDispatchCommand("__proto__")).toBeUndefined();
+    expect(resolveDispatchCommand("constructor")).toBeUndefined();
+    expect(resolveDispatchCommand("toString")).toBeUndefined();
+  });
+});
+
+describe("dispatchCommand exit codes", () => {
+  test("invalid client state refuses sync before local proxy discovery", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-dispatch-client-invalid-"));
+    const previous = process.env.OPENCODEX_HOME;
+    let discoveries = 0;
+    try {
+      process.env.OPENCODEX_HOME = home;
+      writeFileSync(join(home, "config.json"), JSON.stringify({
+        port: 10100,
+        providers: {},
+        defaultProvider: "openai",
+        runtimeRole: "client",
+        client: { apiKeyId: "half-present" },
+      }), "utf8");
+      const args = ["sync"];
+      const deps = {
+        ...fakeDeps,
+        args,
+        findLiveProxy: async () => { discoveries += 1; return null; },
+      };
+      expect(await dispatchCommand({ kind: "command", command: "sync", args }, deps)).toBe(1);
+      expect(discoveries).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      removeTreeWithRetry(home);
+    }
+  });
+
+  test.each(["applied", "catalog-only", "refused"] as const)(
+    "sync with no live proxy reports Aside unavailability after Codex %s without local fallback", async status => {
+      const home = mkdtempSync(join(tmpdir(), "ocx-dispatch-aside-offline-"));
+      const previous = { OPENCODEX_HOME: process.env.OPENCODEX_HOME, CODEX_HOME: process.env.CODEX_HOME };
+      const syncModule = await import("../../src/codex/sync");
+      const catalogModule = await import("../../src/integrations/catalog-refresh");
+      const livenessModule = await import("../../src/server/proxy-liveness");
+      const warnings: string[] = [];
+      const logs: string[] = [];
+      const sync = spyOn(syncModule, "syncModelsToCodex").mockResolvedValue({
+        status, ok: status !== "refused", added: 0, catalogPath: null, catalogExists: false,
+        catalogWritten: false, cacheSynced: false, message: "fixture Codex sync result",
+      });
+      // The real Aside helper/runtime client must run. Fence the independent local
+      // writer and unscoped discovery so this regression cannot reach user files
+      // or a developer's real proxy if either dispatch boundary regresses.
+      const localRefresh = spyOn(catalogModule, "refreshOwnedCatalogIntegrations").mockResolvedValue([]);
+      // A globally discoverable proxy must not override the injected null result.
+      const unscopedDiscovery = spyOn(livenessModule, "findLiveProxy").mockResolvedValue({
+        pid: null, port: 65534, hostname: "127.0.0.1", source: "config",
+      });
+      const http = spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected runtime HTTP request"));
+      const warn = spyOn(console, "warn").mockImplementation((...args) => { warnings.push(args.map(String).join(" ")); });
+      const log = spyOn(console, "log").mockImplementation((...args) => { logs.push(args.map(String).join(" ")); });
+      const error = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        process.env.OPENCODEX_HOME = home;
+        process.env.CODEX_HOME = join(home, "codex");
+        mkdirSync(process.env.CODEX_HOME);
+        const config = {
+          port: 10100, providers: {}, defaultProvider: "openai",
+          asideProfileSync: { allProfiles: true, profiles: {} },
+        } as OcxConfig;
+        const configPath = join(home, "config.json");
+        const before = JSON.stringify(config);
+        writeFileSync(configPath, before);
+        let discoveries = 0;
+        const args = ["sync"];
+        const deps = {
+          ...fakeDeps, args, loadConfig: () => config,
+          findLiveProxy: async () => { discoveries += 1; return null; },
+        };
+        const code = await dispatchCommand({ kind: "command", command: "sync", args }, deps);
+        // An Aside warning does not change a successful Codex sync's exit code.
+        expect(code).toBe(status === "refused" ? 1 : 0);
+        expect(discoveries).toBe(1);
+        expect(sync).toHaveBeenCalledTimes(1);
+        expect(unscopedDiscovery).not.toHaveBeenCalled();
+        expect(http).not.toHaveBeenCalled();
+        expect(localRefresh).not.toHaveBeenCalled();
+        if (status === "refused") {
+          expect(warnings).toEqual([]);
+        } else {
+          expect(warnings).toHaveLength(1);
+          expect(warnings[0]).toContain("Aside profiles were not refreshed:");
+          expect(warnings[0]).toContain("Proxy is not running");
+          expect(warnings[0]).toContain("ocx start");
+        }
+        expect(logs.join("\n")).not.toContain("integration refreshed");
+        expect(readFileSync(configPath, "utf8")).toBe(before);
+        expect(readdirSync(home).sort()).toEqual(["codex", "config.json"]);
+        expect(readdirSync(join(home, "codex"))).toEqual([]);
+      } finally {
+        sync.mockRestore(); localRefresh.mockRestore(); unscopedDiscovery.mockRestore(); http.mockRestore();
+        warn.mockRestore(); log.mockRestore(); error.mockRestore();
+        for (const [key, value] of Object.entries(previous)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        removeTreeWithRetry(home);
+      }
+    },
+  );
+
+  test("returns 0 for help forms", async () => {
+    expect(await dispatchCommand({ kind: "help", command: "help", args: ["help"] }, fakeDeps)).toBe(0);
+    expect(await dispatchCommand({ kind: "help", command: "--help", args: ["--help"] }, fakeDeps)).toBe(0);
+    expect(await dispatchCommand({ kind: "help", command: "-h", args: ["-h"] }, fakeDeps)).toBe(0);
+    expect(await dispatchCommand({ kind: "command", command: undefined, args: [] }, fakeDeps)).toBe(0);
+  });
+
+  test("returns 1 for an unknown command", async () => {
+    const head = { kind: "command" as const, command: "definitely-not-a-command", args: ["definitely-not-a-command"] };
+    expect(await dispatchCommand(head, fakeDeps)).toBe(1);
+  });
+
+  test("returns 1 for inherited Object property names", async () => {
+    for (const name of ["__proto__", "constructor", "toString"]) {
+      const head = { kind: "command" as const, command: name, args: [name] };
+      expect(await dispatchCommand(head, fakeDeps), `${name} must be unknown`).toBe(1);
+    }
+  });
+
+  test("forwards service arguments and preserves handler exit codes", async () => {
+    const previousExitCode = process.exitCode;
+    try {
+      process.exitCode = 7;
+      const successCalls: string[][] = [];
+      const successDeps = {
+        ...fakeDeps,
+        args: ["service", "install", "--scheduler"],
+        serviceCommand: async (...args: string[]) => {
+          successCalls.push(args);
+        },
+      };
+
+      expect(await dispatchCommand(
+        { kind: "command", command: "service", args: successDeps.args },
+        successDeps,
+      )).toBe(0);
+      expect(successCalls).toEqual([["install", "--scheduler"]]);
+
+      for (const expected of [1, 2]) {
+        const calls: string[][] = [];
+        const deps = {
+          ...fakeDeps,
+          args: ["service", "install", "--scheduler"],
+          serviceCommand: async (...args: string[]) => {
+            calls.push(args);
+            process.exitCode = expected;
+          },
+        };
+
+        expect(await dispatchCommand(
+          { kind: "command", command: "service", args: deps.args },
+          deps,
+        )).toBe(expected);
+        expect(calls).toEqual([["install", "--scheduler"]]);
+      }
+    } finally {
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+});
+
+/**
+ * `ocx health` probed once. A proxy that has only just bound can miss a single
+ * probe while its event loop is still settling startup work, so health run
+ * seconds after a service restart reported "Proxy not healthy" and exited 1 for
+ * a proxy that was in fact serving. The stop paths already retry this exact race
+ * under SERVICE_STOP_LIVENESS (#764); health did not.
+ */
+describe("health retries a just-started proxy", () => {
+  test("passes a retry budget to findLiveProxy", async () => {
+    const seen: (number | undefined)[] = [];
+    const deps = {
+      ...fakeDeps,
+      args: ["health"],
+      findLiveProxy: async (io?: { attempts?: number }) => {
+        seen.push(io?.attempts);
+        return { pid: 4242, port: 10100 } as never;
+      },
+    } as unknown as CliDispatchDeps;
+
+    expect(await dispatchCommand({ kind: "command", command: "health", args: deps.args }, deps)).toBe(0);
+    // More than one: a single attempt is the defect. The exact number is the
+    // stop path's, and is asserted rather than inferred so a silent drop back to
+    // one probe fails here.
+    expect(seen).toEqual([3]);
+  });
+
+  test("still reports an absent proxy as unhealthy", async () => {
+    const deps = {
+      ...fakeDeps,
+      args: ["health"],
+      findLiveProxy: async () => null,
+    } as unknown as CliDispatchDeps;
+
+    expect(await dispatchCommand({ kind: "command", command: "health", args: deps.args }, deps)).toBe(1);
+  });
+});
+
+/**
+ * `handleStart` skipped the configured-port probe whenever the pid file and the
+ * runtime-port record were both absent. That absence proves nothing: a
+ * fallback-port sibling overwrites both records when it starts and removes them
+ * when it stops, so `start` shadowed a healthy configured-port proxy with an
+ * ephemeral-port copy and re-pointed client config at the copy.
+ *
+ * Source-level because the executable path binds real ports and spawns a real
+ * child; this pins the one option that decides the behavior, next to the
+ * `handleEnsure` call site that already had it right.
+ */
+describe("start probes the configured port before shadowing it (source-level)", () => {
+  const cliSource = readFileSync(repoPath("src/cli/index.ts"), "utf8");
+
+  test("every findProxyOwnerBeforeJournalRecovery call site asks for the probe", () => {
+    const calls = cliSource.match(/findProxyOwnerBeforeJournalRecovery\s*\(([^)]*)\)/g) ?? [];
+    // The declaration plus both call sites (handleStart, handleEnsure).
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    const invocations = calls.filter(call => !call.includes("options:"));
+    expect(invocations.length).toBe(2);
+    for (const call of invocations) {
+      expect(call).toContain("probeConfiguredPort: true");
+    }
+  });
+
+  /**
+   * The #3106 guard refused start whenever ANY live proxy existed, ignoring an explicit
+   * `--port` that differs from the live proxy's port. That is not the shadow the guard
+   * targets (a bare `start` landing on an ephemeral port); it broke starting a second
+   * instance on another port, and every spawned-launcher test on a machine running a
+   * real proxy timed out its startup wait. The decision is a pure function so the whole
+   * matrix runs at runtime here; the source oracle below only pins that handleStart
+   * actually routes through it.
+   */
+  test("the live-owner decision matrix", () => {
+    // Bare start: the #3106 shadow — still refused.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: undefined, ocxService: undefined }))
+      .toBe("refuse");
+    // Explicit port equal to the live proxy's: same conflict — still refused.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 10100, ocxService: undefined }))
+      .toBe("refuse");
+    // Explicit DIFFERENT port, interactive: the sibling request this fix restores.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 65301, ocxService: undefined }))
+      .toBe("sibling");
+    // Service wrapper keeps its exact stay-out semantics on both port shapes.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 10100, ocxService: "1" }))
+      .toBe("service-stay-out");
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 8080, ocxService: "1" }))
+      .toBe("service-stay-out");
+    // Only the exact "1" sentinel is service context — "0"/"false" cannot reach stay-out.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 8080, ocxService: "0" }))
+      .toBe("sibling");
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: undefined, ocxService: "false" }))
+      .toBe("refuse");
+  });
+
+  test("handleStart routes its live-owner branch through the shared decision", () => {
+    expect(cliSource).toContain("decideStartWithLiveOwner({");
+    // No leftover inline refusal that could bypass the tested decision.
+    expect(cliSource).not.toContain("explicitSiblingPort");
+  });
+
+  test("a sibling start carries its flag into every chooseListenPort call", () => {
+    // The sibling instance must not persist its explicit port into config.port: the
+    // configured-port proxy still owns this home, and `ocx service` bakes config.port.
+    // Both call sites (initial pick and the EADDRINUSE re-pick) have to pass the flag,
+    // or the re-pick path silently regains the old behavior.
+    const calls = cliSource.match(/await chooseListenPort(([^)]*))/g) ?? [];
+    expect(calls.length).toBe(2);
+    for (const call of calls) {
+      expect(call).toContain("sibling: siblingStart");
+    }
+    expect(cliSource).toContain("siblingStart = true;");
+  });
+
+  test("the probe option still gates on an explicit true", () => {
+    // A truthy-but-not-true default would silently probe for callers that pass
+    // nothing, which is a different behavior than the one asserted above.
+    expect(cliSource).toContain("options.probeConfiguredPort === true");
+  });
+});
+
+describe("logout parses argv before touching the credential store", () => {
+  /**
+   * `ocx logout --json` used to lowercase `--json`, pass it to removeCredential as a provider
+   * name, print "Logged out of --json." and exit 0. A caller that can only see the exit code
+   * got a success for an operation that removed nothing.
+   *
+   * The severity is not "a wasted call". `normalizeAuthStore` copies every top-level key it
+   * finds, so a hand-edited, legacy, or corrupted auth.json carrying a `--json` key would lose
+   * that key's active account -- and the key itself if it was the last account. These
+   * assertions therefore compare the store FILE before and after, which proves the store was
+   * never reached rather than trusting a stubbed function.
+   *
+   * Safe against the developer's real store: `tests/preload.ts` sandboxes HOME and
+   * OPENCODEX_HOME for every invocation, wrapped or bare, so this writes to a temp home.
+   */
+  const authPath = (): string => join(getConfigDir(), "auth.json");
+  const snapshot = (): string | null => existsSync(authPath()) ? readFileSync(authPath(), "utf8") : null;
+
+  /**
+   * Seed a real credential before every case, because otherwise these assertions are vacuous:
+   * the sandbox home starts with no `auth.json`, so `before` and `after` would both be null and
+   * a comparison between them would pass even if the command HAD written to the store. Found by
+   * probing the sandbox rather than by reading the test -- the file genuinely does not exist at
+   * `<tmp>/.opencodex/auth.json` when the suite starts.
+   *
+   * With a credential present the file exists, so "byte-identical before and after" is a claim
+   * with content: any write, including the destructive `--json`-as-provider-name path, changes it.
+   */
+  const seed = async (): Promise<string> => {
+    await saveCredential("claude", { access: "seed-access", refresh: "seed-refresh", expires: Date.now() + 600_000 });
+    const contents = snapshot();
+    expect(contents, "seeded auth.json must exist or the non-mutation assertions are vacuous").not.toBeNull();
+    return contents!;
+  };
+
+  const runLogout = async (args: string[]): Promise<{ code: number; out: string[]; err: string[]; before: string | null; after: string | null }> => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const log = console.log;
+    const error = console.error;
+    console.log = (...v: unknown[]) => out.push(v.join(" "));
+    console.error = (...v: unknown[]) => err.push(v.join(" "));
+    const before = snapshot();
+    try {
+      const argv = ["logout", ...args];
+      const code = await dispatchCommand(
+        { kind: "command", command: "logout", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+      return { code, out, err, before, after: snapshot() };
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("a flag is never read as a provider name and leaves the store byte-identical", async () => {
+    await seed();
+    const result = await runLogout(["--json"]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+    expect(result.out.join("")).not.toContain("Logged out");
+  });
+
+  test("an omitted provider is a usage error, not a no-op success", async () => {
+    await seed();
+    const result = await runLogout([]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+  });
+
+  test("an unknown option is rejected and the store is untouched", async () => {
+    await seed();
+    const result = await runLogout(["claude", "--wat"]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+  });
+
+  test("extra positionals are a usage error", async () => {
+    await seed();
+    const result = await runLogout(["claude", "gemini"]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+  });
+
+  test("a provider with no stored credential is not-found, not usage", async () => {
+    // 4 rather than 2: the call was well-formed, the thing simply is not there. Collapsing
+    // those two into one code is what made the account family unscriptable (#2698).
+    await seed();
+    const result = await runLogout(["gemini", "--json"]);
+    expect(result.code).toBe(4);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+    expect(JSON.parse(result.out.join("\n"))).toMatchObject({ ok: false, removed: false, reason: "not_found" });
+  });
+
+  test("a stored provider is removed and reported in both modes", async () => {
+    await seed();
+    expect(getAccountSet("claude")).not.toBeNull();
+
+    const human = await runLogout(["claude"]);
+    expect(human.code).toBe(0);
+    expect(human.out.join("")).toContain("Logged out of claude.");
+    expect(getAccountSet("claude")).toBeNull();
+
+    // Order-independent, and idempotent: a second logout is now a clean not-found.
+    await seed();
+    const json = await runLogout(["--json", "claude"]);
+    expect(json.code).toBe(0);
+    expect(JSON.parse(json.out.join("\n"))).toMatchObject({ ok: true, provider: "claude", removed: true });
+    expect(getAccountSet("claude")).toBeNull();
+  });
+});
+
+describe("logout reports only what it actually did", () => {
+  /**
+   * Two defects an adversarial audit found in the first version of the argv fix, both
+   * reproduced before being fixed.
+   *
+   * The first was the same bug one dash shorter: the parser treated only `--*` as options, so
+   * `ocx logout -j` used `-j` as the provider name. With a `-j` key in the store -- which
+   * `normalizeAuthStore` happily preserves -- that deleted a credential and exited 0.
+   *
+   * The second was a non-atomic read-then-remove. `getAccountSet` followed by
+   * `removeCredential` leaves a window where a concurrent logout removes the same account and
+   * both callers report a removal. `removeCredential` now returns its disposition from inside
+   * the serialized mutation, so only the caller that actually removed something says so.
+   */
+  const authPath = (): string => join(getConfigDir(), "auth.json");
+  const snapshot = (): string | null => existsSync(authPath()) ? readFileSync(authPath(), "utf8") : null;
+
+  const run = async (args: string[]): Promise<{ code: number; out: string[] }> => {
+    const out: string[] = [];
+    const log = console.log;
+    const error = console.error;
+    console.log = (...v: unknown[]) => out.push(v.join(" "));
+    console.error = (...v: unknown[]) => out.push(v.join(" "));
+    const argv = ["logout", ...args];
+    try {
+      const code = await dispatchCommand(
+        { kind: "command", command: "logout", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+      return { code, out };
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("a short flag is an option, not a provider, and its sentinel credential survives", async () => {
+    // The sentinel is the point: a store key named exactly like the malformed token. Seeding
+    // only a well-named provider cannot detect this class of bug, because removing `-j` would
+    // leave the rest of the file byte-identical.
+    await saveCredential("-j", { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+    expect(getAccountSet("-j")).not.toBeNull();
+
+    const result = await run(["-j"]);
+    expect(result.code).toBe(2);
+    expect(getAccountSet("-j"), "a flag must never reach the store as a provider name").not.toBeNull();
+    expect(result.out.join("")).not.toContain("Logged out");
+  });
+
+  test("a --json=... spelling is rejected rather than treated as a provider", async () => {
+    await saveCredential("--json=true", { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+    const result = await run(["--json=true"]);
+    expect(result.code).toBe(2);
+    expect(getAccountSet("--json=true")).not.toBeNull();
+  });
+
+  test("the malformed-token sentinel survives a --json invocation", async () => {
+    await saveCredential("--json", { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+    const before = snapshot();
+    const result = await run(["--json"]);
+    expect(result.code).toBe(2);
+    expect(getAccountSet("--json"), "the store must not be reached at all").not.toBeNull();
+    expect(snapshot()).toEqual(before);
+  });
+
+  test("concurrent logouts: exactly one reports the removal", async () => {
+    await saveCredential("gemini", { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+    const [first, second] = await Promise.all([run(["gemini"]), run(["gemini"])]);
+    // One removal (0) and one not-found (4). Two zeroes would mean a caller claimed credit for
+    // a mutation it did not perform, which is what the preflight allowed.
+    expect([first.code, second.code].sort()).toEqual([0, 4]);
+    expect(getAccountSet("gemini")).toBeNull();
+  });
+
+  test("removeCredential returns its disposition from inside the mutation", async () => {
+    await saveCredential("claude", { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+    expect(await removeCredential("claude")).toBe("removed");
+    expect(await removeCredential("claude")).toBe("not-found");
+    expect(await removeCredential("never-stored")).toBe("not-found");
+  });
+});
+
+describe("logout rejects anything that is not a possible provider id", () => {
+  /**
+   * Third round on the same defect, which is why the fix stopped naming spellings.
+   *
+   * `--json` was rejected, then `-j` was not; `-j` was rejected, then `—json` with a Unicode
+   * em dash was not. Each patch enumerated one more variant of "looks like a flag" while the
+   * store kept accepting anything that did not match that enumeration. The rule is now stated
+   * positively via `isValidProviderName`: start and end alphanumeric, internal `._-` allowed.
+   * Everything that cannot be a provider id is refused before the store is opened.
+   *
+   * Real providers contain dashes -- `github-copilot`, `google-antigravity` -- so a blanket
+   * dash ban would have been wrong; this is why the check is a shape rule, not a character ban.
+   */
+  const run = async (arg: string): Promise<number> => {
+    const argv = ["logout", arg];
+    const log = console.log;
+    const error = console.error;
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      return await dispatchCommand(
+        { kind: "command", command: "logout", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("Unicode dash tokens never reach the store", async () => {
+    // Em dash and minus sign. Both survived the ASCII-only guard and deleted sentinels.
+    for (const token of ["\u2014json", "\u2212json", "\u2013j"]) {
+      await saveCredential(token, { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+      expect(await run(token), `${JSON.stringify(token)} must be rejected`).toBe(2);
+      expect(getAccountSet(token), `${JSON.stringify(token)} sentinel must survive`).not.toBeNull();
+    }
+  });
+
+  test("reserved and malformed names are refused before any store access", async () => {
+    // `__proto__` is asserted without a sentinel: seeding it is impossible, because
+    // `saveCredential("__proto__")` corrupts the store object itself -- which is precisely why
+    // the validator reserves it. Trying to seed it threw inside the store, and that failure is
+    // the argument for rejecting the name at the CLI boundary.
+    expect(await run("__proto__")).toBe(2);
+    for (const token of ["policy", "-lead", "trail-", ".dot"]) {
+      await saveCredential(token, { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+      expect(await run(token), `${token} must be rejected`).toBe(2);
+      expect(getAccountSet(token), `${token} sentinel must survive`).not.toBeNull();
+    }
+  });
+
+  test("providers that legitimately contain dashes still work", async () => {
+    // The guard must not overshoot: these are real provider ids from listOAuthProviders().
+    for (const provider of ["github-copilot", "google-antigravity", "command-code"]) {
+      await saveCredential(provider, { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+      expect(await run(provider), `${provider} must be accepted`).toBe(0);
+      expect(getAccountSet(provider)).toBeNull();
+    }
+  });
+
+  test("an uppercase provider is normalised, not rejected", async () => {
+    await saveCredential("github-copilot", { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+    expect(await run("GITHUB-COPILOT")).toBe(0);
+    expect(getAccountSet("github-copilot")).toBeNull();
+  });
+});
+
+describe("doctor refuses --json rather than printing prose as success", () => {
+  const runDoctor = async (flag: string): Promise<number> => {
+    const argv = ["doctor", flag];
+    const log = console.log;
+    const error = console.error;
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      return await dispatchCommand(
+        { kind: "command", command: "doctor", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("exact --json, --json=true, and Unicode dashes all exit 2", async () => {
+    for (const flag of ["--json", "--json=true", "\u2014json"]) {
+      expect(await runDoctor(flag), `${JSON.stringify(flag)} must be refused`).toBe(2);
+    }
+  });
+});
+
+describe("GUI command delegation", () => {
+  const config = {
+    port: 10100,
+    runtimeRole: "hub" as const,
+    hub: { managementPublicOrigin: "https://hub.example.test" },
+    corsAllowOrigins: ["https://dashboard.example.test"],
+    providers: {},
+    defaultProvider: "openai",
+  };
+
+  test("opens the hub management ingress on its literal IPv4 loopback bind", () => {
+    const hubConfig = {
+      port: 10100,
+      hostname: "100.76.170.81",
+      runtimeRole: "hub" as const,
+      hub: {
+        managementPublicOrigin: "https://hub.example.test",
+        managementIngress: { enabled: true as const, port: 10102 },
+      },
+    } as Pick<OcxConfig, "port" | "hostname" | "runtimeRole" | "hub">;
+    const live = { hostname: "100.76.170.81", port: 10100 };
+
+    expect(selectDefaultGuiUrl(hubConfig, live, hostname => hostname ?? "127.0.0.1"))
+      .toBe("http://127.0.0.1:10102");
+
+    const withoutIngress = { ...hubConfig, hub: { managementPublicOrigin: "https://hub.example.test" } };
+    expect(selectDefaultGuiUrl(withoutIngress, live, hostname => hostname ?? "127.0.0.1"))
+      .toBe("http://100.76.170.81:10100");
+  });
+
+  test("keeps the default open behavior and requires an explicit pairing origin", async () => {
+    let opens = 0;
+    const deps = {
+      loadConfig: () => config,
+      openDefaultGui: async () => { opens += 1; return 0; },
+    };
+    expect(await runGuiCommand([], deps)).toBe(0);
+    expect(opens).toBe(1);
+    expect(await runGuiCommand(["pair"], deps)).toBe(1);
+    expect(await runGuiCommand(["pair", "--origin", "https://dashboard.example.test", "extra"], deps)).toBe(1);
+  });
+
+  test("prints a created grant once and maps remote API refusal to exit 1 without echoing response data", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const logSpy = spyOn(console, "log").mockImplementation(value => { stdout.push(String(value)); });
+    const errorSpy = spyOn(console, "error").mockImplementation(value => { stderr.push(String(value)); });
+    try {
+      const base = {
+        loadConfig: () => config,
+        openDefaultGui: async () => 0,
+        findLiveProxy: async () => ({ pid: 4242, port: 10100, source: "runtime" as const }),
+      };
+      const grant = `ocx_pair_${"C".repeat(43)}`;
+      expect(await runGuiCommand(["pair", "--origin", "https://dashboard.example.test", "--json"], {
+        ...base,
+        requestPairingGrant: async () => ({
+          kind: "created",
+          grant,
+          browserOrigin: "https://dashboard.example.test",
+          serverOrigin: "https://hub.example.test",
+          expiresAt: 1_800_000_300_000,
+        }),
+      })).toBe(0);
+      expect(stdout.join(" ").split(grant)).toHaveLength(2);
+
+      stdout.length = 0;
+      expect(await runGuiCommand(["pair", "--origin", "https://dashboard.example.test"], {
+        ...base,
+        requestPairingGrant: async () => ({ kind: "unavailable", reason: "rejected" }),
+      })).toBe(1);
+      expect(`${stdout.join(" ")} ${stderr.join(" ")}`).not.toContain("remote-response-secret");
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("login routes the Codex account names instead of printing the provider wall", () => {
+  /**
+   * `ocx login codex` used to fall through to handleLogin, which knows only the public
+   * OAuth and API-key providers, and answered with a ~90-name usage list that never
+   * contains the word the user typed. The Codex pool is reachable (`ocx account login
+   * codex`), so the dead end was vocabulary, not capability.
+   *
+   * The observable proof that the routing happened is the account path's own precondition:
+   * that flow runs inside the proxy, so with no live proxy it reports "Proxy is not
+   * running" and exits 1. handleLogin would have printed "Usage: ocx login <provider>"
+   * and killed the process with process.exit(1) instead, which is also why these cases
+   * cannot simply assert on a non-Codex name here.
+   */
+  const runLogin = async (args: string[]): Promise<{ code: number; err: string }> => {
+    const err: string[] = [];
+    const errorSpy = spyOn(console, "error").mockImplementation((...v: unknown[]) => { err.push(v.join(" ")); });
+    try {
+      const argv = ["login", ...args];
+      const code = await dispatchCommand(
+        { kind: "command", command: "login", args: argv },
+        { ...fakeDeps, args: argv, findLiveProxy: async () => null } as unknown as CliDispatchDeps,
+      );
+      return { code, err: err.join("\n") };
+    } finally {
+      errorSpy.mockRestore();
+    }
+  };
+
+  test("every Codex spelling reaches the account-pool login", async () => {
+    for (const name of ["codex", "chatgpt", "openai", "CODEX", " codex "]) {
+      const result = await runLogin([name]);
+      expect(result.code, `${name} must route to the account login`).toBe(1);
+      expect(result.err).toContain("Proxy is not running");
+      expect(result.err).not.toContain("Usage: ocx login <provider>");
+    }
+  });
+
+  test("account-login flags ride into the request body, not just past the parser", async () => {
+    // An earlier version of this case asserted the 503 path with --reauth/--id attached and
+    // called that "flags survive". It could not fail: dropping the flags at the dispatch seam
+    // leaves an empty leftover list, so rejectArgs stays quiet and the liveness probe prints
+    // the same message. The only falsifiable proof is the request the flags are supposed to
+    // reach, so this one answers the probe with a live proxy and reads the POST body.
+    const calls: { url: string; method?: string; body?: string }[] = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), method: init?.method, body: typeof init?.body === "string" ? init.body : undefined });
+      return new Response(JSON.stringify({ flowId: "flow-1", url: "https://example.invalid/auth" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const argv = ["login", "codex", "--reauth", "--id", "acct-1", "--no-wait", "--json"];
+      const code = await dispatchCommand(
+        { kind: "command", command: "login", args: argv },
+        {
+          ...fakeDeps,
+          args: argv,
+          findLiveProxy: async () => ({ hostname: "127.0.0.1", port: 65500 }),
+        } as unknown as CliDispatchDeps,
+      );
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.url).toContain("/api/codex-auth/login");
+      expect(calls[0]?.method).toBe("POST");
+      expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ id: "acct-1", reauth: true });
+    } finally {
+      logSpy.mockRestore();
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test("an unsupported flag is still rejected as a usage error", async () => {
+    const result = await runLogin(["codex", "--nope"]);
+    expect(result.code).toBe(2);
+    expect(result.err).toContain("Unexpected argument(s): --nope");
+  });
+
+  test("a name that is not a Codex spelling still gets the provider wall, not the account path", async () => {
+    // Closes the other half of the routing claim: the predicate is the gate, so a regression
+    // that sent every 'ocx login' through the account command would print "Proxy is not
+    // running" here instead of the wall. handleLogin ends in process.exit, which a test
+    // cannot survive, so the exit is spied and turned into a throw.
+    const err: string[] = [];
+    const errorSpy = spyOn(console, "error").mockImplementation((...v: unknown[]) => { err.push(v.join(" ")); });
+    const exitSpy = spyOn(process, "exit").mockImplementation(((exitCode?: number) => {
+      throw new Error(`process.exit:${exitCode}`);
+    }) as never);
+    try {
+      const argv = ["login", "definitely-not-a-provider"];
+      await expect(dispatchCommand(
+        { kind: "command", command: "login", args: argv },
+        { ...fakeDeps, args: argv, findLiveProxy: async () => null } as unknown as CliDispatchDeps,
+      )).rejects.toThrow("process.exit:1");
+      const printed = err.join("\n");
+      expect(printed).toContain("Usage: ocx login <provider>");
+      expect(printed).toContain("ocx login codex");
+      expect(printed).toContain("openai-apikey");
+      expect(printed).not.toContain("Proxy is not running");
+    } finally {
+      exitSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("the provider wall names the Codex route without joining the public OAuth surface", () => {
+    const usage = loginUsageMessage();
+    expect(usage).toContain("ocx login codex");
+    // The wall is what the production path prints (asserted above through console.error);
+    // this reads the same source so a wording regression names the field that changed.
+    expect(usage).toContain("openai-apikey");
+    // Routing must not re-open the generic OAuth path for the pool credential:
+    // tests/oauth/oauth-public-surface.test.ts owns that exclusion.
+    expect(listOAuthProviders()).not.toContain("chatgpt");
+    expect(listOAuthProviders()).not.toContain("codex");
+    // The other table the routing silently shadows: if a key-login provider ever took one of
+    // these ids, 'ocx login <that id>' would become unreachable with no other failing test.
+    for (const name of ["openai", "codex", "chatgpt"]) expect(isKeyLoginProvider(name)).toBe(false);
+    expect(isKeyLoginProvider("openai-apikey")).toBe(true);
+    expect(isCodexAccountLoginName("codex")).toBe(true);
+    expect(isCodexAccountLoginName("xai")).toBe(false);
+  });
+
+  test("the registry entry keeps documenting the Codex route", () => {
+    // help.ts and registry.ts carry the only discoverability text a user sees before typing;
+    // the existing help/registry suites only require that an 'ocx login' line exists at all.
+    const details = (CLI_COMMANDS.find(entry => entry.name === "login")?.details ?? []).join(" ");
+    expect(details).toContain("ocx login codex");
+    expect(details).toContain("openai-apikey");
+  });
+});

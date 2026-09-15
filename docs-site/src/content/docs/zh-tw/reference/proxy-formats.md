@@ -14,6 +14,10 @@ opencodex 以多種客戶端方言呈現一個本機代理。Codex 客戶端可�
 
 Responses 表示是橋接的中心。原生相容的路由可跳過部分轉譯並 passthrough 請求，但認證、路由、許可控制與回應安全仍在代理邊界發生。在[設定](/zh-tw/reference/configuration/)中設定監聽器與許可金鑰；當一個公開模型 id 應在多個目標間選擇時使用[組合](/zh-tw/guides/combos/)。
 
+## 上游重新導向
+
+攜帶憑證的模型、圖片、影片和搜尋請求不會自動跟隨 HTTP 重新導向，包括同源重新導向。請設定最終上游 API URL，而非會重新導向的別名。伺服器不會向重新導向目標再次傳送憑證或請求內文。各回應處理路徑保留原有的錯誤處理或轉送行為；原生 Responses 和 compact 路徑仍可向用戶端回傳原始 3xx 與 `Location`。用戶端的重新導向行為與此伺服器傳輸政策屬於不同邊界。
+
 ## 端點概覽
 
 | 客戶端介面 | 端點 | 成功的非串流結果 | 成功的串流或 socket 結果 |
@@ -22,7 +26,7 @@ Responses 表示是橋接的中心。原生相容的路由可跳過部分轉譯�
 | OpenAI Chat Completions | `POST /v1/chat/completions` | `chat.completion` JSON | `chat.completion.chunk` SSE，以 `[DONE]` 結束 |
 | Anthropic Messages | `POST /v1/messages` | Anthropic `message` JSON | Anthropic Messages SSE |
 | Anthropic token 計數 | `POST /v1/messages/count_tokens` | `{ "input_tokens": number }` | 不適用 |
-| 模型探索 | `GET /v1/models` | 三種目錄契約之一 | 不適用 |
+| 模型探索 | `GET /v1/models` | 目錄或明確指定的 Desktop 快照 | 不適用 |
 | 語音與 Realtime | `POST /v1/live`, `POST /v1/realtime/calls` | 中繼的 call-creation 回應 | 一個獨立的 sideband WebSocket 雙向中繼 frame |
 | Responses compaction | `POST /v1/responses/compact` | 取代歷史 JSON | 不適用 |
 
@@ -150,9 +154,15 @@ Responses 表示是橋接的中心。原生相容的路由可跳過部分轉譯�
 { "input_tokens": 123 }
 ```
 
+無法解析的日期型 Desktop ID 也可能是探索結果中缺少的真實原生模型 ID。現有資訊不足以
+解析該 ID 時，Messages 和 count-tokens 回傳 HTTP 503 及固定錯誤 `desktop_model_mapping_unavailable`；這不代表
+模型無效。未知的舊版雜湊別名仍回傳 HTTP 400。兩種情況都不會移除日期或回退到其他路由。
+已知 ID、已註冊映射、精確 `modelMap` 匹配及已識別的真實原生 ID 維持原有處理方式。
+請重新整理模型探索或重新套用已連接 hub 的設定後再試；僅重試本身不能保證解決。
+
 ## `GET /v1/models`
 
-相同路由服務三個期待不相容目錄封裝的客戶端。除非也存在 `client_version`，否則 Anthropic flavor 勝出。
+未指定 `format=desktop-config` 時，使用以下一般目錄契約：
 
 | 契約 | 觸發 | 頂層結構 | 模型 id 行為 |
 | --- | --- | --- | --- |
@@ -160,7 +170,30 @@ Responses 表示是橋接的中心。原生相容的路由可跳過部分轉譯�
 | Codex 目錄 | `client_version` query 參數 | `{ "models": [...] }` | 原生與路由項目帶有更豐富的 Codex 目錄欄位、可見性、effort、WebSocket 與多代理中繼資料 |
 | 普通 OpenAI 清單 | 無觸發 | `{ "object": "list", "data": [...] }` | 可見的原生 id 為裸 id；路由 id 為別名或 `provider/model` |
 
+### Desktop 設定快照
+
+`GET /v1/models?ids=desktop&format=desktop-config` 明確選擇 Desktop 快照，不依賴
+user-agent。回應為 `{ "version": 1, "models": [...] }`，帶有 `Cache-Control: no-store`。
+客戶端送出 `Accept: application/json`、`anthropic-version: 2023-06-01` 及現有資料存取憑證；
+不需要管理員權杖，也不上傳設定檔。項目是 hub 發出的 Desktop 設定模型，不是 Codex 目錄列。
+
+此格式與 `ids=cli` 或任何 `client_version` 一起使用時回傳 HTTP 400。未指定格式時，上述一般
+契約維持不變。Claude 關閉時回傳 `{ "version": 1, "models": [] }`；已連接的 Desktop apply
+會視為無法使用，不寫入替代設定。回傳一般目錄而非版本 1 的舊 hub 不受支援，客戶端不會改用
+本機產生的 ID。
+
+快照仍是唯讀模型清單，不是金鑰輪換或設定檔上傳 API。Desktop 金鑰移轉、復原與中斷由既有
+客戶端連線流程處理。輪換保留模型項目和選擇；CLI 的 `rotation` 區分 `committed` 與
+`rolled_back`。中斷會還原管理設定，或對已確認的舊設定檔回報標準回退，同時保留使用者欄位和
+後來有效的選擇。衝突或未完成的復原不會標為完成。需要重新啟動 Desktop 才會讀取磁碟變更；
+中斷不會自動撤銷 hub 金鑰。參見 [Desktop 指南](/zh-tw/guides/claude-code/)。
+thinking 重播與提示快取仍由獨立的 [#3719](https://github.com/lidge-jun/opencodex/issues/3719) 跟進。
+
 ## `POST /v1/live` 與 Realtime sideband
+
+下方帳戶綁定說明適用於原生 Codex 用戶端。透過外部 API 金鑰使用語音轉寫及 GPT-Live，請參閱[英文音訊 API 規格](/reference/proxy-formats/#streaming-dictation)。
+
+Connections > API keys 包含獨立的聽寫與即時語音區域。資料金鑰僅保留在表單記憶體中。聽寫會上傳選取的檔案；語音連線檢查不使用麥克風，而是等待工作階段確認。已設定不代表連線成功。
 
 `POST /v1/live` 接受 ChatGPT/Codex App Frameless call-creation 介面。
 `POST /v1/realtime/calls` 接受 OpenAI Realtime call-creation 介面。opencodex 選擇一個合格的 OpenAI 家族路由、為上游認證模式正規化 call-creation 請求，並中繼有界的回應。
@@ -199,14 +232,20 @@ Compaction 為需要縮短長 Responses 對話的客戶端回傳取代歷史。
 
 | 介面 | 專屬 | Bearer | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP 與 WebSocket | 必填 | 代理許可被拒 | 被拒 |
-| `/v1/responses/compact` | 必填 | 代理許可被拒 | 被拒 |
-| `/v1/chat/completions` | 必填 | 代理許可被拒 | 被拒 |
+| `/v1/responses` HTTP 與 WebSocket | 接受 | 接受 | 被拒 |
+| `/v1/responses/compact` | 接受 | 接受 | 被拒 |
+| `/v1/chat/completions` | 接受 | 接受 | 被拒 |
 | `/v1/messages` 與 `/v1/messages/count_tokens` | 接受 | 接受 | 接受 |
 | `/v1/models` | 接受 | 接受 | 接受 |
 | `/v1/live`、`/v1/realtime/calls` 與 sideband join | 接受 | 接受 | 接受 |
 
-Responses 家族與 Chat 請求為供應商或 Codex Direct passthrough 保留 `Authorization`，因此遠端代理金鑰必須使用專屬標頭。Messages 與 Realtime 介面需要更廣的客戶端相容性，因此接受所有三種形式。
+Responses 系列和 Chat 請求接受專用標頭或 Bearer 欄位中的代理金鑰。在原生路由上，所選的已儲存 Codex 憑證會取代 admission bearer；其他路由會移除該 bearer。代理金鑰絕不會用作 upstream 憑證。如果還要提供獨立的 provider bearer，請將代理金鑰放在專用標頭中。
+
+沒有金鑰且不使用 OAuth 的 Cursor 路由可以使用呼叫端另外提供的 bearer，但不能使用代理 secret 或自動補入的 ChatGPT main 憑證。Combo/policy 選擇及實際發生的 shadow/thread-spawn 路由改寫不會將呼叫端的原始憑證傳遞給新目標。正規 OpenAI 路由僅在 JWT 包含 ChatGPT 帳戶宣告，且任何明確提供的帳戶標頭都與該宣告相符時，才可在內部路由變更後還原呼叫端的單一非代理金鑰 bearer。 將呼叫端驗證轉送至選用的 OpenAI sidecar 時，需要單一 JWT，以及明確提供且相符的 `chatgpt-account-id`。即使明確提供了帳戶標頭，opaque bearer 也不會跨路由變更還原。 除此之外，最終目標必須擁有自己的設定、OAuth 或已儲存憑證，否則請求會在本機失敗。只有 thread-spawn 標記而沒有路由變更時，不會移除憑證。
+
+對於未設定金鑰的 Cursor Chat 請求，只有實際規劃了 OpenAI 輔助呼叫且存在標準的 Direct 候選時，才會補充已儲存的 main 驗證。無關的 Cursor 請求不會透過此流程佔用 native main，因此不會延遲設定檔切換。輔助呼叫憑證仍受啟動和切換保護限制，並與 Cursor bearer 分離。Pool 及明確指定帳號的輔助呼叫保留現有帳號選擇。
+
+Claude replay 只會以目前 turn 已取得所有權的記憶體 snapshot 保留 main 憑證，並且僅在最終目標為正規 ChatGPT 路由時還原它。
 
 :::caution
 Data-plane 金鑰不是管理憑證。管理 API 使用獨立的管理秘密；請見[管理 API](/zh-tw/reference/management-api/)。絕不為兩個平面重用同一個秘密。
@@ -221,7 +260,7 @@ Data-plane 金鑰不是管理憑證。管理 API 使用獨立的管理秘密；�
 | 401 | `authentication_error` | 必填的代理許可憑證缺失或無效 |
 | 403 | `origin_rejected` | Responses/OpenAI data-plane 請求或 WebSocket 升級來自不允許的來源 |
 | 503 | `combo_unavailable` | 所選組合中的每個目標都不可用、在冷卻中、停用或因其他原因不合格 |
-| 400 | `unreadable_encrypted_agent_task` | 加密的 v2 worker task 沒有可消耗它的合格原生 ChatGPT 目標 |
+| 400 | `unreadable_encrypted_agent_task` | 加密的 v2 worker task 沒有可處理它的合格規範 ChatGPT 目標或明確信任的 Responses 目標 |
 | 426 | `upgrade_required` | Responses WebSocket 傳輸被停用或升級失敗；請使用 HTTP |
 
 Anthropic 來源的失敗以 Anthropic 的錯誤封裝渲染，因此該方言上的來源拒絕是 403 `permission_error`，而非 OpenAI 風格的 `origin_rejected` body。

@@ -12,7 +12,7 @@ opencodex 内置了一个由代理提供服务的本地 web 仪表盘（`gui/` �
 ocx gui
 ```
 
-该命令会在浏览器中打开 `http://localhost:<port>`；如果代理尚未运行，会先自动启动。开发时也可
+该命令会在浏览器中打开 `http://localhost:<port>`；在启用了管理 ingress 的 hub 上则打开 `http://127.0.0.1:<管理端口>`；如果代理尚未运行，会先自动启动。开发时也可
 让 GUI dev server 单独连接到正在运行的代理：
 
 ```bash
@@ -37,8 +37,8 @@ bun run dev:gui
 | **启动安全** | 显示注入的 Codex 路由能否在重启后继续工作，并分别显示服务、launcher shim 状态和准确的修复命令。 |
 | **Windows 托盘** | 安装用户登录托盘，一键控制代理启动、停止、重启、面板和状态。托盘不是代理重启服务。 |
 | **Codex 自动启动** | 允许已安装的 Codex launcher shim 运行 `ocx ensure`。此开关不会安装 shim 或后台服务。 |
-| **Providers** | 添加、编辑、设为默认（仅已启用）、启用/禁用、删除 provider，并在支持时管理 OAuth 账号池和 API key 池。删除当前默认时，会切换到剩余的第一个已启用 provider（若存在）；否则拒绝删除并保留当前默认。Claude（Anthropic）OAuth 池中，每个已登录账号显示各自的 5 小时与周限额条（用量按凭证计）；探测失败时保留上次已知数值并标记为暂时不可用。 |
-| **Add provider** | 搜索 registry preset，选择账号登录、API key 服务、本地服务器或自定义 endpoint。 |
+| **Providers** | 添加、编辑、设为默认（仅已启用）、启用/禁用、删除 provider，并在支持时管理 OAuth 账号池和 API key 池。删除当前默认时，会切换到剩余的第一个已启用 provider（若存在）；否则拒绝删除并保留当前默认。Claude（Anthropic）OAuth 池中，每个已登录账号显示各自的 5 小时与周限额条（用量按凭证计）；探测失败时保留上次已知数值并标记为暂时不可用。 未选中任何 provider 时显示的 Providers 概览带有**刷新全部额度**按钮，会在服务端一次性重新读取所有已配置的 provider；上游探测失败的 provider 会保留上次已知数值，因此状态文案只表示检查已完成，而不声称每个数值都是最新的，各行自身的检查时间仍是该 provider 的新鲜度信号。 |
+| **Add provider** | 标签页上方的单个搜索框可同时搜索账号、免费、本地、付费四个标签页。搜索时选中的标签页不会跳转，结果按标签页分组并显示数量。本地运行时（Ollama、vLLM、LM Studio、LiteLLM）拥有独立标签页，过长的说明会截断为两行，点击即可查看全文。 |
 | **Codex Auth** | 添加 ChatGPT/Codex 池账号，选择下一 session 的账号，刷新 5h / 每周 / 30d 配额，启用或停用配额自动切换，设置其 1–100% 阈值和临时故障 failover。 |
 | **Subagents** | 在 `spawn_agent` override 列表中置顶最多五个原生或路由模型。 |
 | **Models** | 开关原生 GPT 与路由模型，配置 provider allowlist、上下文上限、v1/base/v2 以及 v2 thread 数量。 |
@@ -46,6 +46,16 @@ bun run dev:gui
 | **Usage / Debug** | 查看 token usage 覆盖率与趋势，或启用可选的 provider transport 和 usage 提取诊断。 |
 | **Storage** | 只读查看 CODEX_HOME 磁盘占用（会话、归档、数据库、附件）。可选归档清理：预览最旧 N%，默认隔离到 `CODEX_HOME/.trash`，或勾选后永久删除。**自动清理策略**为可选且**默认关闭**（`storageCleanupPolicy.enabled`）；可在 Storage 页配置阈值/目标/计划/模式，或点「立即运行」。可在 Storage 页从隔离区恢复（JSONL + 线程）。活动会话保持只读。Codex 锁定最新/活动的 `state_*.sqlite` 时拒绝清理与恢复。 |
 | **Stop** | 优雅地停止代理和已安装的后台服务，恢复原生 Codex 并退出（`POST /api/stop`）。在使用任务计划程序后端的 Windows 上，仪表板会拒绝并提示改用 `ocx stop`：任务结束后包装器仍可能重新拉起代理，只有运行在代理之外的 stop 才能在恢复客户端配置前确认这个重启窗口。被拒绝时不会做任何更改。 |
+
+用量、仪表板、供应商工作区、供应商目录和 API 密钥页面会提示部分记录被排除，即使没有可读取的记录。次数、日期和使用排名仅反映可读取的记录。历史不完整时，无法保存模型的最常用排序；请选择其他排序或修复历史后重试。
+
+### 筛选请求日志
+
+Logs 可组合界面、被拦截请求、提供商、完整模型名、状态、时间、速度和会话 ID，筛选当前已加载的日志。选项包含回退尝试；模型匹配忽略大小写及首尾空格，但不做部分匹配。日志中消失的选项恢复为全部。
+
+时间范围为最近 15 分钟、1 小时或 1 天；Logs 标签页每 30 秒更新一次，即使关闭自动刷新也会更新。速度按完整请求耗时计算每秒输出 token，分为小于 15、15 至小于 50、至少 50；启用速度筛选时排除无测量值的请求。成功为 2xx，错误为 4xx/5xx。
+
+显示匹配数与已加载总数；重置恢复全部行，并区分无匹配与空日志。界面选择支持方向键及 Home/End，不查询已加载范围之外的历史记录。
 
 ### 链接到某个部分
 
@@ -57,6 +67,19 @@ bun run dev:gui
 ## 模型可见性
 
 **Models** 开关表示 Codex 中的最终可见状态。路由模型只有在 provider allowlist 中（或未设置 allowlist）且未被禁用时才会开启。开启模型会原子地协调两个过滤条件；**全部开启** 会清除 allowlist，因此以后新发现的模型也会开启。
+
+### 在提供方工作区管理模型
+
+在提供方的**模型**标签页中，**删除**会移除已保存的自定义定义。原有的原生模型或实时发现的模型可能
+重新显示，因此模型数量可能保持不变。**隐藏**只改变目录可见性，不会删除定义，也不会改变直接路由策略。
+点击**在模型中管理可见性**可打开**模型**页面并恢复显示；即使提供方标签页已没有任何模型行，也能使用此入口。
+
+**添加**会保存自定义定义，但不会清除已有的隐藏状态或提供方选择规则。保存后的模型可能仍被隐藏。
+如果模型已存在，请在**模型**页面管理其可见性。已确认保存时，即使目录刷新失败，定义也已保存；
+请按刷新提示操作，不要重复添加。若无法确认更改结果，请先刷新模型状态，再重试。
+
+提供方的模型数量统计服务器返回的当前模型清单中未禁用的唯一条目，计数在搜索和显示数量限制之前进行。
+它不是允许列表的大小或实时发现的模型数量，也不能证明条目来自上游发现。选择标记和发现信息与该计数分开显示。
 
 ## 委派选择器与生成路由的区别
 
@@ -96,9 +119,10 @@ Pool 模式会在主账号和已添加的 Codex 账号之间选择；Direct 只�
   只有当它上面的账号全部耗尽或不可用时才会降到更靠后的顺序。改动顺序会从**下一个未绑定请求**起生效，
   且不会移动已经绑定的 thread。Codex Desktop（主）账号同样参与排序，可以设为 **最后** 留作备用。
   用 `ocx account priority` 设置的非预设值也会保留在卡片上，仍可选择。
-- Thread affinity 可避免每个请求都来回切换账号。启用配额自动切换后，长时间运行的 thread 会被
-  定期重新评估；当相关 usage 达到阈值，并且存在使用率确实更低的可用账号时，该 thread 可能会
-  重新绑定。
+- Thread affinity 可避免每个请求都来回切换账号。默认开启 `pool.cacheAffinity` 后，长时间运行的
+  thread 不会仅因 usage 达到阈值就重新绑定；只有账号耗尽或无法继续服务时才会离开，并且只改绑到
+  确有额度余量且使用率确实更低的账号。关闭该标志后，才会在存在使用率确实更低且确有额度余量的
+  可用账号时按阈值重新绑定。
 - 新 session 可以选择 usage 最低的可用账号。付费计划按已知 5h、每周、30d 窗口中的最高使用率
   评分；Go/Free 计划只使用 30d 窗口。
 - **Refresh quotas** 会立即重新读取账号 usage，使路由逻辑与页面上的账号卡片使用同一份数据。
@@ -141,7 +165,7 @@ GUI 是代理 JSON 管理 API 之上的轻量客户端。常用 endpoint 包括�
 | `PUT /api/codex-auth/active` · `PUT /api/codex-auth/auto-switch` · `PUT /api/codex-auth/failover` | 选择下一次请求使用的账号并配置账号池路由。 |
 | `GET /api/codex-auth/active` · `PUT /api/codex-auth/accounts/priority` | 读取实际生效的账号（含表示是否固定的 `pinned` 和指明被固定账号的 `pinnedAccountId`），并设置单个账号的选择顺序。 |
 | `POST /api/codex-auth/login` · `GET /api/codex-auth/login-status` | 通过浏览器登录添加池账号。 |
-| `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | 使用 tail、provider、精确状态码或状态类别筛选近期请求元数据。`limit`/`offset` 从最新一行向前分页（`offset=0` 为最新一页）。响应为 `{ timeZone, total, logs }`，其中 `total` 为分页前的匹配行数。 |
+| `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | 使用 tail、provider、精确状态码或状态类别筛选近期请求元数据。`limit`/`offset` 从最新一行向前分页（`offset=0` 为最新一页）。响应为 `{ timeZone, generatedAt, total, logs }`，其中 `total` 为分页前的匹配行数。 |
 | `GET` / `PUT /api/subagent-models` | 读取或设置五个置顶的 `spawn_agent` override 模型。 |
 | `POST /api/stop` | 停止代理/服务，恢复原生 Codex 并退出。在 Windows 任务计划程序后端会以 `respawnable_service` 拒绝，无法读取该状态时以 `service_state_unknown` 拒绝；两种情况都不会做任何更改。 |
 

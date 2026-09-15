@@ -1,12 +1,12 @@
 ---
 name: ocx
-description: Drive a running opencodex (`ocx`) proxy from the CLI — account pools, provider routing, model catalog, usage and cost attribution, request logs, access keys, storage cleanup, and the management API. Use when a task involves controlling or inspecting an opencodex proxy rather than editing the opencodex codebase. Triggers: ocx, opencodex, proxy control, account pool, pause account, pool strategy, provider routing, usage report, cost attribution, access key, request log, conversation trace, storage cleanup, management API.
+description: "Drive a running opencodex (`ocx`) proxy from the CLI — account pools, provider routing, model catalog, usage and cost attribution, request logs, access keys, storage cleanup, and the management API. Use when a task involves controlling or inspecting an opencodex proxy rather than editing the opencodex codebase. Triggers: ocx, opencodex, proxy control, account pool, pause account, pool strategy, provider routing, usage report, cost attribution, access key, request log, conversation trace, storage cleanup, management API."
 ---
 
 # Operating `ocx`
 
 `ocx` controls a locally running opencodex proxy. The CLI covers the dashboard's operational
-surface, with one consent exception (starring) recorded under Consent below. `ocx capabilities`
+surface, subject to Consent and Secret-bearing commands below. `ocx capabilities`
 lists the *declared* index, not every verb.
 
 Be precise about the gap, because guessing costs you more than reading: the capability index below
@@ -90,6 +90,32 @@ starring would be useful, say so and let the user decide.
 The same boundary covers the session-gated `/api/codex-prompt` writes: read them with
 `ocx inspect codex-prompt`, and leave the writes to the dashboard.
 
+## Secret-bearing commands
+
+**Do not create an access key or start an access-key rotation from an agent session.**
+This covers the create and rotation-start operations under `ocx access key`,
+`ocx access keys`, and `ocx api-key`, their `opencodex` equivalents and executable
+wrappers, and direct POST requests to `/api/keys` and `/api/keys/rotate`.
+Both text and JSON responses contain a one-time plaintext data-plane credential,
+which can enter the agent transcript. Ask the user to perform that step in a
+human-operated terminal outside the agent session, configure and verify the
+replacement, and report only confirmation plus non-secret key/rotation IDs.
+Never ask for the plaintext key in chat or offer a pipe, redirection, or API
+workaround to perform the secret-returning step inside the agent session.
+
+`ocx hub invite` has the same boundary: text and JSON output expose a plaintext pairing
+grant or a command embedding it. Use the human-operated terminal handoff in
+[recipe 10](references/03_recipes.md#10-invite-one-more-machine-onto-a-hub); never ask for
+the grant or generated command in chat. Continue non-secret setup and verification normally.
+
+Configuration confirmation is not approval to revoke the existing credential.
+Identify the existing key ID and obtain separate explicit revocation approval
+before committing an in-place rotation or removing an old, separately replaced key.
+An existing explicit approval for that exact revocation remains valid; setup
+confirmation alone does not supply it. Commit and abort return no plaintext key,
+but still require authority for their state changes. Follow
+[recipe 5](references/03_recipes.md#5-prepare-an-access-key-rotation-without-exposing-the-new-key).
+
 ## Destructive verbs
 
 `storage trash restore` and `storage policy run` refuse without `--yes` (exit 2, nothing sent).
@@ -106,7 +132,20 @@ Report the count and bytes from that output and get explicit approval before add
 `--mode quarantine` (the default) can be undone with `storage trash restore`; `--mode permanent`
 cannot.
 
-## Remote hub: two things agents get wrong
+## Remote hub: three things agents get wrong
+
+**A hub is one port, and `ocx hub invite` writes the join command for you.** Remote machines dial
+`hostname:port` with their own per-client key; the hub's own processes dial `127.0.0.1:<the same
+port>` with no credential, through the loopback companion listener
+(`unauthenticatedLoopbackListener: {"enabled": true}`, no port). Have the operator run `ocx hub invite`
+on the hub outside the agent session rather than assembling an `ocx connect` line: it mints a single-use code and prints the exact
+command, with both origins already filled in. Its `--management-url` is a confirmation of
+`hub.managementPublicOrigin`, not an override. The operator transfers the command directly to the joining machine; keep it out of the transcript.
+
+Two consequences that look like bugs and are not. `ocx status` on a hub prints a `Hub:` block —
+read it before asking the operator anything about ports or tokens. And a hub does not rewrite its
+**own** Codex/Grok/Claude configs unless that listener is enabled; the skip says so in those words,
+and it is a gate, not the `clientIntegrations` toggle.
 
 **Pairing is not hub setup.** Configuring a hub — providers, accounts, routing, keys — never
 needs a pairing code. `GET /opencodex-session` mints a session by itself for a loopback
@@ -129,7 +168,11 @@ When `disconnect` refuses, do not route around it. Each refusal means the unwind
 proven safe: another process owns the token, no journal records the pre-connect state, a
 different client key owns the journal, or the restore was only partial.
 
-Details, including key rotation's two-step commit: `references/05_remote_hub.md`.
+Details, including the one-port recipe, the invite flow and key rotation's two-step commit:
+`references/05_remote_hub.md`. Service and launchd semantics, including why
+`ocx service repair` can correctly do nothing while `ocx service restart` always restarts —
+so a restart is never a hand-written `launchctl kickstart`:
+`references/04_failure_semantics.md`.
 
 ## References
 

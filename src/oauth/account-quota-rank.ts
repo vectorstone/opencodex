@@ -68,6 +68,25 @@ function headroomOf(provider: string, accountId: string): number | null {
 }
 
 /**
+ * Remaining headroom percent for one account, or null when nothing has measured it.
+ *
+ * Exported for the generic fill-first threshold, which needs the measurement itself rather
+ * than an ordering. Null stays null all the way out: a caller must decide what "unmeasured"
+ * means for its own rule instead of being handed a fabricated 0 or 100.
+ */
+export function accountHeadroomPercent(provider: string, accountId: string): number | null {
+  return headroomOf(provider, accountId);
+}
+
+/** Unknown usage is not exhaustion; Kiro's explicit overage verdict is authoritative. */
+export function isAccountQuotaExhausted(provider: string, accountId: string): boolean {
+  const exhaustion = provider === "kiro" ? getKiroAccountExhaustion(`${provider}\u0000${accountId}`) : null;
+  if (exhaustion !== null) return exhaustion.exhausted;
+  const headroom = headroomOf(provider, accountId);
+  return headroom !== null && headroom <= 0;
+}
+
+/**
  * Order candidates best-first.
  *
  * Returns the input untouched when no candidate has quota evidence, which keeps every
@@ -90,7 +109,7 @@ export function rankAccountsByHeadroom(provider: string, ring: readonly string[]
     const headroom = headroomOf(provider, id);
     if (exhaustion !== null || headroom !== null) sawEvidence = true;
 
-    if (exhaustion?.exhausted === true) return { id, bucket: RANK_EXHAUSTED, headroom: 0, index };
+    if (isAccountQuotaExhausted(provider, id)) return { id, bucket: RANK_EXHAUSTED, headroom: 0, index };
     if (headroom === null) return { id, bucket: RANK_UNKNOWN, headroom: 0, index };
     return { id, bucket: RANK_HEALTHY, headroom, index };
   });

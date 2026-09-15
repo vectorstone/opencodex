@@ -83,14 +83,35 @@ hatalar" sütunu bu tabloyu tekrarlamak yerine rotaya özgü ek sonuçları list
 | `GET /api/grok` | Grok yönetilen yapılandırma durumunu ve aday modelleri okuyun | 400 durum okuma hatası |
 | `PUT /api/grok/selection` | Hariç tutulan Grok modellerini kalıcı hale getirin | 400 geçersiz veya aşırı büyük seçim |
 | `POST /api/grok/apply` | Kalıcı hale getirilen Grok yapılandırmasını yönetilen senkronizasyon aracılığıyla uygulayın | 409 `grok_apply_busy`; 400/500 uygulama hatası |
+| `GET /api/grok/reset-coupons?accountId=...` | Aktif veya belirtilen xAI hesabı için kalan Grok faturalandırma sıfırlama jetonlarını ve geçerlilik pencerelerini okuyun | 400 eksik hesap; 401 kimlik doğrulaması yok; 502 yukarı akış gRPC-Web hatası |
+| `POST /api/grok/reset-coupons/consume` | Uygun bir sıfırlama kuponunu kullanın. Gövde `{ accountId?, tokenId?, operationId? }`. İsteğe bağlı `operationId` (UUIDv4) kullanımı idempotent yapar: aynı kimliği yinelemek, çift kullanım olmadan kalıcı sonucu yeniden oynatır. | 400 geçersiz JSON/UUID; 401 kimlik doğrulaması yok; 409 `identity_mismatch`; 502 yukarı akış hatası; 503 kayıt defteri kapasitesi |
 | `GET, PUT /api/claude-desktop` | Claude Desktop yönlendirilen/yerel profilini okuyun veya kalıcı hale getirin | 400 geçersiz veya kullanılamaz atama |
 | `POST /api/claude-desktop/apply` | Kaydedilen profili Claude Desktop'ın yönetilen yapılandırmasına yazın | 400/500 yazma hatası |
 | `GET /api/claude-desktop/status` | Kaydedilen ve uygulanan profili ve Desktop sağlığını inceleyin | 400 durum okuma hatası |
 | `GET, PUT /api/claude-code` | Claude Code ağ geçidi, kimlik doğrulama modu, model haritası, bağlam, ajan ve sidecar ayarlarını okuyun veya güncelleyin | 400 geçersiz alan veya şekil |
 
+Kontrol paneli her iki kupon yolunu da **Providers > xAI Grok > Accounts**
+üzerinden yürütür: oturum açmış her hesap satırı, kalan kupon sayısını gösteren
+bir bilet rozeti taşır ve rozet, geçerlilik pencerelerini listeleyen ve süresi
+dolmaya en yakın kuponu kullanan bir iletişim kutusu açar. İletişim kutusu
+istemci tarafından üretilen bir `operationId` gönderir ve yeniden denemek yerine
+zaman aşımından sonra göndermeyi durdurur; çünkü günlük kaydı hâlâ açık olan
+bir kullanım yeniden yürütülür. `ocx account grok-reset-coupons` uçbirim
+eşdeğeri olarak kalır.
+
 Model kadrosunun ve şifrelenmiş çalışan görevi davranışının arkasındaki
 kavramlar için [Alt Ajan Arayüzü](/tr/guides/sub-agent-surface/) sayfasına
 bakın.
+
+### İstemci entegrasyonu geri alma günlüğü
+
+| Yöntem ve yol | Amaç | Önemli hatalar |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | Geri alma işlemlerini, isteğe bağlı olarak tek bir istemci için listeler. Her satır sunucunun hesapladığı `deletable` alanını içerir. | 400 geçersiz istemci |
+| `DELETE /api/client-integrations/journal?opId=...` | Eski bir geri alma işlemini kullanımdan kaldırır ve mümkünse anlık görüntüsünü siler. Başarılı yanıtta `snapshotRemoved: false`, temizliğin bakım yeniden denemesi için saklandığını belirtir. | 400 eksik `opId`; 404 bulunmayan veya zaten kaldırılmış işlem; 409 istemcinin en yeni işlemi |
+
+Silme, günlüğü yeniden yazmak yerine bir silme kaydı ekler. Geçerli geri alma noktasını korumak için
+her istemcinin en yeni işlemi sunucu tarafında korunur.
 
 ### Kombolar
 
@@ -142,6 +163,8 @@ Hedef stratejileri, soğuma süreleri, takma adlar ve yönlendirme hataları iç
 | `POST /api/storage/cleanup-policy/run` | Manuel bir temizleme politikası çalıştırması başlatın | 409 `already_running`; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | Yalnızca test amaçlı politika akış kancası | Kullanılamadığında 404 `not_found` |
 
+Bir satır mevcut ayrıştırıcı boyut sınırını aşarsa `GET /api/usage` ve `GET /api/keys` okunabilir satır toplamlarını korur ve yanıt düzeyinde `usageIncomplete: true` ile `usageIncompleteReason: "oversized_rows"` ekler. Bu tanı, boş veya eşleşmeyen sonuçlar dahil önbellekte ve artımlı eklemelerde korunur; yeniden oluşturma sırasında tekrar hesaplanır. Sağlayıcı, model ve API anahtarı kimlikleri kısaltılmaz. Bayrağın bulunmaması tüm kayıtların geçerli olduğunu kanıtlamaz. Bu bilgi `historyTruncated`, `entriesTruncated` ve token ölçüm kapsamından ayrıdır.
+
 `GET /api/usage?range=30d&surface=codex` için `accounts`, gözlemlenen her Codex
 havuz etiketi için bir satır içerir. Her satır `accountLogLabel`, belirteç
 toplamları, `usageCoverageRatio` ve geçerli olarak yapılandırılmış görüntüleme
@@ -174,10 +197,16 @@ gönderin. Kurtarma gerekebileceğinde karantinayı tercih edin.
 | `GET /api/models` | Kontrol paneli/CLI model satırlarını döndürün | Toplama doyduğunda `catalog_busy` |
 | `GET /api/client-config?client=...` | Desteklenen herhangi bir dosya entegrasyonu için salt okunur bir istemci yapılandırması oluşturun | 400 desteklenmeyen istemci; 503 katalog kullanılamıyor |
 | `PUT /api/disabled-models` | Paylaşılan devre dışı model listesini değiştirin | 400 geçersiz JSON |
-| `PUT /api/model-visibility` | Sağlayıcı veya model düzeyindeki görünürlüğü atomik olarak değiştirin | 400 geçersiz sağlayıcı, kapsam, hedef veya gövde |
+| `PUT /api/model-visibility` | Sağlayıcı veya model düzeyindeki görünürlüğü atomik olarak değiştirin | 400 geçersiz sağlayıcı, kapsam, hedef veya gövde; 409 `initial_model_selection_pending` (Model listesini yenileyip tekrar deneyin.) |
 | `GET, POST /api/custom-models` | Özel modelleri listeleyin veya bir tane ekleyin | 400 geçersiz alanlar; 404 sağlayıcı eksik; 409 yinelenen model |
 | `PUT, DELETE /api/custom-models/{id}` | Bir özel modeli düzenleyin veya silin | 400 geçersiz kimlik/alanlar; 404 bulunamadı; 409 yinelenen model |
-| `GET, PUT /api/selected-models` | Sağlayıcı izin listelerini ve kullanılabilirliğini okuyun veya bir izin listesini değiştirin | 400 eksik sağlayıcı/gövde; 404 bilinmeyen sağlayıcı |
+| `GET, PUT /api/selected-models` | Sağlayıcı izin listelerini ve kullanılabilirliğini okuyun veya bir izin listesini değiştirin | 400 eksik sağlayıcı/gövde; 404 bilinmeyen sağlayıcı; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | Ön ayarları okuyun veya preset/all/custom modunu seçin | 400 geçersiz mod veya desteklenmeyen ön ayar; 404 bilinmeyen sağlayıcı; PUT 409 `initial_model_selection_pending` |
+
+Manuel model, Models panosunda aynı sağlayıcı ve model kimliğine sahip satırın yerini alır. OpenAI manuel satırı `openai/<model>` kimliğini ve görünürlük kontrollerini korur. Silindiğinde hesap niteleyicisi olmayan yerel satır geri gelir. Hesapla nitelenen yerel satırlar ayrı kalır. Yerel rotalar ve hesap yetkileri değişmez. Yerel olmayan OpenAI görünürlük hedefi, yapılandırılmış bir manuel modelle eşleşmelidir.
+
+
+Güvenilir ilk model listesi hazır olana kadar `/api/selected-models` ve `/api/model-presets` için geçerli PUT istekleri de HTTP 409 ve `initial_model_selection_pending` kodunu döndürür. Model keşfini örneğin `GET /api/models` ile yenileyin ve başarılı olduktan sonra yeniden deneyin.
 
 ### OAuth hesapları, sağlayıcı anahtarları ve veri düzlemi anahtarları
 
@@ -216,6 +245,17 @@ döndürülmez.
 | `GET /api/provider-quotas` | Sağlayıcı kota raporlarını okuyun; `refresh=1` yenilemeye zorlar | — |
 | `GET, PUT /api/provider-context-caps` | Küresel, tüm sağlayıcılar veya tek sağlayıcı bağlam sınırlarını okuyun veya güncelleyin | 400 geçersiz istek; 404 bilinmeyen sağlayıcı |
 | `GET /api/provider-presets` | Çalışma zamanı kayıt defterinden türetilen GUI sağlayıcı önayarlarını döndürün | — |
+
+Bağlam sınırı yanıtı `caps` (etkin sınırlar) ve `values` (devre dışıyken de saklanan son seçimler)
+alanlarını içerir. Sağlayıcının sınırını `value` olmadan etkinleştirmek seçimini geri yükler;
+ilk etkinleştirmede genel `contextCapValue` kullanılır. Bu kural OpenAI için de geçerlidir:
+anahtar özel bir 922k modu seçmez. Etkin sınır tüm yerel pencereleri sınırlar; uzun bağlamı
+destekleyen modeller yalnızca kendi desteklenen üst sınırlarına kadar genişletilebilir.
+`{ "value": 600000, "setAll": true }`, genel değeri ve yalnızca etkin sınırları günceller.
+Sınırı kapalı olan sağlayıcılar, daha sonra yeniden etkinleştirildiğinde kullanılacak seçimlerini korur.
+`value` olmadan `{ "setAll": true }`, yapılandırılmış tüm sağlayıcıların sınırlarını geçerli genel
+değerle etkinleştirir ve saklanan seçimlerini değiştirir. Devre dışı bırakmak seçimi silmez;
+yeniden yüklemeden sonra da saklar, ancak bir sınır olarak uygulamaz.
 
 `provider_has_dependent_combos` bir güvenlik engelidir: sağlayıcılarını silmeden
 önce bağımlı komboları kaldırın veya düzenleyin.
@@ -272,7 +312,7 @@ devreder. Rotaları şunlardır:
 | `PUT /api/codex-auth/failover` | Hesap yük devretme eşiğini ayarlayın | 400 geçersiz eşik |
 | `GET /api/codex-auth/quota` | Hesaba göre önbelleğe alınmış kota durumunu okuyun | — |
 | `GET /api/codex-auth/reset-credits` | Bir hesap için sıfırlama kredisi uygunluğunu inceleyin | 400 eksik hesap kimliği; yukarı akış durum doğrudan geçişi; 500 arama hatası |
-| `POST /api/codex-auth/reset-credits/consume` | Uygun bir sıfırlama kredisini tüketin | 400 eksik hesap kimliği; yukarı akış durum doğrudan geçişi; 503 `server_busy`; 500 tüketme hatası |
+| `POST /api/codex-auth/reset-credits/consume` | Uygun bir sıfırlama kredisini tüketin. İsteğe bağlı `operationId` (UUIDv4) kullanımı işlemi idempotent yapar: aynı kimlik ikinci bir kredi harcamak yerine tek bir kalıcı sonucu yeniden oynatır. | 400 eksik hesap kimliği veya geçersiz `operationId`; kimlik başka bir hesaba aitse 409 `identity_mismatch`; yukarı akış durum doğrudan geçişi; 503 `server_busy`, `capacity` veya `unavailable`; 500 tüketme hatası |
 | `POST /api/codex-auth/login` | Codex girişini veya yeniden kimlik doğrulamasını başlatın | 400 geçersiz istek; çakışma/meşgul giriş durumları |
 | `POST /api/codex-auth/login/code` | Bir Codex giriş akışı için manuel bir kod gönderin | 400 geçersiz akış/kod |
 | `POST /api/codex-auth/login/cancel` | Bir Codex giriş akışını iptal edin | — |
@@ -311,4 +351,3 @@ entegrasyonlar için en yararlıdır.
 ## Uzak oturumlar ve veri anahtarı döndürme
 
 `POST /api/keys/rotate {id}` on dakikalık geçişi başlatır ve yeni sırrı yalnızca bir kez döndürür. `POST /api/keys/rotate/commit {id,rotationId}` onaylar, `DELETE /api/keys/rotate {id,rotationId}` iptal eder. Yönetim kimlik doğrulaması gerekir; veri anahtarı bunları çağıramaz. `POST /api/session/logout` mevcut `gui-session`, eşleşen Origin ve CSRF ister. Admin token 403 alır ve onay oturumu oluşturamaz.
-

@@ -12,6 +12,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   ClientPathError,
+  clineConfigPath,
+  clineSettingsDir,
   EXPORT_CLIENTS,
   asideAccountDir,
   asideConfigPath,
@@ -26,6 +28,8 @@ import {
   kimiHomeDir,
   mcodeConfigPath,
   mcodeHomeDir,
+  omoAgentDir,
+  omoConfigPath,
   ompAgentDir,
   ompModelsConfigPath,
   opencodeGlobalConfigPath,
@@ -35,6 +39,8 @@ import {
   piConfigPath,
   primeAgentDir,
   primeConfigPath,
+  raycastAiDir,
+  raycastConfigPath,
   zcodeConfigPath,
   zcodeHomeDir,
   type ExportClientId,
@@ -188,6 +194,7 @@ export const INTEGRATION_CLIENTS: Record<IntegrationClientId, IntegrationClientS
     id: "hermes",
     configPath: (env = process.env, home = homedir()) => hermesConfigPath(env, home),
     detectDir: (env = process.env, home = homedir()) => hermesHomeDir(env, home),
+    sourcePreservingYaml: { path: ["providers", "opencodex"] },
   },
   openclaw: {
     id: "openclaw",
@@ -260,6 +267,45 @@ export const INTEGRATION_CLIENTS: Record<IntegrationClientId, IntegrationClientS
      * look at.
      */
     unresolvedPathHint: (env = process.env, home = homedir()) => join(asideHomeDir(env, home), "u"),
+  },
+  raycast: {
+    id: "raycast",
+    configPath: (env = process.env, home = homedir()) => raycastConfigPath(env, home),
+    /*
+     * The `ai` directory, not `Raycast.app`. Raycast creates it only when the
+     * user clicks "Reveal Providers Config" in Settings > AI, which is exactly
+     * the signal that Custom Providers is reachable on this install; an app
+     * bundle alone says nothing about the plan or the feature.
+     *
+     * No `sourcePreservingYaml`: that patcher handles block-map leaves only,
+     * and our entry is a SEQUENCE item, so the file is re-rendered through
+     * `renderYaml` (block style). The `[id=opencodex]` selector keeps the user's
+     * other providers in place across that re-render.
+     */
+    detectDir: (env = process.env, home = homedir()) => raycastAiDir(env, home),
+  },
+  omo: {
+    id: "omo",
+    configPath: (env = process.env, home = homedir()) => omoConfigPath(env, home),
+    /*
+     * The AGENT directory, not `~/.omo`. The v4 launcher wrapper creates
+     * `~/.omo` to hold `binary-runtime` without ever creating `agent/`, so
+     * detecting on the parent reports an omo v5 install that is not there --
+     * and `installed` is what stops apply from writing a catalog for an engine
+     * that will never read it. Prime's agent directory and Aside's account
+     * directory are the same shape; Pi's parent-directory check is the odd one.
+     *
+     * No `sourcePreservingYaml` (JSON), no `writerLock` (single writer), and no
+     * `resolvePaths` -- unlike Aside, both omo paths are a pure function of env
+     * and home, so reading them in sequence cannot straddle a state change.
+     */
+    detectDir: (env = process.env, home = homedir()) => omoAgentDir(env, home),
+  },
+  cline: {
+    id: "cline",
+    configPath: (env = process.env, home = homedir()) => clineConfigPath(env, home),
+    detectDir: (env = process.env, home = homedir()) => clineSettingsDir(env, home),
+    writerLock: { suffix: ".lock" },
   },
 };
 

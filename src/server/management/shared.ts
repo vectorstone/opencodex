@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { captureInitialSelectionBaseline, finalizeInitialModelSelection } from "../../providers/initial-model-selection-runtime";
+import { initialModelSelectionPending } from "../../providers/initial-model-selection";
 import { readFileSync } from "node:fs";
 import type { CatalogModel } from "../../codex/catalog";
 import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
@@ -35,7 +37,7 @@ import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap
 import { resolveCodexHomeDir } from "../../codex/home";
 import { readUsageEntries } from "../../usage/log";
 import { getUsageDebugLogEntries } from "../../usage/debug";
-import { parseRange, parseUsageSurface, summarizeUsage } from "../../usage/summary";
+import { cacheObservationFromUsage, parseRange, parseUsageSurface, summarizeUsage } from "../../usage/summary";
 import { stripCodexRuntimeProviderFields } from "../../codex/auth-context";
 import { getProviderRegistryEntry, providerMatchesRegistryTransport } from "../../providers/registry";
 import { getDebugLogEntries } from "../../lib/debug-log-buffer";
@@ -53,6 +55,7 @@ import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, serviceTierContext, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
 import type { PersistedUsageAttempt } from "../../usage/log";
+import { usageModelPriceOptions } from "../../usage/model-identity";
 import { isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO } from "../auth-cors";
 import { applySystemEnvToggle } from "../system-env";
 
@@ -76,7 +79,8 @@ export function parseDebugLogQuery(url: URL): { after: number; limit: number } {
 export type MetricUnavailableReason =
   | "usage_missing" | "usage_unsupported" | "output_missing" | "invalid_duration"
   | "price_unmatched" | "invalid_cache_breakdown"
-  | "invalid_usage" | "combo_attempt_unavailable";
+  | "invalid_usage" | "combo_attempt_unavailable"
+  | "ttft_missing" | "decode_window_too_short";
 
 export type TokPerSecondResult =
   | { kind: "value"; value: number; estimated: boolean }
@@ -93,7 +97,7 @@ export type CostResult =
   | { kind: "value"; estimate: NonNullable<ReturnType<typeof estimateRequestCost>>; estimateReasons: CostEstimateReason[] }
   | { kind: "unavailable"; reason: MetricUnavailableReason };
 
-export type MetricSource = Pick<RequestLogEntry, "provider" | "model" | "durationMs" | "usageStatus" | "usage" | "requestedServiceTier" | "configuredServiceTier" | "responseServiceTier" | "tierOutcome"> & {
+export type MetricSource = Pick<RequestLogEntry, "provider" | "model" | "durationMs" | "firstOutputMs" | "usageStatus" | "usage" | "requestedServiceTier" | "configuredServiceTier" | "responseServiceTier" | "tierOutcome" | "routeDecision" | "cacheProvenance"> & {
   attempts?: readonly PersistedUsageAttempt[];
 };
 
@@ -108,6 +112,51 @@ export function tokPerSecondResult(entry: Pick<MetricSource, "durationMs" | "usa
     };
   }
   return { kind: "value", value, estimated: entry.usageStatus === "estimated" || entry.usage.estimated === true };
+}
+
+/**
+ * Shortest post-TTFT window that can carry a decode-rate estimate (#4038).
+ *
+ * Below one second the window is dominated by things that are not decoding: TTFT jitter, the
+ * proxy's own buffering, and the granularity of the timestamps themselves. A 240-token response
+ * whose first token arrived 50 ms before the last one is not a 4800 tok/s model, and printing
+ * that number is worse than printing nothing — which is precisely why the earlier attempt at
+ * this metric (#4040) was closed as an unreliable estimate.
+ */
+export const MIN_DECODE_WINDOW_MS = 1_000;
+
+/**
+ * Estimated DECODE throughput: output tokens over the window after the first token (#4038).
+ *
+ * Strictly additive. `tokensPerSecond`, `tokPerSecondResult`, `RequestLogEntry` and
+ * `usage.jsonl` are untouched, and the end-to-end rate beside it keeps meaning exactly what it
+ * has always meant — it is documented as end-to-end, so this is a missing metric rather than a
+ * miscalculated one.
+ *
+ * Always `estimated: true`. The proxy's TTFT is when the FIRST BYTE reached the proxy, which is
+ * not the provider's own generation start, so this can never be more than an estimate no matter
+ * how long the window is. Saying so in the payload is the honest half of the answer to #4040;
+ * MIN_DECODE_WINDOW_MS is the other half.
+ */
+export function decodeTokPerSecondResult(
+  entry: Pick<MetricSource, "durationMs" | "firstOutputMs" | "usageStatus" | "usage">,
+): TokPerSecondResult {
+  if (!entry.usage) return { kind: "unavailable", reason: "usage_missing" };
+  if (entry.usageStatus === "unsupported") return { kind: "unavailable", reason: "usage_unsupported" };
+  if (entry.usage.outputTokens <= 0) return { kind: "unavailable", reason: "output_missing" };
+  // A row that predates TTFT capture, or a non-streaming turn that never recorded one, has no
+  // window to measure. That is a different fact from a bad duration, so it gets its own reason.
+  if (entry.firstOutputMs === undefined) return { kind: "unavailable", reason: "ttft_missing" };
+  if (!Number.isFinite(entry.firstOutputMs) || entry.firstOutputMs < 0 || !Number.isFinite(entry.durationMs)) {
+    return { kind: "unavailable", reason: "invalid_duration" };
+  }
+  const windowMs = entry.durationMs - entry.firstOutputMs;
+  // TTFT at or past the total duration means the two clocks disagree; there is no window.
+  if (windowMs <= 0) return { kind: "unavailable", reason: "invalid_duration" };
+  if (windowMs < MIN_DECODE_WINDOW_MS) return { kind: "unavailable", reason: "decode_window_too_short" };
+  const value = tokensPerSecond(entry.usage.outputTokens, windowMs);
+  if (value === null) return { kind: "unavailable", reason: "invalid_duration" };
+  return { kind: "value", value, estimated: true };
 }
 
 export function unavailableCostReason(entry: MetricSource): MetricUnavailableReason {
@@ -132,14 +181,17 @@ export function unavailableCostReason(entry: MetricSource): MetricUnavailableRea
 export function costResult(entry: MetricSource): CostResult {
   const tier = serviceTierContext(entry);
   const estimate = entry.attempts?.length
-    ? estimateComboCost(entry.attempts, undefined, tier)
-    : estimateRequestCost({ provider: entry.provider, model: entry.model, usage: entry.usage, usageStatus: entry.usageStatus, serviceTier: tier });
+    ? estimateComboCost(entry.attempts.map(attempt => ({ ...attempt, ...usageModelPriceOptions(entry, attempt) })), undefined, tier)
+    : estimateRequestCost({ provider: entry.provider, model: entry.model, usage: entry.usage, usageStatus: entry.usageStatus, serviceTier: tier, ...usageModelPriceOptions(entry, entry) });
   if (!estimate) return { kind: "unavailable", reason: unavailableCostReason(entry) };
   const estimateReasons = [
     entry.usageStatus === "estimated" || entry.usage?.estimated ? "usage_estimated" as const : undefined,
-    entry.usage && entry.usage.cachedInputTokens === undefined
-      && entry.usage.cacheReadInputTokens === undefined
-      && entry.usage.cacheCreationInputTokens === undefined ? "cache_detail_missing" as const : undefined,
+    // A cost estimate is qualified by cache detail it can TRUST. A detail object that exists only
+    // because a strict client requires the field carries no cache reading, so it qualifies the
+    // estimate exactly as a missing one does — reading it as a measured zero prices the request
+    // as an uncached send that nothing observed.
+    entry.usage && cacheObservationFromUsage(entry.usage, entry.cacheProvenance).provenance !== "observed"
+      ? "cache_detail_missing" as const : undefined,
     estimate.price?.source === "expected" || estimate.attempts?.some(a => a.price.source === "expected")
       ? "expected_price_overlay" as const : undefined,
     estimate.price?.source === "user" || estimate.attempts?.some(a => a.price.source === "user")
@@ -149,11 +201,26 @@ export function costResult(entry: MetricSource): CostResult {
   return { kind: "value", estimate, estimateReasons };
 }
 
-export function requestLogDto(entry: RequestLogEntry): Record<string, unknown> {
+/**
+ * `/api/logs` row projection.
+ *
+ * `includeDecodeRate` exists because `/api/request-history` shares this DTO but not its
+ * contract (#4038). The value would be meaningful there — `firstOutputMs` does survive into a
+ * persisted-usage row — so this is a scope decision, not a correctness one: the decode rate is
+ * a Logs-page metric, and widening a separate endpoint's response shape is not this change's
+ * business. Flipping it on later is one argument.
+ */
+export function requestLogDto(
+  entry: RequestLogEntry,
+  { includeDecodeRate = true }: { includeDecodeRate?: boolean } = {},
+): Record<string, unknown> {
   return {
     ...entry,
     displayMetrics: {
       tokPerSecond: tokPerSecondResult(entry),
+      // The parent uses the REQUEST's own TTFT. A combo parent must not borrow an attempt's,
+      // which would measure a window the parent never had.
+      ...(includeDecodeRate ? { decodeTokPerSecond: decodeTokPerSecondResult(entry) } : {}),
       cost: costResult(entry),
     },
     ...(entry.attempts?.length
@@ -162,7 +229,9 @@ export function requestLogDto(entry: RequestLogEntry): Record<string, unknown> {
           ...attempt,
           displayMetrics: {
             tokPerSecond: tokPerSecondResult(attempt),
-            cost: costResult({ ...attempt, attempts: undefined, requestedServiceTier: entry.requestedServiceTier, configuredServiceTier: entry.configuredServiceTier, responseServiceTier: entry.responseServiceTier }),
+            // Each attempt measures its own attempt-relative TTFT.
+            ...(includeDecodeRate ? { decodeTokPerSecond: decodeTokPerSecondResult(attempt) } : {}),
+            cost: costResult({ ...attempt, attempts: undefined, routeDecision: entry.routeDecision, requestedServiceTier: entry.requestedServiceTier, configuredServiceTier: entry.configuredServiceTier, responseServiceTier: entry.responseServiceTier }),
           },
         })),
       }
@@ -178,13 +247,24 @@ export function requestLogDto(entry: RequestLogEntry): Record<string, unknown> {
  */
 export async function fetchAllModels(config: OcxConfig): Promise<CatalogModel[]> {
   const { gatherRoutedModels } = await import("../../codex/catalog");
-  return gatherRoutedModels(config);
+  const baseline = captureInitialSelectionBaseline(config);
+  if (!baseline) return gatherRoutedModels(config);
+  const outcomes: Array<{ provider: string; state: "authoritative" | "degraded" }> = [];
+  const models = await gatherRoutedModels(config, { providerModelOutcomes: outcomes });
+  finalizeInitialModelSelection(config, baseline, uniqueCatalogModelsForPublicList(models),
+    outcomes.filter(outcome => outcome.state === "authoritative").map(outcome => outcome.provider));
+  return models;
 }
 
 export interface GrokCandidateModel {
   id: string;
   contextWindow?: number;
   native: boolean;
+}
+
+/** Configuration pickers may retain disabled choices, but never offer provisional models. */
+export async function fetchInitializedModels(config: OcxConfig): Promise<CatalogModel[]> {
+  return (await fetchAllModels(config)).filter(model => !initialModelSelectionPending(config.providers[model.provider]));
 }
 
 /**
