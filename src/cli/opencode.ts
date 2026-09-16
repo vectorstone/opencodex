@@ -676,14 +676,6 @@ export function opencodeNotFoundHint(
   return platform === "win32" && code === 9009 && !signal ? OPENCODE_INSTALL_HINT : null;
 }
 
-export function requireOpencodeManagementToken(
-  readConfiguredAdminToken: () => string | null = configuredAdminToken,
-): string {
-  const token = readConfiguredAdminToken()?.trim();
-  if (token) return token;
-  throw new Error("opencodex admin token is not configured.");
-}
-
 export async function cmdOpencode(args: string[]): Promise<number> {
   const startupConfig = loadConfig();
   const live = await ensureProxyForOpencode(startupConfig);
@@ -693,14 +685,14 @@ export async function cmdOpencode(args: string[]): Promise<number> {
   }
 
   const apiKey = opencodeApiKey(startupConfig);
-  // Fork F-003: `/api/models` is a management endpoint — it requires the admin
-  // token, not the data-plane admission key. The proxy is already running at this
-  // point, so `requireOpencodeManagementToken()` sees the same token the server
-  // initialized with, and a missing token fails loudly instead of producing a
-  // partial or misleading model catalog.
+  // `/api/models` is a management endpoint — it requires the admin token, not the data-plane
+  // admission key. The proxy is already running at this point, so `configuredAdminToken()` sees
+  // the same token the server initialized with, and an absent token fails loudly here instead of
+  // producing a partial or misleading model catalog.
   let proxyModels: OpencodeProxyModelRow[];
   try {
-    const managementToken = requireOpencodeManagementToken();
+    const managementToken = configuredAdminToken();
+    if (!managementToken) throw new Error("No local admin token is available; check the running proxy's home.");
     proxyModels = await fetchOpencodeProxyModels(live, managementToken, {
       managementOrigin: localManagementOrigin({ ...startupConfig, hostname: live.hostname }, live.port),
     });

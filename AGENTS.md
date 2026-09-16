@@ -198,6 +198,15 @@ The initial register below was audited against the common `v2.27.0` ancestor
 commits and changes that leave no final tree difference are history, not
 fork-maintained behavior, and do not belong in this register.
 
+Each entry states its **upstream disposition**, verified against the recorded
+upstream commit. `fork-only` means upstream has no equivalent and the local
+implementation must be kept. `absorbed` means upstream now implements the same
+contract, so the local implementation should be deleted and only the contract
+kept. `partially overlapping` means upstream covers part of the contract and the
+entry names what remains local. Re-verify the disposition, not just the
+behavior, on every sync: an `absorbed` entry kept past its absorption is the
+most expensive kind of fork delta, because it re-conflicts every time.
+
 ### Fork delta register
 
 #### F-001 — Durable three-mode Codex integration
@@ -205,6 +214,10 @@ fork-maintained behavior, and do not belong in this register.
 - `clientIntegrations.codex` supports `full`, `catalog-only`, and `off`. For
   backward compatibility, a missing value or `true` means `full`,
   `"catalog-only"` means `catalog-only`, and `false` means `off`.
+- The fork-only part of this contract is the **third state**. Upstream implements
+  `full` and `off` as a boolean (`z.boolean()` in `src/config/schema/leaf-validators.ts`);
+  `catalog-only` has no upstream equivalent, so the schema union, the persisted
+  mode, and the mode-aware sync branch are what must survive.
 - `catalog-only` refreshes the Codex model catalog and `models_cache.json` while
   leaving provider routing, profiles, journal, history, and session data under
   the user's existing ownership. It must not silently become full integration.
@@ -221,52 +234,73 @@ fork-maintained behavior, and do not belong in this register.
   `tests/codex-integration/native-codex-toggle.test.ts`,
   `gui/tests/integrations-api.test.ts`, and
   `gui/tests/integrations-overview-rows.test.ts`.
-- Re-verified against upstream v2.56.0 (`e4a8539b9`) on 2026-09-15: the schema union was
-  re-applied onto the relocated leaf validator, and `syncModelsToCodex` keeps upstream's
-  hub gate (`shouldSyncCodexOnStart`) alongside the three-mode read.
-- Original fork implementation: `0160b8f7`. Upstream may contain other internal
-  operations described as catalog-only; they are not equivalent unless the
-  durable config, ownership boundary, management API, and GUI contract above all
-  remain true.
+- Known semantic conflict to re-check each sync: `GET /api/native-integrations`
+  deliberately reads `loadConfig()` for the Codex row (a mode change committed by
+  `mutatePersistedConfig` writes disk only, so the startup snapshot would report
+  the previous mode) while the sibling claude/grok/desktop rows read the passed
+  `config`. Upstream calls `codexStatus(config, ...)`. Keep the fresh read, and
+  keep it scoped to Codex; do not "unify" it onto `config`.
+- Disposition: **fork-only** as of upstream v2.56.0 (`e4a8539b9`). Upstream may
+  contain other internal operations described as catalog-only; they are not
+  equivalent unless the durable config, ownership boundary, management API, and
+  GUI contract above all remain true.
+- Original fork implementation: `0160b8f7`.
 
 #### F-002 — Safe Codex client-metadata forwarding in API-key mode
 
-- The OpenAI Responses adapter's API-key path forwards allowed client identity
-  metadata such as `User-Agent`, `originator`, and relevant session/thread
-  headers when supplied by the caller. This supports upstreams that validate the
-  originating Codex client.
-- The configured provider API key remains authoritative. Never forward the
-  caller's `authorization` or `chatgpt-account-id` in this mode, and retain the
-  defensive rejection of any future forwarded-header name containing `key`,
-  `token`, or `secret`.
-- The key paths are `src/adapters/openai-responses/passthrough.ts` (the `FORWARD_HEADERS`
-  allowlist and the API-key forwarding loop) and the `src/adapters/openai-responses.ts`
-  facade that re-exports them; the regression sentinel is
-  `tests/codex-integration/codex-metadata-integrity.test.ts`.
-- Re-verified against upstream v2.56.0 (`e4a8539b9`) on 2026-09-15, where the adapter was split
-  into `openai-responses/` leaves: `user-agent` and the forwarding loop were re-applied to the
-  leaf, and the sentinel case for API-key mode forwarding still passes.
+- The `openai-responses` adapter preserves the incoming client's `User-Agent` as
+  a non-credential fallback in **both** auth modes, because some Responses
+  gateways select their Codex compatibility path from the real client
+  fingerprint.
+- An explicitly configured provider `User-Agent` remains authoritative in any
+  header casing, and the caller value must not be joined as a second spelling.
+  When the caller sends none, the adapter invents no client identity.
+- This relays exactly one header. It is **not** a wider caller-header contract:
+  never forward the caller's `authorization` or `chatgpt-account-id`, and never
+  reach for the `FORWARD_HEADERS` allowlist to implement it.
+- `User-Agent` must **not** be added back to `FORWARD_HEADERS`. Eleven call sites
+  read that allowlist (`src/codex/auth-context.ts`, `src/server/claude-messages.ts`,
+  `src/server/chat-completions.ts`, `src/server/ws-bridge.ts`,
+  `src/server/responses/compact.ts`, `src/vision/describe.ts`, the web-search
+  executor), so listing it there relays the caller fingerprint on the Claude
+  inbound, Chat bridge, WS bridge, and sidecar paths that never opted into this
+  contract — and it also hands key-mode upstreams the whole 17-entry forward set,
+  including `x-oai-attestation` and `x-codex-turn-metadata`.
+- The key path is `src/adapters/openai-responses/passthrough.ts`
+  (`applyCallerUserAgentFallback` plus its call site after the auth branch), and
+  the regression sentinel is `tests/codex-integration/codex-metadata-integrity.test.ts`
+  (API-key forwarding, no-wider-allowlist, case-insensitive configured value, no
+  invented identity).
+- Disposition: **absorbed** by upstream `45cfb04e9` (#4702), reachable in the
+  upstream `dev` line; not yet in the v2.56.0 release tag (`e4a8539b9`). The
+  local implementation is upstream's `applyCallerUserAgentFallback`, adopted
+  verbatim during the 2026-09-16 audit. Keep the contract and the sentinels;
+  prefer upstream's implementation whenever this file conflicts.
 - Original fork implementation: `0ac0d028` and `960e2b59`. This is a credential
   boundary: changes require explicit security review and `bun run privacy:scan`.
 
-#### F-003 — OpenCode catalog authentication and modality export
+#### F-003 — OpenCode catalog authentication
 
 - `ocx opencode` fetches the management `/api/models` catalog with the configured
   OpenCodex admin token, not with the data-plane admission key. If the management
   token is unavailable, fail explicitly instead of producing a partial or
   misleading model catalog.
-- Preserve non-empty catalog `inputModalities` and export them to OpenCode as
-  `modalities.input`. Missing or empty modality arrays must omit that block so
-  OpenCode keeps its own defaults.
-- Key paths currently include `src/cli/opencode.ts`,
-  `src/clients/config-export.ts`, and the `src/clients/config-export/` leaf modules; regression
-  sentinels include `tests/providers/opencode-cli.test.ts` and
-  `tests/config/client-config-export.test.ts`.
-- Re-verified against upstream v2.56.0 (`e4a8539b9`) on 2026-09-15: `cmdOpencode` now reaches the
-  management catalog through `requireOpencodeManagementToken()` while keeping upstream's
-  `localManagementOrigin` override, and `ocx opencode` still fails explicitly without the admin
-  token. Upstream also widened the opencode modality block to `{input, output}` plus
-  `attachment`; the fork's contract holds as a subset of that richer shape.
+- The user-visible failure is a message on stderr and exit status `1`. Upstream
+  achieves the same outcome inline in `cmdOpencode`; the fork's former
+  `requireOpencodeManagementToken()` helper was a refactor of that same behavior
+  and was removed during the 2026-09-16 audit. Do not reintroduce a helper whose
+  sentinel tests the helper rather than the CLI contract.
+- The key path is `src/cli/opencode.ts`; the regression sentinel is
+  `tests/providers/opencode-cli.test.ts`, which drives `cmdOpencode` and asserts
+  both the admin-token fetch and the loud failure without one.
+- Modality export is **not** part of this entry: upstream `ad09340d7` (#4300,
+  tagged v2.52.0) implements the same propagation plus `attachment`, and covers
+  it in `tests/providers/opencode-cli.test.ts` and
+  `tests/config/client-config-export.test.ts`. The fork's duplicate pair was
+  removed during the 2026-09-16 audit.
+- Disposition: **absorbed** as of upstream v2.56.0 (`e4a8539b9`) — the fork's
+  remaining delta is zero beyond the error-message wording. Delete this entry
+  entirely once a sync confirms the upstream message is acceptable.
 - Original fork implementation: `41dfada4` and `0a558755`. Authentication changes
   are security-boundary changes and require explicit security review.
 
@@ -281,13 +315,25 @@ fork-maintained behavior, and do not belong in this register.
 - OpenCode emits `limit` only when authoritative context and output values are both known.
   Pi, OMP, Prime, and Gajae preserve either known field independently; ZCode emits optional
   `limit.output`. Combo output capability is the minimum only when every target is known.
-- Key paths include `src/types/config.ts`, `src/codex/catalog/parsing.ts`,
-  `src/codex/catalog/model-hints.ts`, `src/codex/catalog/routed-gather.ts`,
+- Key paths include `src/types/config.ts`, `src/codex/catalog/routed-gather.ts`,
   `src/codex/catalog/aggregation.ts`, `src/server/management/model-rows.ts`,
   `src/server/management/model-routes.ts`, `src/clients/config-export.ts`,
   `src/clients/config-export/model-metadata.ts`, `src/clients/config-export/contracts.ts`,
   `src/clients/config-export/omp.ts`, `src/clients/config-export/zcode.ts`,
   `src/cli/export-command.ts`, `src/cli/opencode.ts`, and the Models GUI/API/i18n files.
+  (`src/codex/catalog/parsing.ts` and `src/codex/catalog/model-hints.ts` were listed before the
+  2026-09-16 audit and carry no fork delta: upstream owns `CatalogModel.maxOutputTokens` and the
+  `routedMaxOutputTokens` derivation unchanged. Do not re-list a path without checking
+  `git diff <upstream-tag> dev -- <path>`.)
+- `maxOutputTokens` means the **output ceiling** — the same quantity as a vendor's published
+  `output`/`max_tokens`/`max_completion_tokens`. It is emphatically **not** the same thing as
+  `defaultMaxOutputTokens` / `modelMaxOutputTokens`, which are wire request defaults the adapters
+  substitute when a caller omits `max_output_tokens` (`src/adapters/openai-chat.ts`
+  `resolveMaxTokens`, `src/adapters/anthropic.ts`). Those two must never be read as per-model
+  capability, and `routedMaxOutputTokens` is where the distinction is enforced.
+- `summarize*` functions that report `modelsWithoutLimits` count a row as limited only when its
+  **output** capability is known too. That is a user-visible number in `ocx export` output; keep it
+  consistent with what the serializers actually emit.
 - Upstream v2.56.0 split `config-export.ts` and `catalog/provider-fetch.ts` into leaf modules and
   reintroduced a uniform `SCHEMA_REQUIRED_OUTPUT_BUDGET` (32,000) for opencode's paired `limit`.
   This fork keeps the authoritative rule instead and does not ship that constant; the
@@ -296,10 +342,13 @@ fork-maintained behavior, and do not belong in this register.
 - Regression sentinels include `tests/codex-integration/codex-catalog.test.ts`,
   `tests/codex-integration/catalog-input-modality-enum.test.ts`,
   `tests/config/client-config-export.test.ts`, `tests/providers/opencode-cli.test.ts`,
-  `tests/server/management-client-config-route.test.ts`, and the relevant GUI model tests.
-- Original fork implementation: `6272fc3f4`. Last re-verified against upstream v2.56.0 on
-  2026-09-15, where the contract was ported onto the split leaf modules and the stand-in removed
-  again. Upstream disposition: fork-only as of upstream v2.56.0 (`e4a8539b9`).
+  `tests/server/management-client-config-route.test.ts`, `tests/cli/cli-export-command.test.ts`,
+  `tests/clients/client-export-modality-enum.test.ts`, and the relevant GUI model tests.
+- Disposition: **fork-only** as of upstream v2.56.0 (`e4a8539b9`) **and still fork-only on the
+  upstream `dev` line**, where `outputBudgetFor` and `SCHEMA_REQUIRED_OUTPUT_BUDGET` both survive.
+  This is the highest-conflict entry in the register: expect the stand-in to be reintroduced on
+  every sync and re-remove it.
+- Original fork implementation: `6272fc3f4`.
 
 #### F-005 — ZCode semantic ownership canonicalization
 
@@ -319,10 +368,24 @@ fork-maintained behavior, and do not belong in this register.
   regression sentinel is `tests/clients/integrations-writer.test.ts`, including the
   key-reorder plus catalog-drift refresh case and the protected connection-edit
   conflict case.
-- Original fork implementation: `2780fc291`. Re-verified against upstream v2.56.0
-  (`e4a8539b9`) on 2026-09-15, where `ownership-policy.ts` auto-merged and the semantic
-  fingerprint survived; upstream's own ADR-0092 now records the same runtime-metadata contract.
-  Upstream disposition: fork-only as of upstream v2.56.0 (`e4a8539b9`).
+- The load-bearing case is a **pre-`v2.35.0` ZCode ownership record**. Upstream
+  `63941b583` added `semanticProtectedBlockFingerprint` (v2.35.0), which makes the
+  semantic companion path available in `classifyIntegration`; a record written
+  before that carries only the byte-exact `protectedBlockFingerprint`. Measured on
+  2026-09-16 by disabling the canonicalizer against such a record with key reorder
+  plus catalog drift: with canonicalization the state is `stale` and
+  `applyIntegration` succeeds; without it the state is `conflict` and the apply is
+  refused, leaving the user to delete `~/.zcode/v2/config.json` by hand. Do not
+  describe this entry as dead code because the current records carry the semantic
+  companion — that is true only for records written after v2.35.0.
+- Disposition: **fork-only**. Upstream `63941b583` absorbed only the generic
+  semantic fingerprint; the ZCode-specific `canonicalizeZcodeValue` has no upstream
+  equivalent at either v2.56.0 (`e4a8539b9`) or on the upstream `dev` line.
+- Original fork implementation: `2780fc291`. Note for accuracy: at that commit the
+  fork tree did not yet contain `semanticContribution` or
+  `semanticProtectedBlockFingerprint` — the v2.35.0 merge (`58703ee6a`) brought them
+  in afterwards. F-005's own net delta is the canonicalizer plus its writer mount
+  point, not the semantic machinery.
 
 #### F-006 — Routed V2 collaboration plaintext delivery
 
@@ -344,11 +407,34 @@ fork-maintained behavior, and do not belong in this register.
   `tests/responses/namespace-tool-compat.test.ts` and
   `tests/server/server-xai-responses-streaming.test.ts`, covering both streaming and JSON
   Responses output.
-- Original fork implementation: `0a1cff56d`. Re-verified against upstream v2.56.0 (`e4a8539b9`)
-  on 2026-09-15: the module auto-merged with the fork behavior intact, and upstream's separate
-  opt-in `plaintextV2AgentMessages` compiler in `src/responses/plaintext-v2-agent-messages.ts` is
-  a different, default-off mechanism that does not replace this always-on routed contract.
-  Upstream disposition: fork-only as of upstream v2.56.0 (`e4a8539b9`).
+- Disposition: **partially overlapping**. Upstream `src/responses/plaintext-v2-agent-messages.ts`
+  performs the *same* `message.encrypted` strip over the *same* three tool names
+  (`hasAgentMessageEncryptionMarker` / `rewriteAgentMessageToolDeclaration`), and
+  `src/server/responses/passthrough-dispatch.ts` already calls
+  `restorePlaintextV2AgentMessageCalls`. What remains genuinely fork-only is:
+  (a) this path is **always on**, whereas upstream's compiler is behind the opt-in
+  `plaintextV2AgentMessages` config flag plus `inboundWire`/`canonicalChatGpt` gates;
+  (b) the fork additionally attaches `encrypted_function_args: []` on restore and strips it
+  again on replay (`rewriteInputItem`). Do not record this as fork-only — a future sync
+  following that label would keep a duplicate of the upstream strip and never notice that
+  the two could be unified behind upstream's compiler plus a default-on gate.
+- Original fork implementation: `0a1cff56d`.
+
+#### F-007 — Custom-model dialog accessible name
+
+- The Models page "add custom model" button carries an explicit
+  `aria-label={t("models.customAdd")}`, so a screen reader announces the action
+  even though the button's visible content is only the `+` glyph plus the label
+  text. Without it the accessible name is derived from content that changes with
+  the icon rendering.
+- Key path is `gui/src/pages/Models.tsx`; covered by the existing Models GUI
+  tests (`gui/tests/models-status-toast.test.tsx` locates the button by that
+  label), so there is no separate sentinel.
+- Disposition: **absorbed**. Upstream independently added the same attribute
+  (`gui/src/pages/Models.tsx` on the upstream `dev` line). Because both sides
+  changed the same line, this is a guaranteed textual conflict on every sync for
+  a one-attribute change; on conflict, take upstream's line and drop this entry.
+- Original fork implementation: `23906fe99`.
 
 ### Registering future fork-only changes
 
@@ -396,6 +482,17 @@ For every upstream sync:
 4. Audit every `F-NNN` entry after the merge. Confirm its contract in code and
    run its focused regression sentinels. Review automatically merged overlapping
    files for semantic conflicts even when Git reported no textual conflict.
+   **Also audit for regression coverage the merge deleted.** A conflict resolved
+   by taking a whole fork-side file silently discards every upstream test added
+   to it, and nothing reports that: the file still runs green, it just runs
+   fewer tests. The v2.56.0 sync lost twelve upstream tests from
+   `tests/codex-integration/codex-metadata-integrity.test.ts` exactly this way
+   (upstream had 21, the merged file had 12) while covering live code —
+   `applyCodexRoutingHint`, the mixed-case `CODEX_RESPONSES_LITE_HEADER`
+   override, `stripBracketedModelSuffix` alias directions. Compare each
+   conflicted test file against the upstream version before resolving:
+   `git show <upstream-tag>:<path> | grep -c '  test('` versus the local count,
+   or diff the test-name lists for any file that took the fork side wholesale.
 5. Because the current register touches shared config, server management, an
    adapter, authentication, GUI, and documentation, run the focused tests plus
    `bun run typecheck`, `bun run test`, `bun run privacy:scan`, the required GUI

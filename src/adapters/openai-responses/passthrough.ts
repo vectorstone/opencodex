@@ -51,9 +51,6 @@ export const FORWARD_HEADERS = [
   "session_id",
   "session-id",
   "thread-id",
-  // Fork F-002: Codex client identity. Some upstreams (codex_only gateways)
-  // validate the originating client, so the API-key path below relays this too.
-  "user-agent",
   "x-client-request-id",
   "x-codex-beta-features",
   "x-codex-installation-id",
@@ -66,6 +63,31 @@ export const FORWARD_HEADERS = [
   "x-responsesapi-include-timing-metrics",
   CODEX_RESPONSES_LITE_HEADER,
 ];
+
+/**
+ * Preserve the caller's client fingerprint unless the provider explicitly owns that header.
+ *
+ * Fork F-002. Some Responses-compatible gateways (codex_only upstreams) select their Codex
+ * compatibility path from the originating client, so `User-Agent` is relayed in both auth
+ * modes. Two boundaries keep this from becoming general caller-header forwarding:
+ *
+ * - A configured provider header with that name — in any casing — stays authoritative, and
+ *   the comparison is case-insensitive so an operator's `User-Agent` cannot be joined by a
+ *   second spelling from the caller.
+ * - When the caller sends none, no client identity is invented.
+ *
+ * `User-Agent` is deliberately NOT added to `FORWARD_HEADERS`: that allowlist is also read by
+ * the Claude inbound, Chat bridge, WS bridge and sidecar paths, so widening it would relay the
+ * caller's fingerprint far past the routed API-key adapter this contract is about.
+ */
+function applyCallerUserAgentFallback(
+  headers: Record<string, string>,
+  incoming: IncomingMeta,
+): void {
+  if (Object.keys(headers).some(name => name.toLowerCase() === "user-agent")) return;
+  const userAgent = incoming.headers.get("user-agent");
+  if (userAgent) headers["User-Agent"] = userAgent;
+}
 
 /** Replace every `input_image` part under a routed-compaction body with a short marker. */
 function stripInputImagesDeep(value: unknown): unknown {
@@ -223,19 +245,12 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         }
         if (provider.apiKey) headers["Authorization"] = `Bearer ${provider.apiKey}`;
         if (provider.headers) Object.assign(headers, provider.headers);
-        // Fork F-002: relay allowed client identity metadata so upstreams that
-        // validate the originating Codex client (e.g. codex_only User-Agent
-        // checks) can inspect the original caller. The configured provider API
-        // key stays authoritative: `authorization` and `chatgpt-account-id` are
-        // deliberately skipped, and the defensive name-based guard rejects any
-        // future FORWARD_HEADERS entry containing "key", "token", or "secret".
-        for (const h of FORWARD_HEADERS) {
-          if (h === "authorization" || h === "chatgpt-account-id") continue;
-          if (/key|token|secret/i.test(h)) continue;
-          const v = incoming?.headers.get(h);
-          if (v) headers[h] = v;
-        }
       }
+      // Fork F-002: single non-credential fallback, applied after the auth branch so a configured
+      // provider `User-Agent` stays authoritative in either mode. This is not the FORWARD_HEADERS
+      // loop: no credential (`authorization`, `chatgpt-account-id`) and no other caller header is
+      // relayed here, so key mode cannot inherit the forward-mode credential contract by accident.
+      applyCallerUserAgentFallback(headers, incoming);
 
       const forward = provider.authMode === "forward";
       let convertedRoutedCustomToolNames: Set<string> | undefined;

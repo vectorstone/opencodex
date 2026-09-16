@@ -24,7 +24,6 @@ import {
   opencodeApiKey,
   opencodeCatalogFromProxyRows,
   opencodeGlobalConfigPath,
-  requireOpencodeManagementToken,
   opencodeLaunchNativeSlugs,
   opencodeModelKey,
   opencodeNotFoundHint,
@@ -534,42 +533,12 @@ describe("ocx opencode proxy model catalog", () => {
     ]);
   });
 
-  test("opencodeCatalogFromProxyRows propagates inputModalities from proxy rows", () => {
-    const config = cfg();
-    const rows = [
-      { namespaced: "p/vision", provider: "p", id: "vision", disabled: false, inputModalities: ["text", "image"] },
-      { namespaced: "p/audio", provider: "p", id: "audio", disabled: false, inputModalities: ["text", "audio"] },
-      { namespaced: "p/text", provider: "p", id: "text", disabled: false },
-      { namespaced: "p/empty-arr", provider: "p", id: "empty-arr", disabled: false, inputModalities: [] },
-    ];
-    const catalog = opencodeCatalogFromProxyRows(rows, config);
-
-    const vision = catalog.find(m => m.namespaced === "p/vision")!;
-    expect(vision.inputModalities).toEqual(["text", "image"]);
-
-    const audio = catalog.find(m => m.namespaced === "p/audio")!;
-    expect(audio.inputModalities).toEqual(["text", "audio"]);
-
-    // No inputModalities field → absent in catalog (not replaced with [])
-    const text = catalog.find(m => m.namespaced === "p/text")!;
-    expect(text.inputModalities).toBeUndefined();
-
-    // Empty array → treated the same as absent
-    const emptyArr = catalog.find(m => m.namespaced === "p/empty-arr")!;
-    expect(emptyArr.inputModalities).toBeUndefined();
-  });
-
-  test("buildOpencodeProviderBlockFromCatalog emits modalities.input for multimodal models", () => {
-    const block = buildOpencodeProviderBlockFromCatalog(10100, [
-      { namespaced: "p/vision", provider: "p", id: "vision", inputModalities: ["text", "image"] },
-      { namespaced: "p/audio", provider: "p", id: "audio", inputModalities: ["text", "audio"] },
-      { namespaced: "p/text-only", provider: "p", id: "text-only" },
-    ]);
-    expect(block.models["p/vision"]?.modalities).toEqual({ input: ["text", "image"], output: ["text"] });
-    expect(block.models["p/audio"]?.modalities).toEqual({ input: ["text", "audio"], output: ["text"] });
-    // Text-only model: no modalities block emitted
-    expect(block.models["p/text-only"]?.modalities).toBeUndefined();
-  });
+  /**
+   * Modality propagation is covered upstream by "carries /api/models modalities into the blocks the
+   * launcher injects", which drives the same `opencodeCatalogFromProxyRows` ->
+   * `buildOpencodeProviderBlocksFromCatalog` path and additionally asserts both block generations,
+   * the `attachment` flag, disabled rows, and undeclared rows. F-003 no longer needs its own copy.
+   */
 });
 
 describe("ocx opencode native slug selection", () => {
@@ -766,18 +735,63 @@ describe("ocx opencode admission key", () => {
 });
 
 describe("ocx opencode management token", () => {
-  test("returns the configured admin token for management API calls", () => {
-    expect(requireOpencodeManagementToken(() => "ocx_admin_token")).toBe("ocx_admin_token");
-    expect(requireOpencodeManagementToken(() => "  ocx_admin_token  ")).toBe("ocx_admin_token");
-  });
+  /**
+   * F-003's contract at the CLI boundary: the catalog is fetched with the configured admin token
+   * and never with the data-plane admission key, and an absent admin token fails loudly instead of
+   * producing a partial catalog. Upstream implements the same rule inline in `cmdOpencode`; this
+   * test drives that path rather than a helper, so the assertion cannot outlive the behavior.
+   */
+  test("fetches the catalog with the admin token and fails loudly without one", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-opencode-mgmt-token-"));
+    const configPath = join(home, "config.json");
+    writeFileSync(configPath, JSON.stringify(cfg()));
 
-  test("fails early when the admin token is unavailable", () => {
-    expect(() => requireOpencodeManagementToken(() => null)).toThrow(
-      "opencodex admin token is not configured.",
-    );
-    expect(() => requireOpencodeManagementToken(() => "   ")).toThrow(
-      "opencodex admin token is not configured.",
-    );
+    const previousHome = process.env.OPENCODEX_HOME;
+    const previousToken = process.env.OPENCODEX_ADMIN_AUTH_TOKEN;
+    const liveness = await import("../../src/server/proxy-liveness");
+    const directHttp = await import("../../src/server/direct-local-http");
+    const childProcess = await import("node:child_process");
+    const finder = spyOn(liveness, "findLiveProxy").mockResolvedValue({
+      port: 10123, hostname: "127.0.0.1", pid: null, source: "config",
+    });
+    const seen: Array<string | null> = [];
+    const fetcher = spyOn(directHttp, "directLocalHttpFetch").mockImplementation(async (_input, init) => {
+      seen.push(new Headers(init?.headers).get("x-opencodex-api-key"));
+      return Response.json([]);
+    });
+    const spawn = spyOn(childProcess, "spawn").mockImplementation(() => {
+      const child = new childProcess.ChildProcess();
+      queueMicrotask(() => child.emit("exit", 0, null));
+      return child;
+    });
+    const logged: string[] = [];
+    const stderr = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    });
+    try {
+      process.env.OPENCODEX_HOME = home;
+      process.env.OPENCODEX_ADMIN_AUTH_TOKEN = "fixture-admin-token";
+      delete process.env[OPENCODE_CONFIG_CONTENT_ENV];
+      expect(await cmdOpencode([])).toBe(0);
+      expect(seen).toEqual(["fixture-admin-token"]);
+
+      // Same run with no admin token anywhere: refuse rather than emit a partial catalog.
+      delete process.env.OPENCODEX_ADMIN_AUTH_TOKEN;
+      seen.length = 0;
+      logged.length = 0;
+      expect(await cmdOpencode([])).toBe(1);
+      expect(seen).toEqual([]);
+      expect(logged.join("\n")).toContain("Could not fetch the model catalog from the proxy");
+      // The child was launched exactly once, by the successful first run.
+      expect(spawn).toHaveBeenCalledTimes(1);
+    } finally {
+      finder.mockRestore(); fetcher.mockRestore(); spawn.mockRestore(); stderr.mockRestore();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      if (previousToken === undefined) delete process.env.OPENCODEX_ADMIN_AUTH_TOKEN;
+      else process.env.OPENCODEX_ADMIN_AUTH_TOKEN = previousToken;
+      removeTreeWithRetry(home);
+    }
   });
 });
 

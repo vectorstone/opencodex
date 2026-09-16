@@ -15,6 +15,15 @@ Retired Codex Spark has no model-specific tool or Responses Lite override; gener
 namespace scrubbing remain shared compatibility behavior. Codex quota/reset evidence follows the
 [shared/Reserve policy](../providers/openai-tiers.md#public-provider-contract), including suppression of retired model-derived evidence before shared recovery.
 
+The `openai-responses` adapter preserves the incoming `User-Agent` as a non-credential fallback in
+both `key` and `forward` modes, because some Responses gateways select their Codex compatibility path
+from the real client fingerprint. A configured provider header with that name wins
+case-insensitively and the caller value is not joined as a second spelling; when the caller sends
+none the adapter invents no client identity. This is **not** the `FORWARD_HEADERS` allowlist: that
+list is also read by the Claude inbound, the Chat bridge, the WS bridge, and the vision/web-search
+sidecars, so `user-agent` must not be added to it, and this fallback must not grow into general
+caller-header forwarding. Fork contract: `AGENTS.md` F-002.
+
 ### Credential-bearing HTTP redirects
 
 Credential/body-bearing HTTP sends use `redirect: "manual"` at the final executor boundary,

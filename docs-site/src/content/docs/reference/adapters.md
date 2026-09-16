@@ -182,6 +182,12 @@ of the HTTP retry loop.
 - In `forward` mode only a safe header allowlist is relayed (`FORWARD_HEADERS`): authorization,
   ChatGPT account id, and the OpenAI beta/originator/session headers. This is the ChatGPT-login path
   that also powers the [sidecars](/guides/sidecars/).
+- In both `key` and `forward` mode the adapter preserves the incoming client's `User-Agent`, because
+  some Responses-compatible gateways select their Codex compatibility path from the real client
+  fingerprint. An explicitly configured provider `User-Agent` remains authoritative regardless of
+  header casing, and if the caller sends none no client identity is invented. This is a single
+  non-credential fallback, not broader caller-header forwarding: it does not widen `FORWARD_HEADERS`
+  and relays no other caller header.
 
 ## Command Code session affinity
 
