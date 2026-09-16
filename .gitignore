@@ -47,6 +47,13 @@ devlog/**/security-advisory-draft*
 **/.codexclaw/
 .omo/
 **/.omo/
+# `.omc` is the same class of per-machine agent state, and it has already reached
+# this index once: `.omc/project-memory.json` recorded the local home path
+# (`/Users/<name>/`), which made `bun run privacy:scan` fail for everyone, while
+# four `.omc/sessions/*.json` files rode along in the same commit. Nothing in
+# `src/`, the build, the typecheck, or the test path reads any of it.
+.omc/
+**/.omc/
 
 # Local development worktrees
 .worktrees/
