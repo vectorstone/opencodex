@@ -1,10 +1,13 @@
 import {
   CODEX_EXHAUSTED_USAGE_PERCENT,
   CODEX_UNKNOWN_USAGE_SCORE,
-  resetAtToMs,
 } from "../quota";
 import { isThirtyDayOnlyCodexPlan } from "../plan";
+import { isTerminalShortWindow } from "../quota-types";
 import type { CodexQuotaScope } from "./health-store";
+import type { TransientProbeGrant } from "./thread-affinity";
+
+export { TERMINAL_SHORT_WINDOW_FRESHNESS_MS } from "../quota-types";
 
 export const CODEX_DEFAULT_QUOTA_COOLDOWN_MS = 60_000;
 export const CODEX_MAX_QUOTA_COOLDOWN_MS = 24 * 60 * 60_000;
@@ -24,14 +27,6 @@ export const CODEX_MAX_QUOTA_AVOID_MS = 6 * 60 * 60_000;
 /** Minimum gap between probe leases for one cooled-down account. */
 export const CODEX_QUOTA_PROBE_INTERVAL_MS = 5 * 60_000;
 export const CODEX_FAILURE_WINDOW_MS = 5 * 60_000;
-/**
- * How recently a 100% burst reading must have been OBSERVED to exclude an account when it
- * carries no reset timestamp (#3425). Deliberately far tighter than the 6h disk-hydration
- * horizon in `quota.ts`: shorter than any plausible five-hour burst window, so a persisted
- * reading can never strand a recovered account, and long enough that a snapshot taken at
- * admission is still fresh when selection reads it.
- */
-export const TERMINAL_SHORT_WINDOW_FRESHNESS_MS = 5 * 60_000;
 /** How long a transient failure keeps the account out of pool selection. */
 export const CODEX_TRANSIENT_SOFT_AVOID_MS = 30_000;
 export const CODEX_TRANSIENT_SOFT_AVOID_ESCALATION_MS = [
@@ -78,6 +73,15 @@ export type CodexUpstreamOutcomeMeta = {
   probeLeaseId?: string;
   /** Scope of `probeLeaseId` when it was granted against a model-scoped cooldown. */
   probeQuotaScope?: CodexQuotaScope;
+  /**
+   * The half-open TRANSIENT-HOLD probe this request was granted, when it was the one request
+   * admitted to test a held account (#4701). A different lease to `probeLeaseId` above, in a
+   * different domain: that one governs a quota cooldown, this one governs a 5xx hold. The two
+   * are mutually exclusive by construction -- `isTransientOnlyAffinityBlock` refuses to
+   * recognise a transient hold on an account that carries quota health -- so a request never
+   * holds both and never pays two recovery permits for one send.
+   */
+  transientProbe?: TransientProbeGrant;
   /**
    * Already-chosen alternate for same-request 429 retry. When set, promotion
    * reuses this account instead of calling {@link pickAlternateCodexAccount}
@@ -128,44 +132,11 @@ export function computeCodexUsageScore(quota: {
   return Math.max(...values);
 }
 
-/**
- * A short-only reading that proves the account is blocked NOW.
- *
- * Freshness is not optional. `getAccountQuota` performs no expiry check, partial updates
- * carry a still-open short tuple forward, and disk hydration accepts a persisted reading for
- * hours — so scoring 100 from `shortPercent` alone would keep excluding an account whose
- * five-hour window has since reset. Merge no longer carries an elapsed shortResetAt, but an
- * explicit incoming elapsed tuple is still stored, and a missing reset cannot be aged there.
- * That is #3029 pointed the other way: the issue is that
- * an exhausted account stays selected, and "a recovered account stays excluded" trades one
- * unusable pool for another.
- *
- * A reading with no `shortResetAt` cannot be aged, so it stays unknown. The conservative
- * direction here is the one that keeps an account selectable: a wrongly-selected account
- * fails one request, while a wrongly-excluded one is invisible until someone reads the pool
- * by hand.
- *
- * A missing reset can instead be aged by shortObservedAt (#3425). General updatedAt is not
- * sufficient: credit-only updates preserve the old short tuple but advance that timestamp.
- * Old disk snapshots without short-window provenance remain unknown.
- */
-function isTerminalShortWindow(
-  quota: { shortPercent?: number; shortResetAt?: number; shortObservedAt?: number },
-  now: number,
-): boolean {
-  if (typeof quota.shortPercent !== "number" || !Number.isFinite(quota.shortPercent)) return false;
-  if (quota.shortPercent < CODEX_EXHAUSTED_USAGE_PERCENT) return false;
-  const resetAt = quota.shortResetAt;
-  if (typeof resetAt !== "number" || !Number.isFinite(resetAt) || resetAt <= 0) {
-    const observedAt = quota.shortObservedAt;
-    if (typeof observedAt !== "number" || !Number.isFinite(observedAt)) return false;
-    const age = now - observedAt;
-    return age >= 0 && age <= TERMINAL_SHORT_WINDOW_FRESHNESS_MS;
-  }
-  // Seconds and milliseconds both reach storage, so the split lives in one place next to the
-  // merge that also ages a stored reset instant (`resetAtToMs`, src/codex/quota.ts).
-  return resetAtToMs(resetAt) > now;
-}
+// `isTerminalShortWindow` moved to ../quota-types, the leaf the dashboard can import. Routing
+// and the account-switch warning have to answer this identically for the same snapshot, and
+// they did not: see the note on the shared function (#5045). Its #3029 and #3425 reasoning —
+// why freshness is not optional, and why a reading with no reset and no observation stays
+// unknown rather than exhausted — moved with it.
 
 export function classifyCodexUpstreamOutcome(
   outcome: CodexUpstreamOutcome,

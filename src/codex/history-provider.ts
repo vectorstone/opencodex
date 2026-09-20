@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { zstdDecompressSync } from "node:zlib";
+import { parseSessionMetaLine, type ParsedSessionMeta } from "./history-rollout-read";
+export { MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES, readThreadFieldsFromRollout, type RolloutThreadFields } from "./history-rollout-read";
 import { Database } from "bun:sqlite";
 import { resolveCodexStateDbPath } from "./paths";
+import { openCodexStateForPreflight } from "./history-state-open";
 import { atomicWriteFile, getConfigDir } from "../config";
 import {
   CODEX_HISTORY_RESUMABLE_SOURCES,
@@ -14,13 +16,6 @@ import {
   type CodexHistoryBackupEntry,
   type CodexHistoryBackupManifest,
 } from "./history-manifest";
-
-/**
- * Cap for decompressing a lone `.jsonl.zst` rollout during quarantine restore.
- * Bounds peak memory while reconstructing thread rows; never write the decoded
- * JSONL to disk.
- */
-export const MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES = 64 * 1024 * 1024;
 
 /**
  * The manifest that shadows one state database.
@@ -74,6 +69,22 @@ let historyDbBusyTimeoutMs = 5000;
  */
 export function setHistoryDbBusyTimeoutForTests(ms: number): void {
   historyDbBusyTimeoutMs = ms;
+}
+
+/**
+ * Carry that timeout across a realm boundary. A Worker starts from the default above and cannot
+ * observe a parent that shortened the window — the same reason its run message carries the homes
+ * explicitly — so `history-job.ts` sends this value and `history-worker.ts` adopts it. In
+ * production both sides already hold the codex-rs-matching 5s. A non-finite or negative value is
+ * refused rather than allowed to disable the wait the app expects.
+ */
+export function currentHistoryDbBusyTimeoutMs(): number {
+  return historyDbBusyTimeoutMs;
+}
+
+export function adoptHistoryDbBusyTimeout(ms: number): void {
+  if (!Number.isFinite(ms) || ms < 0) return;
+  historyDbBusyTimeoutMs = Math.floor(ms);
 }
 
 function openStateDb(stateDbPath: string): Database {
@@ -311,6 +322,19 @@ class CodexHistoryIntegrityError extends Error {
  * O_APPEND does not allocate an ordinal or update that writer's in-memory cursor.
  * Refuse before changing the DB, manifest, or first-line provider; never guess N+1.
  */
+/**
+ * The one refusal reason that means "the native writer owns this history", as opposed
+ * to "something is wrong". It is a stand-down for the relabel unit on apply
+ * (`src/codex/inject.ts`) and for the history half of a restore; every other reason is
+ * a hard refusal in both directions.
+ *
+ * Exported as a constant rather than repeated as a literal because the apply and restore
+ * directions have to agree on it exactly. They drifted once already: apply learned to
+ * stand down while restore kept refusing, which is how #4812's uninstall deadlock
+ * survived the fix that was supposed to end it.
+ */
+export const HISTORY_RELABEL_STANDS_DOWN = "history_paginated_requires_native_writer";
+
 function assertLegacyHistoryRecord(line: string): void {
   let value: unknown;
   try { value = JSON.parse(line); } catch { throw new CodexHistoryIntegrityError("history_rollout_record_invalid"); }
@@ -320,7 +344,7 @@ function assertLegacyHistoryRecord(line: string): void {
   const record = value as Record<string, unknown>;
   const payload = record.payload;
   if (Object.hasOwn(record, "ordinal") || (payload !== null && typeof payload === "object" && (payload as Record<string, unknown>).history_mode === "paginated")) {
-    throw new CodexHistoryIntegrityError("history_paginated_requires_native_writer");
+    throw new CodexHistoryIntegrityError(HISTORY_RELABEL_STANDS_DOWN);
   }
 }
 
@@ -381,7 +405,7 @@ function assertLegacyHistoryWritable(path: string, heldFd?: number): void {
 function assertLegacyHistoryStore(db: Database): void {
   const columns = db.query<{ name: string }, []>("PRAGMA table_info(threads)").all();
   if (columns.some(column => column.name === "history_mode")) {
-    throw new CodexHistoryIntegrityError("history_paginated_requires_native_writer");
+    throw new CodexHistoryIntegrityError(HISTORY_RELABEL_STANDS_DOWN);
   }
 }
 
@@ -404,23 +428,39 @@ export function preflightCodexHistoryInjection(
     if (!existsSync(resolvedPath)) {
       return restoreEntries.length > 0 ? "history_state_database_missing" : null;
     }
-    db = new Database(resolvedPath, { readonly: true });
+    // Read-only, and narrowed so a cleanly-closed WAL store is inspected rather than refused
+    // (#4943). The open order is the safety property; see history-state-open.ts.
+    db = openCodexStateForPreflight(resolvedPath);
     const columns = db.query<{ name: string }, []>("PRAGMA table_info(threads)").all();
     const paginatedColumn = columns.some(column => column.name === "history_mode");
-    if (paginatedColumn && restoreEntries.length > 0) return "history_paginated_requires_native_writer";
+    if (paginatedColumn && restoreEntries.length > 0) return HISTORY_RELABEL_STANDS_DOWN;
     for (const entry of restoreEntries) assertLegacyHistoryWritable(entry.rolloutPath);
-    const rows = db.query<{ rollout_path: string; history_mode: string | null }, []>(`
-      SELECT rollout_path, ${paginatedColumn ? "history_mode" : "NULL AS history_mode"}
+    const rows = db.query<{ rollout_path: string; history_mode: string | null; model_provider: string }, []>(`
+      SELECT rollout_path, ${paginatedColumn ? "history_mode" : "NULL AS history_mode"}, model_provider
       FROM threads
       WHERE ${providerTableMode
         ? resumeHistory ? "model_provider IN ('openai', 'opencodex')" : "0"
         : "model_provider = 'opencodex'"}
     `).all();
+    // No ORDER BY: a paginated opencodex row can precede a paginated openai one, so the
+    // verdict waits for the full scan instead of standing down on the first paginated row.
+    let foundPaginatedRow = false;
+    let foundPaginatedOpenaiRow = false;
     for (const row of rows) {
-      if (paginatedColumn || row.history_mode === "paginated") return "history_paginated_requires_native_writer";
+      if (paginatedColumn || row.history_mode === "paginated") {
+        foundPaginatedRow = true;
+        // A provider-table transition removes the root openai_base_url, and a row already
+        // paginated cannot be relabeled: standing it down would route the openai-tagged
+        // thread to Codex's built-in OpenAI endpoint. A still-legacy row only stands down.
+        if (providerTableMode && row.history_mode === "paginated" && row.model_provider === "openai") {
+          foundPaginatedOpenaiRow = true;
+        }
+        continue;
+      }
       assertLegacyHistoryWritable(row.rollout_path);
     }
-    return null;
+    if (foundPaginatedOpenaiRow) return "history_paginated_openai_requires_native_writer";
+    return foundPaginatedRow ? HISTORY_RELABEL_STANDS_DOWN : null;
   } catch (error) {
     return error instanceof CodexHistoryIntegrityError
       ? error.message
@@ -989,24 +1029,6 @@ function assertRestoreReadback(
   }
 }
 
-interface ParsedSessionMeta {
-  record: { type?: unknown; timestamp?: unknown; payload: { model_provider?: unknown; source?: unknown } & Record<string, unknown> };
-}
-
-/** Parse one JSONL line into a `session_meta` record, or null if it isn't one. */
-function parseSessionMetaLine(line: string): ParsedSessionMeta | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
-  const record = parsed as ParsedSessionMeta["record"];
-  if (record.type !== "session_meta" || !record.payload || typeof record.payload !== "object") return null;
-  return { record };
-}
-
 /**
  * Find the LAST `session_meta` line in a rollout, mirroring the app's last-writer-wins fold
  * (codex-rs `apply_session_meta_from_item`). We base our patch on the most recent metadata so we
@@ -1073,142 +1095,6 @@ function compensateConcurrentSessionMetaAppend(
     // The caller reports an integrity conflict and retains the manifest. Compensation is
     // best-effort because a second write failure must not erase the original failure evidence.
   }
-}
-
-/**
- * Fields needed to re-insert a production-shaped `threads` row from a rollout JSONL when a
- * Phase-2 quarantine predates full `satellite-backup.json` thread snapshots.
- *
- * Uses the same last-writer-wins `session_meta` fold as {@link readLatestSessionMeta}, plus the
- * first user-message preview (codex-rs `list.rs` / `EventMsg::UserMessage` path).
- */
-export interface RolloutThreadFields {
-  id: string;
-  modelProvider: string;
-  source: string;
-  firstUserMessage: string;
-  hasUserEvent: number;
-  cwd?: string;
-  historyMode?: string;
-  cliVersion?: string;
-}
-
-function textFromContentParts(content: unknown): string | null {
-  if (typeof content === "string" && content.trim()) return content.trim();
-  if (!Array.isArray(content)) return null;
-  const parts: string[] = [];
-  for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-    const p = part as Record<string, unknown>;
-    if (typeof p.text === "string" && p.text.trim()) parts.push(p.text.trim());
-    else if (typeof p.input_text === "string" && p.input_text.trim()) parts.push(p.input_text.trim());
-  }
-  const joined = parts.join("\n").trim();
-  return joined || null;
-}
-
-/** Extract the first user-message preview from a rollout line, or null. */
-function extractUserMessagePreview(line: string): string | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
-  const record = parsed as { type?: unknown; payload?: unknown };
-  const payload = record.payload;
-  if (!payload || typeof payload !== "object") return null;
-  const p = payload as Record<string, unknown>;
-
-  if (record.type === "event_msg") {
-    // codex-rs EventMsg::UserMessage — payload.type is "user_message" (or omitted in fixtures).
-    if (p.type === "user_message" || typeof p.message === "string") {
-      if (typeof p.message === "string" && p.message.trim()) return p.message.trim();
-      const fromContent = textFromContentParts(p.content);
-      if (fromContent) return fromContent;
-    }
-    return null;
-  }
-
-  if (record.type === "response_item") {
-    if (p.type === "message" && p.role === "user") {
-      return textFromContentParts(p.content);
-    }
-  }
-  return null;
-}
-
-/**
- * Reconstruct thread identity + listing fields from a staged/restored rollout JSONL.
- * Returns null when the file is missing or has no parseable `session_meta`.
- *
- * Accepts plain `.jsonl` or a lone `.jsonl.zst` (legacy Phase-2 quarantine). Compressed
- * rollouts are decompressed in memory with {@link MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES};
- * no decompressed copy is written to disk.
- */
-export function readThreadFieldsFromRollout(path: string): RolloutThreadFields | null {
-  if (!path || !existsSync(path)) return null;
-  let raw: string;
-  try {
-    raw = path.endsWith(".zst")
-      ? decompressRolloutZstUtf8(path)
-      : readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
-  return parseThreadFieldsFromRolloutText(raw);
-}
-
-function decompressRolloutZstUtf8(
-  path: string,
-  maxBytes: number = MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES,
-): string {
-  const compressed = readFileSync(path);
-  const decoded = zstdDecompressSync(compressed as Uint8Array<ArrayBuffer>, {
-    maxOutputLength: maxBytes,
-  });
-  if (decoded.byteLength > maxBytes) {
-    throw new Error("rollout_zst_too_large");
-  }
-  return new TextDecoder().decode(decoded);
-}
-
-function parseThreadFieldsFromRolloutText(raw: string): RolloutThreadFields | null {
-  const lines = raw.split("\n");
-  let latest: ParsedSessionMeta | null = null;
-  let firstUserMessage = "";
-  for (const line of lines) {
-    if (!line) continue;
-    if (line.includes("\"session_meta\"")) {
-      const meta = parseSessionMetaLine(line);
-      if (meta) latest = meta;
-    }
-    if (!firstUserMessage) {
-      const preview = extractUserMessagePreview(line);
-      if (preview) firstUserMessage = preview;
-    }
-  }
-  if (!latest) return null;
-  const payload = latest.record.payload;
-  const id = typeof payload.id === "string" ? payload.id : "";
-  if (!id) return null;
-  const modelProvider = typeof payload.model_provider === "string" && payload.model_provider
-    ? payload.model_provider
-    : "openai";
-  const source = typeof payload.source === "string" && payload.source
-    ? payload.source
-    : "cli";
-  return {
-    id,
-    modelProvider,
-    source,
-    firstUserMessage,
-    hasUserEvent: firstUserMessage.trim() ? 1 : 0,
-    ...(typeof payload.cwd === "string" ? { cwd: payload.cwd } : {}),
-    ...(typeof payload.history_mode === "string" ? { historyMode: payload.history_mode } : {}),
-    ...(typeof payload.cli_version === "string" ? { cliVersion: payload.cli_version } : {}),
-  };
 }
 
 /**

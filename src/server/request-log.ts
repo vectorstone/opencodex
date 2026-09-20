@@ -1,5 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { stampApiKeyAccountLabel, usesApiKeyAccount } from "../providers/label";
+import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
+import { readBoundedResponseBody } from "../lib/bounded-body";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -9,6 +12,7 @@ import {
   isCyberPolicyCode,
   isCyberPolicyMessage,
   isRateLimitOrQuotaFailureMessage,
+  isUpstreamResetReplayRefusedMessage,
   upstreamErrorMessageFromPayload,
 } from "../lib/errors";
 import { CODEX_CONFIG_PATH, readRootTomlString } from "../codex/paths";
@@ -17,7 +21,9 @@ import { readCodexCatalogPath } from "../codex/catalog";
 import type { AttemptTierOutcome, OcxProviderConfig, OcxUsage } from "../types";
 import { normalizeRouteDecisionTrace, type RouteDecisionTraceV1 } from "../routing/trace";
 import type { AdapterRequest } from "../adapters/base";
+import type { RequestSpendSettlement } from "./responses/request-spend";
 import type { AdapterTierMetadata } from "../providers/fastwire";
+import { UPSTREAM_RESET_REPLAY_REFUSED_CODE } from "../lib/upstream-retry";
 import { redactSecretString, sanitizeLogMetadataString } from "../lib/redact";
 import {
   appendUsageEntry,
@@ -40,6 +46,7 @@ import {
   usageStatusForFinalLog,
   usageTotalTokens,
   type AttemptRecoveryKind,
+  type AttemptRecoveryWithheld,
   type CacheTelemetryProvenance,
   type PersistedRequestSpend,
   type PersistedUsageAttempt,
@@ -62,10 +69,15 @@ import { inferCursorContextWindow } from "../adapters/cursor/discovery";
 import { KIRO_MODEL_CONTEXT_WINDOWS, normalizeKiroModelId } from "../providers/kiro-models";
 import { DEVIN_MODEL_CONTEXT_WINDOWS } from "../adapters/devin/live-models";
 import { modelRecordValue } from "../reasoning-effort";
+import type { RequestMetricsRecorder } from "./request-metrics";
 
 export interface RequestLogContext {
   model: string;
   provider: string;
+  /** Optional process-lifetime aggregate sink, injected by the server composition owner. */
+  requestMetricsRecorder?: RequestMetricsRecorder;
+  /** Bounded terminal enum observed while inspecting a buffered response body. */
+  observedTerminalStatus?: ResponsesTerminalStatus;
   /**
    * Identity of the ONE logical request this context serves (#4546). Set from the execution
    * budget minted at ingress; a retry leg, a repair refetch and a combo child share it.
@@ -138,6 +150,15 @@ export interface RequestLogContext {
   preserveResolvedModelFromRoute?: boolean;
   usage?: OcxUsage;
   usageLogInputTokens?: number;
+  /**
+   * The output ceiling this request may actually spend, for the durable spend reservation
+   * (#4707). Captured from the caller's `max_output_tokens`; absent when the caller omitted it
+   * and the adapter's own provider/model default decides, in which case only the input estimate
+   * is reserved up front and settlement corrects it.
+   */
+  spendOutputCeilingTokens?: number;
+  /** Settles this request's durable spend entries from `addFinalRequestLog`. */
+  spendTracker?: RequestSpendSettlement;
   attempts?: PersistedUsageAttempt[];
   /** Internal mutable final attempt; omitted from RequestLogEntry/JSONL. */
   activeAttempt?: PersistedUsageAttempt;
@@ -277,6 +298,7 @@ export interface RequestLogEntry {
 }
 
 const requestLog: RequestLogEntry[] = [];
+const requestLogObserversForTests = new Set<(entry: RequestLogEntry) => void>();
 const MAX_LOG_SIZE = 2000;
 const requestLogEntryBytes = new WeakMap<RequestLogEntry, number>();
 let requestLogBytes = 0;
@@ -477,6 +499,9 @@ export function addRequestLog(entry: RequestLogEntry) {
   else if (retained !== entry) delete retained.claudeCompatibility;
   entry = retained;
   retainRequestLogEntry(entry);
+  for (const observer of requestLogObserversForTests) {
+    try { observer(entry); } catch { /* test observation must never fail request logging */ }
+  }
   try {
     // Failure diagnostics survive the 200-entry ring buffer by riding the persisted
     // usage entry (devlog/_plan/260716_claudecode_hardening/030). Success rows stay
@@ -550,6 +575,12 @@ export function addRequestLog(entry: RequestLogEntry) {
   } catch {
     /* request logging must never fail a user request */
   }
+}
+
+/** Test-only finalized-row observation without polling the management projection. */
+export function observeRequestLogsForTests(observer: (entry: RequestLogEntry) => void): () => void {
+  requestLogObserversForTests.add(observer);
+  return () => { requestLogObserversForTests.delete(observer); };
 }
 
 export function nextRequestLogId(_timestamp = Date.now()): string {
@@ -700,7 +731,15 @@ export function requestLogErrorCode(
     }
     return "permission_denied";
   }
-  if (status === 429) return "rate_limit_exceeded";
+  if (status === 429) {
+    // A refused ambiguous reset answers 429 by design (it must not invite a client
+    // retry that could duplicate inference); classify it by its message so the log
+    // distinguishes a proxy refusal from provider throttling.
+    if (upstreamError?.trim() && isUpstreamResetReplayRefusedMessage(upstreamError)) {
+      return UPSTREAM_RESET_REPLAY_REFUSED_CODE;
+    }
+    return "rate_limit_exceeded";
+  }
   if (status === 503) return "server_is_overloaded";
   if (status >= 500) return "upstream_server_error";
   return `http_${status}`;
@@ -752,6 +791,22 @@ export function catalogModelSupportsServiceTier(modelId: string, serviceTier: st
 
 export function applyResponseLogMetadata(logCtx: RequestLogContext, payload: unknown): void {
   if (!payload || typeof payload !== "object") return;
+  if (logCtx.observedTerminalStatus === undefined) {
+    const eventType = (payload as { type?: unknown }).type;
+    const response = (payload as { response?: unknown }).response;
+    const responseStatus = response && typeof response === "object"
+      ? (response as { status?: unknown }).status
+      : (payload as { status?: unknown }).status;
+    if (eventType === "response.completed") {
+      logCtx.observedTerminalStatus = "completed";
+    } else if (eventType === "response.failed") {
+      logCtx.observedTerminalStatus = "failed";
+    } else if (eventType === "response.incomplete") {
+      logCtx.observedTerminalStatus = "incomplete";
+    } else if (responseStatus === "completed" || responseStatus === "failed" || responseStatus === "incomplete") {
+      logCtx.observedTerminalStatus = responseStatus;
+    }
+  }
   const source = "response" in payload && typeof (payload as { response?: unknown }).response === "object"
     ? (payload as { response?: unknown }).response
     : payload;
@@ -772,8 +827,10 @@ export function applyResponseLogMetadata(logCtx: RequestLogContext, payload: unk
   }
   const usage = usageFromResponsesPayload((source as { usage?: unknown }).usage);
   if (usage && !logCtx.usageFromBridge) {
-    logCtx.usage = usage;
-    if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+    if (!recordKeyWireAttemptUsage(logCtx, usage)) {
+      logCtx.usage = usage;
+      if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+    }
     // Counts taken off a wire, not reported raw. The zero-default token-detail objects strict
     // clients require are indistinguishable here from a measured zero, so the cache detail these
     // counts carry is recorded as synthesized rather than as an observed miss.
@@ -839,7 +896,13 @@ export function usageFromResponsesPayload(usage: unknown): OcxUsage | undefined 
  * Mark a refusal this proxy synthesized locally. Sets origin to `synthetic` and a
  * distinct local reason so the request log cannot be read as an upstream overload.
  */
-export function markLocalRequestLogRefusal(logCtx: RequestLogContext, reason: string): void {
+// Typed by the two fields it writes rather than by the whole context: the durable-spend tracker
+// has to mark a row from a narrow view of it, and widening that view to the full context there
+// would pull the entire log shape into a module that touches two of its fields.
+export function markLocalRequestLogRefusal(
+  logCtx: Pick<RequestLogContext, "localTerminalReason" | "terminalSource">,
+  reason: string,
+): void {
   logCtx.localTerminalReason = reason;
   logCtx.terminalSource = "synthetic";
 }
@@ -1206,6 +1269,31 @@ export function recordNoAccountAffinityFailure(
   logCtx.errorCode ??= "codex_no_account";
   return resolved;
 }
+// Attempt identity can change in place while a combo parent retains an older context copy.
+// These objects own their usage even after a rotation to an unknown key identity.
+const keyUsageOwners = new WeakSet<PersistedUsageAttempt>();
+const keyWireUsageBaselines = new WeakMap<PersistedUsageAttempt, OcxUsage | undefined>();
+
+function cloneKeyUsage(usage: OcxUsage | undefined): OcxUsage | undefined {
+  return usage ? { ...usage } : undefined;
+}
+
+/** Replace this physical send's wire snapshot against the pre-send baseline; repeats do not sum. */
+export function recordKeyWireAttemptUsage(logCtx: RequestLogContext, usage: OcxUsage | undefined): boolean {
+  if (!usage) return false;
+  const attempt = logCtx.activeAttempt;
+  if (!attempt || !keyUsageOwners.has(attempt) || !keyWireUsageBaselines.has(attempt)) return false;
+  const baseline = keyWireUsageBaselines.get(attempt);
+  const current = { ...usage };
+  attempt.usage = baseline
+    ? aggregateAttemptUsage([
+      { ...attempt, usage: baseline, usageStatus: baseline.estimated ? "estimated" : "reported" },
+      { ...attempt, usage: current, usageStatus: current.estimated ? "estimated" : "reported" },
+    ]).usage
+    : current;
+  logCtx.usage = attempt.usage;
+  return true;
+}
 
 export function addFinalRequestLog(
   requestId: string,
@@ -1237,13 +1325,19 @@ export function addFinalRequestLog(
       logCtx.activeAttempt,
       effectiveStatus,
       Date.now() - (logCtx.activeAttemptStartedAt ?? start),
-      logCtx.usage,
+      keyUsageOwners.has(logCtx.activeAttempt)
+        ? logCtx.activeAttempt.usage
+        : logCtx.usage,
     );
     // The final row and its active physical attempt describe the same terminal. Preserve the
     // semantic code on both so detailed attempt telemetry cannot regress to a generic status code.
     if (errorCode) logCtx.activeAttempt.errorCode = errorCode;
     else delete logCtx.activeAttempt.errorCode;
   }
+  // The one seam every request passes exactly once, whatever transport served it and however
+  // it ended. The terminal usage belongs to the last send that left; the ledger resolves every
+  // earlier send of this request as unresolved spend rather than handing its tokens back.
+  logCtx.spendTracker?.settle(logCtx.usage);
   const existing = finalizedUsage(
     logCtx.providerAdapter ?? logCtx.provider,
     logCtx.usage,
@@ -1254,6 +1348,7 @@ export function addFinalRequestLog(
   const attempts = logCtx.attempts?.map(attempt => ({
     ...attempt,
     recoveryKinds: [...attempt.recoveryKinds],
+    ...(attempt.recoveryWithheld?.length ? { recoveryWithheld: [...attempt.recoveryWithheld] } : {}),
     ...(attempt.usage ? { usage: { ...attempt.usage } } : {}),
     ...(attempt.tierOutcome ? { tierOutcome: { ...attempt.tierOutcome } } : {}),
   }));
@@ -1263,6 +1358,17 @@ export function addFinalRequestLog(
   const usageStatus = aggregate?.status ?? existing.status;
   const totalTokens = aggregate?.totalTokens ?? existing.totalTokens;
   const spend = requestSpendRecord(logCtx, attempts);
+  const durationMs = Date.now() - start;
+  logCtx.requestMetricsRecorder?.recordFinalRequest({
+    ...(logCtx.inboundProtocol ? { protocol: logCtx.inboundProtocol } : {}),
+    status: effectiveStatus,
+    durationMs,
+    ...(logCtx.firstOutputMs !== undefined ? { firstOutputMs: logCtx.firstOutputMs } : {}),
+    ...(meta?.terminalStatus ? { terminalStatus: meta.terminalStatus } : {}),
+    ...(closeReason ? { closeReason } : {}),
+    ...(attempts !== undefined ? { attempts } : {}),
+    ...(spend ? { spendSends: spend.sends } : {}),
+  });
   const cacheProvenance = classifyCacheTelemetryProvenance(loggedUsage, {
     wireParsed: logCtx.usageWireParsed === true,
   });
@@ -1310,7 +1416,7 @@ export function addFinalRequestLog(
       : {}),
     ...(logCtx.resolvedModel ? { resolvedModel: logCtx.resolvedModel } : {}),
     status: effectiveStatus,
-    durationMs: Date.now() - start,
+    durationMs,
     ...(logCtx.firstOutputMs !== undefined ? { firstOutputMs: logCtx.firstOutputMs } : {}),
     ...(errorCode ? { errorCode } : {}),
     ...(meta?.terminalStatus ? { terminalStatus: meta.terminalStatus } : {}),
@@ -1528,6 +1634,84 @@ export function sealRequestAttemptIdentity(
   attempt.provider = provider;
   attempt.adapter = adapter;
   if (isCodexUsageAccountLogLabel(accountLogLabel)) attempt.accountLogLabel = accountLogLabel;
+  else delete attempt.accountLogLabel;
+}
+
+/** Preserve metered JSON failures before key recovery consumes/cancels their body. */
+export async function recordKeyAttemptFailure(logCtx: RequestLogContext, response: Response, signal?: AbortSignal): Promise<void> {
+  const attempt = logCtx.activeAttempt;
+  if (!attempt || !KEY_ACCOUNT_LOG_LABEL_RE.test(attempt.accountLogLabel ?? "")) return;
+  attempt.status = response.status;
+  const cancelOriginal = (): void => { try { void response.body?.cancel().catch(() => {}); } catch { /* closed */ } };
+  signal?.addEventListener("abort", cancelOriginal, { once: true });
+  try {
+    if (signal?.aborted) { cancelOriginal(); return; }
+    const body = await readBoundedResponseBody(response.clone(), { signal, totalTimeoutMs: 1000, inactivityTimeoutMs: 1000 });
+    if (body.truncated || body.oversized) return;
+    const value = JSON.parse(body.text);
+    const usage = usageFromResponsesPayload(value?.usage ?? value?.response?.usage);
+    if (usage) recordKeyWireAttemptUsage(logCtx, usage);
+  } catch { /* Absent/malformed usage remains unknown; recovery still owns the response. */ }
+  finally { signal?.removeEventListener("abort", cancelOriginal); }
+}
+
+/** Add raw per-response usage before a bridge combines multiple rounds for the client. */
+export function recordKeyAttemptUsage(logCtx: RequestLogContext, usage: OcxUsage | undefined): void {
+  const attempt = logCtx.activeAttempt;
+  if (!attempt || !usage) return;
+  attempt.usage = attempt.usage
+    ? aggregateAttemptUsage([{ ...attempt, usageStatus: attempt.usage.estimated ? "estimated" : "reported" },
+      { ...attempt, usage, usageStatus: usage.estimated ? "estimated" : "reported" }]).usage
+    : { ...usage };
+  logCtx.usage = attempt.usage;
+}
+
+/** A stable active object lets combo/stream callbacks keep pointing at the final attempt.
+ * Earlier key segments are immutable, flat snapshots inserted before that active object. */
+export function noteProviderAttemptSend(
+  logCtx: RequestLogContext,
+  providerName: string,
+  provider: OcxProviderConfig,
+  inputTokenEstimate: number | undefined,
+  recovery?: AttemptRecoveryKind,
+): void {
+  const attempt = logCtx.activeAttempt;
+  const previous = attempt?.accountLogLabel;
+  stampApiKeyAccountLabel(logCtx, providerName, provider);
+  const next = logCtx.accountLogLabel;
+  if (attempt && usesApiKeyAccount(provider)) keyUsageOwners.add(attempt);
+  if (attempt && attempt.sendCount > 0 && previous !== next
+    && (KEY_ACCOUNT_LOG_LABEL_RE.test(previous ?? "") || KEY_ACCOUNT_LOG_LABEL_RE.test(next ?? ""))) {
+    // An input estimate is not evidence that a failed send used that many tokens.
+    delete attempt.inputTokenEstimate;
+    finishRequestAttempt(attempt, attempt.status >= 100 ? attempt.status
+      : recovery === "key-401" ? 401 : recovery?.includes("429") ? 429 : 502,
+    Date.now() - (logCtx.activeAttemptStartedAt ?? Date.now()), attempt.usage);
+    const completed = { ...attempt, recoveryKinds: [...attempt.recoveryKinds],
+      ...(attempt.usage ? { usage: { ...attempt.usage } } : {}),
+      ...(attempt.tierOutcome ? { tierOutcome: { ...attempt.tierOutcome } } : {}) };
+    const attempts = logCtx.attempts ??= [attempt];
+    const index = attempts.indexOf(attempt);
+    if (index >= 0) attempts.splice(index, 0, completed);
+    else attempts.push(completed, attempt);
+    const fresh = beginRequestAttempt(completed.ordinal + 1, providerName, completed.model, completed.adapter);
+    // Effort/tier metadata describes the request and is captured before the physical send.
+    for (const key of ["requestedEffort", "effectiveEffort", "reasoningWireField", "reasoningWireValue", "tierOutcome"] as const) {
+      if (completed[key] !== undefined) Object.assign(fresh, { [key]: completed[key] });
+    }
+    for (const key of Object.keys(attempt)) delete (attempt as unknown as Record<string, unknown>)[key];
+    Object.assign(attempt, fresh);
+    delete logCtx.usage;
+    logCtx.activeAttemptStartedAt = Date.now();
+  }
+  if (attempt) {
+    sealRequestAttemptIdentity(attempt, logCtx.provider, attempt.adapter, next);
+    recordAttemptCredentialSource(attempt, providerName, provider, attempt.adapter);
+  }
+  noteAttemptSend(attempt, inputTokenEstimate, recovery);
+  if (attempt && keyUsageOwners.has(attempt)) {
+    keyWireUsageBaselines.set(attempt, cloneKeyUsage(attempt.usage));
+  }
 }
 
 /** Capture only the resolved upstream route; inbound auth and today's config cannot label old usage. */
@@ -1577,6 +1761,22 @@ export function noteAttemptSend(
   if (recovery && !attempt.recoveryKinds.includes(recovery)) {
     attempt.recoveryKinds.push(recovery);
   }
+}
+
+/**
+ * Record that a recovery this attempt was eligible for did not happen.
+ *
+ * Deliberately NOT `noteAttemptSend`: nothing was sent, so `sendCount` must not move. The two
+ * together are what make a one-send log readable — no kind and no withheld reason means nothing
+ * was eligible, a withheld reason means something was and the budget refused it (#5044).
+ */
+export function noteAttemptRecoveryWithheld(
+  attempt: PersistedUsageAttempt | undefined,
+  reason: AttemptRecoveryWithheld,
+): void {
+  if (!attempt) return;
+  if (!attempt.recoveryWithheld) attempt.recoveryWithheld = [];
+  if (!attempt.recoveryWithheld.includes(reason)) attempt.recoveryWithheld.push(reason);
 }
 
 export function finishRequestAttempt(
@@ -1661,4 +1861,5 @@ export function clearRequestLogsForTests(): void {
   requestLog.length = 0;
   requestLogBytes = 0;
   requestLogsHydratedFromDisk = false;
+  requestLogObserversForTests.clear();
 }

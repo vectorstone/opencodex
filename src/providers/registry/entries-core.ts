@@ -17,6 +17,7 @@ import type { ProviderRegistryEntry } from "./types";
 import {
   ANTHROPIC_MODELS,
   ANTHROPIC_MODEL_CONTEXT_WINDOWS,
+  ANTHROPIC_MODEL_INPUT_MODALITIES,
   ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
   ANTHROPIC_MODEL_REASONING_EFFORTS,
   ZAI_GLM_52_REASONING_EFFORTS,
@@ -29,6 +30,8 @@ import {
   OPENAI_API_GPT56_REASONING_EFFORTS,
   META_MUSE_REASONING_EFFORTS,
   META_MUSE_REASONING_EFFORT_MAP,
+  META_MUSE_CODE_REASONING_EFFORTS,
+  META_MUSE_CODE_REASONING_EFFORT_MAP,
   META_MUSE_CONTEXT_WINDOW,
   META_MUSE_MODELS,
   OPENAI_DAYBREAK_MODELS,
@@ -281,6 +284,17 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
         forwardCallerServiceTier: false,
       },
     },
+    // Grok 4.6/4.5 OAuth Responses replays Codex tool history. After a mid-stream 502/reset,
+    // the client can resend a function_call without a matching output, or with hook-injected
+    // developer context between the pair. Google already synthesizes a missing tool_result
+    // (#2199). xAI's Responses parser does not, so the next turns 400 and the thread snowballs.
+    // Reuse the existing adjacency capability (Kimi #4726, DeepSeek #1292). Do not set
+    // statelessResponses: xAI stores responses for 30 days and documents previous_response_id.
+    // https://docs.x.ai/developers/model-capabilities/text/comparison
+    requiresAdjacentResponsesToolResults: true,
+    // The dangling half of the same failure: a call whose output never arrived. Kimi accepts that
+    // shape, so this is a second capability rather than a widening of the one above.
+    requiresPairedResponsesToolResults: true,
     // Vision lineup per docs.x.ai model-capabilities/images/understanding: the grok-4.x chat
     // models accept image input (JPEG/PNG, URL or base64). Without this the catalog leaves
     // inputModalities undefined, and deriveComboCatalogModel defaults an undefined member to
@@ -383,6 +397,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     note: "Log in with your Claude account",
     models: [...ANTHROPIC_MODELS],
     modelContextWindows: { ...ANTHROPIC_MODEL_CONTEXT_WINDOWS },
+    modelInputModalities: { ...ANTHROPIC_MODEL_INPUT_MODALITIES },
     modelReasoningEfforts: { ...ANTHROPIC_MODEL_REASONING_EFFORTS },
     // Codex omits max_output_tokens; without a provider budget the Anthropic adapter
     // falls back to 8192, which truncates long answers with stop_reason=max_tokens.
@@ -403,6 +418,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     models: [...ANTHROPIC_MODELS],
     liveModels: true,
     modelContextWindows: { ...ANTHROPIC_MODEL_CONTEXT_WINDOWS },
+    modelInputModalities: { ...ANTHROPIC_MODEL_INPUT_MODALITIES },
     modelReasoningEfforts: { ...ANTHROPIC_MODEL_REASONING_EFFORTS },
     defaultMaxOutputTokens: ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
     defaultModel: "claude-sonnet-5",
@@ -420,6 +436,10 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // or the one the Claude /v1/messages inbound derives); the adapter itself never invents one.
     // Evidence: https://platform.kimi.com/docs/api/chat
     promptCacheKey: true,
+    // Kimi's Responses endpoint rejects hook-provided context between a tool call and
+    // its matching result (#4726), the same strict shape DeepSeek exposed in #1292.
+    // The flag is inert while this preset uses the Chat wire.
+    requiresAdjacentResponsesToolResults: true,
     featured: true,
     oauthId: "kimi",
     jawcodeBundle: "moonshot",
@@ -581,12 +601,15 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     label: "Meta Muse Code (CLI credential)",
     adapter: "openai-responses",
     baseUrl: "https://api.meta.ai/v1",
-    // Meta own client sends this on every Muse Code call. We never have, so a future
-    // server-side requirement would break every Muse request with no local signal.
+    // Meta's own client sends these on every Muse Code call. The compatibility marker
+    // is transparent while selecting the credential surface that accepts `max`.
     // Declared here rather than in a transport hook so it also covers model discovery
     // (src/oauth/index.ts:1176) and still yields to a user-set header
     // (mergeRegistryStaticHeaders, src/providers/registry.ts:3494).
-    staticHeaders: { "x-api-version": "1.0.0" },
+    staticHeaders: {
+      "User-Agent": "muse-build/1.3.0 (opencodex compatibility)",
+      "x-api-version": "1.0.0",
+    },
     authKind: "oauth",
     oauthId: "meta-muse",
     dashboardUrl: "https://dev.meta.ai",
@@ -597,8 +620,8 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     liveModels: false,
     modelContextWindows: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_CONTEXT_WINDOW])),
     modelInputModalities: Object.fromEntries(META_MUSE_MODELS.map(id => [id, ["text", "image"] as ["text", "image"]])),
-    modelReasoningEfforts: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_REASONING_EFFORTS])),
-    modelReasoningEffortMap: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_REASONING_EFFORT_MAP])),
+    modelReasoningEfforts: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_CODE_REASONING_EFFORTS])),
+    modelReasoningEffortMap: Object.fromEntries(META_MUSE_MODELS.map(id => [id, META_MUSE_CODE_REASONING_EFFORT_MAP])),
     note: "Signs in to Meta with a browser device code on any platform, then mints the Muse Code subscription key. That grant is reimplemented from the one the Muse Code CLI performs and has NOT been exercised against Meta from OpenCodex, so treat the first login as unverified. If the Muse Code CLI is already signed in on macOS, the existing key is imported instead of starting a new grant. A pasted key from https://dev.meta.ai still works as a fallback when a device login cannot complete, and faces the same format check and live validation. A device login authenticates as Meta own Muse Code client, which is a stronger claim than reusing a key the CLI already minted. Meta scopes that credential to the Muse Code CLI, so this is an UNSUPPORTED use: Meta does not authorize subscription coverage outside its own CLI, how these calls settle is not observable from the API, and you should treat every call as billable against your account. The key, imported or pasted, is copied into OpenCodex's auth store. For an account signed in with the device login, OpenCodex refreshes Meta's subscription windows on demand from the same key endpoint the login uses, at most once every five minutes. For an imported or pasted key there is no endpoint to query them on demand, so OpenCodex reads them from streaming responses and shows the last observed value with its age; refreshing one then requires another streaming turn, and translated (non-passthrough) turns report none. Rate limits apply per team, not per key. For a supported path use the meta-model provider with your own key (export it as META_MODEL_API_KEY).",
   },
   {
@@ -634,6 +657,11 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // Zen Go can close a Chat stream after a fully assembled function call without sending
     // finish_reason or [DONE] (#2260). The adapter still rejects incomplete argument JSON.
     openaiChatEofTolerance: true,
+    // Muse Spark on OpenCode Go can sit silent during prolonged reasoning and close without a protocol terminal.
+    modelResponsesTerminalRepair: {
+      "muse-spark-1.2-contributor": { graceMs: 5_000 },
+      "muse-spark-1.3-contributor": { graceMs: 5_000 },
+    },
     // Go rejects reasoning.encrypted_content with previous_response_id (#3838).
     // Use explicit replay history and the existing stateless Responses policy.
     statelessResponses: true,
@@ -678,17 +706,25 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
       "glm-5.3-flash": ["text", "image"],
       // Experimental DeepSeek vision preview — expected to merge into deepseek-v4-flash later.
       [DEEPSEEK_VISION_PREVIEW_MODEL]: ["text", "image"],
-      // This route is text-only upstream — it is already listed in this preset's
-      // noVisionModels, which routes images through the proxy's vision sidecar and
-      // makes the catalog advertise image input on its behalf. The positive
-      // text-only declaration is what reaches an EXISTING install: derive.ts fills
-      // noVisionModels all-or-nothing, so a config persisted before this id joined
-      // the list keeps a stale list, the sidecar predicate never matches, the row
-      // carries no modality at all, and any combo containing it collapses to
-      // ["text"] (#4505). modelInputModalities IS per-key filled, so this
-      // declaration lands on old configs. It states the route's real upstream
-      // capability and keeps the sidecar explicitly distinct from native vision.
-      "deepseek-v4.1-flash": ["text"],
+      // This route became natively multimodal; it is NOT a sidecar consumer.
+      //
+      // History: the id was declared text-only here and listed in this preset's
+      // noVisionModels, which routed its images through the vision sidecar (#4505).
+      // That classification came from jawcode metadata and went stale. Probed
+      // 2026-09-19 against https://opencode.ai/zen/go/v1/chat/completions with the
+      // headers this proxy sends: the route accepts an image_url part and the model
+      // reads it correctly (a four-band colour chart was described in the right
+      // order). Its sibling deepseek-v4-flash on the same gateway still answers
+      // HTTP 400 "Model only supports text input", which is what keeps the two
+      // distinct here rather than collapsing them.
+      //
+      // The declaration is what reaches an EXISTING install: derive.ts fills
+      // noVisionModels all-or-nothing, so a config persisted while the stale list
+      // was current keeps it forever, and modelInputModalities is filled per-key
+      // BENEATH the saved value. Both halves are repaired by
+      // stale-vision-classification-migration.ts; correcting the registry alone
+      // would fix new installs and leave existing ones stripping images.
+      "deepseek-v4.1-flash": ["text", "image"],
       // Muse Spark Contributor is natively multimodal on Zen Go: it accepts input_image
       // parts over /responses (probed 2026-08-26). Without this declaration the catalog
       // advertises it text-only and the Codex app blocks image attachments client-side with
@@ -742,7 +778,10 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // Kimi K2.7 Code accepts text+image+video: do NOT list it here.
     noVisionModels: [
       "glm-5.3", "glm-5.2", "glm-5", "glm-5.1",
-      "deepseek-v4.1-flash", "deepseek-v4-flash",
+      // deepseek-v4.1-flash is deliberately absent: probed natively multimodal on this
+      // gateway 2026-09-19 (see the modelInputModalities note above). Its sibling
+      // deepseek-v4-flash stays listed — that route rejects image_url upstream.
+      "deepseek-v4-flash",
       "mimo-v2-pro", "mimo-v2.5-pro",
       "minimax-m2.5", "minimax-m2.7",
       "qwen3.7-max",
@@ -1219,3 +1258,4 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     note: "Serverless Inference subscription API. Live discovery exposes only kimi-k2-instruct because Vultr documents it as the sole tool-calling model.",
   },
 ];
+

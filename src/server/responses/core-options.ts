@@ -1,3 +1,4 @@
+import type { NativeResponseControl } from "./native-response-control";
 import type { OcxUsage, OcxProviderContinuationState, OcxConfig } from "../../types";
 import type { CodexAuthPolicyConfig, CodexAuthContext } from "../../codex/auth-context";
 import type { AdmissionLease } from "../../lib/admission";
@@ -10,6 +11,7 @@ import type { NativeMainRefreshDependencies } from "../../codex/main-account";
 import type { InboundWire } from "../../providers/registry";
 import type { ExplicitOpenAiCallerAuth } from "../../providers/openai-sidecar";
 import type { CallerDirectAuth } from "../../providers/caller-authorization";
+import type { CompactionRoutingOverride } from "./compaction-routing";
 import type { TranslatorBudget } from "../../lib/translator-budget";
 import type { TransientSendBudget } from "../../lib/upstream-retry";
 import type { RequestLogContext } from "../request-log";
@@ -50,7 +52,11 @@ export interface HandleResponsesOptions {
   admission?: DataPlaneAdmission;
   /** Called at most once after the complete client body is read and accepted for dispatch. */
   onRequestBodyRead?: () => void;
+  /** Internal handoff for retry wrappers that must reuse the already-accounted request body. */
+  onRequestBodyParsed?: (body: unknown) => void;
   forceEmptyResponseId?: boolean;
+  /** Internal, connection-owned control channel; never reconstructed from headers. */
+  nativeControl?: NativeResponseControl;
   abortSignal?: AbortSignal;
   /** One-shot TTFT callback: first non-empty model output observed (WP4). */
   onFirstOutput?: () => void;
@@ -102,6 +108,7 @@ export interface HandleResponsesOptions {
   callerDirectAuth?: CallerDirectAuth | null;
   /** Internal recursion guard; callers outside this module must not set it. */
   comboAttempt?: boolean;
+  compactionRoutingOverride?: CompactionRoutingOverride | null;
   /** Internal combo handoff for one parent-validated continuation snapshot. */
   comboReplaySnapshot?: {
     sourceBody: unknown;

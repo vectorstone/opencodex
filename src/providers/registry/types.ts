@@ -64,6 +64,10 @@ export interface ProviderModelDiscoveryFilter {
 interface ProviderModelDiscoverySharedSpec {
   /** Query parameters applied to the resolved discovery URL. */
   query?: Readonly<Record<string, string>>;
+  /** Top-level response key containing model rows; defaults to `data`. */
+  envelopeKey?: string;
+  /** Model-row field containing the provider-native identifier; defaults to `id`. */
+  idField?: string;
   /** Declarative eligibility rules evaluated against each untrusted model row. */
   filter?: ProviderModelDiscoveryFilter;
   /** Optional lower byte ceiling; the process-wide hard ceiling still wins. */
@@ -218,6 +222,11 @@ export interface ProviderRegistryEntry {
    */
   requiresAdjacentResponsesToolResults?: boolean;
   /**
+   * Responses upstream that also rejects a tool call with no matching output anywhere in the
+   * replayed input. Seeded/backfilled like other fixed wire capabilities.
+   */
+  requiresPairedResponsesToolResults?: boolean;
+  /**
    * When enabled, tool results that are present but empty are annotated on the wire.
    * Seeded/backfilled like other fixed wire capabilities.
    */
@@ -255,6 +264,8 @@ export interface ProviderRegistryEntry {
   modelServiceTierCapabilityBaseUrlGuard?: (baseUrl: string) => boolean;
   /** Registry default for plaintext reasoning replay; see `OcxProviderConfig.preserveResponsesReasoningContent`. Registry-only like `supportsServiceTier`. */
   preserveResponsesReasoningContent?: boolean;
+  /** Registry default for dropping replayed reasoning items for Responses upstreams that reject them. */
+  dropResponsesReasoningItems?: boolean;
   /** Registry defaults for per-model Codex reasoning propagation; explicit user keys win during enrichment. */
   modelSupportsReasoningSummaries?: Record<string, boolean>;
   /** Registry defaults for per-model Codex Responses verbosity support. */

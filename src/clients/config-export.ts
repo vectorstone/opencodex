@@ -816,6 +816,7 @@ export interface OpenclawModelEntry {
   id: string;
   name: string;
   contextWindow?: number;
+  input?: string[];
 }
 
 export interface OpenclawProviderBlock {
@@ -843,15 +844,15 @@ export interface KimiProviderBlock {
 /**
  * `max_context_size` is mandatory and must be positive, so a model with no
  * authoritative context window is omitted from the document entirely rather
- * than guessed at. `capabilities` is never emitted: our catalog does not
- * assert them, and Kimi's own inference works off OpenAI-style name prefixes
- * that a routed selector will not match.
+ * than guessed at. Catalog image input becomes `image_in`; other capabilities
+ * are not inferred from routed model names.
  */
 export interface KimiModelBlock {
   provider: string;
   model: string;
   max_context_size: number;
   display_name?: string;
+  capabilities?: ["image_in"];
 }
 
 export interface KimiGeneratedConfig {
@@ -870,7 +871,7 @@ export interface GajaeModelEntry {
 /** Gajae validates strictly: an unknown field fails the whole config. */
 export interface GajaeProviderBlock {
   baseUrl: string;
-  apiKeyEnv: string;
+  apiKey: string;
   api: "openai-completions";
   models: GajaeModelEntry[];
 }
@@ -978,10 +979,12 @@ function buildHermesClientConfig(ctx: ExportContext): HermesGeneratedConfig {
 function buildOpenclawClientConfig(ctx: ExportContext): OpenclawGeneratedConfig {
   const models: OpenclawModelEntry[] = normalizeExportModels(ctx.models).map(model => {
     const context = authoritativeContextWindow(model.contextWindow);
+    const input = [...new Set(model.inputModalities?.filter(value => ["text", "image", "video", "audio"].includes(value)))];
     return {
       id: model.namespaced,
       name: exportModelLabel(model),
       ...(context !== undefined ? { contextWindow: context } : {}),
+      ...(input.length > 0 ? { input } : {}),
     };
   });
   const headers = proxyAdmissionHeaders(ctx.config, OPENCLAW_API_KEY_ENV_REF);
@@ -1019,6 +1022,7 @@ function buildKimiClientConfig(ctx: ExportContext): KimiGeneratedConfig {
       model: model.namespaced,
       max_context_size: context,
       ...(model.displayName ? { display_name: model.displayName } : {}),
+      ...(model.inputModalities?.includes("image") ? { capabilities: ["image_in"] as ["image_in"] } : {}),
     };
   }
   return {
@@ -1056,7 +1060,7 @@ function buildGajaeClientConfig(ctx: ExportContext): GajaeGeneratedConfig {
     providers: {
       [OPENCODE_PROVIDER_ID]: {
         baseUrl: ctx.baseUrl,
-        apiKeyEnv: GAJAE_API_KEY_ENV,
+        apiKey: LOOPBACK_API_KEY_PLACEHOLDER,
         api: "openai-completions",
         models,
       },
@@ -1321,8 +1325,8 @@ export const EXPORT_CLIENTS: Record<ExportClientId, ExportClientSpec> = {
     id: "gajae",
     filename: "gajae-models.yaml",
     destination: env => gajaeConfigPath(env),
-    apiKeyEnv: GAJAE_API_KEY_ENV,
-    exportHint: `export ${GAJAE_API_KEY_ENV}=<your key>`,
+    apiKeyEnv: "",
+    exportHint: "No environment variable is needed for the loopback provider.",
     build: buildGajaeClientConfig,
     format: "yaml",
     summarize: summarizeGajae,

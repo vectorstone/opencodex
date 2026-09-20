@@ -15,7 +15,7 @@ yapılandırma dosyasına yazar ve tekrar kaldırır. On beş istemci bu şekild
 | Hermes | `~/.hermes/config.yaml` | YAML | yeni oturumlarda | `OPENCODEX_HERMES_API_KEY` |
 | OpenClaw | `~/.openclaw/openclaw.json` | JSON5 | hemen, çalışan bir ağ geçidinde | `OPENCODEX_OPENCLAW_API_KEY` |
 | Kimi Code | `~/.kimi-code/config.toml` | TOML | yeniden başlatmada veya `/reload` ile | geri döngü (loopback) yer tutucusu |
-| gjc | `~/.gjc/agent/models.yml` | YAML | yeni oturumlarda veya `/model` açtığınızda | `OPENCODEX_GAJAE_API_KEY` |
+| gjc | `~/.gjc/agent/models.yml` | YAML | yeni oturumlarda veya `/model` açtığınızda | non-secret loopback placeholder |
 | DeepSeek Harness (DSH) | `$DSH_HOME/settings.yaml` (varsayılan `~/.dsh/settings.yaml`) | YAML | çalışırken yeniden yükleme | gizli olmayan geri döngü bearer yer tutucusu |
 | MiniMax Code | `~/.minimax/config.yaml` | YAML | yeni oturumlarda veya model seçici açıldıktan sonra | geri döngü (loopback) yer tutucusu |
 | Prime Agent | `~/.prime/agent/models.json` | JSON | yeni oturumlarda | geri döngü yer tutucusu |
@@ -154,6 +154,24 @@ zaman yeniden yazılmaz. Yorum taşıyabilen diğer biçimlerde (Hermes, OpenCla
 Kimi Code, gjc, MiniMax Code, Raycast — bütün belge olarak yazılan YAML, JSON5 ve TOML) veya
 kendi girdilerimiz düzenlenmişse, anahtar kilitlenir ve hangi düzenlemelerin
 size ait olduğunu tahmin etmek yerine devre dışı bırakmayı reddeder.
+
+## Değişiklikleri önizleyin ve onaylayın
+
+Uygula, Değiştir, Devre dışı bırak ve Geri yükle işlemleri artık bir önizlemeyle başlar. İletişim
+kutusu, yönetilen ayarlardan tam olarak hangilerinin değişeceğini, sınırlı değişiklik yollarını ve
+her değişikliğin bir değer eklediğini, güncellediğini veya kaldırdığını gösterir. Onaylamadan önce bu
+planı inceleyin.
+
+Bir plan değişiklik olmadığını bildiriyorsa yönetilen istemci belgesi zaten istenen durumdadır. Seçili
+bir Aside profilinde onaylama, yönetilen belge değişmese bile profilin eşitleme tercihini kaydedebilir.
+
+Dosya siz inceledikten sonra değişirse yazma işlemi eski plan nedeniyle reddedilir. İletişim kutusu
+eski planı güncel planla değiştirir ve yeniden açıkça onaylamanızı ister; yazma işlemini hiçbir zaman
+otomatik olarak yeniden denemez. Önizleme geçici olarak kullanılamıyorsa sayfayı normal şekilde
+yenileyin ve işlemi yeniden başlatın.
+
+Aside, aynı önizleme ve onay akışını bir defada seçili tek bir profil için kullanır. **Tüm profilleri
+eşitle** ayrı bir toplu işlem olarak kalır ve tek bir birleşik önizlemeye bağlı değildir.
 
 ## Dürüstçe ne beklenmeli?
 

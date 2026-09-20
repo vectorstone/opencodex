@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as directHttp from "../../src/server/direct-local-http";
+import { opencodeCatalogToken } from "../../src/lib/admin-secrets";
 import * as childProcess from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -267,7 +268,7 @@ describe("ocx opencode proxy model catalog", () => {
       port: 10123, hostname: "127.0.0.1", pid: null, source: "config",
     });
     const fetcher = spyOn(directHttp, "directLocalHttpFetch").mockImplementation(async (input, init) => {
-      expect(new Headers(init?.headers).get("x-opencodex-api-key")).toBe("fixture-admin-token");
+      expect(new Headers(init?.headers).get("x-opencodex-api-key")).toBe(opencodeCatalogToken("fixture-admin-token"));
       expect(String(input)).toBe("http://127.0.0.1:10123/api/models");
       expect(JSON.parse(readFileSync(configPath, "utf8")).providers.pending.initialModelSelection.status).toBe("pending");
       writeFileSync(configPath, JSON.stringify(ready));
@@ -773,7 +774,7 @@ describe("ocx opencode management token", () => {
       process.env.OPENCODEX_ADMIN_AUTH_TOKEN = "fixture-admin-token";
       delete process.env[OPENCODE_CONFIG_CONTENT_ENV];
       expect(await cmdOpencode([])).toBe(0);
-      expect(seen).toEqual(["fixture-admin-token"]);
+      expect(seen).toEqual([opencodeCatalogToken("fixture-admin-token")]);
 
       // Same run with no admin token anywhere: refuse rather than emit a partial catalog.
       delete process.env.OPENCODEX_ADMIN_AUTH_TOKEN;

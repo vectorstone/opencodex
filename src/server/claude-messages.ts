@@ -29,7 +29,7 @@ import {
 } from "../claude/outbound";
 import { clearableDeadline, idleDeadline } from "../lib/abort";
 import { estimateTokens } from "../lib/token-estimate";
-import { NoEligiblePolicyCandidateError, UnknownRoutingPolicyError, routeModel } from "../router";
+import { captureRouteStaticPolicy, NoEligiblePolicyCandidateError, UnknownRoutingPolicyError, routeModel } from "../router";
 import { evidenceFromBody } from "../routing/request-evidence";
 import { resolveWireProtocolOverride } from "./adapter-resolve";
 import type { OcxConfig } from "../types";
@@ -420,7 +420,7 @@ async function anthropicNativePassthrough(
   // count_tokens too — counts must match what the real send will contain, and the 32MB
   // body cap applies to it equally. Non-message bodies pass through untouched.
   if (Array.isArray(body.messages)) {
-    await normalizeAnthropicImages(body.messages);
+    await normalizeAnthropicImages(body.messages, { abortSignal: req.signal });
     enforceAnthropicImageLimits(body.messages);
   }
   const headers = new Headers();
@@ -790,6 +790,22 @@ async function handleClaudeMessagesWithBudget(
 
   if (!requestedModel) requestedModel = (anthropicBody as Rec).model as string;
   const stream = internalBody.stream === true;
+  /**
+   * This proxy's count of the prompt it is about to forward, computed at most once.
+   *
+   * Two readers want it and they want it under different rules. The usage log takes it as a
+   * floor only for estimated-usage adapters, because its merge is `max(reported, estimate)` and
+   * would otherwise overwrite real usage. `message_start` takes it whenever the upstream sent
+   * no confirmed usage before the first frame, where nothing is merged and the terminal
+   * `message_delta` still corrects it (#4857).
+   */
+  let requestTokenFloor: number | undefined;
+  const claudeRequestTokenFloor = (): number => {
+    if (requestTokenFloor === undefined) {
+      requestTokenFloor = estimateClaudeRequestTokens(anthropicBody as Rec, requestedModel);
+    }
+    return requestTokenFloor;
+  };
   // Routed adapters only support streamed turns; always stream internally and fold
   // the translated Anthropic SSE into a message JSON for non-streaming clients.
   internalBody.stream = true;
@@ -801,7 +817,10 @@ async function handleClaudeMessagesWithBudget(
     const route = routeModel(config, internalBody.model as string, evidenceFromBody(internalBody));
     // Settle the wire once so the sampling decision below reads the effective
     // adapter rather than the provider-wide default (#404).
-    route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, "anthropic");
+    route.staticPolicy = captureRouteStaticPolicy(
+      route.providerName, route.modelId, route.provider, route.staticPolicy.effectiveAlias, "anthropic",
+    );
+    route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, "anthropic", route.staticPolicy);
     logCtx.routeDecision = route.routeDecision;
     if (route.provider.adapter === "openai-responses") {
       delete internalBody.max_output_tokens;
@@ -815,7 +834,7 @@ async function handleClaudeMessagesWithBudget(
     // accurate-usage adapters — the request-log merge is max(reported, estimate) and
     // would overwrite real usage (audit 133 R1#7).
     if (route.provider.adapter === "cursor" || route.provider.adapter === "kiro") {
-      logCtx.usageLogInputTokens = estimateClaudeRequestTokens(anthropicBody as Rec, requestedModel);
+      logCtx.usageLogInputTokens = claudeRequestTokenFloor();
     }
     // Effort safety valve (devlog 136 B6, audit 139 R2#2): opus-shaped aliases make
     // every routed model look like a reasoning model to Claude clients, so a forced
@@ -988,7 +1007,13 @@ async function handleClaudeMessagesWithBudget(
 
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("text/event-stream") && response.body) {
-    const anthropicSse = responsesSseToAnthropicSse(response.body, requestedModel, { translatorBudget });
+    const anthropicSse = responsesSseToAnthropicSse(response.body, requestedModel, {
+      translatorBudget,
+      // Only a floor, and only for the first frame: an upstream that reports usage early wins
+      // over it inside the translator, and the terminal `message_delta` carries the
+      // authoritative count either way (#4857).
+      inputTokenFloor: claudeRequestTokenFloor(),
+    });
     if (stream) {
       return new Response(anthropicSse, {
         status: 200,

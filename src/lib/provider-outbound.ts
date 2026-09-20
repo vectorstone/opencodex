@@ -7,7 +7,7 @@ import {
   resolvePublicAddresses,
 } from "./destination-policy";
 import { pinnedHttpGet, pinnedHttpPost } from "./pinned-http";
-import { effectiveProxyFor, noProxyMatches, normalizeProxyHostname, outboundProxyConfigured } from "./proxy-env";
+import { configuredOutboundFetch, effectiveProxyFor, noProxyMatches, normalizeProxyHostname, outboundProxyConfigured } from "./proxy-env";
 import { publicProviderBaseUrl } from "./provider-url";
 
 type ProviderGetInit = Omit<RequestInit, "body" | "method" | "redirect">;
@@ -104,19 +104,67 @@ export async function providerRedirectError(response: Response, requestUrl: stri
   return `provider returned ${response.status} redirect to ${target}; configure the final provider URL directly`;
 }
 
+/**
+ * Default client identity for proxy-originated provider outbound requests.
+ *
+ * Every request through the provider outbound wrapper — connection tests, model
+ * discovery, quota probes — is initiated by the proxy itself, so there is no
+ * client request to inherit a User-Agent from, and the pinned Node-style
+ * transport sends none. WAF/CDN front ends commonly answer UA-less requests
+ * with a 403 that surfaced as "provider added but no models" (#5104). A caller
+ * that materializes its own User-Agent — registry static headers, provider
+ * `headers`, or a vendor-specific client fingerprint — keeps that value and is
+ * never given a second User-Agent; this only fills the name nobody claimed.
+ * The value is what survives, not its spelling: both the pinned transport and
+ * the SOCKS transport rebuild the set through `new Headers()`, which lowercases
+ * every name before it reaches the wire. Inference traffic never uses this
+ * wrapper, so the client-fingerprint rationale of #1751 is unaffected.
+ */
+const PROVIDER_OUTBOUND_DEFAULT_USER_AGENT = "opencodex";
+
+function hasUserAgentHeader(headers: HeadersInit | null | undefined): boolean {
+  if (!headers) return false;
+  if (headers instanceof Headers) return headers.has("user-agent");
+  if (Array.isArray(headers)) return headers.some(([name]) => name.toLowerCase() === "user-agent");
+  return Object.keys(headers).some(name => name.toLowerCase() === "user-agent");
+}
+
+function withDefaultOutboundUserAgent(
+  init: ProviderGetInit | ProviderPostInit,
+): ProviderGetInit | ProviderPostInit {
+  const headers = init.headers;
+  if (hasUserAgentHeader(headers)) return init;
+  if (headers instanceof Headers) {
+    const merged = new Headers(headers);
+    merged.set("User-Agent", PROVIDER_OUTBOUND_DEFAULT_USER_AGENT);
+    return { ...init, headers: merged };
+  }
+  if (Array.isArray(headers)) {
+    return { ...init, headers: [...headers, ["User-Agent", PROVIDER_OUTBOUND_DEFAULT_USER_AGENT]] };
+  }
+  return { ...init, headers: { ...(headers ?? {}), "User-Agent": PROVIDER_OUTBOUND_DEFAULT_USER_AGENT } };
+}
+
 async function providerOutboundRequest(
   name: string,
   provider: ProviderOutboundConfig,
   url: string,
   method: "GET" | "POST",
-  init: ProviderGetInit | ProviderPostInit,
+  rawInit: ProviderGetInit | ProviderPostInit,
   dependencies: ProviderOutboundDependencies = {},
 ): Promise<Response> {
+  // See PROVIDER_OUTBOUND_DEFAULT_USER_AGENT: this wrapper only carries proxy-originated
+  // diagnostic traffic, so it identifies itself unless the caller already did.
+  const init = withDefaultOutboundUserAgent(rawInit);
   const postUrl = method === "POST" ? new URL(url) : undefined;
   if (postUrl?.protocol !== undefined && postUrl.protocol !== "https:") {
     throw new ProviderOutboundPolicyError("provider POST URL must use HTTPS");
   }
-  if (provider.fetch) {
+  // A provider entry keeps unknown configuration keys, so `fetch` can arrive as a value the
+  // operator wrote into the file rather than an executor a caller attached. Calling that would
+  // throw inside discovery and fail the provider for a reason nothing in its configuration
+  // explains; the built-in transport is what a configured value means.
+  if (typeof provider.fetch === "function") {
     // A caller-owned executor cannot be peer-pinned here. This branch keeps literal/config
     // checks and redirect blocking, but does not provide the resolved-address guarantees of
     // the built-in transport. Main-request migration must define that executor contract first.
@@ -184,7 +232,7 @@ async function providerOutboundRequest(
     if (!proxyConfigured) throw error;
     warnProxyBoundaryOnce();
     warnProxyDnsDegradationOnce();
-    return globalThis.fetch(url, { ...init, method, redirect: "manual" });
+    return configuredOutboundFetch(url, { ...init, method, redirect: "manual" });
   }
   // A canonical TUN exception with no scheme-matched proxy must retain the
   // validated address, even when an unrelated HTTP_PROXY/ALL_PROXY is present.
@@ -193,7 +241,7 @@ async function providerOutboundRequest(
     // When the Mihomo exception could have admitted an answer, pin the transport to the
     // proxy the admission assumed instead of letting fetch re-infer it from the environment.
     const proxy = (allowMihomoIpv6FakeIp && effectiveProxy) ? effectiveProxy : undefined;
-    return globalThis.fetch(url, { ...init, method, redirect: "manual", ...(proxy ? { proxy } : {}) });
+    return configuredOutboundFetch(url, { ...init, method, redirect: "manual", ...(proxy ? { proxy } : {}) });
   }
   if (proxyConfigured && resolved.privateNetwork && !noProxyMatches(parsed)) {
     const hostname = normalizeProxyHostname(parsed.hostname);

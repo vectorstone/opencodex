@@ -14,7 +14,7 @@ file, and removes it again. Fifteen clients work this way, each with a switch:
 | Hermes | `~/.hermes/config.yaml` | YAML | new sessions | `OPENCODEX_HERMES_API_KEY` |
 | OpenClaw | `~/.openclaw/openclaw.json` | JSON5 | immediately, on a running gateway | `OPENCODEX_OPENCLAW_API_KEY` |
 | Kimi Code | `~/.kimi-code/config.toml` | TOML | on restart, or `/reload` | loopback placeholder |
-| gjc | `~/.gjc/agent/models.yml` | YAML | new sessions, or when you open `/model` |`OPENCODEX_GAJAE_API_KEY` |
+| gjc | `~/.gjc/agent/models.yml` | YAML | new sessions, or when you open `/model` |non-secret loopback placeholder |
 | DeepSeek Harness (DSH) | `$DSH_HOME/settings.yaml` (default `~/.dsh/settings.yaml`) | YAML | hot reload | non-secret loopback bearer placeholder |
 | MiniMax Code | `~/.minimax/config.yaml` | YAML | new sessions, or after opening the model picker | loopback placeholder |
 | Prime Agent | `~/.prime/agent/models.json` | JSON | new sessions | loopback placeholder |
@@ -27,6 +27,16 @@ file, and removes it again. Fifteen clients work this way, each with a switch:
 Generated catalogs include only enabled models from each provider selection. This applies to both
 downloads and managed integrations, including Pi and Aside. The management model list still shows
 the full roster so you can enable additional models.
+
+For Gajae built-in presets, keep the routing choice in `~/.gjc/agent/config.yml`:
+
+```yaml
+modelProfile:
+  proxyProvider: opencodex
+  proxyMode: always
+```
+
+Keep your chosen `modelProfile.default` to apply it when plain `gjc` starts. The managed integration owns only `providers.opencodex` in `models.yml`; refreshing or disabling that provider does not rewrite your preset choice. Refresh the integration after changing the exported model selection.
 
 The managed OpenCode integration owns two fragments: `provider.opencodex` (opencode V1) and
 `providers.opencodex` (opencode V2). Only the V2 block carries the per-model reasoning-effort
@@ -189,6 +199,24 @@ dialog names the file, says what is lost, and points at the snapshot that makes 
 undoable. The switch itself stays locked, because the switch cannot know which edits
 you meant to keep — only you can say so. Nothing else is relaxed: a file we cannot
 parse, or one whose structure we cannot reason about, still refuses.
+
+## Preview and confirm changes
+
+Apply, Replace, Disable, and Restore now begin with a preview. The dialog shows exactly which
+managed settings will change, including the bounded change paths and whether each change adds,
+updates, or removes a value. Review that plan before confirming.
+
+When a plan reports no changes, it means the managed client document already has the requested
+state. For a selected Aside profile, confirming can still save that profile's sync preference even
+though the managed document does not change.
+
+If the file changes after you review it, the write is refused as stale. The dialog replaces the
+old plan with the updated one and asks you to confirm again; it never retries the write
+automatically. If a preview is temporarily unavailable, reload the page normally and start the
+action again.
+
+Aside uses the same preview and confirmation flow for one selected profile at a time. **Sync all
+profiles** remains a separate bulk action and is not bound to one combined preview.
 
 ## What to expect, honestly
 

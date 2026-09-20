@@ -1,3 +1,4 @@
+import { isNativeControlResponse } from "./native-response-control";
 import type { ResponsesRequestContext, ResponsesAdmissionState } from "./core-options";
 import type { PreparedResponsesRequest } from "./request-prepare";
 import type { ResponsesTransport } from "./request-transport";
@@ -15,6 +16,8 @@ import {
   relayWithAbort,
 } from "../relay";
 import { isUsageDebugEnabled } from "../../usage/debug";
+import { isReplayRefusalResponse } from "../../lib/upstream-retry";
+import { teeWithBoundedInspection } from "../inspection-tee";
 import {
   codexForwardTerminalOutcomeRecorder,
   usesCodexForwardPoolAuth,
@@ -27,21 +30,18 @@ import type { ResponsesTerminalStatus } from "../../bridge";
 import { isCodexWsQuotaObservedResponse, isCodexWsUpstreamResponse } from "./ws-upstream";
 import { recordSubagentQuotaFailureForThreadSpawn } from "../../codex/subagent-model-fallback";
 import { recordCodexUpstreamOutcome } from "../../codex/routing";
-import { codexProbeLeaseId, codexProbeQuotaScope } from "../../codex/auth-context";
+import { codexProbeLeaseId, codexProbeQuotaScope, codexTransientProbeGrant, releaseCodexAuthContextProbeLease } from "../../codex/auth-context";
 import { consumeComboFailure } from "./core-combo-failure";
 import { readDisplaySafeErrorText } from "./core-errors";
 import { streamingContextOverflowResponse, jsonContextOverflowResponse } from "./context-overflow";
 import { formatPassthroughUpstreamError } from "./passthrough-error";
-import {
-  providerModelResponsesTerminalRepair,
-  providerModelResponsesUpstreamStreaming,
-} from "../../providers/registry";
 import {
   resolvePassthroughWebSearchBridgeAuth,
   planPassthroughWebSearchBridge,
   createPassthroughWebSearchBridgeStream,
   createPassthroughWebSearchBridgeExecutor,
 } from "../../web-search/passthrough-bridge";
+import { bridgeSearchReplayScope } from "../../responses/bridge-search-replay-cache";
 import { fetchWithHeaderTimeout, providerFetch } from "./fetch-helpers";
 import { providerApiKeySelectionIsCurrent } from "../../providers/api-key-selection";
 import { requiresVisionPreprocessing } from "../../vision";
@@ -79,7 +79,10 @@ import {
 import { createRoutedCustomToolRestoreBlockRewrite } from "../responses-custom-tool-repair";
 import { createRoutedToolSearchRestoreBlockRewrite } from "../responses-tool-search-repair";
 import { createGithubCopilotResponsesBlockRewrite } from "../github-copilot-responses-repair";
-import { createGrokResponsesControlFrameBlockRewrite } from "../grok-responses-control-frame";
+import {
+  createGrokResponsesControlFrameBlockRewrite,
+  createGrokResponsesTimestampBlockRewrite,
+} from "../grok-responses-control-frame";
 import { createGrokResponsesSparseTerminalBlockRewrite } from "../grok-responses-snapshot-repair";
 import {
   createPlaintextV2AgentMessageCallRestoreRewrite,
@@ -95,6 +98,24 @@ import {
   normalizeDefaultNamespaceInJson,
 } from "../responses-undeclared-tool-guard";
 import { isWin32EagerRewrite, selectEagerPath } from "../../lib/bun-stream-caps";
+
+/**
+ * Platform override for the two relay-path policy calls below. Tests only.
+ *
+ * The eager relay is reachable only on win32 and darwin, so a Linux shard cannot exercise it
+ * without claiming to be one of them. Overwriting `process.platform` globally does that, and a
+ * great deal more: every filesystem, ACL and state-directory decision in the process follows it,
+ * and the spend-ledger owner lowercases its home on win32, which on a case-sensitive filesystem
+ * names a DIFFERENT directory. A row that did that stopped being able to reserve its send and
+ * delivered no terminal at all, reporting as a relay defect. This narrows the claim to the two
+ * calls that actually choose the relay path.
+ */
+let relayPlatformForTests: NodeJS.Platform | undefined;
+
+/** Internal test contract, not operator configuration: no config key reaches this. */
+export function setRelayPlatformForTests(platform: NodeJS.Platform | undefined): void {
+  relayPlatformForTests = platform;
+}
 import { linkAbortSignal, UPSTREAM_JSON_BODY_READ_OPTIONS } from "./core-lifetime";
 import { registerTurn, unregisterTurn, trackStreamLifetime } from "../lifecycle";
 import { relaySseEagerBounded } from "../relay-eager";
@@ -243,7 +264,12 @@ export async function deliverPassthroughResponse(
       } else if (!shouldDeferCodexResetDerivedCooldown(
         upstreamResponse,
         options.deferCodexResetDerivedCooldown,
-      )) {
+      ) && !isReplayRefusalResponse(upstreamResponse)) {
+        // A refusal this proxy made is not evidence about the account. Recording it would
+        // classify the synthetic 429 as quota exhaustion and write a default cooldown against
+        // a credential the request may never have reached, and that false signal outlives the
+        // request. The sibling recorders on this path already decline: the terminal recorder
+        // needs an ok streaming body, and the quota-header snapshot finds no quota headers.
         recordCodexUpstreamOutcome(config, admissionState.authCtx.accountId, upstreamResponse.status, {
           ...quotaMeta,
           threadId: admissionState.authCtx.affinityKey,
@@ -251,6 +277,7 @@ export async function deliverPassthroughResponse(
           modelId: route.modelId,
           probeLeaseId: codexProbeLeaseId(admissionState.authCtx),
           probeQuotaScope: codexProbeQuotaScope(admissionState.authCtx),
+          transientProbe: codexTransientProbeGrant(admissionState.authCtx),
           writerGeneration: admissionState.authCtx.writerGeneration,
           // Includes a replay's second 401, which is the case that actually retires the
           // account — fence it on the credential the request was holding.
@@ -298,7 +325,20 @@ export async function deliverPassthroughResponse(
       return formatPassthroughUpstreamError(upstreamResponse.status, errorText, {
         statusText: upstreamResponse.statusText,
         headers,
+        // Provenance, not inference: `errorText` is empty when the bounded read finds nothing
+        // display-safe, and an empty body is exactly what the retryable-429 default fires on.
+        replayRefusal: isReplayRefusalResponse(upstreamResponse),
       });
+    }
+
+    if (options.nativeControl && isNativeControlResponse(upstreamResponse) && upstreamResponse.body) {
+      // A native chain carries several response terminals. Ordinary SSE repair,
+      // cancellation-on-terminal and local previous-response replay are single-response
+      // contracts and would truncate it. Keep the bounded upstream as the sole reader.
+      options.nativeControl.relayActive = true;
+      commitReasoningReplayServingRoute(nativeExchange.request.headers);
+      const body = trackStreamLifetime(upstreamResponse.body, upstream, undefined, options.turnAdmissionLease);
+      return new Response(body, { status: upstreamResponse.status, headers });
     }
 
     // Bun#32111 workaround: passthrough SSE uses tee()+native relay to avoid the
@@ -317,11 +357,7 @@ export async function deliverPassthroughResponse(
       // before relay starts. Waiting for SSE completion would retain request state across the whole
       // stream; a later body failure does not undo that this destination accepted and served the turn.
       commitReasoningReplayServingRoute(nativeExchange.request.headers);
-      const terminalRepairPolicy = providerModelResponsesTerminalRepair(
-        route.providerName,
-        route.provider,
-        route.modelId,
-      );
+      const terminalRepairPolicy = route.staticPolicy.model.responsesTerminalRepair;
       // #3761: opt-in hosted-web-search bridge. Codex always declares the hosted web_search tool,
       // and this branch relays that declaration on the assumption the destination executes it.
       // A KEY-auth gateway that does not (Ollama Cloud GLM) answers with a function_call named
@@ -380,12 +416,20 @@ export async function deliverPassthroughResponse(
             describeImages: requiresVisionPreprocessing(config, route.provider, route.modelId, route.providerName),
             sidecar: config.webSearchSidecar,
           }),
+          // Scope the executed-search memo to this exact upstream (#4587). The Responses adapter
+          // derives the same scope from the same base URL before the NEXT turn is dispatched, so
+          // a replayed hosted cell can be turned back into the destination's own call and result.
+          destinationScope: bridgeSearchReplayScope(route.provider.baseUrl),
           // Appending a search result can push the continuation past the ceiling the first leg
           // was admitted under, so the same limit is re-applied before every later send.
           checkOutboundBody: (continuationBody: string) => {
             const result = checkOutboundBodySize(continuationBody, config.maxUpstreamBodyBytes);
             return result.admitted ? undefined : describeOutboundBodyRefusal(result);
           },
+          // Resolution can acquire the account's sole cooldown-recovery probe before the routed
+          // provider reveals whether it will request search. Hand an unused lease back on every
+          // terminal path; after an executed search, the outcome recorder has already settled it.
+          onFinalize: () => releaseCodexAuthContextProbeLease(openAiSidecar?.authContext),
           signal: upstream.signal,
         })
         : upstreamResponse.body;
@@ -468,6 +512,9 @@ export async function deliverPassthroughResponse(
           ? createGrokResponsesControlFrameBlockRewrite()
           : undefined,
         grokClientCompatibilityEnabled
+          ? createGrokResponsesTimestampBlockRewrite()
+          : undefined,
+        grokClientCompatibilityEnabled
           ? createGrokResponsesSparseTerminalBlockRewrite(translatorBudget)
           : undefined,
         snapshotRepairEnabled
@@ -498,12 +545,13 @@ export async function deliverPassthroughResponse(
         ? composeSseBlockRewrites(...blockRewrites)
         : undefined;
       const needsClientRewrite = clientBlockRewrite !== undefined;
+      const relayPlatform = relayPlatformForTests ?? process.platform;
       // #864: win32 rewrite traffic must never enter the tee()+JS-pull chain
       // (Bun#32111 JS-sink segfault — text frames pass, the terminal block is
       // lost). The eager single reader applies the same rewrites inline.
-      const win32EagerRewrite = isWin32EagerRewrite(process.platform, needsClientRewrite);
+      const win32EagerRewrite = isWin32EagerRewrite(relayPlatform, needsClientRewrite);
       const eagerPath = selectEagerPath(
-        process.platform,
+        relayPlatform,
         needsClientRewrite,
         config.streamMode ?? "auto",
       );
@@ -593,16 +641,18 @@ export async function deliverPassthroughResponse(
           })),
         );
       }
-      const [nativeBody, inspectBody] = passthroughSseBody.tee();
       const turnAc = new AbortController();
       const clientGone = new AbortController();
+      const clientGoneSignal = options.abortSignal
+        ? AbortSignal.any([clientGone.signal, options.abortSignal])
+        : clientGone.signal;
+      // Pace against raw bytes before rewrites, without detaching terminal ownership.
+      const [nativeBody, inspectBody] = teeWithBoundedInspection(passthroughSseBody, { clientGoneSignal });
       linkAbortSignal(upstream, turnAc.signal);
       registerTurn(turnAc, options.turnAdmissionLease);
       const inspectionConsumerOptions = {
         // Request abort can reject the fetch body before the response cancel hook runs.
-        clientGoneSignal: options.abortSignal
-          ? AbortSignal.any([clientGone.signal, options.abortSignal])
-          : clientGone.signal,
+        clientGoneSignal,
         drainBounds: { ms: 15_000, bytes: 32 * 1024 * 1024 },
         upstream,
         pinCompletedResponseIdToFirstSeen: githubCopilotRepairEnabled,
@@ -772,7 +822,7 @@ export async function deliverPassthroughResponse(
       // stream that never closes. Non-streaming clients keep the plain JSON.
       if (clientRequestedStream === true
         && options.inboundTransport !== "websocket"
-        && providerModelResponsesUpstreamStreaming(route.providerName, route.provider, route.modelId) === false
+        && route.staticPolicy.model.responsesUpstreamStreaming === false
         && route.provider.adapter === "openai-responses") {
         let completed: Record<string, unknown> | undefined;
         try {
@@ -819,7 +869,7 @@ export async function deliverPassthroughResponse(
       // WS turns reframe this JSON into events in the bridge, which is the
       // other relay-free path — normalize ids so both bounded-JSON paths agree.
       const outboundJson = options.inboundTransport === "websocket"
-        && providerModelResponsesUpstreamStreaming(route.providerName, route.provider, route.modelId) === false
+        && route.staticPolicy.model.responsesUpstreamStreaming === false
         && hasResponsesItemIdRepair(route.provider.responsesItemIdRepair)
         ? (() => {
           try {

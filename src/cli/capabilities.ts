@@ -361,6 +361,25 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["account", "import-orca"],
+    summary: "Preview or register read-only links to Orca-managed Codex accounts without another login.",
+    routes: [],
+    flags: [
+      { name: "--source", value: "string", required: true, summary: "Orca data directory containing codex-accounts." },
+      { name: "--registry", value: "string", required: true, summary: "The chosen Orca profile's orca-data.json account registry." },
+      { name: "--apply", value: "boolean", summary: "Register new accounts; requires a stopped proxy. Default is preview." },
+      { name: "--json", value: "boolean", summary: "Emit counts and fixed invalid-reason codes without credentials or source paths." },
+    ],
+    mutates: true,
+    json: "envelope",
+    details: [
+      "Local files only; never copies refresh tokens or changes Orca authentication files.",
+      "Skips existing ChatGPT identities. New accounts remain pending until dashboard validation.",
+      "Orca must keep the source login available and refreshed; a missing or expired source fails closed.",
+      "Mixed eligible and invalid entries exit successfully; an all-invalid result exits nonzero.",
+    ],
+  },
+  {
     command: ["account", "refresh"],
     summary: "Refresh account quotas without model validation; pending Codex accounts require dashboard consent.",
     routes: [
@@ -709,11 +728,32 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["system", "codex-cli-update", "attest"],
+    summary: "Observe the selected or explicitly named Windows npm Codex installation files without enabling updates.",
+    routes: [],
+    flags: [
+      { name: "--candidate", value: "string", summary: "Absolute npm codex.cmd or package bin/codex.js path; all four paths are all-or-none." },
+      { name: "--npm-prefix", value: "string", summary: "Absolute prefix containing node_modules/@openai/codex." },
+      { name: "--npm-cli", value: "string", summary: "Absolute node_modules/npm/bin/npm-cli.js path." },
+      { name: "--node", value: "string", summary: "Absolute node.exe path; observed, never executed." },
+      { name: "--json", value: "boolean", summary: "Emit the path-free installation identity observation." },
+    ],
+    mutates: false,
+    json: "envelope",
+    details: [
+      "Opt-in Windows x64 local-volume inspection using held native file handles; refuses reparse points, active writers and unsupported layouts.",
+      "Without explicit paths, the proof-bound launcher snapshot identifies the selected candidate: the configured CODEX_CLI_PATH or the first codex on the captured PATH, with an OpenCodex wrapper resolving to its codex.opencodex-real backing. Discovery only proposes paths; the held-handle observation remains the authority.",
+      "Success binds observed file identities and bytes, not selected-runtime admission or installer ownership.",
+      "selectionAttested, managed and applyAllowed remain false. The digest is an observation, not a durable update permit.",
+      "Does not run the named Codex/npm/Node files, query a registry, install software, control processes or persist state.",
+    ],
+  },
+  {
     command: ["system", "codex-restart"],
-    summary: "Restart the Codex app-server.",
+    summary: "Restart the Codex desktop app and app-servers.",
     routes: [{ method: "POST", path: "/api/system/codex-restart" }],
     flags: [
-      { name: "--yes", value: "boolean", summary: "Required: restarts the operator's running Codex app-server." },
+      { name: "--yes", value: "boolean", summary: "Required: fully quits and relaunches the operator's Codex desktop app and restarts its app-servers." },
       { name: "--json", value: "boolean", summary: "Emit the restart result as JSON." },
     ],
     mutates: true,

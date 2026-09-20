@@ -19,18 +19,31 @@ otomatik başlatma dolgusunu kurar.
 
 ## Proxy yaşam döngüsü
 
-### `ocx start [--port <port>]`
+### `ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]`
 
-Proxy sunucusunu başlatın (tercih edilen port `10100`). Bu port doluysa
-opencodex başka bir kullanılabilir port seçer ve kaydeder. PID/çalışma zamanı
-portu durumunu yazar ve ikinci bir canlı örneği başlatmayı reddeder. Başlangıçta
-her sağlayıcının modellerini Codex'in kataloğuna senkronize eder. Kapatıldığında
-— yönetilen bir servis olarak başlatılmadığı sürece (`OCX_SERVICE=1`) — yerel
-Codex'i geri yükler.
+Proxy sunucusunu başlatın (tercih edilen port `10100`). PID/çalışma zamanı portu
+durumunu yazar ve ikinci bir canlı örneği başlatmayı reddeder. Tercih edilen port
+doluysa `start`, portu tutan süreci sorgular ve her iki durumda da durur: orada bir
+opencodex yanıt veriyorsa başlatmayı reddeder, aksi halde portu tutan sürecin
+tanımlanamadığını bildirir. İlk proxy'yi çalışır durumda bırakıp Codex'i ikinciye
+yönlendireceği için dinleyiciyi kendiliğinden başka bir porta taşımaz. Aynı
+`OPENCODEX_HOME` kullanılırken farklı bir `--port` açıkça verilse de başlangıç reddedilir;
+yalnızca gözlem ve sınır uygulama kiplerinin ikisi de aynı harcama günlüğüne yazar. Bağımsız
+bir kardeş örnek için ayrı bir `OPENCODEX_HOME` kullanın. `port: 0` yalnızca port seçimini
+işletim sistemine bırakır, durumu ayırmaz. Başlangıçta her sağlayıcının modellerini Codex'in kataloğuna
+senkronize eder. Kapatıldığında — yönetilen bir servis olarak başlatılmadığı sürece
+(`OCX_SERVICE=1`) — yerel Codex'i geri yükler.
+
+`--socks5` (varsayılan `127.0.0.1:10808`) SOCKS5 URL'sini `config.proxy` içine kaydeder ve giden
+HTTP(S) isteklerini gerçek bir SOCKS5 tünelinden yönlendirir. `--socks5-off` yalnızca kaydedilmiş
+SOCKS5 proxy'sini temizler; HTTP proxy'sini silmez. Değer yapılandırmada tutulduğu için `ocx update`
+sonrasında da korunur. URL kullanıcı adı ve parola içerebilir, ancak başlangıç günlüklerinde gizlenir.
 
 ```bash
 ocx start
 ocx start --port 8080
+ocx start --port 10100 --socks5
+ocx start --socks5-off
 ```
 
 ### `ocx stop`
@@ -266,6 +279,8 @@ yanıtlar ve geçersiz kataloglar, herhangi bir yerel yazma işleminden önce re
 doğrulama isteğe bağlıdır ve yalnızca ortam değişkeni adıyla (`--auth-env`) okunur, argv'den
 alınmaz.
 
+`HTTP_PROXY` veya `http_proxy` geçerliyken `NO_PROXY` ya da `no_proxy` içinde eşleşen bir istisna yoksa loopback HTTP istekleri, kimlik doğrulama başlıkları eklenmeden ve herhangi bir istek gönderilmeden reddedilir. `ALL_PROXY`/`all_proxy` ve yalnızca `HTTPS_PROXY`/`https_proxy` ayarları bu HTTP kısıtlamasını tetiklemez; HTTPS üzerinden katalog alımına izin verilmeye devam edilir. Ret mesajı proxy adresini veya kimlik doğrulama belirtecini içermez. Boş olmayan `http_proxy` ve `no_proxy` değerleri sırasıyla `HTTP_PROXY` ve `NO_PROXY` değerlerinden önce gelir. Bun ile uyumlu proxy atlama kuralları için ana makine adları, eşleşen `host:port` girdileri, `[::1]` gibi köşeli parantez içindeki IPv6 adresleri veya `*` kullanın; URL, yol veya `*.` öneki kullanmayın.
+
 Katalog ve önbellek, paylaşılan Codex katalog kilidi altında yazılır; bir hata durumunda
 last-known-good dosyalar korunur. Aynı baytlar, mtime değerlerini koruyan bir no-op'tur.
 `--restart-codex`, `--restart-app-server-only` ve kullanımdan kaldırılmış takma ad
@@ -291,10 +306,10 @@ UAC onayı gerekebilir. Zaten normal veya yüksek öncelik ayarlanmışsa yalnı
 
 | Alt komut | Eylem |
 | --- | --- |
-| none | Servis yoksa kurup başlatın; varsa yenileyip yeniden başlatın. Sağlıklı bir Windows Task Scheduler tanımı yeniden kullanılır; eski bir tanım yeniden kaydedilebilir ve yükseltme gerektirebilir. |
+| none | Servis yoksa kurup başlatın; varsa mevcut servise `repair` uygulayın. Sağlıklı bir Windows Task Scheduler tanımı yeniden kullanılır; eski bir tanım yeniden kaydedilebilir ve yükseltme gerektirebilir. |
 | `install` | Servisi oluşturun ve başlatın. Kaydeder, bu da Windows'ta yükseltme gerektirir. |
-| `repair` | Kurulu bir servisi yerinde yenileyin ve yeniden başlatın. Sağlıklı bir Windows Task Scheduler tanımı yeniden kullanılır; eski bir tanım yeniden kaydedilebilir ve yükseltme gerektirebilir. |
-| `restart` | `repair` komutunun takma adıdır. |
+| `repair` | Kurulu bir servisi yerinde yenileyin. macOS'ta yönetici yalnızca bir şey değiştiğinde yeniden yüklenir; böylece sağlıklı, değişmemiş bir iş çalışmaya devam eder ve yenileme bir kesinti olmaz. Linux ve Windows'ta servis yeniden başlatılır; sağlıklı bir Windows Task Scheduler tanımı yeniden kullanılır, eski bir tanım ise yeniden kaydedilebilir ve yükseltme gerektirebilir. |
+| `restart` | Aynı yenileme ve her platformda garantili yeniden başlatma. macOS'ta değişmemiş, zaten yüklü bir iş yerinde kickstart edilir. `repair` komutunun takma adı değildir. |
 | `start` | Kurulu bir servisi başlatın. |
 | `stop` | Servisi durdurun ve yerel Codex'i geri yükleyin. |
 | `status` | Servis ve proxy tanılamalarını artı günlük yollarını bildirin. |

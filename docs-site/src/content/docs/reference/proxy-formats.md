@@ -255,11 +255,16 @@ uses an unsupported protocol, opencodex skips the WebSocket attempt and uses HTT
 dialing the upstream directly.
 
 These rules belong to the upstream WebSocket transport, independently of the selected provider
-adapter. HTTP fetch-based Responses requests, including SSE fallback, use Bun's HTTP proxy rules
-and do not use `ALL_PROXY`. `config.proxy` fills missing `HTTP_PROXY`/`HTTPS_PROXY` values; the
-resulting scheme-specific value also takes precedence over an existing `ALL_PROXY` for WebSocket.
-For an HTTPS upstream that requires a proxy, set `HTTPS_PROXY` or `config.proxy`; `HTTP_PROXY`
-alone leaves both WSS and its HTTPS fallback without a scheme-matched proxy.
+adapter. HTTP fetch-based Responses requests, including SSE fallback, use the
+[configured outbound fetch](/reference/configuration/server/#server-fields). A server SOCKS5 proxy — set
+with `config.proxy` or inherited from a SOCKS5 `ALL_PROXY` — uses OpenCodex's built-in tunnel when
+`NO_PROXY`/`no_proxy` does not exempt the target. Scheme-specific
+`HTTP_PROXY`/`HTTPS_PROXY` values retain Bun's native HTTP(S) handling, while a non-SOCKS
+`ALL_PROXY` is not a native HTTP fetch route. `config.proxy` fills missing
+`HTTP_PROXY`/`HTTPS_PROXY` values; the resulting scheme-specific value also takes precedence over
+an existing `ALL_PROXY` for WebSocket. For an HTTPS upstream that requires a proxy, set
+`HTTPS_PROXY` or `config.proxy`; `HTTP_PROXY` alone leaves both WSS and its HTTPS fallback without
+a scheme-matched proxy.
 
 Every terminal Responses usage object includes both detail objects, even when the provider did not
 report those details:
@@ -563,7 +568,9 @@ upstream (`404`). Both legs carry Codex's `session-id` and `thread-id` headers; 
 account choice is bound to that pair (process-local), so a join that reaches the proxy reuses the
 account that created the call, while Direct mode forwards the caller's current bearer on both legs.
 The relayed client headers are exactly `openai-alpha`, `x-session-id`, `session-id`, `thread-id`,
-`originator`, and `x-oai-attestation` (`LIVE_CLIENT_PROTOCOL_HEADERS` in `src/server/live.ts`);
+`originator`, `x-oai-attestation`, and `x-codex-turn-metadata`
+(`LIVE_CLIENT_PROTOCOL_HEADERS` in `src/server/live.ts`); each is relayed only when the caller
+sent it, and none is invented.
 `Authorization` and the ChatGPT account id are proxy-owned on ChatGPT-backed routes (Pool replaces
 them with the stored account, Direct forwards the validated caller bearer) and an API-key provider
 gets its own bearer. Codex only sends the join to the proxy when `experimental_realtime_ws_base_url`

@@ -24,7 +24,7 @@ import {
 } from "../codex/desired-state";
 import { syncModelsToCodex } from "../codex/sync";
 import { collectOrcaCodexHomeDiagnostic } from "../codex/home";
-import { restoreNativeCodexAsync } from "../codex/inject";
+import { restoreNativeCodexAsync, type CodexNativeRestoreResult } from "../codex/inject";
 import { stripGrokConfig } from "../grok/inject";
 import { handleRestartScopeAfterWrite, readRestartScope, type RestartScope } from "./restart-scope";
 import { normalizeUpdateChannel, runGuiUpdateWorker } from "../update/job";
@@ -106,6 +106,7 @@ const commandRunners: Record<string, CommandRunner> = {
   restore: async deps => {
     const restoreArgs = deps.args.slice(1);
     const restoreJson = takeFlag(restoreArgs, "--json");
+    const removeProviderTable = takeFlag(restoreArgs, "--remove-codex-provider-table");
     if (restoreArgs[0] === "back") {
       // Reverse switch: re-point plain `codex` at the RUNNING proxy without touching its
       // lifecycle — the counterpart of `ocx restore`. Start/stop triggers are unchanged;
@@ -145,6 +146,9 @@ const commandRunners: Record<string, CommandRunner> = {
       }
       const target = collectOrcaCodexHomeDiagnostic();
       return emitBack(true, `Plain \`codex\` now routes through opencodex in ${target.effectiveCodexHome} (undo with: ocx restore).`, 0);
+    }
+    if (removeProviderTable && !restoreJson) {
+      console.log("⚠️  Removing [model_providers.opencodex] means conversations already tagged opencodex will stop opening.");
     }
     const desired = setIntegrationEnabled("codex", false);
     if (!desired.ok) {
@@ -191,9 +195,9 @@ const commandRunners: Record<string, CommandRunner> = {
         return grokCode;
       }
     }
-    let r: { success: boolean; message: string };
+    let r: CodexNativeRestoreResult | Pick<CodexNativeRestoreResult, "success" | "message">;
     try {
-      r = await restoreNativeCodexAsync({ revalidateDesiredState: true });
+      r = await restoreNativeCodexAsync({ revalidateDesiredState: true, removeProviderTable });
     } catch (err) {
       r = { success: false, message: err instanceof Error ? err.message : String(err) };
     }
@@ -232,7 +236,16 @@ const commandRunners: Record<string, CommandRunner> = {
       code = 1;
     }
     if (r.success) {
-      console.log("Codex integration is OFF and plain `codex` now runs natively. Switch back with: ocx restore back");
+      const retained = "retainedCodexProviderTable" in r ? r.retainedCodexProviderTable : undefined;
+      if (retained) {
+        console.log("Codex integration is OFF and plain `codex` now runs natively.");
+        console.log("The following lines remain in $CODEX_HOME/config.toml because conversations already tagged opencodex resolve their provider only through this table:");
+        console.log(retained.lines.join("\n"));
+        console.log(`Follow-up: ${retained.followUp}`);
+        console.log("Switch back with: ocx restore back");
+      } else {
+        console.log("Codex integration is OFF and plain `codex` now runs natively. Switch back with: ocx restore back");
+      }
       console.log(`Note: ${OCX_NATIVE_REPLAY_RECOVERY_NOTE}`);
     } else {
       console.error("Plain `codex` was not fully restored. Inspect $CODEX_HOME/config.toml before using native Codex.");
@@ -932,9 +945,9 @@ export type StartOwnerDecision = "refuse" | "service-stay-out" | "sibling";
  *
  * The #3106 guard exists so a bare `start` cannot shadow a healthy configured-port
  * proxy with an ephemeral-port copy. An interactive `--port X` naming a DIFFERENT
- * port than the live proxy's is an explicit sibling request, not that shadow — and
- * refusing it also broke every spawned-launcher test on a machine running a real
- * proxy, because the probe reaches the machine-global port across sandbox homes.
+ * port than the live proxy's is an explicit sibling request, not that shadow. The
+ * state-directory spend-ledger lease makes the final same-home refusal; keeping this
+ * decision allows isolated homes on one machine to remain independent.
  * The service wrapper always passes the configured port and keeps its exact
  * stay-out-of-the-way semantics: it never takes the sibling path.
  */
@@ -950,6 +963,60 @@ export function decideStartWithLiveOwner(input: {
     && input.ocxService !== "1";
   if (sibling) return "sibling";
   return input.ocxService === "1" ? "service-stay-out" : "refuse";
+}
+
+/** What `chooseListenPort` does when the preferred port stayed busy through prefer-retry. */
+export type BusyPreferredPortDecision =
+  | "hop"
+  | "refuse-live-proxy"
+  | "service-stay-out"
+  | "refuse-unidentified-holder";
+
+/**
+ * Pure decision for a soft `start` whose preferred port is busy and whose only remaining
+ * option is an ephemeral port.
+ *
+ * The hop exists so a first start is not defeated by a port this machine happens to be
+ * using. What it must never be is a silent answer to "someone is already here": a start
+ * that hops takes over this home's pid and runtime-port records and re-points Codex at
+ * itself, so hopping past a live opencodex leaves two proxies running and the editor
+ * talking to the one the user did not mean (#5004). The hop path never asked who held the
+ * port, and `findLiveProxy` returning null — a stale record, a probe that lost a race, a
+ * loopback family split — was enough to reach it.
+ *
+ * So the decision is made from the holder's own answer rather than from this home's
+ * bookkeeping, and both outcomes stop the start. An opencodex answer is the duplicate this
+ * closes. A holder that does not answer as opencodex is deliberately NOT called foreign:
+ * an identity probe returns the same nothing for a foreign server, an unreachable one, and
+ * one that lost a race, so all the start can honestly say is that the port it was told to
+ * use is taken by something it could not identify — and moving to an arbitrary port is the
+ * one response that hides that from the user while re-pointing Codex. An explicit
+ * `--port` never reaches here (`findAvailablePort` refuses the fallback instead), and a
+ * configured port of 0 is a request for an ephemeral port, not a collision.
+ *
+ * Service-wrapper context keeps the semantics `decideStartWithLiveOwner` gives it: a
+ * healthy proxy on the port means the port is served, and the wrapper's
+ * `if %ERRORLEVEL% NEQ 0` loop must see a zero exit rather than respawn every 5 seconds.
+ */
+export function decideBusyPreferredPort(input: {
+  preferredPort: number;
+  selectedPort: number;
+  hardPin: boolean;
+  holderIsOpencodex: boolean;
+  ocxService: string | undefined;
+}): BusyPreferredPortDecision {
+  // Port 0 (or an unusable preference) asked the OS to choose; nothing was taken away.
+  if (input.preferredPort <= 0) return "hop";
+  // The preferred port was obtained — no hop happened, nothing to decide.
+  if (input.selectedPort === input.preferredPort) return "hop";
+  // Defensive: a hard pin cannot reach a different port, and if it ever did, the pin is
+  // the user's explicit instruction and not something to answer with a refusal here.
+  if (input.hardPin) return "hop";
+  if (input.holderIsOpencodex) {
+    // Same sentinel rule as decideStartWithLiveOwner: only the exact "1" is service context.
+    return input.ocxService === "1" ? "service-stay-out" : "refuse-live-proxy";
+  }
+  return "refuse-unidentified-holder";
 }
 
 export function resolveDispatchCommand(command: string | undefined): string | undefined {

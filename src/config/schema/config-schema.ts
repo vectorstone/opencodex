@@ -13,6 +13,7 @@ import {
   quotaResetNotifySchema,
   remoteGuiConfigSchema,
   runtimeRoleSchema,
+  spendSchema,
   configuredCodexPoolAccountIds,
   apiKeyEntrySchema,
   asideProfileSyncSchema,
@@ -20,6 +21,7 @@ import {
   CODEX_ACCOUNT_NAMESPACE_ACCOUNT_ID_COLLISION_ERROR,
   codexAccountNamespacesSchema,
   modelPinnedEffortsSchema,
+  compactionRoutingSchema,
   modelPreferHostedToolsConfigError,
   providerModelCostsConfigError,
   providerRelativeSendPathConfigError,
@@ -59,6 +61,8 @@ import { parseDesktopProfile } from "../../claude/desktop-profile";
 import { DEFAULT_APP_OWNED_MEMORY_BUDGET_BYTES, MAX_APP_OWNED_MEMORY_BUDGET_MB, MIN_APP_OWNED_MEMORY_BUDGET_MB } from "../../lib/app-owned-memory";
 
 export const configSchema = z.object({
+  codexNativeSteering: z.boolean().optional().catch(false),
+  codexNativeInjection: z.boolean().optional().catch(false),
   port: z.number().int().min(0).max(65535).default(10100),
   // A malformed hand edit must disable only remote-role behavior, not discard
   // providers or data-plane keys. Live writes are rejected explicitly below.
@@ -70,6 +74,8 @@ export const configSchema = z.object({
   // A malformed privacy block must never be read as "unmask": .catch(undefined) drops it and
   // emailMaskingEnabled then falls back to masked, which is also what an absent block means.
   privacy: z.object({ maskEmails: z.boolean().optional() }).strict().optional().catch(undefined),
+  // Malformed hand edits disable this opt-in exporter. Live writes reject them in diagnostics.ts.
+  metricsExport: z.object({ enabled: z.boolean().optional() }).strict().optional().catch(undefined),
   // A malformed present client block must remain diagnosable from raw config and
   // fail closed through src/client/state.ts; unrelated provider state still loads.
   client: clientConnectionSchema.optional().catch(undefined),
@@ -122,6 +128,7 @@ export const configSchema = z.object({
   ]).optional().catch(undefined),
   providers: z.record(z.string(), providerConfigSchema),
   modelPinnedEfforts: modelPinnedEffortsSchema.optional(),
+  compactionRouting: compactionRoutingSchema.optional().catch(undefined),
   defaultProvider: z.string().min(1).default("openai"),
   defaultModelAliases: z.boolean().optional(),
   // Malformed hand edits disable this opt-in projection without rejecting providers.
@@ -164,6 +171,11 @@ export const configSchema = z.object({
   quotaResetNotify: quotaResetNotifySchema.optional().catch(undefined),
   // Same rationale: a bad auto-refresh section must not cost the operator their providers.
   catalogAutoRefresh: catalogAutoRefreshSchema.optional().catch(undefined),
+  // Same rationale again, with the failure direction stated: a malformed spend section
+  // degrades to "no ceiling", which means observe-only accounting rather than an outage. That
+  // is the safe degrade for traffic and the dangerous one for the operator, so the write path
+  // rejects it and loadConfig warns -- the same pair codexPool uses below.
+  spend: spendSchema.optional().catch(undefined),
   // These selections pre-date schema validation and used to pass through as
   // unknown fields. Invalid hand edits must disable only the optional
   // delegation/native-default feature, not reject the whole config and hide
@@ -180,6 +192,10 @@ export const configSchema = z.object({
   codexShimAutoRestore: z.boolean().optional(),
   codexDesktopAuthless: z.boolean().optional().catch(undefined),
   codexClientCompaction: z.boolean().optional().catch(undefined),
+  // Presentation-only label for the injected provider. A malformed value degrades to undefined
+  // and the default label is emitted, rather than failing the parse or writing a config Codex
+  // would refuse to load — the provider id routing depends on is never derived from it.
+  codexProviderDisplayName: z.string().trim().min(1).max(128).optional().catch(undefined),
   pausedCodexAccountIds: z.array(z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/)).optional(),
   // A malformed policy degrades to "no policy" rather than failing the parse, so a hand-edited
   // typo cannot trip the backup-and-defaults repair path and wipe providers or pool accounts.
@@ -460,6 +476,17 @@ export const configSchema = z.object({
         code: "custom",
         path: ["providers", redactSecretString(name), "modelSupportsReasoningSummaries"],
         message: reasoningSummariesError,
+      });
+    }
+    const suppressSyntheticMaxError = booleanRecordConfigError(
+      (provider as { modelSuppressSyntheticMax?: unknown }).modelSuppressSyntheticMax,
+      "modelSuppressSyntheticMax",
+    );
+    if (suppressSyntheticMaxError) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["providers", redactSecretString(name), "modelSuppressSyntheticMax"],
+        message: suppressSyntheticMaxError,
       });
     }
     const verbositySupportError = booleanRecordConfigError(

@@ -38,7 +38,7 @@ export type UsageStatus = "reported" | "unreported" | "unsupported" | "estimated
  * The old name `CodexUsageAccountLogLabel` is kept as an alias because it is exported and used
  * across modules; the two predicates below are what callers should choose between.
  */
-export type UsageAccountLogLabel = "main" | `p${string}` | `o${string}`;
+export type UsageAccountLogLabel = "main" | `p${string}` | `o${string}` | `k${string}`;
 export type CodexUsageAccountLogLabel = UsageAccountLogLabel;
 
 /**
@@ -76,6 +76,26 @@ export type AttemptRecoveryKind =
   | "opaque-blob-rejection"
   | "empty-completion"
   | "reasoning-effort-downgrade";
+
+/**
+ * Why a recovery this request was otherwise willing to make did not happen.
+ *
+ * Recorded separately from `recoveryKinds` and from `sendCount`, because the question it
+ * answers is different from either. A log showing one physical send and no recovery kind used
+ * to be ambiguous: it could mean nothing was eligible, or that something was eligible and the
+ * send budget withheld it. Those need opposite follow-ups, and the second one was invisible
+ * (#5044).
+ *
+ * `sendCount` deliberately does not move for these. A refused attempt is not a physical send,
+ * and inflating the count to signal the refusal would corrupt the one number that means
+ * "requests this proxy actually made".
+ *
+ * Bounded vocabulary on purpose: it is a wire value a maintainer reads, never a credential, an
+ * account id, an upstream body, prompt content, or exception text.
+ */
+export type AttemptRecoveryWithheld =
+  | "retry-send-budget"
+  | "rotation-send-budget";
 
 /** Request-time upstream credential class, never a credential or account identifier. */
 export type UsageCredentialSource = "grok-oauth" | "xai-api-key";
@@ -139,6 +159,11 @@ export interface PersistedUsageAttempt {
   firstOutputMs?: number;
   sendCount: number;
   recoveryKinds: AttemptRecoveryKind[];
+  /**
+   * Recoveries this attempt was eligible for and did not make. Absent on ordinary attempts so
+   * old rows keep their exact shape.
+   */
+  recoveryWithheld?: AttemptRecoveryWithheld[];
   usageStatus: UsageStatus;
   /**
    * True when the proxy answered this turn locally and issued no upstream request. It travels on
@@ -487,6 +512,10 @@ const ATTEMPT_RECOVERY_KINDS = new Set<AttemptRecoveryKind>([
   "empty-completion",
   "reasoning-effort-downgrade",
 ]);
+const ATTEMPT_RECOVERY_WITHHELD = new Set<AttemptRecoveryWithheld>([
+  "retry-send-budget",
+  "rotation-send-budget",
+]);
 const USAGE_STATUSES = new Set<UsageStatus>([
   "reported",
   "unreported",
@@ -620,6 +649,14 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
         && ATTEMPT_RECOVERY_KINDS.has(value as AttemptRecoveryKind),
     ))]
     : [];
+  // Same shape as `recoveryKinds`: unknown values are dropped rather than failing the row, so a
+  // log written by a newer build stays readable by an older one.
+  const recoveryWithheld = Array.isArray(attempt.recoveryWithheld)
+    ? [...new Set(attempt.recoveryWithheld.filter(
+      (value): value is AttemptRecoveryWithheld => typeof value === "string"
+        && ATTEMPT_RECOVERY_WITHHELD.has(value as AttemptRecoveryWithheld),
+    ))]
+    : [];
   return {
     ordinal: attempt.ordinal as number,
     provider: attempt.provider,
@@ -639,6 +676,7 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
       : {}),
     sendCount: attempt.sendCount as number,
     recoveryKinds,
+    ...(recoveryWithheld.length ? { recoveryWithheld } : {}),
     usageStatus: attempt.usageStatus as UsageStatus,
     ...(isCodexUsageAccountLogLabel(attempt.accountLogLabel)
       ? { accountLogLabel: attempt.accountLogLabel }
@@ -852,18 +890,61 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
   };
 }
 
-function ensureUsageLogDir(): void {
+// Bound hot-path filesystem hardening to once per second while ensuring an external mode
+// widening cannot suppress write-triggered repair for the lifetime of the process.
+const USAGE_LOG_PERMISSION_RECHECK_MS = 1_000;
+
+type UsageLogPermissionCheck = {
+  path: string;
+  checkedAt: number;
+};
+
+let ensuredUsageLogDir: UsageLogPermissionCheck | null = null;
+let ensuredUsageLogFile: UsageLogPermissionCheck | null = null;
+
+function usageLogPermissionCheckIsCurrent(
+  check: UsageLogPermissionCheck | null,
+  path: string,
+  now: number,
+): boolean {
+  return check?.path === path
+    && now >= check.checkedAt
+    && now - check.checkedAt < USAGE_LOG_PERMISSION_RECHECK_MS;
+}
+
+function ensureUsageLogDir(now: number): void {
   const dir = getConfigDir();
+  if (usageLogPermissionCheckIsCurrent(ensuredUsageLogDir, dir, now)) return;
   recordOwnedConfigPath(dir, usageLogPath());
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { chmodSync(dir, 0o700); } catch { /* best-effort on platforms that ignore chmod */ }
+  ensuredUsageLogDir = { path: dir, checkedAt: now };
 }
 
 export function appendUsageEntry(entry: PersistedUsageEntry): void {
-  ensureUsageLogDir();
+  const line = `${JSON.stringify(normalizeUsageEntry(entry))}\n`;
   const path = usageLogPath();
-  appendFileSync(path, `${JSON.stringify(normalizeUsageEntry(entry))}\n`, { encoding: "utf-8", mode: 0o600 });
-  try { chmodSync(path, 0o600); } catch { /* best-effort on platforms that ignore chmod */ }
+  const now = Date.now();
+  const doAppend = (): void => {
+    ensureUsageLogDir(now);
+    const filePermissionsCurrent = usageLogPermissionCheckIsCurrent(ensuredUsageLogFile, path, now);
+    appendFileSync(path, line, { encoding: "utf-8", mode: 0o600 });
+    if (!filePermissionsCurrent) {
+      try { chmodSync(path, 0o600); } catch { /* best-effort on platforms that ignore chmod */ }
+      ensuredUsageLogFile = { path, checkedAt: now };
+    }
+  };
+  try {
+    doAppend();
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      ensuredUsageLogDir = null;
+      ensuredUsageLogFile = null;
+      doAppend();
+      return;
+    }
+    throw error;
+  }
 }
 
 export type UsageLogRevision = {
@@ -1057,6 +1138,8 @@ export function resetUsageReadCacheForTests(): void {
   managementUsageReadInflight?.abort.abort();
   managementUsageReadInflight = null;
   retainedUsageSnapshot = null;
+  ensuredUsageLogDir = null;
+  ensuredUsageLogFile = null;
 }
 
 function readExactly(fd: number, length: number, position: number): Buffer | null {

@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { buildArgs, buildChildEnv, createCodeBuddyAdapter, type SpawnFn } from "../../src/adapters/codebuddy/adapter";
+import { guardCodeBuddyScaffolding } from "../../src/adapters/codebuddy/scaffold-guard";
 import { CODEBUDDY_CN_PROFILE, CODEBUDDY_GLOBAL_PROFILE, clearCodeBuddyBinaryCache } from "../../src/adapters/codebuddy/profiles";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
@@ -14,6 +15,7 @@ const enc = new TextEncoder();
 beforeEach(() => clearCodeBuddyBinaryCache());
 
 interface FakeChild extends EventEmitter {
+  pid?: number;
   stdout: Readable;
   stderr: Readable;
   stdin: Writable;
@@ -221,6 +223,273 @@ describe("codebuddy runTurn streams a headless turn", () => {
     expect(child.written.join("")).toContain('"text":"hello"');
   });
 
+  test("refuses a full-message DSML calls-and-invoke scaffold", async () => {
+    const leaked = "I'll inspect it.\n<｜｜DSML｜｜ calls>\n"
+      + "<｜｜DSML｜｜ invoke name=\"functions.exec\">\nsecret-command";
+    const stdout = [
+      enc.encode(`${JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: leaked }] },
+      })}\n`),
+      enc.encode('{"type":"result","subtype":"success","is_error":false}\n'),
+    ];
+    const adapter = createCodeBuddyAdapter(provider(), {
+      spawn: () => fakeChild(stdout) as unknown as ChildProcess,
+      which: () => "/usr/bin/codebuddy",
+      killGraceMs: 20,
+    });
+
+    const events = await run(adapter, parsed());
+    expect(events.filter(event => event.type === "text_delta"))
+      .toEqual([{ type: "text_delta", text: "I'll inspect it.\n" }]);
+    expect(events.some(event => event.type === "done")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      code: "vendor_scaffold_detected",
+      retryable: false,
+      status: 502,
+    });
+    expect(JSON.stringify(events)).not.toContain("secret-command");
+  });
+
+  test.each(["Bash", "exec", "shell", "apply_patch"])("refuses a bare %s DSML invoke", name => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+
+    guarded({
+      type: "text_delta",
+      text: `<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="${name}">private-body`,
+    });
+
+    expect(events).toEqual([expect.objectContaining({ type: "error", code: "vendor_scaffold_detected" })]);
+  });
+
+  test("holds a bare invoke prefix split across deltas until its name arrives", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+
+    guarded({ type: "text_delta", text: "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"" });
+    expect(events).toEqual([]);
+    guarded({ type: "text_delta", text: "Bash\">private-body" });
+
+    expect(events).toEqual([expect.objectContaining({ type: "error", code: "vendor_scaffold_detected" })]);
+  });
+
+  test("detects a DSML control sequence split across streamed text deltas", async () => {
+    const frame = (text: string) => `${JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+    })}\n`;
+    const stdout = [
+      enc.encode(frame("Safe prefix.\n<｜｜DS")),
+      enc.encode(frame("ML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"funct")),
+      enc.encode(frame("ions.exec\">private-body")),
+      enc.encode('{"type":"result","subtype":"success","is_error":false}\n'),
+    ];
+    const adapter = createCodeBuddyAdapter(provider(), {
+      spawn: () => fakeChild(stdout) as unknown as ChildProcess,
+      which: () => "/usr/bin/codebuddy",
+      killGraceMs: 20,
+    });
+
+    const events = await run(adapter, parsed());
+    expect(events.filter(event => event.type === "text_delta"))
+      .toEqual([{ type: "text_delta", text: "Safe prefix.\n" }]);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "vendor_scaffold_detected" });
+    expect(events.some(event => event.type === "done")).toBe(false);
+    expect(JSON.stringify(events)).not.toContain("private-body");
+  });
+
+  test("refuses DSML calls-and-invoke scaffolding from reasoning independently", async () => {
+    const stdout = [
+      enc.encode(`${JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: {
+            type: "thinking_delta",
+            thinking: "Safe thought.\n<｜｜DSML｜｜ calls>\n"
+              + "<｜｜DSML｜｜ invoke name=\"functions.exec\">private-body",
+          },
+        },
+      })}\n`),
+      enc.encode('{"type":"result","subtype":"success","is_error":false}\n'),
+    ];
+    const adapter = createCodeBuddyAdapter(provider(), {
+      spawn: () => fakeChild(stdout) as unknown as ChildProcess,
+      which: () => "/usr/bin/codebuddy",
+      killGraceMs: 20,
+    });
+
+    const events = await run(adapter, parsed());
+    expect(events.filter(event => event.type === "thinking_delta"))
+      .toEqual([{ type: "thinking_delta", thinking: "Safe thought.\n" }]);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      code: "vendor_scaffold_detected",
+      retryable: false,
+    });
+    expect(events.some(event => event.type === "done")).toBe(false);
+    expect(JSON.stringify(events)).not.toContain("private-body");
+  });
+
+  test("delivers a lone discussed DSML calls tag unchanged", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+    const answer = "The string <｜｜DSML｜｜ calls> names the calls container.";
+
+    guarded({ type: "text_delta", text: answer });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "text_delta", text: answer },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("delivers quoted and inline-code DSML literals unchanged", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+    const answer = "\"<｜｜DSML｜｜ calls>\"\n"
+      + "\"<｜｜DSML｜｜ invoke name=\\\"Bash\\\">\"\n"
+      + "Use `<｜｜DSML｜｜ calls>` when discussing the literal.\n"
+      + "> <｜｜DSML｜｜ calls>\n> <｜｜DSML｜｜ invoke name=\"exec\">";
+
+    guarded({ type: "text_delta", text: answer });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "text_delta", text: answer },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("delivers a fenced DSML source example unchanged across deltas", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+    const first = "```text\n<｜｜DSML｜｜ calls>\n";
+    const second = "<｜｜DSML｜｜ invoke name=\"Bash\">\n```";
+
+    guarded({ type: "text_delta", text: first });
+    guarded({ type: "text_delta", text: second });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "text_delta", text: first },
+      { type: "text_delta", text: second },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("delivers source strings containing both DSML literals unchanged", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+    const answer = "const calls = '<｜｜DSML｜｜ calls>';\n"
+      + "const invoke = '<｜｜DSML｜｜ invoke name=\"functions.exec\">';";
+
+    guarded({ type: "text_delta", text: answer });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "text_delta", text: answer },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("delivers an unquoted invoke line when no calls container precedes it", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+    const answer = "<｜｜DSML｜｜ invoke name=\"functions.exec\">";
+
+    guarded({ type: "text_delta", text: answer });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "text_delta", text: answer },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("releases a lone control-line candidate at the terminal", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+
+    guarded({ type: "text_delta", text: "<｜｜DSML｜｜ calls>" });
+    expect(events).toEqual([]);
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "text_delta", text: "<｜｜DSML｜｜ calls>" },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("delivers a calls block whose invoke name is empty", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+    const answer = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"\">";
+
+    guarded({ type: "text_delta", text: answer });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "text_delta", text: answer },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("queues later events behind an unresolved marker prefix", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+
+    guarded({ type: "thinking_delta", thinking: "<" });
+    guarded({ type: "text_delta", text: "Hello" });
+    guarded({ type: "tool_call_start", id: "call_1", name: "exec" });
+    expect(events).toEqual([]);
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "thinking_delta", thinking: "<" },
+      { type: "text_delta", text: "Hello" },
+      { type: "tool_call_start", id: "call_1", name: "exec" },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("keeps an existing pending slot when its channel receives an empty delta", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+
+    guarded({ type: "thinking_delta", thinking: "<" });
+    guarded({ type: "text_delta", text: "Hello" });
+    guarded({ type: "thinking_delta", thinking: "" });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "thinking_delta", thinking: "<" },
+      { type: "text_delta", text: "Hello" },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
+  test("moves a replaced pending marker prefix to its new arrival position", () => {
+    const events: AdapterEvent[] = [];
+    const guarded = guardCodeBuddyScaffolding(event => events.push(event));
+
+    guarded({ type: "thinking_delta", thinking: "<" });
+    guarded({ type: "text_delta", text: "<" });
+    guarded({ type: "thinking_delta", thinking: "not marker\n<" });
+    guarded({ type: "done", stopReason: "stop" });
+
+    expect(events).toEqual([
+      { type: "thinking_delta", thinking: "<" },
+      { type: "text_delta", text: "<" },
+      { type: "thinking_delta", thinking: "not marker\n" },
+      { type: "thinking_delta", thinking: "<" },
+      { type: "done", stopReason: "stop" },
+    ]);
+  });
+
   test("region isolation: the global adapter never spawns with the CN environment", async () => {
     let seenEnv: NodeJS.ProcessEnv | undefined;
     const spawn: SpawnFn = (_cmd, _args, opts) => { seenEnv = opts.env as NodeJS.ProcessEnv; return fakeChild([enc.encode('{"type":"result","subtype":"success"}\n')]) as unknown as ChildProcess; };
@@ -346,8 +615,80 @@ describe("codebuddy runTurn streams a headless turn", () => {
     expect(events.some(e => e.type === "done")).toBe(false);
   });
 
+  test("a Windows abort terminates the cmd shim process tree", async () => {
+    const controller = new AbortController();
+    const stdoutStream = new Readable({
+      read() { setTimeout(() => controller.abort(), 5); },
+    });
+    const child = new EventEmitter() as FakeChild;
+    child.pid = 4242;
+    child.stdout = stdoutStream;
+    child.stderr = Readable.from([]);
+    child.written = [];
+    child.stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+    child.killed = false;
+    child.exitCode = null;
+    const directSignals: string[] = [];
+    child.kill = signal => { directSignals.push(signal ?? "SIGTERM"); return true; };
+    const killedTrees: number[] = [];
+
+    const adapter = createCodeBuddyAdapter(provider(), {
+      platform: "win32",
+      spawn: () => child as unknown as ChildProcess,
+      which: () => "C:\\npm\\codebuddy.cmd",
+      killWindowsProcessTree: pid => {
+        killedTrees.push(pid);
+        child.exitCode = 1;
+        child.emit("close", 1);
+      },
+      killGraceMs: 20,
+    });
+    const events = await run(adapter, parsed(), incoming(controller.signal));
+
+    expect(killedTrees).toEqual([4242]);
+    expect(directSignals).toEqual([]);
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", retryable: false }));
+  });
+
   test("a timeout destroys a stalled stdout stream and returns even when close never arrives", async () => {
+    type TimingPhase = "entry" | "spawn" | "sigterm" | "stdout_close" | "stdout_error" | "timeout" | "return";
+    type TimingClassification =
+      | "within_budget"
+      | "pre_spawn_late"
+      | "timeout_dispatch_missing"
+      | "timeout_dispatch_late"
+      | "timeout_event_missing"
+      | "stdout_settlement_missing"
+      | "stdout_settlement_late"
+      | "reap_or_return_late";
+    const phaseOrder: readonly TimingPhase[] = [
+      "entry", "spawn", "sigterm", "stdout_close", "stdout_error", "timeout", "return",
+    ];
+    const phaseMs: Partial<Record<TimingPhase, number>> = {};
+    let startedAt = 0;
+    const boundedElapsed = (): number => Math.min(1_000, Math.max(0, Date.now() - startedAt));
+    const mark = (phase: TimingPhase): void => { phaseMs[phase] ??= boundedElapsed(); };
+    const classify = (elapsed: number): TimingClassification => {
+      if (elapsed < 250) return "within_budget";
+      if ((phaseMs.spawn ?? 0) >= 250) return "pre_spawn_late";
+      if (phaseMs.sigterm === undefined) return "timeout_dispatch_missing";
+      if (phaseMs.sigterm >= 250) return "timeout_dispatch_late";
+      if (phaseMs.timeout === undefined) return "timeout_event_missing";
+      const streamSettledAt = Math.min(
+        phaseMs.stdout_close ?? Number.POSITIVE_INFINITY,
+        phaseMs.stdout_error ?? Number.POSITIVE_INFINITY,
+      );
+      if (!Number.isFinite(streamSettledAt)) return "stdout_settlement_missing";
+      if (streamSettledAt >= 250) return "stdout_settlement_late";
+      return "reap_or_return_late";
+    };
+    const diagnostic = (elapsed: number): string => {
+      const phases = phaseOrder.map(phase => `${phase}_ms=${phaseMs[phase] ?? -1}`).join(",");
+      return `codebuddy_timeout_timing classification=${classify(elapsed)} total_ms=${elapsed} ${phases}`;
+    };
     const stdoutStream = new Readable({ read() { /* stays open until timeout destroys it */ } });
+    stdoutStream.once("close", () => mark("stdout_close"));
+    stdoutStream.once("error", () => mark("stdout_error"));
     const child = new EventEmitter() as FakeChild;
     child.stdout = stdoutStream;
     child.stderr = Readable.from([]);
@@ -357,22 +698,34 @@ describe("codebuddy runTurn streams a headless turn", () => {
     child.exitCode = null;
     const signals: string[] = [];
     child.kill = (sig?: string) => {
+      if ((sig ?? "SIGTERM") === "SIGTERM") mark("sigterm");
       child.killed = true;
       signals.push(sig ?? "SIGTERM");
       return true;
     };
 
     const adapter = createCodeBuddyAdapter(provider(), {
-      spawn: () => child as unknown as ChildProcess,
+      spawn: () => {
+        mark("spawn");
+        return child as unknown as ChildProcess;
+      },
       which: () => "/usr/bin/codebuddy",
       timeoutMs: 10,
       killGraceMs: 10,
       reapTimeoutMs: 35,
     });
-    const startedAt = Date.now();
-    const events = await run(adapter, parsed());
+    startedAt = Date.now();
+    mark("entry");
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn!(parsed(), incoming(), event => {
+      if (event.type === "error" && event.status === 504 && event.code === "timeout") mark("timeout");
+      events.push(event);
+    });
+    mark("return");
+    // The measured assertion uses the raw elapsed time; clamping would hide a genuine overrun.
+    const elapsed = Date.now() - startedAt;
 
-    expect(Date.now() - startedAt).toBeLessThan(250);
+    expect(elapsed, diagnostic(elapsed)).toBeLessThan(250);
     expect(stdoutStream.destroyed).toBe(true);
     expect(signals).toContain("SIGTERM");
     expect(events).toContainEqual(expect.objectContaining({ type: "error", status: 504, code: "timeout" }));

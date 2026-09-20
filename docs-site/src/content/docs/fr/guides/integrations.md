@@ -14,7 +14,7 @@ puis peut le retirer. Quinze clients fonctionnent ainsi, chacun avec son propre 
 | Hermes | `~/.hermes/config.yaml` | YAML | dans les nouvelles sessions | `OPENCODEX_HERMES_API_KEY` |
 | OpenClaw | `~/.openclaw/openclaw.json` | JSON5 | immédiatement, sur une passerelle en cours d'exécution | `OPENCODEX_OPENCLAW_API_KEY` |
 | Kimi Code | `~/.kimi-code/config.toml` | TOML | au redémarrage ou avec `/reload` | valeur fictive de bouclage |
-| gjc | `~/.gjc/agent/models.yml` | YAML | dans les nouvelles sessions ou à l'ouverture de `/model` |`OPENCODEX_GAJAE_API_KEY` |
+| gjc | `~/.gjc/agent/models.yml` | YAML | dans les nouvelles sessions ou à l'ouverture de `/model` |non-secret loopback placeholder |
 | DeepSeek Harness (DSH) | `$DSH_HOME/settings.yaml` (`~/.dsh/settings.yaml` par défaut) | YAML | rechargement à chaud | jeton porteur fictif et non secret pour le bouclage |
 | MiniMax Code | `~/.minimax/config.yaml` | YAML | dans les nouvelles sessions ou après l’ouverture du sélecteur de modèles | valeur fictive de bouclage |
 | Prime Agent | `~/.prime/agent/models.json` | JSON | dans les nouvelles sessions | valeur fictive de bouclage |
@@ -133,6 +133,24 @@ n'est jamais réécrit. Pour les autres formats susceptibles de contenir des com
 Kimi Code, gjc, MiniMax Code et Raycast — documents YAML, JSON5 et TOML réécrits en entier), ou lorsque les propres entrées
 d'opencodex ont été modifiées, le commutateur se verrouille et la désactivation est refusée plutôt que de
 deviner quelles modifications vous appartiennent.
+
+## Prévisualiser et confirmer les modifications
+
+Appliquer, Remplacer, Désactiver et Restaurer commencent désormais par un aperçu. La boîte de dialogue
+indique exactement quels réglages gérés vont changer, avec les chemins concernés dans les limites prévues
+et la nature de chaque modification : ajout, mise à jour ou suppression. Examinez ce plan avant de confirmer.
+
+Lorsqu’un plan n’indique aucune modification, cela signifie que le document client géré est déjà dans l’état
+demandé. Pour un profil Aside sélectionné, la confirmation peut tout de même enregistrer sa préférence de
+synchronisation, même si le document géré ne change pas.
+
+Si le fichier change après votre examen, l'écriture est refusée car le plan est devenu obsolète. La boîte de
+dialogue remplace l'ancien plan par le nouveau et vous demande de confirmer à nouveau ; elle ne relance jamais
+l'écriture automatiquement. Si l'aperçu est temporairement indisponible, rechargez normalement la page et
+recommencez l'action.
+
+Aside utilise le même flux d'aperçu et de confirmation pour un seul profil sélectionné à la fois. **Synchroniser
+tous les profils** reste une action groupée distincte et n'est pas liée à un aperçu combiné unique.
 
 ## À quoi s'attendre, en toute transparence
 

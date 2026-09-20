@@ -5,10 +5,8 @@ import {
   RESPONSES_CORE_MODULES,
   readResponsesCoreModule,
 } from "../helpers/responses-core-source";
-import { createResponsesSendBudget } from "../../src/server/responses/request-send-budget";
 import { createRequestExecutionBudget } from "../../src/lib/request-execution-budget";
-import { createTranslatorBudget } from "../../src/lib/translator-budget";
-import type { TransientSendBudget } from "../../src/lib/upstream-retry";
+import { budgetOwner } from "../helpers/send-budget-owner";
 
 // Existing, separately owned siblings at the extraction boundary. A new owner
 // cannot silently disappear from source-oracle coverage by being absent from the inventory.
@@ -82,7 +80,15 @@ describe("Responses core module boundaries", () => {
     const ingress = readResponsesCoreModule("core.ts");
     const native = readResponsesCoreModule("passthrough-execution.ts");
     expect(ingress).toContain("return await executePassthroughResponse(");
-    expect(native).toContain("return await deliverPassthroughResponse(");
+    // Delivery is awaited inside the try, and its direct body is wrapped before
+    // the return. What matters is that both awaits stay inside the lease owner,
+    // not that the delivery call is itself the return expression.
+    expect(native).toContain("const response = await deliverPassthroughResponse(");
+    expect(native).toContain("return guardDirectPassthroughBodyInactivity(");
+    expect(native.indexOf("await deliverPassthroughResponse("))
+      .toBeLessThan(native.indexOf("return guardDirectPassthroughBodyInactivity("));
+    expect(native.indexOf("return guardDirectPassthroughBodyInactivity("))
+      .toBeLessThan(native.indexOf("} finally {"));
     expect(native.indexOf("admissionState.pendingHostAdmissionLease = null;"))
       .toBeLessThan(native.indexOf("await preparePassthroughExchange("));
     expect(native).toMatch(/finally\s*\{\s*if \(nativeHostState\.lease\)\s*\{\s*releaseUpstreamHostAdmission\(nativeHostState\.lease\);\s*releaseCodexAuthContextProbeLease\(admissionState\.authCtx\);/);
@@ -111,20 +117,6 @@ describe("Responses core module boundaries", () => {
     expect(continuation).toContain("transportState.activeAdapter");
   });
 });
-
-function budgetOwner(sendBudget: TransientSendBudget) {
-  const translatorBudget = createTranslatorBudget();
-  const result = createResponsesSendBudget({
-    req: new Request("http://localhost/v1/responses"),
-    logCtx: { model: "test", provider: "test" },
-    options: { translatorBudget, sendBudget },
-  });
-  if (result instanceof Response) {
-    translatorBudget.dispose();
-    throw new Error("Unexpected workflow refusal without a workflow root");
-  }
-  return { owner: result, dispose: () => translatorBudget.dispose() };
-}
 
 describe("Responses request-owned send budget after extraction", () => {
   test("legacy holders retain identity and an exhausted remainder stays zero", () => {
@@ -172,6 +164,40 @@ describe("Responses request-owned send budget after extraction", () => {
       owner.noteTransientSends(1);
       expect(holder.used).toBe(4);
       expect(owner.remainingTransientSendBudget(3)).toBe(0);
+    } finally { dispose(); }
+  });
+
+  test("an adapter reservation spends the handed-down hop instead of buying a second send", () => {
+    const holder = createRequestExecutionBudget();
+    const { owner, dispose } = budgetOwner(holder);
+    try {
+      const hop = owner.reserveCredentialHop("auth-recovery", "test|model", true);
+      expect(hop.allowed).toBe(true);
+      if (!hop.permit) throw new Error("Expected a recovery permit");
+      // The reservation is the charge, before anything dispatched.
+      expect(holder.used).toBe(1);
+      owner.pendingHopPermit = hop.permit;
+      const adapterBudget = owner.adapterDispatchBudget;
+      if (!adapterBudget) throw new Error("Expected an adapter dispatch budget");
+
+      // Kiro and Cursor reserve once per physical send. Their FIRST reservation in this leg is
+      // the hop's own replay, so it spends the permit rather than charging again (#4709).
+      const first = adapterBudget.reserveDispatch({ sendClass: "transient", targetKey: "url" });
+      expect(first.allowed).toBe(true);
+      if (!first.allowed) throw new Error("unreachable");
+      expect(first.permit.use()).toBe(true);
+      expect(first.permit.use()).toBe(false);
+      expect(holder.used).toBe(1);
+      expect(owner.pendingHopPermit).toBeUndefined();
+
+      // Every later send in the same ladder is a new physical send and is charged.
+      const second = adapterBudget.reserveDispatch({ sendClass: "transient", targetKey: "url" });
+      expect(second.allowed).toBe(true);
+      expect(holder.used).toBe(2);
+      // The view delegates live rather than snapshotting: a frozen copy would read as a budget
+      // that can never be exhausted.
+      expect(adapterBudget.used).toBe(2);
+      expect(adapterBudget.remainingBaseSends(3)).toBe(1);
     } finally { dispose(); }
   });
 });

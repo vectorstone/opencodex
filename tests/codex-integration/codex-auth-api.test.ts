@@ -1,3 +1,6 @@
+import { registerWarmupRateLimitCases } from "../helpers/codex-warmup-rate-limit";
+import { registerResetCreditConsumeValidationTests } from "../helpers/reset-credit-consume-validation";
+import { registerPoolReauthCauseCases } from "../helpers/pool-reauth-cause";
 import * as usageHistoryModule from "../../src/usage/log";
 import { getAccountQuotaHistory } from "../../src/codex/quota";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
@@ -2088,6 +2091,8 @@ describe("codex-auth API", () => {
     expect(existsSync(join(TEST_DIR, "config.json"))).toBe(false);
   });
 
+  registerPoolReauthCauseCases(makeConfig, seedPoolAccount);
+
   test("pool plan refresh batches multiple authoritative changes into one config save", async () => {
     const config = makeConfig();
     seedPoolAccount(config, { id: "pool-plan-a", email: "pool-plan-a@example.com", plan: "plus" });
@@ -2871,16 +2876,7 @@ describe("codex-auth API", () => {
     });
   });
 
-  test("reset-credit consume rejects invalid account ids before credential lookup", async () => {
-    const req = new Request("http://localhost/api/codex-auth/reset-credits/consume", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ accountId: "../bad" }),
-    });
-    const resp = await handleCodexAuthAPI(req, new URL(req.url), makeConfig());
-    expect(resp!.status).toBe(400);
-    expect(await resp!.json()).toMatchObject({ error: "Invalid account id format" });
-  });
+  registerResetCreditConsumeValidationTests(makeConfig, seedPoolAccount);
 
   test("reset-credit consume returns remaining from refreshed quota, not the consume payload", async () => {
     const config = makeConfig();
@@ -5344,14 +5340,17 @@ describe("codex-auth API", () => {
     if (restart) clearAccountNeedsReauth(accountId);
     const rows = await listCodexAuthAccounts(config, false);
     const authFailed = !replace && (status === 401 || status === 403);
+    // The stored verdict's own http status names the cause whether or not the in-memory
+    // mark still exists; a bare mark no longer flattens the projection to refresh_failed.
+    const expectedReason = status === 403 ? "forbidden" : "unauthorized";
     const row = rows.find(entry => entry.id === accountId);
     expect(row).toMatchObject({
       needsReauth: authFailed,
-      health: { status: authFailed ? "reauth_required" : "warning", reason: authFailed ? "refresh_failed" : "validation_pending" },
+      health: { status: authFailed ? "reauth_required" : "warning", reason: authFailed ? expectedReason : "validation_pending" },
     });
     // The reason travels with the state, so an operator reading the account surface can tell a
     // failed refresh from a pending validation without inferring it from `health` (#4212).
-    if (authFailed) expect(row).toMatchObject({ reauthReason: "refresh_failed" });
+    if (authFailed) expect(row).toMatchObject({ reauthReason: expectedReason });
     else expect(row).not.toHaveProperty("reauthReason");
     fail = false;
     await refresh();
@@ -5530,27 +5529,7 @@ describe("codex-auth API", () => {
     expect(getCodexAccountCredential("quota-unknown")).toBeNull();
   });
 
-  test("OAuth creation rejects a namespace claimed during warmup without persisting", async () => {
-    const config = makeConfig();
-    const result = await completeMockCodexOAuth({
-      config,
-      requestBody: { id: "oauth-race" },
-      oauthAccountId: "acct-oauth-race",
-      email: "oauth-race@example.test",
-      onWarmup: () => {
-        config.codexAccountNamespaces = { "oauth-race": "pool-a" };
-      },
-    });
-
-    expect(result.startStatus).toBe(200);
-    expect(result.state).toMatchObject({
-      status: "error",
-      error: "account id must not collide with a configured Codex account namespace",
-    });
-    expect(config.codexAccounts).toEqual([]);
-    expect(config.codexAccountNamespaces).toEqual({ "oauth-race": "pool-a" });
-    expect(getCodexAccountCredential("oauth-race")).toBeNull();
-  });
+  registerWarmupRateLimitCases(makeConfig, completeMockCodexOAuth);
 
   test("OAuth creation reports a durable add when catalog convergence is pending", async () => {
     const accountId = "oauth-picker-pending";

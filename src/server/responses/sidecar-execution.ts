@@ -17,6 +17,7 @@ import {
   clampImageMaxRounds,
 } from "../../images";
 import type { ProviderAdapter } from "../../adapters/base";
+import type { OcxParsedRequest } from "../../types";
 import { rotateProviderTransportOn429, rateLimitRetryPolicyFor } from "../../providers/key-failover";
 import {
   GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
@@ -35,7 +36,7 @@ import { bindRouteReasoningReplayScope, adapterNeedsForcedContinuation } from ".
 import { namespacedToolName } from "../../types";
 import { providerFetch } from "./fetch-helpers";
 import type { AttemptRecoveryKind } from "../../usage/log";
-import { noteAttemptSend, recordAdapterReasoning, recordAdapterTier } from "../request-log";
+import { recordAdapterReasoning, recordAdapterTier } from "../request-log";
 import { normalizeLogConversationId } from "../request-log-conversation";
 import { rememberResponseState } from "../../responses/state";
 import { trackStreamLifetime } from "../lifecycle";
@@ -65,6 +66,8 @@ export async function executeResponsesSidecars(
     | "commitResolvedOAuthSelection"
     | "resolveSelectionAdapter"
     | "oauthDispatch"
+    | "noteRoutedAttemptSend"
+    | "bindKeyUsageFromBridge"
   >,
   sidecarState: Pick<ResponsesSidecarAuth, "routedCompaction" | "openAiSidecar">,
   responseEffects: Pick<
@@ -153,6 +156,7 @@ export async function executeResponsesSidecars(
   const rotateSidecarProviderOn429 = async (
     retryAfter: string | null,
     responseHeaders?: Headers,
+    retryParsed?: OcxParsedRequest,
   ): Promise<ProviderAdapter | null> => {
     const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
@@ -184,6 +188,8 @@ export async function executeResponsesSidecars(
         route.providerName,
         transportState.genericFailoverAccountId,
         retryAfter,
+        Date.now(),
+        route.modelId,
       );
       if (!nextAccountId) {
         hop.permit?.release();
@@ -192,7 +198,7 @@ export async function executeResponsesSidecars(
       try {
         const snapshot = await failoverAccountSnapshot(route.providerName, nextAccountId);
         transportState.genericFailovers += 1;
-        if (!await applyFailoverSnapshot(snapshot)) {
+        if (!await applyFailoverSnapshot(snapshot, retryParsed)) {
           hop.permit?.release();
           return null;
         }
@@ -250,9 +256,22 @@ export async function executeResponsesSidecars(
       return null;
     }
     const rotatedAdapter = resolveSelectionAdapter(
-      resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+      resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
       config.cacheRetention,
     );
+    // The sidecar loops build each attempt from an iteration-local shallow copy of parsed, so a
+    // rebind that lands only on the outer request never reaches the wire: the retry would pair
+    // the new bearer with the previous account's Kiro routing metadata and continuation identity.
+    // Rebind the exact request the rotated adapter will be built from (same pattern as the
+    // continuation loop's nextParsed); when the hook ran without one, the outer bind below stands.
+    if (retryParsed && retryParsed !== parsed) {
+      bindRouteReasoningReplayScope({
+        parsed: retryParsed,
+        providerName: route.providerName,
+        provider: route.provider,
+        adapterName: rotatedAdapter.name,
+      });
+    }
     bindRouteReasoningReplayScope({
       parsed,
       providerName: route.providerName,
@@ -322,7 +341,7 @@ export async function executeResponsesSidecars(
       ...(vidPlan ? { videoPlan: vidPlan } : {}),
       forwardHeaders: requestState.selectedForwardHeaders,
       onAttemptSend: (recovery?: AttemptRecoveryKind) =>
-        noteAttemptSend(logCtx.activeAttempt, logCtx.usageLogInputTokens, recovery),
+        transportState.noteRoutedAttemptSend(logCtx.usageLogInputTokens, recovery),
       abortSignal: options.abortSignal,
       maxRounds: imgPlan && vidPlan
         ? clampImageMaxRounds(Math.min(config.images?.maxRounds ?? 3, config.images?.videoMaxRounds ?? 2))
@@ -352,11 +371,7 @@ export async function executeResponsesSidecars(
         if (!logCtx.conversationId && parsed._cursorConversationId) {
           logCtx.conversationId = normalizeLogConversationId(parsed._cursorConversationId);
         }
-        logCtx.usageFromBridge = true;
-        if (usage) {
-          logCtx.usage = usage;
-          if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
-        }
+        transportState.bindKeyUsageFromBridge(usage);
       },
       on429: rotateSidecarProviderOn429,
       retryOn429Policy: rateLimitRetryPolicyFor(route.provider),
@@ -432,13 +447,9 @@ export async function executeResponsesSidecars(
         recordAdapterTier(logCtx, request);
       },
       onAttemptSend: (recovery?: AttemptRecoveryKind) =>
-        noteAttemptSend(logCtx.activeAttempt, logCtx.usageLogInputTokens, recovery),
+        transportState.noteRoutedAttemptSend(logCtx.usageLogInputTokens, recovery),
       onUsage: usage => {
-        logCtx.usageFromBridge = true;
-        if (usage) {
-          logCtx.usage = usage;
-          if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
-        }
+        transportState.bindKeyUsageFromBridge(usage);
       },
       recordSidecarOutcome: wsPlan.forwardSidecar?.recordOutcome,
       connectTimeoutMs: config.connectTimeoutMs ?? 200_000,

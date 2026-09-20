@@ -1,17 +1,22 @@
 # Inbound Compatibility Surfaces
 
+Native result continuations and function-result injection follow [the mode-specific result and control contract](../transports/streaming-health.md#experimental-native-function-result-injection); this surface does not infer upstream support or alter its defaults.
+
+Native steering follows [the shared WebSocket contract](../transports/streaming-health.md#experimental-native-mid-turn-steering); this surface's defaults remain unchanged.
+
 Compatibility callers retain the public Responses ingress described by the
 [core module ownership](../transports/responses.md#core-module-ownership). This surface retains its existing behavior.
 
 The configuration-only [plaintext V2 contract](../subagents.md#plaintext-v2-agent-messages)
-is scoped to canonical ChatGPT Responses forwarding; other source-area behavior described here is unchanged.
+is scoped to canonical ChatGPT Responses forwarding; other source-area behavior described here is unchanged. Cursor's localized native-shell names follow the [routing-commentary guard contract](../providers/cursor.md#cursor-native-exec).
 
 ## Standalone file transcription
 
 `src/server/audio-transcriptions.ts` owns `POST /v1/audio/transcriptions`, independently of
 Responses and Chat conversion. `src/server/audio-upstream.ts` resolves explicit data-plane keys
 on both listeners and substitutes stored OpenAI credentials. Direct stored-main access claims
-the enclosing admission lease; Pool uses the existing sidecar account resolver. A selected
+the enclosing admission lease and derives its account header only from that stored credential;
+caller-supplied account selection is never retained. Pool uses the existing sidecar account resolver. A selected
 ChatGPT authentication failure never falls through to the paid OpenAI provider.
 
 The bounded multipart input accepts one nonempty file up to 25,000,000 bytes within a 32 MiB
@@ -50,7 +55,7 @@ Translated Claude timeline reminders use the Chat adapter's
 on its exact supported route. This is separate from trailing-notice stabilization
 and from native Chat message passthrough.
 
-Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts.
+Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](../transports/responses.md#passthrough-sse-stream-shapes-314).
 
 ## Chat Completions inbound native path
 
@@ -183,7 +188,7 @@ reasoning ladder into `thinking.effortOptions`. Missing capabilities stay absent
 falling back to OpenCodex guesses, and the integration does not write the removed
 `thinking.effort` / `defaultEffort` fields because MCode owns the active effort per session.
 
-Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../gui-and-management-api.md#usage-accounting); readable totals are not represented as a complete ledger.
+Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../gui-and-management-api.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](../gui-and-management-api.md#upstream-key-account-attribution), independently of subscription quota observations.
 
 Connected CLI usage follows the [client-scoped hub usage contract](../gui-and-management-api.md#usage-accounting); local management and account data remain separate.
 
@@ -245,7 +250,7 @@ Account quota surfaces use [safe probe diagnostics](../transports/inventory.md#a
 
 Live sideband admission and its bounded upstream handshake follow the [runtime contract](../runtime.md#live-sideband-handshake); the ordinary Responses WebSocket exchange remains separate.
 
-Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached.
+Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached, rejects inputs above the safe decoded-pixel ceiling, caps native decode work process-wide, and stops queued work when the request is cancelled.
 
 The [explicit model-capability contract](../config.md#explicit-per-model-capability-declarations) preserves operator declarations through provider storage and catalog capture; it does not infer upstream capability or change this surface's routing behavior.
 
@@ -286,6 +291,10 @@ would itself be a behavior change. A remote reference is recognized and rewritte
 never fetched.
 
 ## Translated Chat control fidelity
+
+Translated Chat ingress does not reshape schemas for Google's
+[endpoint-scoped loss report](../providers/google.md#google-tool-schema-loss-reporting). The report
+is produced only at the final Google adapter boundary and does not alter the ingress body.
 
 A translated Chat turn keeps the controls the caller sent. The Chat ingress pins
 `store:false` for every `openai-responses` route and strips nothing else: the
@@ -331,3 +340,15 @@ Modern `tool` images continue through the existing following-user carrier. These
 an OpenCodex conversion limit, not a provider capability claim. Final Responses-to-adapter
 admission follows the [registry contract](../adapters/registry.md#untranslated-input-media).
 Canonical Responses identity sanitation and narrowly scoped pre-output combo recovery follow [request-local target compatibility](../runtime.md#request-local-target-compatibility); other adapter contracts remain unchanged.
+
+Shared response-log retention and native SSE inspection pacing follow the [bounded inspection contract](../transports/byte-accounting.md#response-log-inspection); other subsystem behavior remains unchanged.
+
+Native steering retains fixed phase deadlines and reconciled replay output; see the [steering stability contract](../transports/streaming-health.md#steering-deadlines-and-replay-completeness).
+
+Native steering generation overrides, explicit public-API eligibility and the consent-gated wire probe follow the [shared control contract](../transports/streaming-health.md#steering-settings-public-api-and-diagnostic-probe); this owner does not change routing or execute diagnostic tools.
+
+Unicode pattern normalization uses [copy-on-write traversal](../transports/byte-accounting.md#unicode-pattern-normalization) while preserving the existing schema and wire semantics.
+
+Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](../gui-and-management-api.md#fast-selector-rows-setting).
+
+The [compaction routing override](../transports/responses.md#compaction-routing-overrides) requires original Responses ingress; translated Chat and Messages calls retain their own routing.

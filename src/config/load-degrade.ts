@@ -33,6 +33,7 @@ import {
   remoteGuiConfigSchema,
   retryOn429PolicySchema,
   runtimeRoleSchema,
+  spendSchema,
 } from "./schema/leaf-validators";
 import { hasWarnedInheritedFastWireConflict, markWarnedInheritedFastWireConflict } from "./warn-memo";
 
@@ -98,6 +99,24 @@ export function warnDegradedStreamMode(rawParsed: unknown, validated: OcxConfig)
   if (raw !== undefined && validated.streamMode === undefined) {
     console.warn(`⚠️  config.json streamMode ${JSON.stringify(raw)} is invalid (expected "auto", "legacy-tee", or "eager-relay") — falling back to "auto"`);
   }
+}
+
+export function warnDegradedCompactionRouting(rawParsed: unknown, validated: OcxConfig): void {
+  if (!rawParsed || typeof rawParsed !== "object") return;
+  const raw = (rawParsed as Record<string, unknown>).compactionRouting;
+  if (raw !== undefined && validated.compactionRouting === undefined) {
+    console.warn("⚠️  config.json compactionRouting is invalid (expected { model, reasoningEffort?, triggers? } with a nonblank model, a declared effort, and triggers drawn without repetition from \"manual\" and \"auto\") — compaction keeps the conversation model");
+  }
+}
+
+/**
+ * Top-level opt-in blocks whose hand-edited form degrades to "off" instead of failing the whole
+ * schema. Grouped behind one entry point because `src/config.ts` sits at its file-size cap, and
+ * the ratchet only ever moves down: a per-block call there costs a line the file does not have.
+ */
+export function warnDegradedTopLevelOptIns(rawParsed: unknown, validated: OcxConfig): void {
+  warnDegradedStreamMode(rawParsed, validated);
+  warnDegradedCompactionRouting(rawParsed, validated);
 }
 
 /**
@@ -634,6 +653,20 @@ export function malformedCatalogAutoRefreshWarning(rawParsed: unknown): string |
   if (result.success) return null;
   const field = result.error.issues[0]?.path.join(".");
   return `catalogAutoRefresh${field ? `.${field}` : ""} ignored: invalid catalog auto-refresh configuration`;
+}
+
+/**
+ * The same silent-in-the-wrong-direction failure, and the most expensive instance of it here:
+ * a dropped spend section means the ceilings are not enforced, and an unenforced ceiling is
+ * indistinguishable from one nothing has reached. The operator finds out from the bill.
+ */
+export function malformedSpendWarning(rawParsed: unknown): string | null {
+  const raw = rawConfigRecord(rawParsed);
+  if (!raw || !Object.hasOwn(raw, "spend")) return null;
+  const result = spendSchema.safeParse(raw.spend);
+  if (result.success) return null;
+  const field = result.error.issues[0]?.path.join(".");
+  return `spend${field ? `.${field}` : ""} ignored: invalid spend ceiling configuration, so no token ceiling is enforced`;
 }
 
 /**

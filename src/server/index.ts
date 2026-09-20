@@ -1,5 +1,6 @@
 import { remoteWorkspaceEnabled } from "../remote-control/workspace-activation";
 import { AuxiliaryListenerBindError } from "./ports";
+import { runAdmittedBodyWork } from "./inbound-body-admission";
 import {
   buildWarmupCompletionFrames,
   buildWsErrorFrame,
@@ -106,7 +107,6 @@ export {
   unregisterTurn,
 } from "./lifecycle";
 import {
-  addFinalRequestLog,
   hydrateRequestLogsFromDisk,
   httpStatusForRequestLogTerminal,
   inspectResponseLogSsePayload,
@@ -116,8 +116,7 @@ import {
   type RequestLogEntry,
 } from "./request-log";
 import { sessionLaneIdFromRequest } from "./request-log-conversation";
-import { admitWorkflowTurn, type WorkflowLane } from "../lib/workflow-budget";
-import { workflowRefusalResponse, type WorkflowRefusalLog } from "./workflow-refusal";
+import { admitHttpWorkflowTurn, workflowDecisionRefusalResponse, type WorkflowRefusalLog } from "./workflow-refusal";
 export {
   addFinalRequestLog,
   filterRequestLogs,
@@ -181,7 +180,7 @@ import {
   type NativeMainStartupLifecycle,
 } from "../codex/native-profile-startup";
 import { EXTERNAL_CALL_PREFIX, LiveCallBindings } from "./live-call-bindings";
-import { codexCompatibleUrl, contextEndpoint, contextRelayActivated } from "../codex/context-compat";
+import { contextEndpoint, contextRelayActivated } from "../codex/context-compat";
 import { fetchAllModels, handleManagementAPI, VERSION, type ManagementApiDeps } from "./management-api";
 import {
   createManagementSessionControl,
@@ -205,8 +204,15 @@ import {
 import { detectInstall } from "../update/index";
 import { createServeOptions, type ServerIngress } from "./index/serve-options";
 import { inspectStartupOwnership, setStartupCacheInvalidationWrite, warnAgentTaskRecoveryStartup, warnPlaintextV2AgentMessagesStartup, type StartServerDeps } from "./index/startup-warnings";
+import { acquireSpendLedgerServerLifecycle, type SpendLedgerServerLifecycle } from "./index/spend-ledger-lifecycle";
 
 export function startServer(port?: number, deps: StartServerDeps = {}): Server<WsData> {
+  const spendLedgerLifecycle = acquireSpendLedgerServerLifecycle(getConfigDir());
+  try { return startServerWithSpendLedgerOwner(port, deps, spendLedgerLifecycle); }
+  catch (error) { spendLedgerLifecycle.releaseAfterFailedStart(); throw error; }
+}
+
+function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartServerDeps, spendLedgerLifecycle: SpendLedgerServerLifecycle): Server<WsData> {
   const localAttestationSecret = deps.localAttestationSecret ?? createLocalAttestationSecret();
   // Captured before loadConfig() starts the optional ACL flight so stop() drains the same dir
   // even if OPENCODEX_HOME changes underneath a long-lived process.
@@ -225,7 +231,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   warnPlaintextV2AgentMessagesStartup(config);
   warnAgentTaskRecoveryStartup(config);
   setLiveStateStoreConfig(config);
-  applyProxyEnv(config);
+  applyProxyEnv(config, true);
   assertServerAuthConfig(config);
   const managementAuth = deps.managementAuthState ?? initializeManagementAuthState(config);
   const managementSessionControl = createManagementSessionControl(managementAuth);
@@ -268,11 +274,11 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     startupOwnershipStatePaths,
     startupWindowsTaskListingCache,
   );
-  // Startup cache invalidation is best-effort and must never block the server from
-  // serving. It now takes K so it cannot race a convergence commit. Use the home
-  // paired with the ownership inspection; re-reading ambient CODEX_HOME here could
-  // invalidate a different installation after an environment or mount change.
-  if (startupCacheOwnership.ownership === "owned" && startupOwnershipHomes !== null) {
+  // Startup cache invalidation is best-effort and applies only when startup sync is enabled.
+  // Check OFF before taking K: on Windows K resolves SID + LocalAppData through PowerShell,
+  // and run 35093667426 exceeded healthy controls by 33.8 s against that 30 s child budget.
+  // The permit callback still re-reads intent under K to close a concurrent disable race.
+  if (shouldSyncCodexOnStart(config) && startupCacheOwnership.ownership === "owned" && startupOwnershipHomes !== null) {
     try {
       const startupCodexHome = startupOwnershipHomes.codexHome;
       // #1046: record whether this actually rewrote the cache. `handleStart` ORs this
@@ -299,6 +305,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   registerAppOwnedMemorySweepFallback();
   configureAppOwnedMemoryBudget(resolveAppOwnedMemoryBudgetBytes(config.appOwnedMemoryBudgetMb));
   enforceAppOwnedMemoryBudget();
+  // Observe-only mode still journals physical sends, so every server owns before configuring.
+  spendLedgerLifecycle.configure(config.spend);
   registerCodexCooldownRecoveryProbeWorker(config);
   // Issue #42 Phase 3: opt-in archived auto-cleanup (default OFF). Unref'd hourly
   // tick for daily/weekly; startup evaluation is fire-and-forget after listen.
@@ -498,28 +506,18 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
   ): Promise<Response> {
     const lease = tryAdmitTurn(sessionLaneIdFromRequest(req.headers));
     if (!lease) return serverBusyResponse(req, "active turns", policy);
-    // A fan-out shares the conversation it serves. Without a reserve, a worker burst takes every
-    // slot under its own root and the interactive turn that started it waits behind its own
-    // children. A request that names a parent is treated as that fan-out; a top-level request is
-    // the conversation and may use the reserved slots.
-    const workflowRootId = req.headers.get("x-codex-parent-thread-id")?.trim() || undefined;
-    const workflowThreadId = req.headers.get("thread-id")?.trim() || undefined;
-    const workflowLane: WorkflowLane = workflowRootId !== undefined
-      && workflowThreadId !== undefined
-      && workflowThreadId !== workflowRootId
-      ? "worker"
-      : "interactive";
-    const workflow = admitWorkflowTurn(workflowRootId, workflowLane, undefined, workflowThreadId);
+    // Root, lane, and the refusal that follows from them, all live in ./workflow-refusal.
+    const workflow = admitHttpWorkflowTurn(req.headers);
     if (workflow && !workflow.admitted) {
       lease.release();
       // withCors, because without Access-Control-Allow-Origin the exposed refusal header is
       // still unreadable to a browser dashboard -- which made exposing it pointless.
-      return withCors(workflowRefusalResponse(workflow.reason, undefined, refusalLog), req, policy);
+      return withCors(workflowDecisionRefusalResponse(workflow, undefined, refusalLog), req, policy);
     }
     const releaseWorkflow = (): void => { if (workflow?.admitted) workflow.lease.release(); };
     let response: Response;
     try {
-      response = await work(lease);
+      response = await runAdmittedBodyWork(req, policy, config.maxInboundBodyBytes, () => work(lease), refusalLog);
     } catch (error) {
       releaseWorkflow();
       lease.release();
@@ -707,7 +705,7 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
       get remoteWorkspaceStopping() { return remoteWorkspaceStopping; },
     });
 
-    server = Bun.serve<WsData>({ ...serveOptions, port: listenPort, hostname: bindHost });
+    server = spendLedgerLifecycle.track(Bun.serve<WsData>({ ...serveOptions, port: listenPort, hostname: bindHost }));
 
     // Both binds are one startup transaction (#1102). If the loopback bind fails after the
     // public one succeeded, leaving the public listener up would strand it: the CLI's port
@@ -715,11 +713,11 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     // accumulating listeners. Roll back and rethrow the original error instead.
     if (loopbackListenerPort !== null) {
       try {
-        loopbackServer = Bun.serve<WsData>({
+        loopbackServer = spendLedgerLifecycle.track(Bun.serve<WsData>({
           ...serveOptions,
           port: loopbackListenerPort,
           hostname: "127.0.0.1",
-        });
+        }));
       } catch (error) {
         try {
           // startServer is synchronous, so this rollback cannot await. Bun begins closing the
@@ -735,11 +733,11 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
     }
     if (managementIngressPort !== null) {
       try {
-        managementIngressServer = Bun.serve<WsData>({
+        managementIngressServer = spendLedgerLifecycle.track(Bun.serve<WsData>({
           ...serveOptions,
           port: managementIngressPort,
           hostname: "127.0.0.1",
-        });
+        }));
       } catch (error) {
         // Preserve the management bind failure while synchronously initiating rollback of every
         // listener already opened in this startup transaction. startServer must not become async.
@@ -796,7 +794,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
             // removes the dir right after stop() settles would hit EPERM/EBUSY on Windows
             // otherwise. Runs even when an earlier release rejected — that rejection still
             // propagates, but not before the child is drained.
-            await flushConfigDirHardening(startupConfigDir);
+            try { spendLedgerLifecycle.release(); }
+            finally { await flushConfigDirHardening(startupConfigDir); }
           }
         },
       );

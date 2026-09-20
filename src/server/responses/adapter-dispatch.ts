@@ -1,3 +1,4 @@
+import { isNonReplayableResponse } from "../../lib/upstream-retry";
 import type { ResponsesRequestContext, ResponsesAdmissionState } from "./core-options";
 import type { PreparedResponsesRequest } from "./request-prepare";
 import type { ResponsesTransport } from "./request-transport";
@@ -11,7 +12,6 @@ import { trackStreamLifetime } from "../lifecycle";
 import {
   recordAdapterReasoning,
   recordAdapterTier,
-  noteAttemptSend,
   sealRequestAttemptIdentity,
   recordAttemptCredentialSource,
 } from "../request-log";
@@ -25,6 +25,7 @@ import {
   hasKeyPoolFailover,
   rotateProviderTransportOn401,
   rateLimitRetryDelayMs,
+  readQuotaResetAt,
   rotateProviderTransportOn429,
 } from "../../providers/key-failover";
 import {
@@ -72,7 +73,12 @@ import { consumeComboFailure } from "./core-combo-failure";
 import { streamingContextOverflowResponse, jsonContextOverflowResponse } from "./context-overflow";
 import { isFixedCodexAccount } from "./core-codex-account";
 import { recordSubagentQuotaFailureForThreadSpawn } from "../../codex/subagent-model-fallback";
-import { isCyberPolicyCode, CYBER_POLICY_FALLBACK_MESSAGE, CYBER_POLICY_ERROR_CODE } from "../../lib/errors";
+import {
+  isCyberPolicyCode,
+  CYBER_POLICY_FALLBACK_MESSAGE,
+  CYBER_POLICY_ERROR_CODE,
+  SEND_BUDGET_EXHAUSTED_CODE,
+} from "../../lib/errors";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
 import { cancelBodyOnAbort } from "../../lib/abort";
 
@@ -115,18 +121,21 @@ export async function prepareAdapterExchange(
     | "genericFailoverAccountId"
     | "genericFailovers"
     | "applyFailoverSnapshot"
+    | "noteRoutedAttemptSend"
   >,
   responseEffects: Pick<ResponsesEffects, "cancelResponseCompletion" | "notifyResponseComplete" | "refreshRequestToolAliases">,
   sendBudgetState: Pick<
     ResponsesSendBudget,
-    | "adapterSendBudget"
+    | "adapterDispatchBudget"
     | "noteAdapterPhysicalSend"
+    | "noteAdapterRecoveryWithheld"
     | "remainingTransientSendBudget"
     | "noteTransientSends"
     | "recoverySendAllowance"
     | "recoveryClassFor"
     | "sendBudgetExhausted"
     | "reserveCredentialHop"
+    | "pendingHopPermit"
   >,
 ) {
   const { options, config, logCtx, req } = requestContext;
@@ -151,8 +160,9 @@ export async function prepareAdapterExchange(
   } = requestState;
   const { cancelResponseCompletion, notifyResponseComplete, refreshRequestToolAliases } = responseEffects;
   const {
-    adapterSendBudget,
+    adapterDispatchBudget,
     noteAdapterPhysicalSend,
+    noteAdapterRecoveryWithheld,
     remainingTransientSendBudget,
     noteTransientSends,
     recoverySendAllowance,
@@ -236,7 +246,11 @@ export async function prepareAdapterExchange(
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
   try {
-    initialRequest = await transportState.activeAdapter.buildRequest(parsed, { headers: requestState.selectedForwardHeaders, translatorBudget });
+    initialRequest = await transportState.activeAdapter.buildRequest(parsed, {
+      headers: requestState.selectedForwardHeaders,
+      translatorBudget,
+      abortSignal: upstream.signal,
+    });
     refreshRequestToolAliases(initialRequest);
     recordAdapterReasoning(logCtx, initialRequest);
     recordAdapterTier(logCtx, initialRequest);
@@ -272,15 +286,17 @@ export async function prepareAdapterExchange(
   let upstreamResponse: Response;
   try {
     if (transportState.activeAdapter.fetchResponse) {
-      noteAttemptSend(logCtx.activeAttempt, inputTokenEstimate);
+      transportState.noteRoutedAttemptSend(inputTokenEstimate);
       await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, upstream.signal);
       upstreamResponse = await transportState.activeAdapter.fetchResponse(builtInitialRequest, {
         abortSignal: upstream.signal,
         timeoutMs: connectMs,
-        sendBudget: adapterSendBudget,
+        sendBudget: adapterDispatchBudget,
         onPhysicalSend: send => noteAdapterPhysicalSend(inputTokenEstimate, send),
+        onRecoveryWithheld: noteAdapterRecoveryWithheld,
         stream: parsed.stream,
         executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+              pacingSlotAcquired: true,
               dispatchOverride: oauthDispatch(builtInitialRequest),
           providerName: route.providerName,
           modelId: route.modelId,
@@ -300,7 +316,7 @@ export async function prepareAdapterExchange(
         : fetchWithResetRetry;
       upstreamResponse = await fetchWithRetryPolicy(
         recovery => {
-          noteAttemptSend(logCtx.activeAttempt, inputTokenEstimate, recovery);
+          transportState.noteRoutedAttemptSend(inputTokenEstimate, recovery);
           return fetchWithHeaderTimeout(builtInitialRequest.url, applyUpstreamRecoveryInit({
             method: builtInitialRequest.method,
             headers: builtInitialRequest.headers,
@@ -331,6 +347,13 @@ export async function prepareAdapterExchange(
     cleanupUpstreamAbort();
     upstream.abort();
     if (options.abortSignal?.aborted) return clientCancelledResponse();
+    // A budget refusal is a decision this process made, not an upstream fault. Reporting it as
+    // 502 does more than mislabel it: the Codex client retries 5xx and does not retry a 429, so
+    // blaming the provider makes the caller send the whole turn again -- the amplification this
+    // budget exists to stop. The passthrough path has answered 429 here since #4546.
+    if (err instanceof SendBudgetExhaustedError) {
+      return formatErrorResponse(429, SEND_BUDGET_EXHAUSTED_CODE, err.message);
+    }
     const msg = describeUpstreamConnectFailure(err, connectMs);
     return formatErrorResponse(502, "upstream_error", msg);
   } finally {
@@ -386,6 +409,7 @@ export async function prepareAdapterExchange(
           retryRequest = await transportState.activeAdapter.buildRequest(parsed, {
             headers: requestState.selectedForwardHeaders,
             translatorBudget,
+            abortSignal: upstream.signal,
             ...(transportState.imageTierBias > 0 ? { imageTierBias: transportState.imageTierBias } : {}),
           });
           recordAdapterReasoning(logCtx, retryRequest);
@@ -412,10 +436,10 @@ export async function prepareAdapterExchange(
       logCtx.providerAdapter = transportState.activeAdapter.name;
       sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, transportState.activeAdapter.name, logCtx.accountLogLabel);
       recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, transportState.activeAdapter.name);
-      noteAttemptSend(logCtx.activeAttempt, retryEstimate, recovery);
       try {
         try {
           if (transportState.activeAdapter.fetchResponse) {
+            transportState.noteRoutedAttemptSend(retryEstimate, recovery);
             await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, upstream.signal);
             // The dispatch boundary is HERE, not before the pacing wait: that wait can reject for
             // an abort, a saturated queue, an expired slot or a removed provider, and none of
@@ -425,10 +449,12 @@ export async function prepareAdapterExchange(
             return await transportState.activeAdapter.fetchResponse(retryRequest, {
               abortSignal: upstream.signal,
               timeoutMs: connectMs,
-            sendBudget: adapterSendBudget,
+            sendBudget: adapterDispatchBudget,
               onPhysicalSend: send => noteAdapterPhysicalSend(retryEstimate, send),
+              onRecoveryWithheld: noteAdapterRecoveryWithheld,
               stream: parsed.stream,
               executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+                pacingSlotAcquired: true,
               dispatchOverride: oauthDispatch(retryRequest),
                 providerName: route.providerName,
                 modelId: route.modelId,
@@ -461,6 +487,7 @@ export async function prepareAdapterExchange(
                 if (refetchAllowance?.permit && !refetchAllowance.permit.use()) {
                   throw new SendBudgetExhaustedError(safeHostLabel(retryRequest.url));
                 }
+                transportState.noteRoutedAttemptSend(retryEstimate, recoveryKind ?? recovery);
                 // Same boundary on the helper path: the thunk is what reaches the wire, and it
                 // can be refused above before it does. use() past the first attempt is a no-op.
                 onDispatch?.();
@@ -499,15 +526,26 @@ export async function prepareAdapterExchange(
         if (options.abortSignal?.aborted) {
           return { failed: clientCancelledResponse() };
         }
+        // Same rule on the recovery leg: the ladder refused to send again, so the answer names
+        // this proxy rather than the provider it never reached.
+        if (err instanceof SendBudgetExhaustedError) {
+          return { failed: formatErrorResponse(429, SEND_BUDGET_EXHAUSTED_CODE, err.message) };
+        }
         const msg = describeUpstreamConnectFailure(err, connectMs);
         return { failed: formatErrorResponse(502, "upstream_error", msg) };
       }
     };
-    // Keep recovery kinds in sync with the native Responses `passthroughRecovery:` loop above.
-    recovery: for (;;) {
-      if (
-        upstreamResponse.status === 401
-        && isOAuth401ReplayProvider
+   // Keep recovery kinds in sync with the native Responses `passthroughRecovery:` loop above.
+   recovery: for (;;) {
+      // Preserve the terminal verdict through adapter and combo error formatting.
+      // This also covers a reset reached by a 401/429/413 recovery refetch.
+      if (isNonReplayableResponse(upstreamResponse)) {
+        cleanupUpstreamAbort();
+        return upstreamResponse;
+      }
+     if (
+       upstreamResponse.status === 401
+       && isOAuth401ReplayProvider
         && transportState.sentOAuthSnapshot
         && !oauth401ReplayAttempted
         && !sendBudgetExhausted()
@@ -548,7 +586,7 @@ export async function prepareAdapterExchange(
         route.provider = refreshedProvider;
         invalidateSameTargetRequest();
         transportState.activeAdapter = resolveSelectionAdapter(
-          resolveWireProtocolOverride(route.providerName, route.modelId, refreshedProvider, inboundWire),
+          resolveWireProtocolOverride(route.providerName, route.modelId, refreshedProvider, inboundWire, route.staticPolicy),
           config.cacheRetention,
         );
         bindRouteReasoningReplayScope({
@@ -581,7 +619,7 @@ export async function prepareAdapterExchange(
         route.provider = rotated;
         invalidateSameTargetRequest();
         transportState.activeAdapter = resolveSelectionAdapter(
-          resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+          resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
           config.cacheRetention,
         );
         bindRouteReasoningReplayScope({
@@ -590,10 +628,15 @@ export async function prepareAdapterExchange(
           provider: route.provider,
           adapterName: transportState.activeAdapter.name,
         });
-        const result = await rebuildAndRefetch("key-401");
-        if ("failed" in result) return result.failed;
-        upstreamResponse = result;
-      }
+       const result = await rebuildAndRefetch("key-401");
+       if ("failed" in result) return result.failed;
+       upstreamResponse = result;
+        // A recovery refetch can itself die on an ambiguous pre-header reset, and the refusal
+        // that answers it is a 429. Every arm below keys on 429, so letting it fall through
+        // hands the marked refusal to the next waiting arm and replays the send it exists to
+        // stop. Re-enter the loop guard instead, which returns it unchanged.
+        if (isNonReplayableResponse(upstreamResponse)) continue recovery;
+     }
 
       // Same-target 429 wait-and-retry (opt-in `retryOn429`, issue #487). Codex never retries
       // 429 itself (it retries 5xx only), and single-key pools cannot use the failover below,
@@ -630,20 +673,44 @@ export async function prepareAdapterExchange(
           upstream.abort();
           return clientCancelledResponse();
         }
-        const result = await rebuildAndRefetch("rate-limit-429");
-        if ("failed" in result) return result.failed;
-        upstreamResponse = result;
-      }
+       const result = await rebuildAndRefetch("rate-limit-429");
+       if ("failed" in result) return result.failed;
+       upstreamResponse = result;
+        // The refusal is a 429 too: without this the while condition is still true and the
+        // next configured attempt replays it on the same target.
+        if (isNonReplayableResponse(upstreamResponse)) continue recovery;
+     }
 
       // Multi-key 429 failover: rotate to the next pool key (cooldown-aware) and retry the
       // SAME request once per remaining key. OAuth/forward providers and single-key pools
       // return null immediately, so this stays a no-op for them (src/providers/key-failover.ts).
       while (upstreamResponse.status === 429 && hasKeyPoolFailover(route.provider)) {
+        // A quota exhaustion is dated in the BODY, not in `Retry-After` — OpenRouter
+        // sends no header for it (#4024). Read a bounded prefix before the socket is
+        // released below; a failed or slow read just leaves the header path in charge.
+        // Peeks a bounded prefix and hands back a Response still carrying the whole
+        // body, so the cancel below still releases the socket.
+        let peeked: Awaited<ReturnType<typeof readQuotaResetAt>>;
+        try {
+          peeked = await readQuotaResetAt(upstreamResponse, { signal: options.abortSignal });
+        } catch {
+          cleanupUpstreamAbort();
+          upstream.abort();
+          return clientCancelledResponse();
+        }
+        if (options.abortSignal?.aborted) {
+          cleanupUpstreamAbort();
+          upstream.abort();
+          return clientCancelledResponse();
+        }
+        upstreamResponse = peeked.response;
+        const quotaResetAt = peeked.at;
         const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
           retryAfter: upstreamResponse.headers.get("retry-after"),
           now: Date.now(),
           attemptedKey: route.provider.apiKey,
           promptCacheKey: parsed.options.promptCacheKey,
+          quotaResetAt,
         });
         if (!rotated) break;
         // Release the failed response's socket before retrying; unread bodies otherwise linger
@@ -652,7 +719,7 @@ export async function prepareAdapterExchange(
         route.provider = rotated;
         invalidateSameTargetRequest();
         transportState.activeAdapter = resolveSelectionAdapter(
-          resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+          resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
           config.cacheRetention,
         );
         bindRouteReasoningReplayScope({
@@ -661,10 +728,13 @@ export async function prepareAdapterExchange(
           provider: route.provider,
           adapterName: transportState.activeAdapter.name,
         });
-        const result = await rebuildAndRefetch("key-429");
-        if ("failed" in result) return result.failed;
-        upstreamResponse = result;
-      }
+       const result = await rebuildAndRefetch("key-429");
+       if ("failed" in result) return result.failed;
+       upstreamResponse = result;
+        // Rotating on the refusal would also write a cooldown against a key that rate-limited
+        // nothing, which outlives the request.
+        if (isNonReplayableResponse(upstreamResponse)) continue recovery;
+     }
 
       // Opt-in Anthropic OAuth account pool (#294): cool the failed account and retry
       // with another eligible OAuth account (bounded per request). Disabled by default.
@@ -692,15 +762,16 @@ export async function prepareAdapterExchange(
           invalidateSameTargetRequest();
           logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
           transportState.activeAdapter = resolveSelectionAdapter(
-            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
             config.cacheRetention,
           );
           sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, transportState.activeAdapter.name, logCtx.accountLogLabel);
           recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, transportState.activeAdapter.name);
-          const result = await rebuildAndRefetch("anthropic-oauth-429");
-          if ("failed" in result) return result.failed;
-          upstreamResponse = result;
-        } catch {
+         const result = await rebuildAndRefetch("anthropic-oauth-429");
+         if ("failed" in result) return result.failed;
+         upstreamResponse = result;
+          if (isNonReplayableResponse(upstreamResponse)) continue recovery;
+       } catch {
           break;
         }
       }
@@ -722,9 +793,23 @@ export async function prepareAdapterExchange(
         // rebuildAndRefetch, so the roster cap alone would let one request walk the roster on
         // an allowance the rest of the request cannot see. A refusal ends the ladder with the
         // real 429 already in hand, which is the decided exhaustion contract.
+        //
+        // Who settles this reservation depends on who dispatches the replay (#4709). An
+        // adapter that owns its ladder -- Kiro's reset loop, Cursor's transport loop --
+        // reserves once per physical send and would charge the same replay again; the helper
+        // path reports it again through `onSendsConsumed`. Both turned one physical send into
+        // two charges, and once the allowance was spent, into a synthetic error in place of
+        // the 429 this hop was recovering from. The wire protocol is resolved from the
+        // provider and model, not from the account, so an account rotation cannot move the
+        // replay between these two shapes.
+        const adapterOwnsDispatch = transportState.activeAdapter.fetchResponse !== undefined;
         const hop = reserveCredentialHop(
           "auth-recovery",
           `${route.providerName}|${route.modelId}|adapter-recovery-oauth-429`,
+          // Only a helper-routed replay reports this send back. A reset-only refetch reports
+          // nothing and an adapter ladder settles the booking itself, so promising an external
+          // report on either would leave a booking pending until it swallowed a later charge.
+          !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
         );
         if (!hop.allowed) break;
         const nextAccountId = rotateGenericOAuthAccountOn429(
@@ -732,6 +817,8 @@ export async function prepareAdapterExchange(
           route.providerName,
           transportState.genericFailoverAccountId,
           upstreamResponse.headers.get("retry-after"),
+          Date.now(),
+          route.modelId,
         );
         if (!nextAccountId) {
           hop.permit?.release();
@@ -750,23 +837,40 @@ export async function prepareAdapterExchange(
           }
           invalidateSameTargetRequest();
           transportState.activeAdapter = resolveSelectionAdapter(
-            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
             config.cacheRetention,
           );
           sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, transportState.activeAdapter.name, logCtx.accountLogLabel);
           recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, transportState.activeAdapter.name);
-          // Confirm at the dispatch boundary, not here: a rebuild can fail while shaping the
-          // request and return `{ failed }` without reaching the wire, and a permit confirmed
-          // before that would hold the charge for a send that never happened.
-          const result = await rebuildAndRefetch("oauth-account-429", () => { hop.permit?.use(); });
+          // The replay IS this hop's send, so hand the reservation down and let the layer that
+          // dispatches settle it: `adapterDispatchBudget` spends it on the adapter's first
+          // reservation, and the retry helper's reporter settles the external booking.
+          sendBudgetState.pendingHopPermit = hop.permit;
+          let result: Response | { failed: Response };
+          try {
+            // Confirm at the dispatch boundary, not here: a rebuild can fail while shaping the
+            // request and return `{ failed }` without reaching the wire, and a permit confirmed
+            // before that would hold the charge for a send that never happened. An
+            // adapter-owned ladder is the exception -- its own reservation is the confirmation,
+            // and settling here first would hand it a dead permit, which it reads as an
+            // exhausted request and stops sending on.
+            result = await rebuildAndRefetch("oauth-account-429", () => {
+              if (!adapterOwnsDispatch) hop.permit?.use();
+            });
+          } finally {
+            sendBudgetState.pendingHopPermit = undefined;
+          }
           if ("failed" in result) {
             // A no-op if the boundary was reached; a refund if the rebuild died before it.
             hop.permit?.release();
             return result.failed;
           }
-          upstreamResponse = result;
-        } catch {
-          // A throw before the send — snapshot fetch, credential application, adapter
+         upstreamResponse = result;
+          // The hop's permit is already settled by the dispatch boundary above; continuing
+          // only skips the remaining arms, it does not abandon a reservation.
+          if (isNonReplayableResponse(upstreamResponse)) continue recovery;
+       } catch {
+         // A throw before the send — snapshot fetch, credential application, adapter
           // resolution — must hand the reservation back. Without this the ladder charges the
           // request for a send it never made, and a later recovery in the same request is
           // refused on an allowance nothing spent. release() is idempotent and a no-op once

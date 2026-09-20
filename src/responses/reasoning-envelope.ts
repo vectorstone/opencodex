@@ -28,9 +28,12 @@ export interface ReasoningEnvelope {
    */
   txt?: string;
   /**
-   * Kiro `reasoningContentEvent.redactedContent`: a KMS-encrypted reasoning blob that is opaque to
-   * the proxy. Kiro's own CLI replays it on the matching `assistantResponseMessage` to preserve
-   * model reasoning across turns, so it round-trips here the same way a signature does.
+   * Kiro's reasoning blob from `reasoningContentEvent`: a KMS-encrypted value that is opaque to the
+   * proxy (the GPT-5.6 family sends it as `signature`, other models as the base64
+   * `redactedContent`, and the value carries a tag naming which one — see
+   * src/adapters/kiro/reasoning.ts). Kiro's own CLI replays it on the matching
+   * `assistantResponseMessage` to preserve model reasoning across turns, so it round-trips here the
+   * same way a signature does.
    */
   krc?: string;
 }
@@ -57,6 +60,36 @@ export function encodeReasoningEnvelope(envelope: ReasoningEnvelope, budget?: Tr
     }
   } finally {
     if (!budget) activeBudget.dispose();
+  }
+}
+
+/**
+ * Whether a thinking part's `signature` is an attestation some provider issued, rather than
+ * the serialized reasoning item the parser parks in the same field.
+ *
+ * `src/responses/parser.ts` stores `JSON.stringify(reasoningItem)` on an UNSIGNED thinking
+ * part so the opaque item survives a same-provider round trip. Every adapter that forwards a
+ * signature upstream is forwarding an opaque attestation, and a provider asked to verify our
+ * own parser state cannot recognize it. The predicate lives beside the envelope code that owns
+ * this field's representation rather than in one adapter, because a private second copy is how
+ * the side that writes the field and a side that reads it come to disagree about what it holds.
+ *
+ * This is a deny-list for exactly that one shape, not a guess at what an attestation looks
+ * like. `src/adapters/anthropic.ts` applies a stricter allow-list on top of it, because an
+ * Anthropic signature has a known base64 spelling; that shape is a fact about Anthropic's wire
+ * and is not assumed of any other provider's token here.
+ */
+export function isProviderIssuedThinkingSignature(
+  signature: string | undefined,
+): signature is string {
+  if (typeof signature !== "string" || signature.length === 0) return false;
+  if (!signature.startsWith("{")) return true;
+  try {
+    const parsed: unknown = JSON.parse(signature);
+    return !parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || (parsed as { type?: unknown }).type !== "reasoning";
+  } catch {
+    return true;
   }
 }
 

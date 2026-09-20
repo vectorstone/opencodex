@@ -79,6 +79,7 @@ managed map을 활성화하면 privacy-safe selector를 만들고, 이후 계정
 | `baseUrl` | `string` | 상위 API 기본 URL입니다. 대부분의 내장 고정 엔드포인트는 불일치를 무시합니다. 충돌 안전 키 프리셋은 같은 이름의 이전 사용자 지정 목적지를 보존합니다. |
 | `requestPacing?` | `{ enabled, requestsPerMinute?, minIntervalMs?, models? }` | 업스트림 사용량, 과금, rate-limit 지표와 별개인 선택적 클라이언트 측 아웃바운드 요청 시작 속도 조절입니다. Provider 제한은 모든 모델에 적용되고 `models` 항목은 정확한 업스트림 모델 ID와 일치하며 지연을 더 늘릴 때만 적용됩니다. 큐 대기는 응답 헤더 타임아웃을 소모하지 않습니다. HTTP, Responses WebSocket, 명시적 어댑터 `fetchResponse`/`runTurn` 전송을 포함합니다. |
 | `responsesPath?` | `string` | 키 인증 `openai-responses` 요청의 상대 리소스 경로입니다. 반드시 `/`로 시작해야 하며 스킴, query, fragment를 포함하면 안 됩니다. |
+| `chatCompletionsPath?` | `string` | `openai-chat` 요청의 상대 리소스 경로로, `responsesPath`와 동일한 형식 규칙이 적용되는 대응 항목입니다. 하나의 업스트림이 Chat Completions와 Responses를 서로 다른 접두사로 제공할 때 필요합니다. 모델별 wire override는 어댑터만 바꾸고 `baseUrl`은 그대로 두므로, 이 설정이 없으면 옵트인된 Chat 요청이 Responses base로 전송됩니다. Z.AI가 제공되는 예시입니다. |
 | `upstreamWebsocket?` | `boolean` | `openai-responses` 요청에 대한 업스트림 Responses WebSocket 전송을 선택적으로 활성화합니다(기본값 `false`). 업스트림이 이 프로토콜을 지원하면 스트리밍 POST가 설정된 Responses 경로(기본값 `/v1/responses`)로 HTTPS 기반 WSS를 사용하고, 일반 파이프라인을 위해 SSE로 다시 인코딩됩니다. forward 공급자는 `{baseUrl}/responses`를 사용하고, key-auth 공급자는 `responsesPath`를 사용하며 미설정 시 기존 `/v1/responses`로 대체됩니다. HTTP 기본 URL은 SSE를 유지하고, Responses가 아닌 경로와 `openai-chat` 요청은 HTTP를 사용합니다. |
 | `supportsServiceTier?` | `boolean` | `service_tier` 케이퍼빌리티 3상태입니다. `true`: fast 모드가 주입할 수 있고 호출자 값도 보존합니다. `false`: 필드를 제거하고 절대 주입하지 않습니다(미지원으로 문서화된 업스트림에는 볼 수 없습니다). 미설정: 미분류 — 호출자가 준 값은 그대로 보존하고 fast 모드는 주입하지 않습니다. 레지스트리는 정식 OpenAI(`true`), DeepSeek, Volcengine Ark(`false`)를 분류하며, 실제로 티어를 지원하는 커스텀 게이트웨이에만 명시적으로 설정하세요. |
 | `preserveResponsesReasoningContent?` | `boolean` | 리플레이되는 Responses reasoning 항목의 평문 reasoning 내용을 지우지 않고 유지합니다(지우는 것은 ChatGPT 백엔드 규칙입니다). DeepSeek처럼 reasoning 리플레이를 허용하는 업스트림에 켜세요. 프록시가 만든 `ocxr1` 봉투는 항상 제거됩니다. |
@@ -128,7 +129,7 @@ managed map을 활성화하면 privacy-safe selector를 만들고, 이후 계정
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` | 기본값이 꺼진 downstream SSE 복구입니다. 정확한 자리표시자 id, 누락된 종료 id, 그리고(`repairInvalidIds`) 정규 `msg_`/`rs_` 접두사가 없는 message/reasoning id를 복구합니다. function-call id는 다시 쓰지 않습니다. 내장 DeepSeek은 마지막 두 가지를 기본으로 켭니다. |
 | `responsesSnapshotRepair?` | `boolean` | 기본값이 꺼진 클라이언트용 복구입니다. SSE와 JSON의 Responses 수명 주기에서 누락된 status, output, 도구 메타데이터를 채우며 raw 검사와 영속화는 변경하지 않습니다. |
 | `retryOn429?` | `{ enabled?: boolean; attempts?: number; intervalMs?: number; maxIntervalMs?: number; respectRetryAfter?: boolean }` | API-key 프로바이더 전용(`authMode: "key"`). 동일 대상 429 재시도: `retryOn429`가 없으면 기능이 꺼져 있고, 객체가 있으면 `enabled: false`가 아닌 한 활성화됩니다. 429 시 대기(업스트림 `Retry-After` 또는 고정 간격) 후 키 장애 조치 전에 동일 키로 동일 요청을 재전송합니다 — 일반 텍스트 턴 복구 루프, Responses passthrough, 이미지/비디오 브리지, web-search 사이드카, 터미널 연속 요청을 모두 포함합니다. 재전송 대상은 프리스트림 HTTP 429 응답뿐이며, 커스텀 `runTurn` 전송은 HTTP 재시도 루프에서 제외됩니다. `attempts`는 첫 429 이후의 동일 키 재전송 횟수(총 전송 = `attempts` + 1)이며, 메인 복구 루프·터미널 가드 연속 요청·브리지 재시도가 공유하는 요청 단위 예산입니다. `attempts`를 모두 소진해도 동일 키 재전송만 중단되며, 이후에는 일반 키 장애 조치 또는 최종 오류 처리가 사용 가능한 대상에 따라 진행됩니다 — 키 인증 passthrough 와이어에는 장애 조치가 없으므로 소진된 429가 그대로 반환됩니다. Codex 자체는 429를 재시도하지 않으므로 단일 키 프로바이더의 유일한 방어선입니다. 기본값: `enabled: true`, `attempts: 3`, `intervalMs: 5000`, `maxIntervalMs: 60000`(단일 대기는 `maxIntervalMs`로 상한, 그 자체는 600000으로 상한), `respectRetryAfter: true`. |
-| `transientRetryOn5xx?` | `{ enabled?: boolean; attempts?: number }` | 키 인증 `openai-chat` 프로바이더 전용입니다. 스트림 시작 전의 일시적인 업스트림 상태(500, 502, 503, 504, 520, 521, 522)를 선택적으로 재시도합니다. 이 옵션이 없으면 꺼져 있고, 객체가 있으면 `enabled: false`가 아닌 한 활성화됩니다. 최초 Responses 요청, 터미널 가드 연속 요청, 네이티브 `/v1/chat/completions`, 429/계정 복구 재조회를 포함합니다. `attempts`는 최초 전송을 포함하여 요청 하나에 허용되는 업스트림 전송의 총횟수(1..10, 기본값 3)입니다. 연결 재설정 복구와 요청 단위 예산 하나를 공유하므로 `3`이면 실제로 프로바이더에 도달하는 요청은 최대 세 번입니다. 대기에는 400ms로 고정된 지수 백오프를 사용하고 상한은 5초이며 `Retry-After`를 따릅니다. 속도 제한을 처리하는 `retryOn429`와는 별개이며, 스트림 도중의 실패는 절대 재전송하지 않습니다. |
+| `transientRetryOn5xx?` | `{ enabled?: boolean; attempts?: number }` | 키 인증 `openai-chat` 및 `openai-responses` 프로바이더 전용입니다. `authMode: "forward"` 프로바이더(ChatGPT 계정 풀)는 이 옵션을 읽지 않고 기본 재시도 단계를 유지합니다. 스트림 시작 전의 일시적인 업스트림 상태(500, 502, 503, 504, 520, 521, 522)를 선택적으로 재시도합니다. 이 옵션이 없으면 꺼져 있고, 객체가 있으면 `enabled: false`가 아닌 한 활성화됩니다. 최초 Responses 요청, 터미널 가드 연속 요청, 네이티브 `/v1/chat/completions`, 429/계정 복구 재조회를 포함합니다. `attempts`는 최초 전송을 포함하여 요청 하나에 허용되는 업스트림 전송의 총횟수(1..10, 기본값 3)입니다. 연결 재설정 복구와 요청 단위 예산 하나를 공유하므로 `3`이면 실제로 프로바이더에 도달하는 요청은 최대 세 번입니다. 대기에는 400ms로 고정된 지수 백오프를 사용하고 상한은 5초이며 `Retry-After`를 따릅니다. 속도 제한을 처리하는 `retryOn429`와는 별개이며, 스트림 도중의 실패는 절대 재전송하지 않습니다. |
 | `autoToolChoiceOnlyModels?` | `string[]` | `tool_choice`가 `auto` 또는 `none`만 받는 모델입니다. 강제 선택은 낮은 수준으로 바뀝니다. |
 | `preserveReasoningContentModels?` | `string[]` | chat 기록에서 이전 assistant `reasoning_content`가 필요한 모델입니다. |
 | `reasoningDetailsModels?` | `string[]` | thinking을 구조화된 `reasoning_details` 배열로 반환하는 모델(`reasoning_split` 사용 MiniMax M 시리즈). 스트림 델타는 누적 스냅샷이라 prefix-diff로 처리하고, 보존된 reasoning은 `reasoning_content` 문자열 대신 `reasoning_details` 배열로 리플레이합니다. |
@@ -139,6 +140,7 @@ managed map을 활성화하면 privacy-safe selector를 만들고, 이후 계정
 | `escapeBuiltinToolNames?` | `boolean` | Anthropic 호환 게이트웨이를 위해 내장 도구 이름을 이스케이프하고, 반환된 호출에서는 다시 복원합니다. |
 | `anthropicEofTolerance?` | `boolean` | `message_stop` 전에 스트림이 끝나도 표시 텍스트 또는 완전한 JSON 객체 툴 입력을 받은 경우에만 완료를 허용합니다（Anthropic 호환 게이트웨이용）. 기본값은 꺼짐. |
 | `googleMode?` | `"ai-studio" \| "vertex" \| "cloud-code-assist"` | Google 전송/인증 모드입니다. 기본값은 `ai-studio`입니다. |
+| `googleToolSchemaPolicy?` | `"compatible" \| "reject-lossy"` | Google 전용입니다. 생략하거나 `compatible`이면 호환 스키마와 기존 비직접 400 복구를 유지합니다. `reject-lossy`는 초기 손실 또는 판정 불가능한 상한 비교를 전송 전에 거부하고 제약을 개방하는 Vertex 또는 Cloud Code Assist 복구를 보류합니다. 직접 AI Studio는 이 복구를 수행하지 않습니다. |
 | `project?` | `string` | Vertex 또는 Antigravity Cloud Code Assist 프로젝트 id입니다. |
 | `location?` | `string` | Vertex 위치입니다. 환경 변수 폴백은 `GOOGLE_CLOUD_LOCATION`입니다. |
 | `mcpServers?` | `Record<string, CursorMcpServerConfig>` | Cursor 전용입니다. stdio 또는 Streamable HTTP MCP 서버입니다. |
@@ -146,17 +148,19 @@ managed map을 활성화하면 privacy-safe selector를 만들고, 이후 계정
 | `unsafeAllowNativeLocalExec?` | `boolean` | Cursor 레거시 불리언입니다. 더 새로운 필드가 설정되지 않았을 때만 `nativeLocalExec: "on"`과 같습니다. |
 | `nativeLocalExec?` | `"off" \| "codex-sandbox" \| "on"` | Cursor 로컬 실행 정책입니다. 기본값은 `off`입니다. `codex-sandbox`는 현재 `off`처럼 실패를 닫습니다. |
 
+공급자 등록·교체(`POST /api/providers`)는 `responsesPath`와 `chatCompletionsPath`를 검증한 뒤 메모리와 파일의 설정을 변경합니다. `PATCH /api/providers?name=<provider>`는 요청 본문을 저장된 공급자에 병합합니다. `disabled` 외의 필드를 변경하는 업데이트(`requestPacing`만 변경하는 업데이트 제외)는 저장 전에 병합된 공급자의 경로를 같은 방식으로 검증하며, 유지된 경로가 유효하지 않으면 `400`을 반환하고 설정을 변경하지 않습니다. 설정 파일을 읽을 때도 같은 경로 규칙을 적용합니다.
+
 API 키 공급자는 리터럴 키나 환경 참조를 둘 수 있습니다. OAuth 공급자는 `ocx login`으로 채워지는 자격 증명 저장소를 사용합니다. 구독 기반 Claude Code 실행 동작은 [`claudeCode.authMode`](/reference/configuration/server/#claude-code)에서 설정합니다.
 
 ## 공급자 진단용 외부 요청 안전성
 
 대시보드 연결 테스트와 라이브 모델 발견은 범위가 제한된 GET 전용 전송을 사용합니다. 아웃바운드 프록시가 없으면 opencodex는 호스트 이름을 한 번만 확인하고, 검증된 주소로만 연결합니다. HTTPS는 원래 Host, SNI, 인증서 검증을 유지하며, 공급자 설정으로 인증서 검사를 끌 수는 없습니다.
 
-`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`가 적용되면 이 작업들은 Bun의 네이티브 fetch를 그대로 사용합니다. URL과 리터럴 주소 검사는 계속 실행되지만, 최종 경로, DNS 응답, 피어는 프록시가 고르므로 opencodex는 그 피어를 고정하거나 검증할 수 없습니다. 이는 명시적인 보안 한계입니다.
+이 작업들은 [서버에 설정된 아웃바운드 fetch](/ko/reference/configuration/server/)를 사용합니다. `config.proxy`로 설정했거나 SOCKS5 `ALL_PROXY`에서 상속된 서버 SOCKS5 프록시는 대상이 `NO_PROXY`에 걸리지 않을 때 OpenCodex의 내장 터널을 사용합니다. `HTTP_PROXY`와 `HTTPS_PROXY`는 Bun의 네이티브 HTTP(S) 처리를 그대로 사용하지만, SOCKS가 아닌 `ALL_PROXY`는 네이티브 HTTP fetch 경로가 아닙니다. URL과 리터럴 주소 검사는 계속 실행되지만, 선택된 프록시가 최종 경로, DNS 응답, 피어를 고르므로 opencodex는 그 피어를 고정하거나 검증할 수 없습니다. 이는 명시적인 보안 한계입니다.
 
 사설/로컬 목적지는 `allowPrivateNetwork: true`가 필요하며, 아웃바운드 프록시가 활성화된 경우에는 일치하는 `NO_PROXY` 항목도 필요합니다. loopback은 자동으로 추가됩니다. CIDR 항목은 해석하지 않으므로 각 LAN 호스트는 따로 적어야 합니다. matcher는 정확한 호스트, 도메인 접미사, 선택적 포트, 괄호로 감싼 IPv6, `*`를 지원합니다. 예를 들면 `192.168.1.50`은 따로 적어야 합니다. 메타데이터와 link-local 목적지는 계속 차단됩니다. 진단 요청은 리디렉션을 거부하고, 자격 증명이 제거된 대상만 보고합니다. 일반적인 공급자 요청의 리디렉션 검토는 이 진단 가드와 별도로 유지됩니다.
 
-Clash / Surge / Mihomo 사용자를 위한 fake-IP DNS 예외는 두 가지이며, 둘 다 DNS *응답*에만 적용됩니다. URL에 적힌 리터럴 주소는 그대로 거부됩니다. IANA 벤치마크 대역 `198.18.0.0/15`(IPv4-mapped IPv6 표기 포함)은 해당 호스트에 아웃바운드 프록시가 적용될 때 허용됩니다. Mihomo 기본 IPv6 fake-IP 대역 `fdfe:dcba:9876::/48`은 더 엄격한 조건에서만 허용됩니다. URL 스킴에 맞는 프록시 변수(`https:`는 `HTTPS_PROXY`, `http:`는 `HTTP_PROXY`, `ALL_PROXY`는 해당 없음)가 설정되어 있어야 하고, 호스트가 `NO_PROXY`에 걸리지 않아야 하며, 그 경우 요청은 해당 프록시에 명시적으로 묶여 나갑니다. 그 밖의 ULA, 인접 프리픽스, 실제 사설 응답과 섞인 fake-IP 응답은 여전히 `allowPrivateNetwork: true`가 필요합니다. 프로바이더 저장 시점 검증에는 IPv6 예외가 적용되지 않습니다.
+Clash / Surge / Mihomo 사용자를 위한 fake-IP DNS 예외는 두 가지이며, 둘 다 DNS *응답*에만 적용됩니다. URL에 적힌 리터럴 주소는 그대로 거부됩니다. IANA 벤치마크 대역 `198.18.0.0/15`(IPv4-mapped IPv6 표기 포함)은 해당 호스트에 아웃바운드 프록시가 적용될 때 허용됩니다. Mihomo 기본 IPv6 fake-IP 대역 `fdfe:dcba:9876::/48`은 더 엄격한 조건에서만 허용됩니다. URL 스킴에 맞는 프록시 변수(`https:`는 `HTTPS_PROXY`, `http:`는 `HTTP_PROXY`) 또는 SOCKS5 `ALL_PROXY`가 설정되어 있어야 하고(SOCKS가 아닌 `ALL_PROXY`는 해당 없음), 호스트가 `NO_PROXY`에 걸리지 않아야 하며, 그 경우 요청은 해당 프록시에 명시적으로 묶여 나갑니다. 그 밖의 ULA, 인접 프리픽스, 실제 사설 응답과 섞인 fake-IP 응답은 여전히 `allowPrivateNetwork: true`가 필요합니다. 프로바이더 저장 시점 검증에는 IPv6 예외가 적용되지 않습니다.
 
 ## Codex 계정 풀
 

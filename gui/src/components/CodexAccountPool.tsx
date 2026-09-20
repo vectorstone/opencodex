@@ -5,6 +5,7 @@ import { EmptyState, type NoticeTone } from "../ui";
 import AddCodexAccountModal from "./AddCodexAccountModal";
 import { useCodexAccountPool, type CodexAccountPoolController } from "../hooks/useCodexAccountPool";
 import { useMainDeviceReauth } from "./use-main-device-reauth";
+import NativeMainProfiles from "./NativeMainProfiles";
 import type { ReactNode } from "react";
 import type { CodexAccountModeState } from "../codex-multi-state";
 import CodexAutoSwitchSetting from "./CodexAutoSwitchSetting";
@@ -503,6 +504,12 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
             mainReauth={mainReauth}
           />
 
+          <NativeMainProfiles
+            apiBase={apiBase}
+            disabled={mainReauthActive}
+            onChanged={() => load(false)}
+          />
+
           <div className="section-sep">
             <span className="section-label">{t("codexAuth.accountPool")}</span>
             <div className="sep-line" />
@@ -546,6 +553,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
         subscribeLoadObserver={controller.subscribeLoadObserver}
         readLastActive={controller.readLastActive}
         onStrategyResolved={setPoolStrategy}
+        threshold={autoSwitch.threshold}
       />
 
       <CodexAuthAdvancedSettings
@@ -599,6 +607,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
           accountModeState={accountModeState}
           switchingId={switchingId}
           orderBusy={priorityUpdatingId !== null}
+          threshold={poolStrategy && poolStrategy !== "round-robin" ? autoSwitchThreshold : undefined}
           onCancel={() => setConfirm(null)}
           onConfirm={() => { void setActive(confirm.id === "__main__" ? "__main__" : confirm.id); }}
         />

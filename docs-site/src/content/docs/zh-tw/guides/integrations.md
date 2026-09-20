@@ -13,7 +13,7 @@ description: 從儀表板把 opencodex 連接到 OpenCode、Pi、OMP、Hermes、
 | Hermes | `~/.hermes/config.yaml` | YAML | 新 sessions | `OPENCODEX_HERMES_API_KEY` |
 | OpenClaw | `~/.openclaw/openclaw.json` | JSON5 | 立即，在執行中的 gateway 上 | `OPENCODEX_OPENCLAW_API_KEY` |
 | Kimi Code | `~/.kimi-code/config.toml` | TOML | 重新啟動時，或 `/reload` | loopback 佔位符 |
-| gjc | `~/.gjc/agent/models.yml` | YAML | 新 sessions，或當你開啟 `/model` 時 | `OPENCODEX_GAJAE_API_KEY` |
+| gjc | `~/.gjc/agent/models.yml` | YAML | 新 sessions，或當你開啟 `/model` 時 | non-secret loopback placeholder |
 | DeepSeek Harness (DSH) | `$DSH_HOME/settings.yaml`（預設 `~/.dsh/settings.yaml`） | YAML | 熱重載 | 非秘密的 loopback bearer 佔位符 |
 | MiniMax Code | `~/.minimax/config.yaml` | YAML | 新 sessions，或開啟模型選擇器後 | loopback 佔位符 |
 | Prime Agent | `~/.prime/agent/models.json` | JSON | 新 sessions | loopback 佔位符 |
@@ -83,6 +83,21 @@ opencodex 從自己的環境讀取這些變數。如果你的 gateway 以 profil
 - 每個客戶端保留十份備份。超過之後，最舊的快照檔案會被移除，其歷史列顯示為 **Backup expired**。
 
 停用只移除 opencodex 記錄為自己寫入的條目。如果你的檔案在我們寫入之後有變更，後續行為取決於我們自己的條目是否完好，以及檔案的格式。對於嚴格 JSON 設定檔（OpenCode、Pi），在我們的區塊**旁邊**進行的編輯——例如新增 MCP 伺服器或你自己的 provider——會顯示為**需要更新**：重新整理會在保留你的條目的前提下合併寫入，但格式可能會被正規化。例外情況是 JSON 無法精確重寫的內容——例如 `1e999` 這類非有限數字、重寫會被四捨五入的數字（極大的整數，或小到會塌縮成零的數字）、`-0`、同一個物件裡重複出現的鍵，或巢狀層數超過 1000 層——此時開關會鎖定，確保沒有任何值被悄悄改動或刪除。**OMP、DSH 與 Hermes** 同樣不受旁邊編輯影響，但原因不同：它們的 writer 只逐位元組修補自己的 `providers.opencodex` 範圍，檔案其餘部分從不會被重寫。至於其餘可以包含註解的格式（OpenClaw、Kimi Code、gjc、MiniMax Code、Raycast——以整份文件寫出的 YAML、JSON5 與 TOML），或當我們自己的條目被編輯過時，開關會鎖定，停用會拒絕執行，而不是猜測哪些編輯是你的。
+
+## 預覽並確認變更
+
+套用、取代、停用與回復現在都會先顯示預覽。對話框會明確列出哪些受管理的設定將會變更，
+包括範圍有限的變更路徑，以及每項變更是新增、更新或移除值。請先檢視計畫，再進行確認。
+
+當計畫顯示沒有變更時，表示受管理的用戶端文件已處於要求的狀態。對選取的 Aside 設定檔，
+即使受管理的文件沒有變更，確認後仍可能儲存該設定檔的同步偏好。
+
+如果檔案在你檢視後又有變更，寫入會因計畫過期而被拒絕。對話框會用更新後的計畫取代舊
+計畫，並要求你再次明確確認；它絕不會自動重試寫入。如果預覽暫時無法使用，請正常重新
+載入頁面，再重新開始該操作。
+
+Aside 會對一次選取的單一設定檔使用相同的預覽與確認流程。**同步所有設定檔**仍是獨立的
+批次操作，不會綁定到單一合併預覽。
 
 ## 誠實的預期
 

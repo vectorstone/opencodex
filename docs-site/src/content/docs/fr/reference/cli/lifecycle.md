@@ -13,13 +13,21 @@ Assistant de configuration interactif (`setup` est un alias de `init`). Il deman
 
 ## Cycle de vie du proxy
 
-### `ocx start [--port <port>]`
+### `ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]`
 
-Démarre le serveur proxy, de préférence sur le port `10100`. Si ce port est occupé, opencodex en choisit un autre qui est disponible et l’enregistre. La commande écrit l’état du PID et du port d’exécution, et refuse de démarrer une deuxième instance active. Au démarrage, elle synchronise dans le catalogue Codex les modèles de chaque fournisseur. À l’arrêt, elle rétablit le fonctionnement natif de Codex, sauf si le proxy a été lancé comme service géré (`OCX_SERVICE=1`).
+Démarre le serveur proxy, de préférence sur le port `10100`. La commande écrit l’état du PID et du port d’exécution, et refuse de démarrer une deuxième instance active. Lorsque le port préféré est occupé, `start` interroge le processus qui l’occupe puis s’arrête dans tous les cas : elle refuse de démarrer si un processus opencodex y répond et signale sinon que le processus est inconnu. Elle ne déplace jamais l’écouteur vers un autre port d’elle-même, car cela laisserait le premier proxy en cours d’exécution et redirigerait Codex vers le second. Un autre `--port` explicite est également refusé avec le même `OPENCODEX_HOME`, car les modes d’observation et de plafond écrivent tous deux dans le même journal de dépenses. Utilisez un `OPENCODEX_HOME` distinct pour une instance sœur indépendante ; `port: 0` ne sépare que l’attribution du port, pas l’état. Au démarrage, elle synchronise dans le catalogue Codex les modèles de chaque fournisseur. À l’arrêt, elle rétablit le fonctionnement natif de Codex, sauf si le proxy a été lancé comme service géré (`OCX_SERVICE=1`).
+
+`--socks5` (par défaut `127.0.0.1:10808`) enregistre l’URL SOCKS5 dans `config.proxy` et achemine
+les requêtes HTTP(S) sortantes dans un véritable tunnel SOCKS5. `--socks5-off` supprime uniquement
+le proxy SOCKS5 enregistré et ne supprime pas un proxy HTTP. La valeur reste après `ocx update`,
+car elle est stockée dans la configuration. L’URL peut contenir un nom d’utilisateur et un mot de
+passe, mais les journaux de démarrage les masquent.
 
 ```bash
 ocx start
 ocx start --port 8080
+ocx start --port 10100 --socks5
+ocx start --socks5-off
 ```
 
 ### `ocx stop`
@@ -170,6 +178,8 @@ redirections, les réponses trop volumineuses et les catalogues invalides sont r
 écriture locale. L'authentification est facultative et lue uniquement par référence à une variable
 d'environnement (`--auth-env`), jamais depuis argv.
 
+Les requêtes HTTP en loopback sont refusées avant l’ajout des en-têtes d’authentification ou tout envoi si `HTTP_PROXY` ou `http_proxy` s’applique sans exception correspondante dans `NO_PROXY` ou `no_proxy`. `ALL_PROXY`/`all_proxy` et les paramètres limités à `HTTPS_PROXY`/`https_proxy` ne déclenchent pas cette restriction HTTP ; l’acquisition de catalogues en HTTPS reste autorisée. Le message de refus ne contient ni l’adresse du proxy ni le jeton d’authentification. Les valeurs non vides de `http_proxy` et `no_proxy` ont priorité sur `HTTP_PROXY` et `NO_PROXY`, respectivement. Pour des exceptions compatibles avec Bun, utilisez des noms d’hôte, des entrées `host:port` correspondantes, des adresses IPv6 entre crochets comme `[::1]`, ou `*`, sans URL, chemin ni préfixe `*.`.
+
 Le catalogue et le cache sont écrits sous le verrou de catalogue Codex partagé ; un échec préserve
 les derniers fichiers valides connus. Des octets identiques constituent une non-opération qui
 préserve les mtimes. `--restart-codex`, `--restart-app-server-only` et l'alias déprécié
@@ -192,10 +202,10 @@ Une confirmation UAC peut être nécessaire. Une priorité déjà normale ou hau
 
 | Sous-commande | Action |
 | --- | --- |
-| aucune | Installe et démarre le service s’il est absent ; sinon, actualise et redémarre le service existant. Une définition Task Scheduler Windows saine est réutilisée ; une définition obsolète peut être réenregistrée et nécessiter une élévation. |
+| aucune | Installe et démarre le service s’il est absent ; sinon, applique `repair` au service existant. Une définition Task Scheduler Windows saine est réutilisée ; une définition obsolète peut être réenregistrée et nécessiter une élévation. |
 | `install` | Crée et démarre le service. L’enregistrement exige une élévation sous Windows. |
-| `repair` | Actualise sur place un service installé et le redémarre. Une définition Task Scheduler Windows saine est réutilisée ; une définition obsolète peut être réenregistrée et nécessiter une élévation. |
-| `restart` | Alias de `repair`. |
+| `repair` | Actualise sur place un service installé. Sous macOS, le gestionnaire n’est rechargé que lorsque quelque chose a changé : une tâche saine et inchangée continue donc de s’exécuter et la réparation n’est pas une interruption. Sous Linux et Windows, le service est redémarré ; une définition Task Scheduler Windows saine est réutilisée, tandis qu’une définition obsolète peut être réenregistrée et nécessiter une élévation. |
+| `restart` | La même actualisation, avec un redémarrage garanti sur toutes les plateformes. Sous macOS, une tâche inchangée déjà chargée est relancée (kickstart) sur place. N’est pas un alias de `repair`. |
 | `start` | Démarre un service installé. |
 | `stop` | Arrête le service et rétablit le fonctionnement natif de Codex. |
 | `status` | Affiche les diagnostics du service et du proxy, ainsi que les chemins des journaux. |

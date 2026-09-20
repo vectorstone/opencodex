@@ -33,6 +33,7 @@ import {
   readCodexCatalogPath,
   readCodexCatalogPathForHome,
   readNativeBaseline,
+  nativeMultiAgentDefaults,
 } from "./parsing";
 import type { CatalogModel, MultiAgentMode, RawCatalog, RawEntry } from "./parsing";
 import {
@@ -50,17 +51,20 @@ import { trustedAccountBoundNativeCatalogSlug } from "./account-models";
 import { bundledCatalogCacheState, loadBundledCodexCatalog } from "./bundled";
 import { isMultiAgentV2Enabled } from "../features";
 import { clampCatalogModelsToCodexSupport } from "./effort";
+import { suppressedSyntheticMaxCatalogSlugs } from "./model-hints";
 import { filterCatalogVisibleModels, gatherRoutedModels, type CatalogGatherProviderModelOutcome } from "./provider-fetch";
-import { exactComboCatalogSlugs, type ComboCatalogOmission } from "./aggregation";
+import { dedupeCatalogEntriesBySlug, enforceCatalogSlugUniqueness, exactComboCatalogSlugs, type ComboCatalogOmission } from "./aggregation";
 import {
   withCatalogWriteSerialization,
   type CatalogWritePermit,
 } from "../catalog-write-serialization";
 import {
+  preparedBytesDifferFromDisk,
   publishHashedCodexCatalogBackup,
   publishLegacyCodexCatalogBackup,
   replaceActiveCodexCatalog,
   replaceCodexModelsCache,
+  type PreparedCatalogFileWrite,
 } from "../internal/catalog-writer";
 import { visibleCodexAccountSelectors } from "./account-models";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS, NATIVE_OPENAI_MODELS, NATIVE_RESERVE_MODEL } from "./native-models";
@@ -75,6 +79,7 @@ import {
 import { finishUpstreamNativeEntry } from "./derive-entry";
 import { finalizeAutoReviewModelOverride } from "./auto-review";
 import { gatedNativeAccountLabel, gatedNativeReauthSuppressionReason, warnGatedNativeSuppressedOnce } from "./gated-native-warn";
+import { reserveCatalogSuppressionReason, warnReserveSuppressedOnce } from "./reserve-warn";
 
 interface RetainedCatalogSyncRead {
   readonly catalogPath: string;
@@ -231,24 +236,6 @@ function revalidateRetainedCatalogSync(
   };
 }
 
-/**
- * Exact bytes currently on disk at `path`, or null when unreadable/absent.
- *
- * Deliberately a Buffer rather than a decoded string: `readFileSync(path, "utf8")`
- * substitutes U+FFFD for every invalid byte, so a file holding a raw 0x80 decodes
- * equal to prepared content holding a legitimately encoded U+FFFD. Comparing the
- * decoded strings would then classify a malformed catalog as identical, skip the
- * atomic repair write, and leave the corruption on disk while reporting
- * `catalogWritten: false`.
- */
-function currentCatalogFileContent(path: string): Buffer | null {
-  try {
-    return readFileSync(path);
-  } catch {
-    return null;
-  }
-}
-
 function pristineCatalogBytes(read: RetainedCatalogSyncRead): string | null {
   if (read.onDiskCatalog && !catalogHasRoutedEntries(read.onDiskCatalog)) {
     try {
@@ -320,6 +307,11 @@ function writeRetainedCatalogSync({
   const enabledGo = filterCatalogVisibleModels(goModels, config);
   const featured = config.subagentModels ?? [];
   const orderedGoModels = orderForSubagents(enabledGo, featured); // stable tie-break among equal priorities
+  const suppressedSyntheticMaxSlugs = suppressedSyntheticMaxCatalogSlugs(
+    config,
+    orderedGoModels,
+    catalogModelsForMerge,
+  );
   const modelPickerOrder = config.modelPickerOrder ?? [];
   const multiAgentMode: MultiAgentMode = config.multiAgentMode === "v1" || config.multiAgentMode === "v2" ? config.multiAgentMode : "default";
   const exactComboSlugs = exactComboCatalogSlugs(config);
@@ -376,6 +368,14 @@ function writeRetainedCatalogSync({
   const accountTargets = new Map(codexAccountNamespaceEntries(config));
   const reserveMainSelectors = accountSelectors.filter(selector =>
     isMainCodexAccountTarget(accountTargets.get(selector) ?? ""));
+  // #4811: an omitted Reserve row carries no reason, so the explanation has to be emitted here,
+  // where the selector inputs that produced the omission are still in scope. Silent for every
+  // install that did not opt into authless Codex Desktop routing.
+  const reserveSuppression = reserveCatalogSuppressionReason(config, {
+    includeAccountBoundNativeOpenAi,
+    mainSelectors: reserveMainSelectors,
+  });
+  if (reserveSuppression) warnReserveSuppressedOnce(reserveSuppression);
   // The active file can own a bare source even when the bundled catalog is the build base.
   // A previously clamped qualified projection must not shorten a retained genuine ladder.
   const reserveObservations = [
@@ -443,6 +443,7 @@ function writeRetainedCatalogSync({
   // like `gpt-5.5`; those must not delete the native OpenAI/Codex base row.
   const baselineCatalog = readCatalogBackup(catalogPath);
   const baseline = readNativeBaseline(catalogPath);
+  const nativePinBaseline = nativeMultiAgentDefaults(baselineCatalog?.models);
   const gatheredProviderNames = new Set(
     Object.entries(config.providers ?? {})
       .filter(([, prov]) => prov.disabled !== true)
@@ -512,8 +513,10 @@ function writeRetainedCatalogSync({
     includeNativeOpenAi,
     accountBoundEntries,
     suppressedBareNativeSlugs,
+    suppressedSyntheticMaxSlugs,
     openaiContextCap,
     nativeDisplayNames: config.providers[OPENAI_CODEX_PROVIDER_ID]?.modelDisplayNames,
+    nativeMultiAgentDefaults: nativePinBaseline,
     policy: {
       ...CANONICAL_NATIVE_CATALOG_CONTENT_POLICY,
       nativeBackfillSlugs: [...availableBareNativeSlugs, ...observedNativeSlugs],
@@ -522,6 +525,9 @@ function writeRetainedCatalogSync({
   });
   clampCatalogModelsToCodexSupport(catalog.models);
   finalizeAutoReviewModelOverride(catalog.models, catalogModelsForMerge, config);
+  // Last mutation before serialization; see `enforceCatalogSlugUniqueness` for why the ordering
+  // against the effort clamp is load-bearing rather than cosmetic.
+  catalog.models = enforceCatalogSlugUniqueness(catalog.models, true);
 
   const added = goEntries.length + accountBoundEntries.length;
   const content = `${JSON.stringify(catalog, null, 2)}\n`;
@@ -536,15 +542,12 @@ function writeRetainedCatalogSync({
   // nothing about the catalog changed. Skipping the no-op write keeps both the mtime
   // and `catalogWritten` honest; `added` still reports the routed rows the catalog
   // carries, because they are on disk either way.
-  const onDiskBytes = currentCatalogFileContent(catalogPath);
-  if (onDiskBytes !== null && onDiskBytes.equals(Buffer.from(content, "utf8"))) {
+  const preparedCatalog: PreparedCatalogFileWrite = { path: catalogPath, content };
+  if (!preparedBytesDifferFromDisk(preparedCatalog)) {
     return { added, path: catalogPath, catalogWritten: false, comboOmissions };
   }
 
-  replaceActiveCodexCatalog(permit, owningCodexHome, {
-    path: catalogPath,
-    content,
-  });
+  replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
   return {
     added,
     path: catalogPath,
@@ -552,6 +555,11 @@ function writeRetainedCatalogSync({
     comboOmissions,
   };
 }
+
+// Re-exported so the #4730 unit regression keeps importing the guard from the sync module it
+// guards; the implementation lives in ./aggregation because the management convergence commit
+// is the second writer that has to apply the identical rule.
+export { dedupeCatalogEntriesBySlug };
 
 export async function syncCatalogModels(
   config: OcxConfig,
@@ -686,10 +694,25 @@ export function invalidateCodexModelsCacheWithPermit(
       client_version: "0.0.0",
       models: [...models, ...observedAccountModels],
     };
-    replaceCodexModelsCache(permit, owningCodexHome, {
+    const preparedCache: PreparedCatalogFileWrite = {
       path: cachePath,
       content: `${JSON.stringify(wrapper, null, 2)}\n`,
-    });
+    };
+    // The same no-op rule the active catalog already applies (#1459), for the same
+    // reason and at the second writer that has to obey it.
+    //
+    // This function is what `refreshCodexModelCatalog` reports as `cacheSynced`, and
+    // `handleStart` ORs that into the stale-app-server warning. Rewriting identical
+    // bytes bumped this file's mtime and returned `true`, so on a start where the
+    // catalog reproduced byte-identically — the settled case — the warning still
+    // claimed "Disk catalog/cache were updated" and told the operator their Codex
+    // model list might be stale, when nothing on disk had changed and Codex held the
+    // same model set the file already described. Returning `false` here makes
+    // `cacheSynced` mean what its name and its consumers already assume, and what
+    // `pullRemoteCatalog` and the early returns in `refreshCodexModelCatalog`
+    // already assert: a write happened.
+    if (!preparedBytesDifferFromDisk(preparedCache)) return false;
+    replaceCodexModelsCache(permit, owningCodexHome, preparedCache);
     return true;
   } catch {
     return false;

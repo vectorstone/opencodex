@@ -17,6 +17,7 @@ import {
   resetUpstreamHostHealth,
 } from "../../codex/upstream-host-health";
 import { safeOriginLabel, fetchWithHeaderTimeout, providerFetch } from "./fetch-helpers";
+import { classifyPoolRecoveryDispatch } from "../../routing/probe-lease";
 import { formatErrorResponse } from "../../bridge";
 import { readBoundedResponseBody } from "../../lib/bounded-body";
 import { upstreamErrorMessageFromPayload, isRateLimitOrQuotaFailureMessage } from "../../lib/errors";
@@ -31,6 +32,7 @@ import {
   resolveCodexModelEntitlements,
   invalidateCodexModelEntitlementsForAccount,
   entitledCodexAccountIdsForModel,
+  recordCodexModelDenialEvidence,
 } from "../../codex/model-entitlements";
 import type { TransientSendBudget } from "../../lib/upstream-retry";
 import { resolveAdapter, resolveWireProtocolOverride } from "../adapter-resolve";
@@ -40,6 +42,7 @@ import { MAIN_CODEX_ACCOUNT_ID } from "../../codex/main-account";
 import { slugsEquivalent } from "../../providers/slug-codec";
 import {
   codexProbeLeaseId,
+  codexTransientProbeGrant,
   codexProbeQuotaScope,
   releaseCodexAuthContextProbeLease,
   resolveCodexAuthContext,
@@ -60,13 +63,14 @@ import { bindRouteReasoningReplayScope } from "./core-replay";
 import {
   conversationStateBindingFromAuth,
   applyAccountChangeConversationStateScrub,
+  conversationCarriesUploadedFiles,
 } from "./account-change-state";
 import {
   recordAdapterReasoning,
   recordAdapterTier,
   sealRequestAttemptIdentity,
   recordAttemptCredentialSource,
-  noteAttemptSend,
+  noteProviderAttemptSend,
 } from "../request-log";
 import { codexAuthContextLogLabel } from "../../codex/account-label";
 import { chargeWorkflowSends } from "../../lib/workflow-budget";
@@ -158,23 +162,80 @@ export function normalizeCodexUnsupportedModelDetail(value: string): string {
 }
 
 
+/**
+ * The model id an authenticated Codex refusal names, or `undefined` when the body is not that
+ * refusal.
+ *
+ * Extracted rather than string-compared so the caller can learn WHICH model was refused. The
+ * route and the wire can legitimately disagree: `applyCodexAccountGatedWireNormalization`
+ * rewrites `gpt-daybreak-blue-latest` to `gpt-5.6-sol` before dispatch, so upstream names the
+ * model it was actually sent. Building the expected sentence from `route.modelId` alone made
+ * that comparison fail for the one model that is still account-gated, which silently disabled
+ * both the alternate-account retry and the same-account ladder built for exactly that case.
+ *
+ * The envelope is unchanged and stays exact: a top-level `detail` string, whitespace-collapsed
+ * and case-folded, matching the whole sentence with nothing before or after it. No prose is
+ * inferred and no other 400 shape is admitted, because a 400 is also what a malformed request
+ * earns and that must never read as an entitlement fact.
+ */
+export function codexUnsupportedModelFromDetail(
+  status: number,
+  bodyText: string,
+): string | undefined {
+  if (status !== 400) return undefined;
+  try {
+    const payload = JSON.parse(bodyText) as unknown;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+    const detail = (payload as { detail?: unknown }).detail;
+    if (typeof detail !== "string") return undefined;
+    const matched = /^the '([^']{1,256})' model is not supported when using codex with a chatgpt account\.$/u
+      .exec(normalizeCodexUnsupportedModelDetail(detail));
+    return matched?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+
+/**
+ * The refused model id when this response is the exact unsupported-model refusal for this
+ * request, read from a bounded clone.
+ *
+ * Same admission rules {@link shouldRetryCodexPoolAccountModel400} always applied, which is now
+ * a predicate over this: a truncated or non-display-safe body proves nothing and is refused.
+ * Returning the id lets the caller record the denial against the model upstream actually named.
+ */
+export async function codexPoolAccountModel400Denial(
+  response: Response,
+  modelId: string,
+  signal?: AbortSignal,
+  wireModelId?: string,
+): Promise<string | undefined> {
+  if (response.status !== 400) return undefined;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    if (!body.displaySafe || body.truncated) return undefined;
+    return isAllowListedCodexAccountModel400(response.status, body.text, modelId, wireModelId)
+      ? codexUnsupportedModelFromDetail(response.status, body.text)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+
 export function isAllowListedCodexAccountModel400(
   status: number,
   bodyText: string,
   modelId: string,
+  wireModelId?: string,
 ): boolean {
-  if (status !== 400) return false;
-  try {
-    const payload = JSON.parse(bodyText) as unknown;
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-    const detail = (payload as { detail?: unknown }).detail;
-    if (typeof detail !== "string") return false;
-    const expected = `The '${modelId}' model is not supported when using Codex with a ChatGPT account.`;
-    return normalizeCodexUnsupportedModelDetail(detail)
-      === normalizeCodexUnsupportedModelDetail(expected);
-  } catch {
-    return false;
-  }
+  const refused = codexUnsupportedModelFromDetail(status, bodyText);
+  if (refused === undefined) return false;
+  return [modelId, wireModelId].some(candidate => (
+    candidate !== undefined
+    && refused === normalizeCodexUnsupportedModelDetail(candidate)
+  ));
 }
 
 
@@ -182,16 +243,9 @@ export async function shouldRetryCodexPoolAccountModel400(
   response: Response,
   modelId: string,
   signal?: AbortSignal,
+  wireModelId?: string,
 ): Promise<boolean> {
-  if (response.status !== 400) return false;
-  try {
-    const body = await readBoundedResponseBody(response.clone(), { signal });
-    return body.displaySafe
-      && !body.truncated
-      && isAllowListedCodexAccountModel400(response.status, body.text, modelId);
-  } catch {
-    return false;
-  }
+  return await codexPoolAccountModel400Denial(response, modelId, signal, wireModelId) !== undefined;
 }
 
 
@@ -221,7 +275,17 @@ export async function shouldRetryCodexPoolAccountQuota(
   // A post-send WebSocket gateway status must not become a second account's send; the
   // body carries no quota evidence either, but the marker is the contract, not the prose.
   if (isNonReplayableResponse(response)) return false;
-  if (response.status === 402 || response.status === 429) return true;
+  if (response.status === 402 || response.status === 429) {
+    // Status alone used to authorize the move, which is right for a limit the ACCOUNT owns and
+    // wrong for one it merely belongs to. An organization- or project-scoped exhaustion refuses
+    // every credential inside that organization, so the second account meets the same counter
+    // and the only thing the rotation buys is a second cold prompt prefix (#4546). Positive
+    // evidence is required to withhold it: the helper fails closed, so an unreadable or
+    // ambiguous body keeps the broad #584 behaviour unchanged, and `rate_limit_exceeded`,
+    // `slow_down` and plan-level exhaustion still rotate exactly as before.
+    const { codexScopedExhaustionCode } = await import("../../codex/quota-rejection");
+    return await codexScopedExhaustionCode(response, { signal }) === undefined;
+  }
   if (response.status < 500 || response.status >= 600) return false;
   try {
     // Reject malformed UTF-8 instead of matching quota words around replacement characters.
@@ -264,7 +328,8 @@ export interface CodexPoolAccountRetryArgs {
   /** Sanitized caller input, before any selected Pool credential was materialized. */
   callerAuthHeaders: Headers;
   config: OcxConfig;
-  route: { providerName: string; modelId: string; provider: OcxProviderConfig };
+  /** Actual routed result narrowed to the fields this retry consumes. */
+  route: Pick<RouteResult, "providerName" | "modelId" | "provider" | "staticPolicy">;
   parsed: OcxParsedRequest;
   logCtx: RequestLogContext;
   options: {
@@ -459,6 +524,7 @@ export async function retryCodexPoolOnAlternateAccount(
       modelId: route.modelId,
       probeLeaseId: codexProbeLeaseId(firstAuthCtx),
       probeQuotaScope: codexProbeQuotaScope(firstAuthCtx),
+      transientProbe: codexTransientProbeGrant(firstAuthCtx),
       writerGeneration: firstAuthCtx.writerGeneration,
     });
   };
@@ -486,6 +552,17 @@ export async function retryCodexPoolOnAlternateAccount(
   // Exact account selectors may retry the same confirmed account above, but must never resolve
   // an alternate. Quota failures and a refreshed entitlement miss remain terminal.
   if (!retryAuthCtx && (firstAuthCtx.fixedAccount || args.sameAccountOnly === true)) {
+    recordUnmovedTransientOutcome();
+    return { kind: "no-alternate" };
+  }
+  // An uploaded file is readable only by the account it was sent to, so NO alternate can serve
+  // this body. Which account would be chosen does not change that, which is why this asks before
+  // the resolution rather than after it: refusing here reserves no send, cancels no response, and
+  // leaves the caller holding the first account's rejection to return unchanged (#4710). The
+  // initial-dispatch sites answer with a 400 instead, because there is no earlier response there
+  // to fall back to. A same-account replay -- the gated-model 400 ladder above -- is unaffected,
+  // since it never leaves the issuing account.
+  if (!retryAuthCtx && conversationCarriesUploadedFiles(parsed._rawBody)) {
     recordUnmovedTransientOutcome();
     return { kind: "no-alternate" };
   }
@@ -557,6 +634,7 @@ export async function retryCodexPoolOnAlternateAccount(
         modelId: route.modelId,
         probeLeaseId: codexProbeLeaseId(firstAuthCtx),
         probeQuotaScope: codexProbeQuotaScope(firstAuthCtx),
+        transientProbe: codexTransientProbeGrant(firstAuthCtx),
         writerGeneration: firstAuthCtx.writerGeneration,
       });
     }
@@ -588,6 +666,7 @@ export async function retryCodexPoolOnAlternateAccount(
       modelId: route.modelId,
       probeLeaseId: codexProbeLeaseId(firstAuthCtx),
       probeQuotaScope: codexProbeQuotaScope(firstAuthCtx),
+      transientProbe: codexTransientProbeGrant(firstAuthCtx),
       writerGeneration: firstAuthCtx.writerGeneration,
       // Retry already advanced the RR ring via excludeAccountId — reuse for promotion.
       ...(retryAuthCtx.accountId ? { promoteAccountId: retryAuthCtx.accountId } : {}),
@@ -603,7 +682,7 @@ export async function retryCodexPoolOnAlternateAccount(
     "pool",
   );
   const retryAdapter = resolveAdapter(
-    resolveWireProtocolOverride(route.providerName, route.modelId, retryProvider, inboundWire),
+    resolveWireProtocolOverride(route.providerName, route.modelId, retryProvider, inboundWire, route.staticPolicy),
     config.cacheRetention,
     route.providerName,
   );
@@ -693,16 +772,35 @@ export async function retryCodexPoolOnAlternateAccount(
       // The same-account gated-model 400 ladder below keeps its own `maxRetrySends` bound and
       // does not take the reserve again; only the move itself does.
       if (accountMovePermit) {
+        // The pool-wide recovery window is consulted BEFORE the request-local permit is used.
+        // `reserveDispatch` charges at reservation time and `release()` is the only way back, so
+        // using the permit first and refusing afterwards would spend a send the request never
+        // made. An account move is recovery traffic like any other: one request's own budget
+        // cannot see that a thousand other requests are moving at the same moment, which is
+        // precisely the amplification this window exists to bound (#4701).
+        //
+        // A refusal here is not a new failure mode: "no alternate was available" is already the
+        // outcome when the pool has nowhere to move this request to, and it is handled.
+        if (!classifyPoolRecoveryDispatch("retry").admitted) {
+          accountMovePermit.release();
+          accountMovePermit = undefined;
+          // The alternate context was resolved and will not send. Hand back whatever recovery
+          // lease it is holding rather than leaving that account unprobeable.
+          releaseCodexAuthContextProbeLease(retryAuthCtx);
+          recordUnmovedTransientOutcome();
+          return { kind: "no-alternate" };
+        }
         const charged = accountMovePermit.use();
         accountMovePermit = undefined;
         if (!charged) {
+          releaseCodexAuthContextProbeLease(retryAuthCtx);
           recordUnmovedTransientOutcome();
           return { kind: "no-alternate" };
         }
         // The move is a physical send like any other, so the root workflow is charged too.
         chargeWorkflowSends(args.options.workflowRootId, 1);
       }
-      noteAttemptSend(logCtx.activeAttempt, passthroughEstimate);
+      noteProviderAttemptSend(logCtx, route.providerName, route.provider, passthroughEstimate);
       try {
         upstreamResponse = await fetchWithHeaderTimeout(
           request.url,
@@ -732,15 +830,29 @@ export async function retryCodexPoolOnAlternateAccount(
       }
       retrySendCount += 1;
       args.onResponse?.(upstreamResponse, retryAuthCtx, request);
+      // The alternate account can refuse the same model, and that refusal is evidence about the
+      // account that produced it. Read BEFORE the ladder's own break, so the ordinary
+      // single-retry path -- every flagship model, which is the #4906 case -- records it too
+      // rather than only the gated ladder below. Without this the pool learns nothing from a
+      // refusal and the next request repeats the same selection.
+      const retryModelDenial = await codexPoolAccountModel400Denial(
+        upstreamResponse,
+        route.modelId,
+        options.abortSignal,
+        parsed.modelId,
+      );
+      if (retryModelDenial !== undefined) {
+        recordCodexModelDenialEvidence(
+          retryAuthCtx.accountId,
+          retryModelDenial,
+          retryAuthCtx.kind === "pool" ? retryAuthCtx.generation : undefined,
+        );
+      }
       if (!retrySameConfirmedAccount || retrySendCount >= maxRetrySends) break;
       // Caller-owned main is an alternate-account replay and can never enter the bounded
       // same-stored-account 400 loop above. Keep that invariant explicit for the account-id reads.
       if (retryAuthCtx.kind === "main") break;
-      if (!await shouldRetryCodexPoolAccountModel400(
-        upstreamResponse,
-        route.modelId,
-        options.abortSignal,
-      )) break;
+      if (retryModelDenial === undefined) break;
       invalidateCodexModelEntitlementsForAccount(retryAuthCtx.accountId);
       let refreshed: Awaited<ReturnType<typeof resolveCodexModelEntitlements>>;
       try {
@@ -827,6 +939,7 @@ export function codexForwardTerminalOutcomeRecorder(
         modelId,
         probeLeaseId: codexProbeLeaseId(authCtx),
         probeQuotaScope: codexProbeQuotaScope(authCtx),
+        transientProbe: codexTransientProbeGrant(authCtx),
         writerGeneration: authCtx.writerGeneration,
       });
       return;
@@ -849,6 +962,7 @@ export function codexForwardTerminalOutcomeRecorder(
       modelId,
       probeLeaseId: codexProbeLeaseId(authCtx),
       probeQuotaScope: codexProbeQuotaScope(authCtx),
+      transientProbe: codexTransientProbeGrant(authCtx),
       writerGeneration: authCtx.writerGeneration,
       // A mid-stream terminal can carry a semantic 401 long after the credential was
       // replaced. It is never replayed — the client already saw output — but it must

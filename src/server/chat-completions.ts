@@ -23,7 +23,7 @@ import { classifyError, cyberPolicyErrorType, CYBER_POLICY_ERROR_CODE, isCyberPo
 import { redactSecretString } from "../lib/redact";
 import { resolveClientRetryAfter } from "../lib/retry-after";
 import { estimateTokens } from "../lib/token-estimate";
-import { NoEligiblePolicyCandidateError, UnknownRoutingPolicyError, routeModel } from "../router";
+import { captureRouteStaticPolicy, NoEligiblePolicyCandidateError, UnknownRoutingPolicyError, routeModel } from "../router";
 import { evidenceFromBody } from "../routing/request-evidence";
 import { resolveWireProtocolOverride } from "./adapter-resolve";
 import { resolveOpenCodeGoTransport } from "../providers/opencode-go-transport";
@@ -150,10 +150,18 @@ async function handleChatCompletionsWithBudget(
   let chatNativeRoute: ReturnType<typeof routeModel> | null = null;
   try {
     const route = routeModel(config, chatBody.model as string, evidenceFromBody(chatBody));
-    route.provider = resolveOpenCodeGoTransport(route.provider, getOrAllocateRequestSessionLane(req));
-    // Settle the wire once so every branch below reads the adapter this model will
-    // actually use, not the provider-wide default (#404).
-    route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, "chat");
+    // Preserve the routed destination for Go recognition, then settle the wire before
+    // deriving protocol-scoped affinity. Recognition must not inspect the flipped adapter.
+    const routedProvider = route.provider;
+    route.staticPolicy = captureRouteStaticPolicy(
+      route.providerName, route.modelId, routedProvider, route.staticPolicy.effectiveAlias, "chat",
+    );
+    const wireProvider = resolveWireProtocolOverride(route.providerName, route.modelId, routedProvider, "chat", route.staticPolicy);
+    route.provider = resolveOpenCodeGoTransport(
+      wireProvider,
+      getOrAllocateRequestSessionLane(req),
+      routedProvider,
+    );
     logCtx.model = route.modelId;
     logCtx.providerAdapter = route.provider.adapter;
     logCtx.requestedModel = requestedModel;
@@ -170,7 +178,9 @@ async function handleChatCompletionsWithBudget(
       if (chatBody.tools !== undefined) parts.push(JSON.stringify(chatBody.tools));
       logCtx.usageLogInputTokens = Math.max(1, estimateTokens(parts.join("\n"), requestedModel));
     }
-    if (!effortRow && isNativeChatRouteEligible(route, chatBody, config)) chatNativeRoute = route;
+    // Combos must enter the Responses routing path so child selection, forced default
+    // effort, failover, and per-attempt telemetry run before any native Chat send.
+    if (!route.combo && !effortRow && isNativeChatRouteEligible(route, chatBody, config)) chatNativeRoute = route;
   } catch (err) {
     if (err instanceof UnknownRoutingPolicyError) {
       logCtx.requestedModel = requestedModel;

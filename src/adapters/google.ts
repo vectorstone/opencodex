@@ -1,5 +1,5 @@
 import type { AdapterFetchContext, AdapterRequest, ProviderAdapter } from "./base";
-import { debugDroppedFrame } from "../lib/debug";
+import { debugDroppedFrame, debugProviderDiagnosticLazy } from "../lib/debug";
 import { createToolCallIdAllocator } from "./tool-call-id";
 import { createImageBudget, materializeInlineImage, MAX_ENCODED_BYTES_PER_IMAGE, artifactHttpUrl } from "../images/artifacts";
 import type {
@@ -20,8 +20,10 @@ import { getVertexAccessToken } from "../lib/gcp-adc";
 import { fetchAntigravityWithRetry, fetchVertexWithRetry } from "./google-http";
 import { safeAntigravityHttpErrorMessage, safeVertexHttpErrorMessage } from "./google-errors";
 import { isVertexTruncatedTurn, vertexTruncationErrorMessage } from "./google-truncation";
-import { ANTIGRAVITY_REQUEST_UA, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
+import { ANTIGRAVITY_REQUEST_UA, antigravitySessionAnchor, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
+import { summarizeGoogleWireShape } from "./google-wire-shape";
 import { compileGoogleWireBody } from "./google-wire-compiler";
+import type { GoogleToolSchemaLossReport, GoogleToolSchemaProfile } from "./google-tool-schema";
 import { identifyRoutedModel } from "./identity";
 import {
   antigravityUsesReplayCache,
@@ -57,7 +59,6 @@ const GOOGLE_BREVITY_INSTRUCTION = [
 
 const ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-
 /**
  * CCA Flash generations that reject the Claude-Agent identity paragraph.
  *
@@ -100,6 +101,20 @@ function stripAntigravityRejectedClaudeSdkParagraph(systemText: string): string 
     .split("\n\n")
     .filter(paragraph => paragraph !== ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH)
     .join("\n\n");
+}
+
+/**
+ * Strips Claude Code CLI's internal billing header (`x-anthropic-billing-header: ...`)
+ * at the start of the system prompt, because Cloud Code Assist / Google Antigravity inspects
+ * `systemInstruction` and rejects requests containing Anthropic billing metadata with
+ * HTTP 429 RESOURCE_EXHAUSTED.
+ *
+ * Matching is restricted to the prompt start (`^` without the `/m` multiline flag) so that
+ * user prompts discussing billing headers in intermediate lines are never modified, and
+ * prompts without a billing header preserve their leading whitespace untouched.
+ */
+function stripAntigravityBillingHeader(systemText: string): string {
+  return systemText.replace(/^x-anthropic-billing-header:[^\n]*\n*/, "");
 }
 
 /**
@@ -276,6 +291,7 @@ function messagesToGeminiFormat(
   parsed: OcxParsedRequest,
   identityModelId: string,
   stripRejectedClaudeSdkParagraph = false,
+  isCloudCodeAssist = false,
 ): { systemInstruction?: unknown; contents: unknown[]; replayedCallIds: string[] } {
   // Neutralize Codex's GPT-5 identity line (Gemini/Antigravity share this path) so a routed model
   // never misreports as GPT-5/OpenAI, and never leaks the proxy identity upstream.
@@ -285,9 +301,12 @@ function messagesToGeminiFormat(
     ...(toolCatalogNudge ? [toolCatalogNudge] : []),
     GOOGLE_BREVITY_INSTRUCTION,
   ].join("\n\n"), identityModelId);
-  const systemText = stripRejectedClaudeSdkParagraph
-    ? stripAntigravityRejectedClaudeSdkParagraph(identifiedSystemText)
+  let systemText = isCloudCodeAssist
+    ? stripAntigravityBillingHeader(identifiedSystemText)
     : identifiedSystemText;
+  if (stripRejectedClaudeSdkParagraph) {
+    systemText = stripAntigravityRejectedClaudeSdkParagraph(systemText);
+  }
   const systemInstruction = { parts: [{ text: systemText }] };
 
   const contents: unknown[] = [];
@@ -720,6 +739,14 @@ function invalidGoogleShapeEvent(
 }
 
 export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapter {
+  const toolSchemaPolicy = provider.googleToolSchemaPolicy ?? "compatible";
+  const toolSchemaProfile = {
+    endpointClass: provider.googleMode ?? "ai-studio",
+  } satisfies GoogleToolSchemaProfile;
+  const reportToolSchemaLoss = (report: GoogleToolSchemaLossReport): void => {
+    if (!report.lossy && report.uncertainComparisons === 0) return;
+    debugProviderDiagnosticLazy("google", "google-tool-schema-loss", () => ({ ...report }));
+  };
   // Per-request closure: resolveAdapter builds a fresh adapter per request (server.ts), so buildRequest
   // can stash the CCA model/session for parseStream's reasoning-replay observation.
   let antigravityModel: string | undefined;
@@ -782,7 +809,11 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
     ...(provider.googleMode === "vertex" || provider.googleMode === "cloud-code-assist"
       ? {
           fetchResponse: (request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> =>
-            (provider.googleMode === "cloud-code-assist" ? fetchAntigravityWithRetry : fetchVertexWithRetry)(request, ctx),
+            (provider.googleMode === "cloud-code-assist" ? fetchAntigravityWithRetry : fetchVertexWithRetry)(
+              request,
+              ctx,
+              { toolSchemaProfile, toolSchemaPolicy },
+            ),
           formatErrorBody: (status: number, _headers: Headers, payloadText: string): string =>
             (provider.googleMode === "cloud-code-assist" ? safeAntigravityHttpErrorMessage : safeVertexHttpErrorMessage)(status, payloadText),
         }
@@ -796,14 +827,14 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       // body, URL or credential.
       const requestedTextFormat = parsed.options.textFormat;
       if (requestedTextFormat) {
-        if (provider.googleMode === "cloud-code-assist") {
-          // Not implemented or verified by opencodex for the Cloud Code Assist envelope,
-          // including Claude models served through it. This is not a claim that the
-          // upstream cannot do it — silence would return unconstrained prose as success,
-          // which is the failure this fix exists to remove.
+        if (provider.googleMode === "cloud-code-assist" && !parsed.modelId.startsWith("gemini-")) {
+          // Not implemented by opencodex for non-Gemini models (including Claude)
+          // served through the Cloud Code Assist envelope. This is not a claim that
+          // the upstream cannot do it — silence would return unconstrained prose as success,
+          // which is the failure this refusal exists to prevent.
           throw new Error(
-            "google cloud-code-assist structured output is not implemented by opencodex — "
-            + "remove response_format or route this model through AI Studio or Vertex",
+            "google cloud-code-assist structured output is not implemented by opencodex for non-Gemini models — "
+            + "remove response_format or route this model through a direct provider",
           );
         }
         if (isImageCapableModel(parsed.modelId)) {
@@ -833,12 +864,14 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         && /^gemini-/.test(routedModelId) && !isImageCapableModel(parsed.modelId);
       // AI Studio's `-tiered` spelling is wire-only; CCA aliases may migrate to another generation.
       const identityModelId = provider.googleMode === "cloud-code-assist" ? routedModelId : parsed.modelId;
-      const stripRejectedClaudeSdkParagraph = provider.googleMode === "cloud-code-assist"
+      const isCloudCodeAssist = provider.googleMode === "cloud-code-assist";
+      const stripRejectedClaudeSdkParagraph = isCloudCodeAssist
         && rejectsClaudeSdkParagraph(parsed.modelId, routedModelId);
       const { systemInstruction, contents, replayedCallIds } = messagesToGeminiFormat(
         parsed,
         identityModelId,
         stripRejectedClaudeSdkParagraph,
+        isCloudCodeAssist,
       );
       lastInjectedCallIds = [...replayedCallIds];
       lastReasoningReplayScope = parsed._reasoningReplayScope;
@@ -951,7 +984,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           const fcc = (existing.functionCallingConfig ?? {}) as Record<string, unknown>;
           draftRequest.toolConfig = { ...existing, functionCallingConfig: { ...fcc, mode: "VALIDATED" } };
         }
-        const compiled = compileGoogleWireBody(draftRequest);
+        const compiled = compileGoogleWireBody(draftRequest, toolSchemaProfile, toolSchemaPolicy);
+        reportToolSchemaLoss(compiled.toolSchemaLossReport);
         const request = compiled.body;
         restoreGoogleToolName = compiled.restoreToolName;
         // Compile names before replay: signatures are keyed by the exact provider-visible name.
@@ -970,6 +1004,20 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           // Vertex and AI Studio share one decision. A second check here would append a
           // duplicate nudge whenever signature sanitization reshapes the tail afterwards.
         }
+        // Opt-in structural description of the request that is about to leave (#5008).
+        //
+        // Passed as a BUILDER, not a value: the lazy form gates before invoking it, so a session
+        // with provider debug off never pays the walk, and it evaluates the projection inside its
+        // own try/catch, so a throw in here cannot turn a built request into a rejected one. The
+        // projection only reads `request`, so the bytes below are the same either way.
+        debugProviderDiagnosticLazy("google", "antigravity-wire-shape", () => summarizeGoogleWireShape(request, {
+          sessionAnchor: antigravitySessionAnchor(parsed),
+          // Signed at translation time, from client history or the durable store. The
+          // Antigravity session cache signs afterwards, inside applyAntigravityReplay, and the
+          // projection attributes that remainder to the cache rather than to this count.
+          historySignedCalls: replayedCallIds.length,
+          replayScopeBound: parsed._reasoningReplayScope !== undefined,
+        }));
         const envelope = {
           model: wireModelId,
           // The envelope's `userAgent` field is a protocol constant ("antigravity"), distinct from
@@ -987,7 +1035,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       }
 
       if (provider.googleMode === "vertex") {
-        const compiled = compileGoogleWireBody(body);
+        const compiled = compileGoogleWireBody(body, toolSchemaProfile, toolSchemaPolicy);
+        reportToolSchemaLoss(compiled.toolSchemaLossReport);
         restoreGoogleToolName = compiled.restoreToolName;
         const vertexProject = provider.project || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || "api-key";
         const vertexLocation = provider.location || process.env.GOOGLE_CLOUD_LOCATION || "global";
@@ -1033,7 +1082,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       if (!apiKey) throw new Error("google (AI Studio) requires a non-empty API key");
       headers["x-goog-api-key"] = apiKey;
 
-      const compiled = compileGoogleWireBody(body);
+      const compiled = compileGoogleWireBody(body, toolSchemaProfile, toolSchemaPolicy);
+      reportToolSchemaLoss(compiled.toolSchemaLossReport);
       restoreGoogleToolName = compiled.restoreToolName;
       return { url, method: "POST", headers, body: JSON.stringify(compiled.body) };
     },

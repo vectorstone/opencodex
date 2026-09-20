@@ -68,6 +68,8 @@ function buildResponseJSONWithBudget(
     toolNsMap?: Map<string, { namespace: string; name: string; freeform?: true }>;
     /** Request-visible tool names. When present, an upstream call outside this set fails closed. */
     declaredToolNames?: ReadonlySet<string>;
+    /** See `bridgeToResponsesSSE`: enforcement is separate from normalization (#4735). */
+    enforceDeclaredToolNames?: boolean;
     /** Declared parameter schema per tool name; repairs integral-float integer args (#1611). */
     toolParameterSchemas?: ReadonlyMap<string, Record<string, unknown>>;
     freeformToolNames?: Set<string>;
@@ -201,7 +203,7 @@ function buildResponseJSONWithBudget(
   ): string => {
     const helper = resolveCodeModeHelperName(codeModeHelperName, toolName, args, namespace, options?.declaredToolNames);
     return helper
-      ? compileCodeModeHelperInput(args, helper)
+      ? compileCodeModeHelperInput(args, helper, codeModeHelperName ?? toolName)
       : repairFreeformToolInput(args, toolName, namespace);
   };
   const parseArgsObj = (args: string): Record<string, unknown> => {
@@ -432,7 +434,11 @@ function buildResponseJSONWithBudget(
         }
         flushToolCall();
         const effectiveName = normalizeDeclaredToolName(e.name, options?.declaredToolNames);
-        if (options?.declaredToolNames && !options.declaredToolNames.has(effectiveName)) {
+        if (
+          options?.declaredToolNames
+          && options.enforceDeclaredToolNames !== false
+          && !options.declaredToolNames.has(effectiveName)
+        ) {
           errorEvent = {
             type: "error",
             message: `routed provider emitted undeclared client tool "${effectiveName}"; only request-declared tools may be called`,
@@ -521,7 +527,7 @@ function buildResponseJSONWithBudget(
         compactionEncryptedContent = e.compactionEncryptedContent;
         sawTerminal = true;
         endTurn = e.endTurn;
-        cleanDone = e.stopReason === undefined;
+        cleanDone = !isTruncatedStopReason(e.stopReason);
         rawStopReason = e.stopReason;
         if (e.providerState) options?.onProviderState?.(e.providerState);
         // Match streaming: max_tokens and content_filter both terminate as incomplete.

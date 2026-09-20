@@ -32,13 +32,26 @@ import { getProviderRegistryEntry, providerMatchesRegistryTransport, providerMod
 import { resolveOpenAiVirtualModel } from "../../providers/openai-virtual-models";
 import { COST4_RATE_KEYS, isValidCost4Rate } from "../../usage/user-cost-overlays";
 import { MAX_COST4_RATE } from "../../usage/expected-prices";
-import { isHostedToolUnsupportedForModel } from "../../responses/hosted-tool-policy";
+import {
+  DECLARABLE_HOSTED_TOOL_TYPES,
+  declaredUnsupportedHostedTools,
+  isHostedToolUnsupportedForModel,
+} from "../../responses/hosted-tool-policy";
 import { getConfigDir } from "../paths";
+import { COMPACTION_TRIGGERS } from "./compaction-triggers";
 
 /** One definition of "usable secret", shared by the schema and the warnings. */
 export function isUsableApiKeySecret(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value === value.trim();
 }
+
+export const compactionRoutingSchema = z.object({
+  model: z.string().trim().min(1),
+  reasoningEffort: z.string().refine(value => pinnedReasoningEffortConfigError(value) === null).optional(),
+  triggers: z.array(z.enum(COMPACTION_TRIGGERS)).nonempty()
+    .refine(values => new Set(values).size === values.length, "triggers must not repeat a value")
+    .optional(),
+}).strict();
 
 /**
  * Bounds for the opt-in same-target 429 wait-and-retry policy. Single source of truth
@@ -243,11 +256,15 @@ export const providerConfigSchema = z.object({
   chatCompletionsPath: z.string().min(1).optional(),
   statelessResponses: z.boolean().optional(),
   requiresAdjacentResponsesToolResults: z.boolean().optional(),
+  requiresPairedResponsesToolResults: z.boolean().optional(),
   annotateEmptyToolOutputs: z.boolean().optional(),
   fastWire: fastWireSchema.nullable().optional(),
   supportsServiceTier: z.boolean().optional(),
   modelSupportsServiceTier: z.record(z.string().min(1), z.boolean()).optional(),
+  modelSuppressSyntheticMax: z.record(z.string().min(1), z.boolean()).optional(),
   preserveResponsesReasoningContent: z.boolean().optional(),
+  dropResponsesReasoningItems: z.boolean().optional(),
+  modelReasoningEffortsAuthoritative: z.boolean().optional(),
   decodesNativeCompactionBlobs: z.boolean().optional(),
   allowEncryptedV2AgentTasks: z.boolean().optional(),
   allowPrivateNetwork: z.boolean().optional(),
@@ -262,6 +279,7 @@ export const providerConfigSchema = z.object({
   // canonical ChatGPT backend WS selection is independent of this flag.
   upstreamWebsocket: z.boolean().optional(),
   directGeminiWireRenames: z.boolean().optional(),
+  googleToolSchemaPolicy: z.enum(["compatible", "reject-lossy"]).optional(),
   noStructuredOutputModels: z.array(z.string().min(1))
     .transform(normalizeNonBlankStringArray)
     .optional(),
@@ -273,6 +291,18 @@ export const providerConfigSchema = z.object({
     .optional(),
   omitReasoningEffortWithToolsModels: z.array(z.string().min(1))
     .transform(normalizeNonBlankStringArray)
+    .optional(),
+  // Validated against a closed vocabulary rather than accepted as free strings. This
+  // schema ends in `.passthrough()`, so a misspelled `web_serch` would otherwise be
+  // accepted, persisted, and strip nothing -- leaving the operator with the upstream 400
+  // the field was set to prevent, and no message saying why (the `codexToolMode` lesson,
+  // #2106).
+  unsupportedHostedTools: z.array(z.string().min(1))
+    .transform(normalizeNonBlankStringArray)
+    .refine(
+      tools => tools.every(tool => DECLARABLE_HOSTED_TOOL_TYPES.has(tool)),
+      { message: `unsupportedHostedTools accepts only hosted tool types: ${[...DECLARABLE_HOSTED_TOOL_TYPES].join(", ")}` },
+    )
     .optional(),
   retryOn429: retryOn429PolicySchema.optional(),
   transientRetryOn5xx: transientRetryOn5xxPolicySchema.optional(),
@@ -299,21 +329,7 @@ export const providerConfigSchema = z.object({
 }).passthrough();
 
 
-/**
- * Shared shape check for the two relative send-path overrides. `field` names the
- * offending key so the message stays specific to what the user actually wrote.
- */
-export function providerRelativeSendPathConfigError(field: string, value: string | undefined): string | null {
-  if (value === undefined) return null;
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || value.includes("://")) {
-    return `${field} must be a relative path without a URL scheme`;
-  }
-  if (!value.startsWith("/")) return `${field} must start with /`;
-  if (value.includes("?") || value.includes("#")) {
-    return `${field} must not include query strings or fragments`;
-  }
-  return null;
-}
+export { providerRelativeSendPathConfigError } from "../provider-relative-send-path";
 
 /**
  * Validate `providers.<name>.modelCosts`: a plain object keyed by exact model
@@ -390,7 +406,13 @@ export function modelPreferHostedToolsConfigError(
   value: unknown,
   field: string,
   providerName: string,
-  provider: { adapter?: unknown; authMode?: unknown; modelAdapters?: unknown; baseUrl?: unknown },
+  provider: {
+    adapter?: unknown;
+    authMode?: unknown;
+    modelAdapters?: unknown;
+    baseUrl?: unknown;
+    unsupportedHostedTools?: unknown;
+  },
 ): string | null {
   if (value === undefined) return null;
   if (!value || typeof value !== "object" || Array.isArray(value)) return `${field} must be a plain object`;
@@ -398,6 +420,12 @@ export function modelPreferHostedToolsConfigError(
   if (prototype !== Object.prototype && prototype !== null) return `${field} must be a plain object with own properties`;
   const entries = Object.entries(value);
   const registry = getProviderRegistryEntry(providerName);
+  // A provider that denies a hosted tool cannot also prefer it. Both keys are
+  // provider-owned capability statements about the same tool, and the denial wins at
+  // request time, so accepting the pair would silently ignore the preference.
+  const declaredUnsupported = declaredUnsupportedHostedTools(
+    provider as { unsupportedHostedTools?: readonly string[] },
+  );
   // Effective transport: a `preserveCustomDestination` registry row reused under a
   // different endpoint keeps its own adapter AND its own auth at runtime, because
   // `routedProviderConfig()` honors `providerMatchesRegistryTransport()`. Both the
@@ -457,6 +485,9 @@ export function modelPreferHostedToolsConfigError(
     for (const tool of entry) {
       if (typeof tool !== "string" || !SUPPORTED_PREFERRED_HOSTED_TOOLS.has(tool)) {
         return `${field}.${key} supports only image_generation`;
+      }
+      if (declaredUnsupported.has(tool)) {
+        return `${field}.${key} cannot prefer ${tool}: unsupportedHostedTools declares it unsupported`;
       }
       if (isHostedToolUnsupportedForModel(key, tool)) {
         return `${field}.${key} cannot prefer ${tool}: the model does not support it`;
@@ -856,4 +887,33 @@ export const quotaResetNotifySchema = z.object({
 export const catalogAutoRefreshSchema = z.object({
   enabled: z.boolean().optional(),
   intervalMinutes: z.number().int().min(0).max(1440).optional(),
+}).strict();
+
+/**
+ * One spend scope's ceiling.
+ *
+ * `.strict()` for the usual reason and one sharper one. Elsewhere a silently ignored key
+ * leaves a feature off that the operator believed was on; here it leaves a BUDGET off, and a
+ * budget nobody is enforcing looks exactly like a budget nobody has exceeded. That is #2106 --
+ * an undeclared option accepted, persisted, and then read as its default -- aimed at spend.
+ *
+ * Only positive integers: 0 would read as "no tokens at all" and refuse every request under
+ * the scope, which is never what writing a budget means. An operator who wants no ceiling
+ * removes the key.
+ */
+const spendScopeSchema = z.object({
+  maxTokens: z.number().int().positive().optional(),
+}).strict();
+
+/**
+ * Durable spend ceilings (#4546).
+ *
+ * Absent, empty, and all-scopes-absent are the same thing: observe-only accounting. There is
+ * no default ceiling anywhere in this section, deliberately.
+ */
+export const spendSchema = z.object({
+  root: spendScopeSchema.optional(),
+  identity: spendScopeSchema.optional(),
+  pool: spendScopeSchema.optional(),
+  retentionDays: z.number().int().min(1).max(365).optional(),
 }).strict();

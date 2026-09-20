@@ -79,6 +79,7 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 | `baseUrl` | `string` |アップストリーム API のベース URL。ほとんどの組み込み固定エンドポイントは不一致を無視します。衝突安全キー プリセットは、古い同じ名前のカスタム宛先を保持します。 |
 | `requestPacing?` | `{ enabled, requestsPerMinute?, minIntervalMs?, models? }` | 上流の使用量、請求、レート制限表示とは別の、クライアント側の送信開始間隔調整です。プロバイダー制限は全モデルに適用され、`models` は上流の正確なモデル ID に一致し、遅延を増やす場合のみ有効です。キュー待機は応答ヘッダーのタイムアウトを消費しません。HTTP、Responses WebSocket、明示的なアダプターの `fetchResponse`/`runTurn` 送信を対象にします。 |
 | `responsesPath?` | `string` |キー認証 `openai-responses` リクエストの相対リソース パス。 `/` で始まり、スキーム、クエリ、またはフラグメントが含まれていない必要があります。 |
+| `chatCompletionsPath?` | `string` | `openai-chat` リクエストの相対リソース パス。 `responsesPath` の対となる設定で、同じ形式ルールが適用されます。1つのアップストリームが Chat Completions と Responses を異なるプレフィックスで提供する場合に必要です。モデルごとの wire override はアダプターのみを変更し `baseUrl` は変更しないため、この設定がないと有効化された Chat リクエストが Responses ベースへ送信されます。同梱例は Z.AI です。 |
 | `upstreamWebsocket?` | `boolean` | `openai-responses` リクエストで使用するアップストリーム Responses WebSocket トランスポート（既定値は無効）。アップストリームがこのプロトコルに対応している場合、ストリーミング POST は設定済みの Responses パス（既定値 `/v1/responses`）へ HTTPS の WSS で接続し、通常の処理向けに SSE へ再エンコードされます。forward プロバイダーは `{baseUrl}/responses`、キー認証プロバイダーは `responsesPath`（未設定時は従来の `/v1/responses`）を使用します。HTTP のベース URL は SSE のままとなり、Responses 以外のパスと `openai-chat` リクエストは HTTP を使用します。 |
 | `supportsServiceTier?` | `boolean` | `service_tier` ケイパビリティの 3 状態です。`true`: fast モードが注入でき、呼び出し元の値も保持されます。`false`: フィールドは削除され、注入もされません (非対応と文書化されたアップストリームには送りません)。未設定: 未分類 — 呼び出し元の値はそのまま保持され、fast モードは注入しません。レジストリは正規 OpenAI (`true`)、DeepSeek、Volcengine Ark (`false`) を分類します。実際にティアをサポートするカスタム ゲートウェイにのみ明示的に設定してください。 |
 | `preserveResponsesReasoningContent?` | `boolean` | リプレイされる Responses reasoning アイテムの平文 reasoning コンテンツを消去せずに保持します (消去は ChatGPT バックエンドのルールです)。DeepSeek のように reasoning リプレイを受け入れるアップストリームで有効にしてください。プロキシ生成の `ocxr1` エンベロープは常に削除されます。 |
@@ -128,7 +129,7 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 | `responsesItemIdRepair?` | `{ message?: string[]; reasoning?: string[]; repairMissingTerminalIds?: boolean; repairInvalidIds?: boolean }` |正確なプレースホルダー ID、欠落している端末 ID、および（`repairInvalidIds` で）正規の `msg_`/`rs_` 接頭辞を欠く message/reasoning ID に対するダウンストリーム SSE 修復はデフォルトで無効になっています。関数呼び出し ID は決して書き換えられません。組み込み DeepSeek は最後の 2 つをデフォルトで有効にします。 |
 | `responsesSnapshotRepair?` | `boolean` | デフォルトで無効のクライアント向け修復です。SSE と JSON の Responses ライフサイクルで欠落した status、output、ツールメタデータを補完し、raw 検査と永続化は変更しません。 |
 | `retryOn429?` | `{ enabled?: boolean; attempts?: number; intervalMs?: number; maxIntervalMs?: number; respectRetryAfter?: boolean }` | API-key プロバイダーのみ(`authMode: "key"`)。オプトインの同一ターゲット 429 リトライ: `retryOn429` が無ければ無効で、オブジェクトがあれば `enabled: false` でない限り有効になります。429 時に待機(上流の `Retry-After` または固定間隔)してから、キー フェイルオーバーの前に同一キーで同一リクエストを再送します — メインのテキストターン回復ループ、Responses passthrough、画像/動画ブリッジ、web-search サイドカー、ターミナル継続要求をすべてカバーします。再送の対象はプリストリームの HTTP 429 応答のみで、カスタム `runTurn` トランスポートは HTTP リトライループの対象外です。`attempts` は最初の 429 以降の同一キー再送回数(合計送信数 = `attempts` + 1)で、メインの回復ループ・ターミナルガード継続・ブリッジ再試行で共有されるリクエスト単位の予算です。`attempts` を使い切っても同一キーでの再送が止まるだけで、通常のキー フェイルオーバーまたは最終エラー処理が利用可能なターゲットに応じて続きます — キー認証の passthrough ワイヤにはフェイルオーバーがないため、使い切った 429 はそのまま返ります。Codex 自体は 429 をリトライしないため、単一キーのプロバイダーでは唯一の防御です。デフォルト: `enabled: true`、`attempts: 3`、`intervalMs: 5000`、`maxIntervalMs: 60000`(1回の待機は `maxIntervalMs` で上限、その上限は 600000)、`respectRetryAfter: true`。 |
-| `transientRetryOn5xx?` | `{ enabled?: boolean; attempts?: number }` | キー認証の `openai-chat` プロバイダーのみ。ストリーム開始前に上流から返される一時的なステータス（500、502、503、504、520、521、522）に対するオプトインの再試行です。設定がなければ無効で、オブジェクトを指定すると `enabled: false` でない限り有効になります。最初の Responses リクエスト、ターミナルガード継続、ネイティブの `/v1/chat/completions`、および 429／アカウント回復時の再取得が対象です。`attempts` は最初の送信を含め、1 回のリクエストで許可される上流への送信総数です（1～10、デフォルトは 3）。接続リセット回復と共有するリクエスト単位の単一予算であるため、`3` を指定した場合、プロバイダーに到達する実リクエストは最大 3 回です。待機には 400 ms を基準とする固定式の指数バックオフを使用し、上限は 5 秒で、`Retry-After` に従います。レート制限を扱う `retryOn429` とは別の機能であり、ストリーム開始後の失敗は再送されません。 |
+| `transientRetryOn5xx?` | `{ enabled?: boolean; attempts?: number }` | キー認証の `openai-chat` および `openai-responses` プロバイダーのみ。`authMode: "forward"` のプロバイダー（ChatGPT アカウントプール）はこのオプションを読まず、既定の再試行段数を維持します。ストリーム開始前に上流から返される一時的なステータス（500、502、503、504、520、521、522）に対するオプトインの再試行です。設定がなければ無効で、オブジェクトを指定すると `enabled: false` でない限り有効になります。最初の Responses リクエスト、ターミナルガード継続、ネイティブの `/v1/chat/completions`、および 429／アカウント回復時の再取得が対象です。`attempts` は最初の送信を含め、1 回のリクエストで許可される上流への送信総数です（1～10、デフォルトは 3）。接続リセット回復と共有するリクエスト単位の単一予算であるため、`3` を指定した場合、プロバイダーに到達する実リクエストは最大 3 回です。待機には 400 ms を基準とする固定式の指数バックオフを使用し、上限は 5 秒で、`Retry-After` に従います。レート制限を扱う `retryOn429` とは別の機能であり、ストリーム開始後の失敗は再送されません。 |
 | `autoToolChoiceOnlyModels?` | `string[]` | `tool_choice` が `auto` または `none` のみを受け入れるモデル。強制的な選択は格下げされます。 |
 | `preserveReasoningContentModels?` | `string[]` |チャット履歴に以前のアシスタント `reasoning_content` が必要なモデル。 |
 | `reasoningDetailsModels?` | `string[]` | thinking を構造化された `reasoning_details` 配列で返すモデル（`reasoning_split` 使用の MiniMax M シリーズ）。ストリーム差分は累積スナップショットとして prefix-diff され、保持された reasoning は `reasoning_content` 文字列ではなく `reasoning_details` 配列としてリプレイされます。 |
@@ -139,6 +140,7 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 | `escapeBuiltinToolNames?` | `boolean` | Anthropic 互換ゲートウェイの組み込みツール名をエスケープし、返された呼び出しで復元します。 |
 | `anthropicEofTolerance?` | `boolean` | `message_stop` 前にストリームが終了しても、可視テキストまたは完全な JSON オブジェクトのツール入力が受信済みの場合に限り完了を許可します（Anthropic 互換ゲートウェイ向け）。デフォルトはオフ。 |
 | `googleMode?` | `"ai-studio" \| "vertex" \| "cloud-code-assist"` | Google トランスポート/認証モード。デフォルトは`ai-studio`です。 |
+| `googleToolSchemaPolicy?` | `"compatible" \| "reject-lossy"` | Google 専用です。省略時または `compatible` は互換スキーマと既存の非直接 400 修復を維持します。`reject-lossy` は初期損失または判定不能な上限付き比較を送信前に拒否し、制約を開く Vertex／Cloud Code Assist 修復を保留します。直接 AI Studio はこの修復を行いません。 |
 | `project?` | `string` | Vertex または Antigravity Cloud Code Assist プロジェクト ID。 |
 | `location?` | `string` |頂点の位置。環境フォールバックは `GOOGLE_CLOUD_LOCATION` です。 |
 | `mcpServers?` | `Record<string, CursorMcpServerConfig>` |カーソルのみ: 標準入出力またはストリーミング可能な HTTP MCP サーバー。 |
@@ -146,17 +148,19 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 | `unsafeAllowNativeLocalExec?` | `boolean` |カーソルのレガシー ブール値。新しいフィールドが設定されていない場合のみ、`nativeLocalExec: "on"` と同等です。 |
 | `nativeLocalExec?` | `"off" \| "codex-sandbox" \| "on"` |カーソルのローカル実行ポリシー。 `off` がデフォルトです。 `codex-sandbox` は現在、`off` と同様にフェールクローズされます。 |
 
+プロバイダーの登録・置換（`POST /api/providers`）では、メモリやファイルの設定を変更する前に `responsesPath` と `chatCompletionsPath` を検証します。`PATCH /api/providers?name=<provider>` はリクエスト本文を保存済みのプロバイダーにマージします。`disabled` 以外のフィールドを変更する更新（`requestPacing` のみの更新を除く）では、保存前にマージ後のプロバイダーのパスを同じ方法で検証し、保持されているパスが無効な場合は `400` を返して設定を変更しません。設定ファイルの読み込みにも同じ経路の規則が適用されます。
+
 API キープロバイダーは、リテラルキーまたは環境参照を保持する場合があります。 OAuth プロバイダーは、`ocx login` によって設定された資格情報ストアを使用します。サブスクリプションに基づくクロード コードの起動動作は、[`claudeCode.authMode`](/reference/configuration/server/#claude-code) で構成されます。
 
 ## プロバイダーによるアウトバウンドの安全性診断
 
 ダッシュボード接続テストとライブ モデル検出では、制限された GET 専用トランスポートが使用されます。送信プロキシを使用しない場合、opencodex はホスト名を一度解決し、その検証されたアドレスにのみ接続します。 HTTPS は元のホスト、SNI、および証明書の検証を保持します。プロバイダー設定では証明書チェックを無効にすることはできません。
 
-`HTTP_PROXY`、`HTTPS_PROXY`、または `ALL_PROXY` が適用される場合、これらの操作は Bun のネイティブ フェッチを維持します。 URL とリテラル アドレスのチェックは引き続き実行されますが、プロキシが最終ルート、DNS 応答、ピアを選択するため、opencodex はそのピアを固定したり検証したりできません。これは明示的なセキュリティ制限です。
+これらの操作は[サーバーで設定された送信 fetch](/ja/reference/configuration/server/)を使用します。`config.proxy` で設定された、または SOCKS5 `ALL_PROXY` から継承したサーバーの SOCKS5 プロキシは、宛先が `NO_PROXY` に一致しない場合に OpenCodex の組み込みトンネルを使用します。`HTTP_PROXY` と `HTTPS_PROXY` は Bun のネイティブ HTTP(S) 処理を維持しますが、SOCKS 以外の `ALL_PROXY` はネイティブ HTTP fetch の経路にはなりません。URL とリテラル アドレスのチェックは引き続き実行されますが、選択されたプロキシが最終ルート、DNS 応答、ピアを決めるため、opencodex はそのピアを固定したり検証したりできません。これは明示的なセキュリティ制限です。
 
 プライベート/ローカル宛先には `allowPrivateNetwork: true` が必要で、送信プロキシがアクティブな場合は、一致する `NO_PROXY` エントリが必要です。ループバックは自動的に追加されます。 CIDR エントリは解釈されないため、各 LAN ホストを明示的にリストします。マッチャーは、正確なホスト、ドメイン サフィックス、オプションのポート、括弧で囲まれた IPv6、および `*` をサポートします。たとえば、`192.168.1.50` を明示的にリストします。メタデータとリンクローカル宛先はブロックされたままになります。診断リクエストはリダイレクトを拒否し、資格情報が剥奪されたターゲットを報告します。通常のプロバイダー要求のリダイレクト レビューは、この診断ガードとは独立したままになります。
 
-Clash / Surge / Mihomo 利用者向けの fake-IP DNS 例外は 2 種類あり、いずれも DNS の*応答*にのみ適用されます。URL に書かれたリテラルアドレスは引き続き拒否されます。IANA ベンチマーク範囲 `198.18.0.0/15`（IPv4-mapped IPv6 表記を含む）は、そのホストにアウトバウンドプロキシが適用される場合に許可されます。Mihomo の既定 IPv6 fake-IP 範囲 `fdfe:dcba:9876::/48` はより厳しい条件でのみ許可されます。URL スキームに一致するプロキシ変数（`https:` は `HTTPS_PROXY`、`http:` は `HTTP_PROXY`、`ALL_PROXY` は対象外）が設定されていること、ホストが `NO_PROXY` に一致しないことが必要で、その場合リクエストはそのプロキシに明示的に固定されます。それ以外の ULA、隣接プレフィックス、実際のプライベート応答と混在した fake-IP 応答には引き続き `allowPrivateNetwork: true` が必要です。プロバイダー保存時の検証には IPv6 例外は適用されません。
+Clash / Surge / Mihomo 利用者向けの fake-IP DNS 例外は 2 種類あり、いずれも DNS の*応答*にのみ適用されます。URL に書かれたリテラルアドレスは引き続き拒否されます。IANA ベンチマーク範囲 `198.18.0.0/15`（IPv4-mapped IPv6 表記を含む）は、そのホストにアウトバウンドプロキシが適用される場合に許可されます。Mihomo の既定 IPv6 fake-IP 範囲 `fdfe:dcba:9876::/48` はより厳しい条件でのみ許可されます。URL スキームに一致するプロキシ変数（`https:` は `HTTPS_PROXY`、`http:` は `HTTP_PROXY`）または SOCKS5 の `ALL_PROXY` が設定されていること（SOCKS 以外の `ALL_PROXY` は対象外）、ホストが `NO_PROXY` に一致しないことが必要で、その場合リクエストはそのプロキシに明示的に固定されます。それ以外の ULA、隣接プレフィックス、実際のプライベート応答と混在した fake-IP 応答には引き続き `allowPrivateNetwork: true` が必要です。プロバイダー保存時の検証には IPv6 例外は適用されません。
 
 ## Codexアカウントプール
 

@@ -1,10 +1,12 @@
 import { saveConfigPreservingClaudeCode } from "../config";
-import { isCodexAccountGenerationLive } from "./account-store";
+import { isCodexAccountGenerationLive, registerCodexRefreshGenerationHandoff } from "./account-store";
+import { handOffThreadAffinityGeneration } from "./routing/thread-affinity";
 import { codexAccountLogLabel } from "./account-label";
 import { isCodexAccountPaused } from "./account-pause";
 import { clearCodexAccountPin, pinnedCodexAccountId } from "./account-priority";
 import { isCodexAccountUsable, type CodexAccountUsabilityOptions } from "./account-usability";
-import { isAccountNeedsReauth, markAccountNeedsReauth } from "./account-runtime-state";
+import { markAccountNeedsReauth } from "./account-runtime-state";
+import { codexAccountPinDrainReason } from "./routing/pin-drain";
 import { POOL_KEY_CODEX, notePoolRotationFailure } from "./pool-rotation";
 import { getAccountQuota, isRetiredCodexSparkModel } from "./quota";
 import { MAIN_CODEX_ACCOUNT_ID } from "./main-account";
@@ -54,6 +56,13 @@ import {
   type CodexUpstreamHealth,
 } from "./routing/health-store";
 import { ownsProbeLease, probeMayClearCooldown, withProbeLeaseReleased } from "./routing/probe-lease";
+// `./routing/probe-lease` above is the QUOTA-COOLDOWN lease; the module below owns the
+// unrelated TRANSIENT-HOLD trial and the pool-wide recovery bound above it (#4701).
+import {
+  isTransientHoldExpired,
+  resolveTransientHoldDispatch,
+  settleTransientProbeForOutcome,
+} from "./routing/transient-hold-dispatch";
 import {
   adoptLegacyLineageAffinity,
   affinityAfterRelease,
@@ -85,7 +94,6 @@ import {
   getPoolAccountPlanForSelection,
   hasCodexQuotaHeadroom,
   isCodexAccountPlanExcluded,
-  isCacheAffinityEnabled,
   isCodexAccountSelectable,
   isHealthySharedCodexSelection,
   isUnknownUsage,
@@ -96,11 +104,13 @@ import {
   pickPriorityPreemption,
   pickResetFirstCodexAccount,
   pickUnboundStrategyAccount,
+  preferModelEntitledAccount,
   sharedStateSelectionOptions,
   strategySelectionOptionsForModelDetour,
   shouldFailover,
   peekAlternateCodexAccount,
 } from "./routing/selection";
+import { mayRebindAffinityForQuota } from "./routing/cache-affinity";
 import {
   clearAllManualPreferences,
   consumeManualPreference,
@@ -181,6 +191,7 @@ export type {
   CodexAffinityMove,
   CodexAffinityReason,
   CodexAffinityDecision,
+  TransientProbeGrant,
 } from "./routing/thread-affinity";
 export {
   isCodexAccountPlanExcluded,
@@ -193,6 +204,13 @@ export {
   getEffectiveActiveCodexAccountId,
   isEffectiveCodexAccountPinned,
 } from "./routing/active-account";
+export { codexAccountPinDrainReason } from "./routing/pin-drain";
+export type { CodexPinDrainReason } from "./routing/pin-drain";
+
+// A shared refresh can outlive the request that opened it. Register the affinity
+// handoff with the flight so a detached G -> G+1 commit cannot strand bindings at G.
+registerCodexRefreshGenerationHandoff(handOffThreadAffinityGeneration);
+
 function hasConfiguredPoolAccount(
   config: OcxConfig,
   accountId: string,
@@ -274,12 +292,6 @@ function isTransientOnlyAffinityBlock(
   return shouldFailover(config, entry.accountId, now)
     || isCodexAccountSoftAvoided(entry.accountId, now)
     || isCodexPoolRefreshCooling(entry.accountId, now);
-}
-
-/** Has a held binding waited longer than a transient failure can reasonably explain? */
-function isTransientHoldExpired(entry: ThreadAffinityEntry, now: number): boolean {
-  return entry.transientHoldSince !== undefined
-    && now - entry.transientHoldSince > CODEX_TRANSIENT_AFFINITY_HOLD_MS;
 }
 
 /**
@@ -389,7 +401,14 @@ function pickLineageServingAccount(
   selectionOptions?: CodexAccountUsabilityOptions,
   modelId?: string,
 ): { accountId: string; reason: CodexAffinityReason } | null {
-  if (lineage.parentConversationKey !== undefined) {
+  // Cohort keying (#4780) makes a tree share one key, so for a same-session family the parent's
+  // key IS this request's and the lookup below would re-ask a question the caller already
+  // answered by finding no binding entry. What remains is the case cohort keying cannot unify:
+  // a session-less chain whose parent this scope has not recorded, where the keys differ.
+  if (
+    lineage.parentConversationKey !== undefined
+    && lineage.parentConversationKey !== lineage.conversationKey
+  ) {
     const parent = lineageServingAccountId(
       lineage.parentConversationKey, config, now, quotaScope, selectionOptions, modelId,
     );
@@ -452,19 +471,7 @@ function releaseDrainedCodexAccountPin(
 ): void {
   const pinned = pinnedCodexAccountId(config);
   if (pinned === undefined) return;
-  const knownUnavailable = isAccountNeedsReauth(pinned) || isCodexAccountPaused(config, pinned);
-  if (knownUnavailable) {
-    clearCodexAccountPin(config);
-    saveConfigPreservingClaudeCode(config);
-    return;
-  }
-  // Temporary drain deliberately forbids every native-main read. A pin on main
-  // cannot be classified by credential liveness or quota until the fenced profile
-  // is readable. Cached reauth and configured pause state were handled above.
-  if (pinned === MAIN_CODEX_ACCOUNT_ID && selectionOptions?.nativeMainSelectionOnly === true) return;
-  const drained = !isCodexAccountUsable(config, pinned, selectionOptions)
-    || !hasCodexQuotaHeadroom(config, pinned, selectionOptions, now);
-  if (!drained) return;
+  if (codexAccountPinDrainReason(config, pinned, selectionOptions, now) === undefined) return;
   clearCodexAccountPin(config);
   saveConfigPreservingClaudeCode(config);
 }
@@ -477,6 +484,8 @@ export function resolveCodexAccountForThread(
   lineage?: CodexThreadLineage,
 ): string | null {
   const resolution = resolveCodexAccountForThreadDetailed(threadId, config, now, quotaScope, undefined, undefined, lineage);
+  // A WITHHELD dispatch is deliberately not an account here: this wrapper cannot carry a retry
+  // time, and answering with the held account is the send the hold prevents. Fails closed.
   return resolution.status === "selected" ? resolution.accountId : null;
 }
 
@@ -581,34 +590,6 @@ function previewReusableAffinityAccount(
     }
   }
   return entry.accountId;
-}
-
-/**
- * May a LIVE binding be moved for quota reasons?
- *
- * Default: no. The bar is genuine exhaustion, because moving a bound conversation discards
- * the prompt cache warmed on its account and a threshold crossing is a hint that the account
- * is getting busy rather than evidence it cannot serve (#4546). Deliberately NOT
- * `hasCodexQuotaHeadroom`, which reads `usage < autoSwitchThreshold` and would reproduce the
- * old rule under a new name.
- *
- * With `pool.cacheAffinity: false` the historical rule comes back: a crossing of
- * `autoSwitchThreshold` is enough. That is capacity-first routing, and an operator who wants
- * it keeps it -- but it is no longer what an install gets by never having heard of the flag.
- */
-function mayRebindAffinityForQuota(
-  config: OcxConfig,
-  accountId: string,
-  usage: number,
-  threshold: number,
-  selectionOptions?: CodexAccountUsabilityOptions,
-): boolean {
-  const overThreshold = threshold > 0 && !isUnknownUsage(usage) && usage >= threshold;
-  if (!isCacheAffinityEnabled(config)) return overThreshold;
-  // The usable half is already guaranteed by both callers, which gate on
-  // isCodexAccountSelectable; kept explicit so the predicate reads correctly on its own.
-  return !isCodexAccountUsable(config, accountId, selectionOptions)
-    || (!isUnknownUsage(usage) && usage >= 100);
 }
 
 /** Reset ordering may move a binding only under the existing cache-affinity release policy. */
@@ -843,6 +824,9 @@ export function previewCodexAccountForRequest(
     const best = pickLowestUsageCodexAccount(config, active, now, quotaScope, selectionOptions);
     if (best) active = best;
   }
+  // Same correction resolve applies, for the same reason: preview must name the account the
+  // request will actually use, or subagent fallback scores a model against the wrong one.
+  active = preferModelEntitledAccount(config, active, now, quotaScope, selectionOptions);
   if (!isCodexAccountUsable(config, active, selectionOptions)) {
     return hasConfiguredPoolAccount(config, active, selectionOptions) ? active : null;
   }
@@ -936,15 +920,12 @@ export function resolveCodexAccountForThreadDetailed(
         const lane = transientDetourAccount(config, detourEntry, now, quotaScope, selectionOptions);
         detourEntry.transientHoldSince ??= now;
         detourEntry.lastUsedAt = now;
-        if (lane !== null && lane !== detourEntry.accountId) {
-          detourEntry.transientDetourAccountId = lane;
-          return { status: "selected", accountId: lane, affinity: { move: "detour", reason: "transient" } };
-        }
         // A provider-wide outage soft-avoids every sibling, so there is nowhere to detour.
         // That is a statement about where this request can go, not about who owns the
         // conversation: dropping the pin here would rebuild the cold prefix elsewhere for
-        // exactly the failure mode the hold exists to survive.
-        return { status: "selected", accountId: detourEntry.accountId, affinity: { move: "held", reason: "transient" } };
+        // exactly the failure the hold exists to survive -- nor a licence to send at the
+        // failing account, which is what the dispatch resolver bounds (#4701).
+        return resolveTransientHoldDispatch(detourEntry, lane, now);
       }
       // Detour expiry or invalidation must not expire the ordinary task. Drop only
       // this model lane and select from ordinary/shared state below.
@@ -1018,16 +999,11 @@ export function resolveCodexAccountForThreadDetailed(
       const detour = transientDetourAccount(config, entry, now, quotaScope, selectionOptions);
       entry.transientHoldSince ??= now;
       entry.lastUsedAt = now;
-      if (detour !== null && detour !== entry.accountId) {
-        entry.transientDetourAccountId = detour;
-        // Deliberately no promoteActiveCodexAccount and no rebind: this is one request routing
-        // around a blip, not the pool deciding where the conversation now lives.
-        return { status: "selected", accountId: detour, affinity: { move: "detour", reason: "transient" } };
-      }
       // No sibling can take it either -- the usual shape of a provider-wide 503. The binding
       // survives: "cannot send right now" and "forget which account owns this conversation"
-      // are different answers, and conflating them is what the hold was added to stop.
-      return { status: "selected", accountId: entry.accountId, affinity: { move: "held", reason: "transient" } };
+      // are different answers. So is the third answer this used to give -- "send at the
+      // failing account" -- now a bounded probe or a typed refusal (#4701).
+      return resolveTransientHoldDispatch(entry, detour, now);
     }
     // A model-only exclusion does not invalidate the shared task binding. Health,
     // generation, pause, cooldown, and failure evidence still retire it normally.
@@ -1241,6 +1217,10 @@ export function resolveCodexAccountForThreadDetailed(
     selectionOptions,
     !preserveSharedSelectionForModelDetour,
   );
+  // The shared cursor can name an account whose own roster denies this model, and an active
+  // account never passes through the eligible list. Correct it for THIS request only -- nothing
+  // is persisted -- and only toward an account eligibility already admitted (#4768).
+  active = preferModelEntitledAccount(config, active, now, quotaScope, selectionOptions);
   if (!isCodexAccountUsable(config, active, selectionOptions)) {
     return hasConfiguredPoolAccount(config, active, selectionOptions)
       ? { status: "selected", accountId: active, affinity: affinityAfterRelease(threadId, releaseReason) }
@@ -1277,6 +1257,10 @@ export function recordCodexUpstreamOutcome(
     recordUpstreamHostFailure(meta.hostKey, { code: meta.lastFailureCode, now: meta.now ?? Date.now() });
   }
   if (!accountId) return;
+  // Conclude the half-open recovery trial BEFORE the admissibility gate below (#4701): an
+  // outcome that gate drops still ended this request, and a lease nobody hands back leaves the
+  // next trial waiting out its deadline. The settle carries its own fences, so this is safe here.
+  settleTransientProbeForOutcome(accountId, meta, classifyCodexUpstreamOutcome(outcome, meta.denial));
   const writerGeneration = meta.writerGeneration ?? captureConfigGeneration();
   if (!isHealthAccountAdmissible(accountId, writerGeneration)) return;
   const now = meta.now ?? Date.now();
