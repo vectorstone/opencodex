@@ -22,15 +22,24 @@
 
 import { existsSync } from "node:fs";
 import { win32 as windowsPath } from "node:path";
+import { waitForSubprocessExit } from "./bounded-subprocess";
+import { decodeWindowsTextBytes } from "./windows-text";
 
 import {
   resolveTrustedWindowsPowerShellExe,
   WindowsSystemDirectoryFfiUnavailableError,
 } from "./windows-elevation";
 
+/**
+ * Shared ceiling for a full effective-token identity lookup. PowerShell startup can
+ * legitimately take several seconds on loaded desktops as well as CI, so every caller
+ * that is not spending a smaller pre-existing deadline uses the same #2914-tested budget.
+ */
+export const WINDOWS_PRINCIPAL_LOOKUP_TIMEOUT_MS = 30_000;
+
 const SID_PATTERN = /^S-1-(?:\d+-)+\d+$/i;
-const SID_EXPRESSION =
-  "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value";
+const IDENTITY_EXPRESSION =
+  "$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent();$identity.User.Value;$identity.Name";
 const DEFAULT_WINDOWS_ARM64_POWERSHELL = windowsPath.join(
   "C:\\Windows\\System32",
   "WindowsPowerShell",
@@ -90,7 +99,12 @@ export interface WindowsPrincipalLookupResult {
   success: boolean;
   exitCode: number | null;
   timedOut: boolean;
-  stdout: string;
+  /**
+   * Raw child stdout. Bytes are allowed because `powershell.exe` writes the console
+   * output code page, not UTF-8, and the decode below is the thing under test: a seam
+   * that only carried a decoded string could never exercise it.
+   */
+  stdout: string | Uint8Array;
 }
 
 export type WindowsPrincipalRunner = (
@@ -106,7 +120,7 @@ const POWERSHELL_ARGS = [
   "-NoProfile",
   "-NonInteractive",
   "-Command",
-  SID_EXPRESSION,
+  IDENTITY_EXPRESSION,
 ] as const;
 
 function windowsPrincipalPowerShellCommand(): string[] {
@@ -130,7 +144,10 @@ function defaultWindowsPrincipalRunner(timeoutMs: number): WindowsPrincipalLooku
     success: result.success,
     exitCode: result.exitCode,
     timedOut: result.exitedDueToTimeout ?? false,
-    stdout: result.stdout ? result.stdout.toString() : "",
+    // Bytes, NOT .toString(): that is UTF-8, and Windows PowerShell 5.1 emits the
+    // console output code page. A non-ASCII account name decoded as UTF-8 becomes
+    // U+FFFD and is then frozen into the identity cache.
+    stdout: result.stdout ?? new Uint8Array(),
   };
 }
 
@@ -143,19 +160,14 @@ async function defaultAsyncWindowsPrincipalRunner(
     stderr: "ignore",
     windowsHide: true,
   });
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    try { proc.kill(); } catch { /* already exited */ }
-  }, Math.max(1, timeoutMs));
-  let exitCode: number | null = null;
-  try {
-    exitCode = await proc.exited;
-  } finally {
-    clearTimeout(timer);
-  }
-  const stdout = proc.stdout
-    ? await new Response(proc.stdout).text().catch(() => "")
+  // No kill grace. The grace exists so a dying child releases a path someone is about to
+  // remove; this lookup holds no such path, and it runs during `ocx start`, where the composed
+  // acceptance cases already measure real startups at up to 38.8s against a bounded watchdog.
+  // Paying two extra seconds per timed-out resolution there buys nothing and costs margin.
+  const { exitCode, timedOut } = await waitForSubprocessExit(proc, timeoutMs, 0);
+  // `.bytes()` rather than `.text()`, for the same reason as the sync runner above.
+  const stdout: string | Uint8Array = !timedOut && proc.stdout
+    ? await new Response(proc.stdout).bytes().catch(() => new Uint8Array())
     : "";
   return {
     success: !timedOut && exitCode === 0,
@@ -167,7 +179,30 @@ async function defaultAsyncWindowsPrincipalRunner(
 
 let principalRunner: WindowsPrincipalRunner = defaultWindowsPrincipalRunner;
 let asyncPrincipalRunner: AsyncWindowsPrincipalRunner = defaultAsyncWindowsPrincipalRunner;
-let cachedPrincipal: string | null = null;
+let principalLocaleForTests: string | undefined;
+
+/**
+ * Decode child stdout the way the rest of this repository already decodes Windows
+ * console output: UTF-16 with or without a BOM, then STRICT UTF-8, then the locale's
+ * legacy code page. Strict-UTF-8-first is what keeps an ordinary UTF-8 host unaffected.
+ *
+ * The SID on the first line is ASCII by construction and survives either way, which is
+ * why this corruption stayed silent: only the account name on the second line breaks.
+ */
+function decodePrincipalStdout(stdout: string | Uint8Array): string {
+  if (typeof stdout === "string") return stdout;
+  return decodeWindowsTextBytes(
+    stdout,
+    principalLocaleForTests ? { locale: principalLocaleForTests } : {},
+  );
+}
+
+export interface WindowsPrincipalIdentity {
+  readonly sid: string;
+  readonly name: string;
+}
+
+let cachedIdentity: WindowsPrincipalIdentity | null = null;
 let asyncLookupInFlight: Promise<string> | null = null;
 
 /**
@@ -191,7 +226,7 @@ let syntheticPrincipalForTests: string | null = null;
  */
 export function setSyntheticWindowsPrincipalForTests(principal: string | null): void {
   syntheticPrincipalForTests = principal;
-  cachedPrincipal = null;
+  cachedIdentity = null;
 }
 
 /** True when an explicit runner override is installed and must take precedence. */
@@ -211,17 +246,27 @@ function identityError(reason: string): NodeJS.ErrnoException {
   return error;
 }
 
-function principalFromResult(result: WindowsPrincipalLookupResult): string {
+function identityFromResult(result: WindowsPrincipalLookupResult): WindowsPrincipalIdentity {
   if (!result.success) {
     throw identityError(result.timedOut
       ? "timed out"
       : `exited ${result.exitCode ?? "null"}`);
   }
-  const sid = result.stdout.trim();
+  const lines = decodePrincipalStdout(result.stdout).trim().split(/\r?\n/);
+  const sid = lines[0]?.trim() ?? "";
+  const name = lines[1]?.trim() ?? "";
   if (!SID_PATTERN.test(sid)) {
     throw identityError(sid ? "returned an invalid SID" : "returned an empty SID");
   }
-  return `*${sid.toUpperCase()}`;
+  if (!name || lines.length !== 2) {
+    throw identityError(name ? "returned an ambiguous account name" : "returned an empty account name");
+  }
+  return Object.freeze({ sid: sid.toUpperCase(), name });
+}
+
+/** Read the effective-token identity only when an earlier lookup already cached it. */
+export function cachedCurrentWindowsIdentity(): WindowsPrincipalIdentity | null {
+  return cachedIdentity;
 }
 
 /** Resolve and process-cache the effective token SID for synchronous ACL paths. */
@@ -229,7 +274,7 @@ export function resolveCurrentWindowsPrincipal(timeoutMs: number): string {
   // Order matters: an explicitly injected runner outranks the synthetic value,
   // so a test can inject a FAILURE on a POSIX host. See the seam comment above.
   if (hasSyncRunnerOverride()) {
-    if (cachedPrincipal) return cachedPrincipal;
+    if (cachedIdentity) return `*${cachedIdentity.sid}`;
     if (timeoutMs <= 0) throw identityError("had no remaining deadline");
     let overridden: WindowsPrincipalLookupResult;
     try {
@@ -237,11 +282,10 @@ export function resolveCurrentWindowsPrincipal(timeoutMs: number): string {
     } catch {
       throw identityError("could not start");
     }
-    const principal = principalFromResult(overridden);
-    cachedPrincipal = principal;
-    return principal;
+    cachedIdentity = identityFromResult(overridden);
+    return `*${cachedIdentity.sid}`;
   }
-  if (cachedPrincipal) return cachedPrincipal;
+  if (cachedIdentity) return `*${cachedIdentity.sid}`;
   if (syntheticPrincipalForTests) return syntheticPrincipalForTests;
   if (timeoutMs <= 0) throw identityError("had no remaining deadline");
   let result: WindowsPrincipalLookupResult;
@@ -250,9 +294,8 @@ export function resolveCurrentWindowsPrincipal(timeoutMs: number): string {
   } catch {
     throw identityError("could not start");
   }
-  const principal = principalFromResult(result);
-  cachedPrincipal = principal;
-  return principal;
+  cachedIdentity = identityFromResult(result);
+  return `*${cachedIdentity.sid}`;
 }
 
 async function waitForExistingLookup(
@@ -284,7 +327,7 @@ async function waitForExistingLookup(
  */
 export async function resolveCurrentWindowsPrincipalAsync(timeoutMs: number): Promise<string> {
   const overridden = hasAsyncRunnerOverride();
-  if (cachedPrincipal) return cachedPrincipal;
+  if (cachedIdentity) return `*${cachedIdentity.sid}`;
   if (asyncLookupInFlight) return waitForExistingLookup(asyncLookupInFlight, timeoutMs);
   // Same precedence rule as the sync path: an injected runner beats the synthetic.
   if (!overridden && syntheticPrincipalForTests) return syntheticPrincipalForTests;
@@ -297,16 +340,15 @@ export async function resolveCurrentWindowsPrincipalAsync(timeoutMs: number): Pr
     } catch {
       throw identityError("could not start");
     }
-    const principal = principalFromResult(result);
-    cachedPrincipal = principal;
-    return principal;
+    cachedIdentity = identityFromResult(result);
+    return `*${cachedIdentity.sid}`;
   })();
   asyncLookupInFlight = lookup;
-  try {
-    return await lookup;
-  } finally {
-    if (asyncLookupInFlight === lookup) asyncLookupInFlight = null;
-  }
+  void lookup.then(
+    () => { if (asyncLookupInFlight === lookup) asyncLookupInFlight = null; },
+    () => { if (asyncLookupInFlight === lookup) asyncLookupInFlight = null; },
+  );
+  return waitForExistingLookup(lookup, timeoutMs);
 }
 
 /** Test seam: replace the sync resolver process and clear its successful cache. */
@@ -317,7 +359,7 @@ export function setWindowsPrincipalRunnerForTests(
     throw new Error("Cannot replace the Windows principal runner while a lookup is in flight.");
   }
   principalRunner = runner ?? defaultWindowsPrincipalRunner;
-  cachedPrincipal = null;
+  cachedIdentity = null;
 }
 
 /** Test seam: replace the async resolver process and clear its successful cache. */
@@ -328,7 +370,27 @@ export function setAsyncWindowsPrincipalRunnerForTests(
     throw new Error("Cannot replace the Windows principal runner while a lookup is in flight.");
   }
   asyncPrincipalRunner = runner ?? defaultAsyncWindowsPrincipalRunner;
-  cachedPrincipal = null;
+  cachedIdentity = null;
+}
+
+/**
+ * Test seam: pin the locale that selects the legacy code page.
+ *
+ * Required rather than convenient. `decodeWindowsTextBytes` picks ONE legacy encoding
+ * from the ambient locale, so CP949, CP932 and CP936 fixtures cannot all decode
+ * correctly in a single process without being told which to expect. Production passes
+ * nothing and keeps the ambient locale.
+ *
+ * Clears the cache and refuses mid-flight for the same reasons the runner setters do:
+ * a successful identity is returned from cache BEFORE any decode, and the async path
+ * decodes after its runner resolves.
+ */
+export function setWindowsPrincipalLocaleForTests(locale: string | null): void {
+  if (asyncLookupInFlight) {
+    throw new Error("Cannot change the Windows principal locale while a lookup is in flight.");
+  }
+  principalLocaleForTests = locale ?? undefined;
+  cachedIdentity = null;
 }
 
 /** Test seam: clear only process-local principal state. */
@@ -336,6 +398,6 @@ export function resetWindowsPrincipalForTests(): void {
   if (asyncLookupInFlight) {
     throw new Error("Cannot reset the Windows principal while a lookup is in flight.");
   }
-  cachedPrincipal = null;
+  cachedIdentity = null;
   syntheticPrincipalForTests = null;
 }

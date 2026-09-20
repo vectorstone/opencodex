@@ -3,16 +3,16 @@ import { jcsStringify } from "../digest";
 import type { LabBehaviorSource, LabBehaviorValues } from "../live/types";
 
 const CLOSED_KEYS = new Set([
-  "wire.adapter", "wire.upstreamProtocol", "wire.responsesPath", "wire.commandCodeVersion", "wire.modelSuffixMode",
+  "wire.adapter", "wire.upstreamProtocol", "wire.responsesPath", "wire.chatCompletionsPath", "wire.commandCodeVersion", "wire.modelSuffixMode",
   "auth.mode", "auth.transport",
   "responses.stateful", "responses.upstreamStreaming", "responses.serviceTier", "responses.fastWireKind", "responses.fastWireValue", "responses.snapshotRepair", "responses.itemIdRepair",
   "limits.contextWindow", "limits.maxInputTokens", "limits.maxOutputTokens",
   "modalities.input",
   "sampling.omitTemperature", "sampling.omitTopP", "sampling.omitPenalties",
-  "reasoning.supported", "reasoning.efforts", "reasoning.defaultEffort", "reasoning.effortMap", "reasoning.wireFormat",
+  "reasoning.supported", "reasoning.efforts", "reasoning.effortsAuthoritative", "reasoning.defaultEffort", "reasoning.effortMap", "reasoning.wireFormat",
   "reasoning.summaryMode", "reasoning.replayMode", "reasoning.splitMode", "reasoning.toggleMode", "reasoning.budgetMode",
   "tools.choiceRestrictions", "tools.parallel", "tools.hostedPreference", "tools.customFreeform", "tools.builtinNameEscaping",
-  "cache.forwarding", "cache.retention", "anthropic.eofPolicy",
+  "cache.forwarding", "cache.retention", "anthropic.eofPolicy", "openai-chat.eofPolicy",
   "google.mode", "google.projectFingerprint", "google.locationFingerprint",
   "openrouter.order", "openrouter.only", "openrouter.allowFallbacks",
   "sidecars.vision", "sidecars.webSearch",

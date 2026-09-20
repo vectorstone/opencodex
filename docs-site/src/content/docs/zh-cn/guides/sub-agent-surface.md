@@ -56,7 +56,9 @@ Dashboard 上的 **Sub-agent delegation** 控件管理三个相关设置：
 
 内置的 v2 指引有 700 字符预算。如果会超出预算，opencodex 会优先删除 roster，而不是截断核心 spawn 指令。内置指引仅在首选模型、可用 roster 或 fallback chain 解析成功时触发。只要配置了 `injectionModel`，自定义提示词就会触发；如果未限定的值无法唯一解析，`{{model}}` 会替换为空字符串。
 
-在 v1 上，opencodex 只会在 `max` 或 `ultra` effort 下注入上游风格的主动委派指引。它不会在 v1 上额外添加首选模型、roster、fallback list 或自定义提示词。
+在 v1 上，opencodex 只在 `max` 或 `ultra` 推理强度下注入与 v2 推荐预设相同的主动委派指引。
+仅改变委派的触发条件：不再需要单独提出委派请求；用户指示以及权限、任务范围和协作工具规则仍然适用。
+它不会在 v1 上额外添加首选模型、roster、fallback list 或自定义提示词。
 
 默认关闭的 `syncCodexSubagentDefaults` 选项与指引是分开的。当 opencodex 拥有活跃的 Codex 路由时，同步或重启可以把所选值写入 Codex TOML 中带标记的 `[agents] default_subagent_model` 和 `default_subagent_reasoning_effort` 条目。opencodex 只会更新或移除带有其标记的字段。如果任一目标字段属于用户，整对值会保持不变，而不会部分写入；含糊不清的 TOML 会在不写入的情况下被拒绝。外部 provider 管理器和用户拥有的根路由也仍然具有最终权威。
 
@@ -72,7 +74,7 @@ per-role fallback 链应该放在 opencodex 配置里，而不是 `$CODEX_HOME/a
 
 重复的模型 id 会在保留第一次出现的前提下移除。在选择过程中，opencodex 会跳过已禁用、不可路由、由已禁用 provider 支撑、标记为 unhealthy、处于 cooldown、没有可用 pooled Codex 账户，或者超出配置配额阈值的候选项。可用性探测会缓存 `subagentModelFallbackPollMs` 的时长，默认 60 秒。
 
-fallback 不会让不兼容的加密任务变得可读。当子任务为 ChatGPT 加密时，即使链中更靠前出现了外部模型，选择也只会限制在规范的原生 ChatGPT 目标上。
+fallback 不会让不兼容的加密任务变得可读。当子任务为 ChatGPT 加密时，即使链中更靠前出现了其他外部模型，选择也只会限制在规范的原生 ChatGPT 目标，以及通过 `allowEncryptedV2AgentTasks: true` 明确信任的直接密钥认证 Responses 路由。combo 仍然只使用规范的原生目标。
 
 ## 加密的 v2 任务传递
 
@@ -80,11 +82,11 @@ Codex 只能把 v2 原生到路由的子任务作为后端加密的 `encrypted_c
 
 opencodex 会安全失败，而不是转发空任务或不可读任务：
 
-- 直接的非原生路由会返回 HTTP 400，并且 `error.code = "unreadable_encrypted_agent_task"`，不会回显密文。
+- 不符合条件的直接非原生路由会返回 HTTP 400，并且 `error.code = "unreadable_encrypted_agent_task"`，不会回显密文。符合条件且通过 `allowEncryptedV2AgentTasks: true` 明确选择加入的直接密钥认证 Responses provider 会改为接收不透明密文，并绕过此错误。
 - 对于该任务，combo 只会考虑规范的原生 ChatGPT 目标，包括重试。如果没有可用目标，则返回相同的 400 错误。
 - 可读的明文任务会保持正常的路由和 fallback 行为。
 
-恢复选项是选择原生 ChatGPT 子级、在 combo 中添加原生 ChatGPT 目标、在异构 provider 委派中使用 v1，或者在你控制调用方时将任务作为明文 v2 `agent_message` 内容重新发送。
+恢复选项是选择原生 ChatGPT 子级、明确信任能够处理不透明载荷的直接密钥认证 Responses 中继、在 combo 中添加原生 ChatGPT 目标、在异构 provider 委派中使用 v1，或者在你控制调用方时将任务作为明文 v2 `agent_message` 内容重新发送。
 
 实验性的 `agentTaskRecovery` 默认关闭。显式启用后，它可以通过向固定 ChatGPT 端点发送额外的认证请求来恢复这种格式，但会消耗配额、增加延迟，并依赖非公开的后端行为。任何失败都会保留原有的 `unreadable_encrypted_agent_task` 错误。详见[英文配置参考](/reference/configuration/agents/#encrypted-v2-task-recovery)。
 
@@ -115,7 +117,7 @@ ocx v2 threads 8
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
-ocx agent fallback set gpt-5.4-mini,xai/grok-4.5 --poll-ms 60000
+ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx agent effort set --subagent max
 ```
 
@@ -170,3 +172,14 @@ curl -X PUT http://localhost:10100/api/injection-model \
 ### 上下文上限
 
 模型上下文上限与子代理模式无关。请在 Models 页面配置它；原生 OpenAI 模型会保留其真实的上下文窗口。
+
+新配置不会写入实验性的 `plaintextV2AgentMessages` 字段，只有显式设置为 `true` 才会启用。
+调用方必须使用 Responses 格式，最终目标必须采用 `adapter: "openai-responses"`、
+`authMode: "forward"` 和准确的基础地址 `https://chatgpt.com/backend-api/codex`。OpenAI API key
+provider、自定义兼容网关、最终发往其他 provider 的请求，以及非 Responses 调用都不会被改写。
+对于符合条件的新原生 ChatGPT v2 工具调用，该选项会临时改写 namespace 和三个保留工具名，
+并删除消息字段的加密标记；响应返回 Codex 前会恢复原 namespace 与工具名。它处理
+`spawn_agent`、`send_message` 和 `followup_task`，不会增加恢复请求。
+HTTPS 仍会加密网络传输，但任务文字可能保存在 Codex 历史、外部模型请求和本地响应或调试文件中。
+已有密文不会改变。该选项依赖 ChatGPT 和 Codex 未公开的行为。详见
+[明文 v2 代理消息](/zh-cn/reference/configuration/agents/#明文-v2-代理消息)。

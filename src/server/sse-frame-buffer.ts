@@ -1,4 +1,8 @@
+import { isCyberPolicyCode, isCyberPolicyMessage } from "../lib/errors";
+
 export const MAX_CLIENT_SSE_FRAME_BYTES = 4 * 1024 * 1024;
+
+export const EMPTY_BYTES = new Uint8Array(0);
 
 const LF_LF = Uint8Array.of(10, 10);
 const LF_CR_LF = Uint8Array.of(10, 13, 10);
@@ -106,10 +110,35 @@ function isResponsesTerminalFrame(block: Uint8Array): boolean {
   const payload = data.join("\n");
   if (payload === "[DONE]") return false;
   try {
-    const parsed = JSON.parse(payload) as { type?: unknown };
-    return parsed.type === "response.completed"
+    const parsed = JSON.parse(payload) as {
+      type?: unknown;
+      code?: unknown;
+      message?: unknown;
+      error?: unknown;
+      last_error?: unknown;
+      response?: { error?: unknown; incomplete_details?: unknown };
+    };
+    if (parsed.type === "response.completed"
       || parsed.type === "response.failed"
-      || parsed.type === "response.incomplete";
+      || parsed.type === "response.incomplete") return true;
+    if (parsed.type !== "error") return false;
+    // A top-level error is terminal for this boundary only when it carries the
+    // same high-confidence cyber-policy evidence used by relay.ts. Ordinary
+    // upstream errors remain transport failures and still become a bounded 502.
+    const candidates = [
+      parsed,
+      parsed.error,
+      parsed.last_error,
+      parsed.response?.error,
+      parsed.response?.incomplete_details,
+    ];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      const record = candidate as { code?: unknown; message?: unknown };
+      if (isCyberPolicyCode(typeof record.code === "string" ? record.code : undefined)) return true;
+      if (typeof record.message === "string" && isCyberPolicyMessage(record.message)) return true;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -128,8 +157,8 @@ function isResponsesTerminalFrame(block: Uint8Array): boolean {
 export class BoundedSseFrameBuffer {
   private readonly maxFrameBytes: number;
   private readonly maxFramesPerFeed: number;
-  private delimiterTail: Uint8Array = new Uint8Array(0);
-  private candidate: Uint8Array = new Uint8Array(0);
+  private delimiterTail: Uint8Array = EMPTY_BYTES;
+  private candidate: Uint8Array = EMPTY_BYTES;
   private candidateBytes = 0;
   private disposed = false;
 
@@ -145,8 +174,8 @@ export class BoundedSseFrameBuffer {
   }
 
   private clear(): void {
-    this.delimiterTail = new Uint8Array(0);
-    this.candidate = new Uint8Array(0);
+    this.delimiterTail = EMPTY_BYTES;
+    this.candidate = EMPTY_BYTES;
     this.candidateBytes = 0;
   }
 
@@ -182,12 +211,12 @@ export class BoundedSseFrameBuffer {
   }
 
   private takeCandidate(): Uint8Array {
-    if (this.candidateBytes === 0) return new Uint8Array(0);
+    if (this.candidateBytes === 0) return EMPTY_BYTES;
     const block = this.candidate.slice(0, this.candidateBytes);
     // Release the working allocation after each complete frame. This avoids
     // retaining a rare multi-MiB frame allocation for the rest of a long-lived
     // stream; normal small-frame allocation remains bounded by feed's frame cap.
-    this.candidate = new Uint8Array(0);
+    this.candidate = EMPTY_BYTES;
     this.candidateBytes = 0;
     return block;
   }
@@ -198,7 +227,7 @@ export class BoundedSseFrameBuffer {
 
     const frames: BoundedSseFrame[] = [];
     const previousTail = this.delimiterTail;
-    this.delimiterTail = new Uint8Array(0);
+    this.delimiterTail = EMPTY_BYTES;
     const tailLength = previousTail.byteLength;
     const totalLength = tailLength + chunk.byteLength;
     const byteAt = (index: number): number => index < tailLength
@@ -259,10 +288,10 @@ export class BoundedSseFrameBuffer {
 
   /** Return the final unterminated block bytes and release all retained state. */
   finish(): Uint8Array {
-    if (this.disposed) return new Uint8Array(0);
+    if (this.disposed) return EMPTY_BYTES;
     try {
       this.retain(this.delimiterTail);
-      this.delimiterTail = new Uint8Array(0);
+      this.delimiterTail = EMPTY_BYTES;
       return this.takeCandidate();
     } finally {
       this.clear();
@@ -280,7 +309,7 @@ export class BoundedSseFrameBuffer {
 export function joinSseFrameBytes(parts: readonly Uint8Array[]): Uint8Array {
   let byteLength = 0;
   for (const part of parts) byteLength += part.byteLength;
-  if (byteLength === 0) return new Uint8Array(0);
+  if (byteLength === 0) return EMPTY_BYTES;
   if (parts.length === 1 && parts[0]!.byteLength === byteLength) return parts[0]!;
   const joined = new Uint8Array(byteLength);
   let offset = 0;

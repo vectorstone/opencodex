@@ -1,17 +1,21 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { zstdDecompressSync } from "node:zlib";
+import { parseSessionMetaLine, type ParsedSessionMeta } from "./history-rollout-read";
+export { MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES, readThreadFieldsFromRollout, type RolloutThreadFields } from "./history-rollout-read";
 import { Database } from "bun:sqlite";
 import { resolveCodexStateDbPath } from "./paths";
+import { openCodexStateForPreflight } from "./history-state-open";
 import { atomicWriteFile, getConfigDir } from "../config";
-
-/**
- * Cap for decompressing a lone `.jsonl.zst` rollout during quarantine restore.
- * Bounds peak memory while reconstructing thread rows; never write the decoded
- * JSONL to disk.
- */
-export const MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES = 64 * 1024 * 1024;
+import {
+  CODEX_HISTORY_RESUMABLE_SOURCES,
+  codexHistoryBackupId,
+  legacyCodexHistoryBackupId,
+  sameCodexHistoryPath,
+  validateCodexHistoryBackupManifest,
+  type CodexHistoryBackupEntry,
+  type CodexHistoryBackupManifest,
+} from "./history-manifest";
 
 /**
  * The manifest that shadows one state database.
@@ -21,11 +25,34 @@ export const MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES = 64 * 1024 * 1024;
  * the same way, since a manifest addressed differently is a different manifest.
  */
 export function historyBackupPathFor(stateDbPath: string): string {
-  const normalized = process.platform === "win32" ? resolve(stateDbPath).toLowerCase() : resolve(stateDbPath);
-  const id = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
-  return join(getConfigDir(), `codex-history-backup-${id}.json`);
+  return join(getConfigDir(), `codex-history-backup-${codexHistoryBackupId(stateDbPath)}.json`);
 }
-const RESUMABLE_SOURCES = ["cli", "vscode"] as const;
+
+/**
+ * Manifest name a database path spelled with the Win32 extended-length prefix
+ * (`\\?\C:\...`) received before that prefix was normalized out of the identity
+ * (#4442). Identical to historyBackupPathFor for every other spelling.
+ */
+export function legacyHistoryBackupPathFor(stateDbPath: string): string {
+  return join(getConfigDir(), `codex-history-backup-${legacyCodexHistoryBackupId(stateDbPath)}.json`);
+}
+
+/**
+ * The manifest that actually shadows one state database. Canonical name first; when
+ * only a pre-#4442 extended-length name exists, that manifest still shadows the
+ * database rather than reading as absent. When BOTH names exist the canonical
+ * manifest wins and the legacy file is left untouched — a conflict is resolved by
+ * keeping both, never by silently replacing one.
+ */
+export function resolveExistingHistoryBackupPath(
+  stateDbPath: string,
+  exists: (path: string) => boolean = existsSync,
+): string {
+  const canonical = historyBackupPathFor(stateDbPath);
+  if (exists(canonical)) return canonical;
+  const legacy = legacyHistoryBackupPathFor(stateDbPath);
+  return legacy !== canonical && exists(legacy) ? legacy : canonical;
+}
 
 /**
  * Open the live `state_5.sqlite` the way the Codex app expects a *secondary* writer to behave:
@@ -42,6 +69,22 @@ let historyDbBusyTimeoutMs = 5000;
  */
 export function setHistoryDbBusyTimeoutForTests(ms: number): void {
   historyDbBusyTimeoutMs = ms;
+}
+
+/**
+ * Carry that timeout across a realm boundary. A Worker starts from the default above and cannot
+ * observe a parent that shortened the window — the same reason its run message carries the homes
+ * explicitly — so `history-job.ts` sends this value and `history-worker.ts` adopts it. In
+ * production both sides already hold the codex-rs-matching 5s. A non-finite or negative value is
+ * refused rather than allowed to disable the wait the app expects.
+ */
+export function currentHistoryDbBusyTimeoutMs(): number {
+  return historyDbBusyTimeoutMs;
+}
+
+export function adoptHistoryDbBusyTimeout(ms: number): void {
+  if (!Number.isFinite(ms) || ms < 0) return;
+  historyDbBusyTimeoutMs = Math.floor(ms);
 }
 
 function openStateDb(stateDbPath: string): Database {
@@ -69,18 +112,26 @@ function openStateDb(stateDbPath: string): Database {
  * concurrently. We do not touch mtime: a fresh mtime is correct here (the app uses mtime as the
  * rollout's updated_at), and forcing it backwards could hide a real edit from list ordering.
  */
-function appendRolloutLine(path: string, line: string): void {
-  const fd = openSync(path, "a");
+function appendRolloutLine(path: string, line: string): Buffer {
+  assertLegacyHistoryRecord(line);
+  // No O_CREAT: a disappeared target is not an invitation to recreate history.
+  const fd = openSync(path, constants.O_RDWR | constants.O_APPEND);
+  const buf = Buffer.from(line.endsWith("\n") ? line : `${line}\n`, "utf8");
   try {
-    const buf = Buffer.from(line.endsWith("\n") ? line : `${line}\n`, "utf8");
+    assertLegacyHistoryWritable(path, fd);
+    historyAppendHooks?.beforeWrite?.(path);
+    assertHistoryDescriptorIdentity(path, fd);
     let offset = 0;
     while (offset < buf.length) {
       offset += writeSync(fd, buf, offset, buf.length - offset, null);
     }
     try { fsyncSync(fd); } catch { /* best-effort durability */ }
+    historyAppendHooks?.afterWrite?.(path);
+    assertHistoryDescriptorIdentity(path, fd);
   } finally {
     closeSync(fd);
   }
+  return buf;
 }
 
 /**
@@ -98,65 +149,156 @@ function appendRolloutLine(path: string, line: string): void {
  * insignificant JSON whitespace. We therefore replace the provider value and pad the removed bytes
  * with spaces so the line's byte length is unchanged. Equal length means we can write at offset 0
  * with no truncate and no inode swap, so this composes safely with the app's cached append handle.
- * Only length-preserving shrinks are handled (e.g. "opencodex" -> "openai"); callers that would
- * grow the value fall back to append-only, which is correct for the opencodex direction.
+ * A previous shrink leaves JSON whitespace in the token slot. That padding is part of the slot,
+ * so an exact restore can later grow "openai" back to "opencodex" without moving any bytes.
  *
- * Returns true when line 1 was patched, false when it could not be done safely (missing file,
- * non-`session_meta` first line, id mismatch, value already correct, or a length-growing change).
+ * Distinguishes an already-correct line from an unsafe one so exact restore never consumes its
+ * manifest after only the trailing metadata was repaired.
  */
-function patchFirstLineProviderInPlace(path: string, expectedId: string, provider: string): boolean {
-  if (!existsSync(path)) return false;
+type FirstLineProviderResult = "current" | "patched" | "unsafe";
+
+type FirstLineProviderPlan =
+  | { readonly state: "current" }
+  | { readonly state: "patchable"; readonly patchedLine: string }
+  | { readonly state: "unsafe" };
+
+function readFirstRolloutLine(fd: number): string | null {
+  // session_meta lines embed base_instructions and can be tens of KB; grow until the line
+  // actually ends rather than imposing a small fixed probe that would reject valid history.
+  const CHUNK = 1 << 16;
+  const MAX_FIRST_LINE = 1 << 24;
+  let collected = Buffer.alloc(0);
+  let nlIndex = -1;
+  let pos = 0;
+  while (nlIndex === -1) {
+    const chunk = Buffer.alloc(CHUNK);
+    const read = readSync(fd, chunk, 0, CHUNK, pos);
+    if (read === 0) break;
+    collected = Buffer.concat([collected, chunk.subarray(0, read)]);
+    nlIndex = collected.indexOf(0x0a);
+    pos += read;
+    if (collected.length > MAX_FIRST_LINE) return null;
+  }
+  return nlIndex === -1 ? null : collected.subarray(0, nlIndex).toString("utf8");
+}
+
+/**
+ * Bounded tail of complete JSONL lines, newest-last.
+ *
+ * Used to refuse a rollout that *became* paginated after a legacy first line
+ * (#4311). Line 1 can still look writable after a newer Codex migrates the
+ * thread in place, and the native projector then dies on the first
+ * out-of-sequence ordinal a legacy append introduces. Every record written
+ * after such a migration carries an ordinal, so the newest records are where
+ * the evidence is.
+ *
+ * One read of a fixed window from EOF, split once. An earlier draft grew the
+ * window chunk by chunk and re-decoded the accumulated buffer on every
+ * iteration, which is quadratic: a rollout whose only `session_meta` sits at
+ * the top would have decoded and split up to the whole window ~256 times. The
+ * window is a cap, not a target — it is not walked and it is not the file.
+ *
+ * Returns `null` only when the file cannot be measured, which the caller
+ * treats as an unreadable record rather than a writable rollout.
+ */
+const ROLLOUT_TAIL_WINDOW_BYTES = 1 << 20;
+
+function readRolloutTailCompleteLines(fd: number): string[] | null {
+  const size = Number(fstatSync(fd).size);
+  if (!Number.isFinite(size) || size < 0) return null;
+  if (size === 0) return [];
+  const start = Math.max(0, size - ROLLOUT_TAIL_WINDOW_BYTES);
+  const window = Buffer.alloc(size - start);
+  const read = readSync(fd, window, 0, window.length, start);
+  if (read === 0) return [];
+  const lines = window.subarray(0, read).toString("utf8").split("\n");
+  // Unless the window reached BOF, the first element starts mid-record (and
+  // possibly mid-codepoint), so it is not a complete line.
+  return (start === 0 ? lines : lines.slice(1)).filter(line => line.length > 0);
+}
+
+function planFirstLineProvider(firstLine: string, expectedId: string, provider: string): FirstLineProviderPlan {
+  const meta = parseSessionMetaLine(firstLine);
+  if (!meta || meta.record.payload.id !== expectedId) return { state: "unsafe" };
+  if (meta.record.payload.model_provider === provider) return { state: "current" };
+
+  // Include JSON whitespace after the value. A prior length-preserving shrink stores its spare
+  // bytes there, so the exact reverse restore may grow back into that padding.
+  const match = firstLine.match(/"model_provider"\s*:\s*"([^"\\]*)"[ \t]*/);
+  if (!match || match.index === undefined) return { state: "unsafe" };
+  const oldToken = match[0];
+  const newCore = `"model_provider":"${provider}"`;
+  if (Buffer.byteLength(newCore, "utf8") > Buffer.byteLength(oldToken, "utf8")) return { state: "unsafe" };
+  const pad = " ".repeat(Buffer.byteLength(oldToken, "utf8") - Buffer.byteLength(newCore, "utf8"));
+  const patchedLine = firstLine.slice(0, match.index) + newCore + pad + firstLine.slice(match.index + oldToken.length);
+  if (Buffer.byteLength(patchedLine, "utf8") !== Buffer.byteLength(firstLine, "utf8")) return { state: "unsafe" };
+  const reparsed = parseSessionMetaLine(patchedLine);
+  if (!reparsed
+    || reparsed.record.payload.id !== expectedId
+    || reparsed.record.payload.model_provider !== provider) return { state: "unsafe" };
+  return { state: "patchable", patchedLine };
+}
+
+function inspectFirstLineProvider(path: string, expectedId: string, provider: string): "current" | "patchable" | "unsafe" {
+  if (!existsSync(path)) return "unsafe";
+  const fd = openSync(path, "r");
+  try {
+    const firstLine = readFirstRolloutLine(fd);
+    return firstLine === null ? "unsafe" : planFirstLineProvider(firstLine, expectedId, provider).state;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readFirstLineProviderValue(path: string, expectedId: string): string | null {
+  if (!existsSync(path)) return null;
+  const fd = openSync(path, "r");
+  try {
+    const firstLine = readFirstRolloutLine(fd);
+    if (firstLine === null) return null;
+    const meta = parseSessionMetaLine(firstLine);
+    if (!meta || meta.record.payload.id !== expectedId) return null;
+    return typeof meta.record.payload.model_provider === "string"
+      ? meta.record.payload.model_provider
+      : null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function patchFirstLineProviderInPlace(
+  path: string, expectedId: string, provider: string,
+  expectedIdentity: { dev: number | bigint; ino: number | bigint },
+): FirstLineProviderResult {
+  historyAppendHooks?.beforeFirstLineOpen?.(path);
   const fd = openSync(path, "r+");
   try {
-    // Read the first line by growing the probe until we hit a newline. session_meta lines embed
-    // base_instructions and can be tens of KB; a fixed cap would silently skip the in-place patch
-    // (and fall back to append-only, re-opening the first-line-clone resurrection gap), so we read
-    // until the line actually ends rather than guessing a ceiling.
-    const CHUNK = 1 << 16;
-    const MAX_FIRST_LINE = 1 << 24; // 16 MiB hard stop so a newline-less/corrupt file can't OOM us.
-    let collected = Buffer.alloc(0);
-    let nlIndex = -1;
-    let pos = 0;
-    while (nlIndex === -1) {
-      const chunk = Buffer.alloc(CHUNK);
-      const read = readSync(fd, chunk, 0, CHUNK, pos);
-      if (read === 0) break; // EOF with no newline: single-line file, skip
-      collected = Buffer.concat([collected, chunk.subarray(0, read)]);
-      nlIndex = collected.indexOf(0x0a);
-      pos += read;
-      if (collected.length > MAX_FIRST_LINE) return false;
-    }
-    if (nlIndex === -1) return false; // no newline anywhere: skip
-    const firstLine = collected.subarray(0, nlIndex).toString("utf8");
-
-    const meta = parseSessionMetaLine(firstLine);
-    if (!meta) return false;
-    if (meta.record.payload.id !== expectedId) return false;
-    if (meta.record.payload.model_provider === provider) return false;
-
-    // Locate the exact `"model_provider":"<value>"` token (allowing whitespace after the colon).
-    const match = firstLine.match(/"model_provider"\s*:\s*"([^"\\]*)"/);
-    if (!match || match.index === undefined) return false;
-    const oldToken = match[0];
-    const newCore = `"model_provider":"${provider}"`;
-    if (Buffer.byteLength(newCore, "utf8") > Buffer.byteLength(oldToken, "utf8")) return false; // grow: not length-preserving
-    const pad = " ".repeat(Buffer.byteLength(oldToken, "utf8") - Buffer.byteLength(newCore, "utf8"));
-    const newToken = `${newCore}${pad}`;
-
-    const patchedLine = firstLine.slice(0, match.index) + newToken + firstLine.slice(match.index + oldToken.length);
-    // Length must be identical so the trailing bytes (newline + rest of file) are untouched.
-    if (Buffer.byteLength(patchedLine, "utf8") !== Buffer.byteLength(firstLine, "utf8")) return false;
-    // Sanity: the patched line must still parse and carry the new provider.
-    const reparsed = parseSessionMetaLine(patchedLine);
-    if (!reparsed || reparsed.record.payload.model_provider !== provider) return false;
-
-    const out = Buffer.from(patchedLine, "utf8");
+    const assertIdentity = (): void => {
+      assertHistoryDescriptorIdentity(path, fd);
+      const held = fstatSync(fd);
+      if (held.dev !== expectedIdentity.dev || held.ino !== expectedIdentity.ino) {
+        throw new CodexHistoryIntegrityError("history_rollout_identity_changed");
+      }
+    };
+    assertIdentity();
+    assertLegacyHistoryWritable(path, fd);
+    const firstLine = readFirstRolloutLine(fd);
+    if (firstLine === null) return "unsafe";
+    const plan = planFirstLineProvider(firstLine, expectedId, provider);
+    if (plan.state === "unsafe") return "unsafe";
+    if (plan.state === "current") return "current";
+    const out = Buffer.from(plan.patchedLine, "utf8");
+    historyAppendHooks?.beforeFirstLineWrite?.(path);
+    assertIdentity();
+    assertLegacyHistoryWritable(path, fd);
     let offset = 0;
     while (offset < out.length) {
       offset += writeSync(fd, out, offset, out.length - offset, offset);
     }
     try { fsyncSync(fd); } catch { /* best-effort durability */ }
-    return true;
+    historyAppendHooks?.afterFirstLineWrite?.(path);
+    assertIdentity();
+    return "patched";
   } finally {
     closeSync(fd);
   }
@@ -164,9 +306,186 @@ function patchFirstLineProviderInPlace(path: string, expectedId: string, provide
 
 export type CodexHistoryProvider = "openai" | "opencodex";
 
-export type CodexHistoryFailureReason = "busy" | "permission";
+export type CodexHistoryFailureReason = "busy" | "permission" | "integrity";
+
+class CodexHistoryIntegrityError extends Error {
+  constructor(
+    code: string,
+    readonly progress: { readonly rows: number; readonly files: number } = { rows: 0, files: 0 },
+  ) {
+    super(code);
+    this.name = "CodexHistoryIntegrityError";
+  }
+}
+
+/** Paginated ordinals and projection offsets belong to Codex's live writer.
+ * O_APPEND does not allocate an ordinal or update that writer's in-memory cursor.
+ * Refuse before changing the DB, manifest, or first-line provider; never guess N+1.
+ */
+/**
+ * The one refusal reason that means "the native writer owns this history", as opposed
+ * to "something is wrong". It is a stand-down for the relabel unit on apply
+ * (`src/codex/inject.ts`) and for the history half of a restore; every other reason is
+ * a hard refusal in both directions.
+ *
+ * Exported as a constant rather than repeated as a literal because the apply and restore
+ * directions have to agree on it exactly. They drifted once already: apply learned to
+ * stand down while restore kept refusing, which is how #4812's uninstall deadlock
+ * survived the fix that was supposed to end it.
+ */
+export const HISTORY_RELABEL_STANDS_DOWN = "history_paginated_requires_native_writer";
+
+function assertLegacyHistoryRecord(line: string): void {
+  let value: unknown;
+  try { value = JSON.parse(line); } catch { throw new CodexHistoryIntegrityError("history_rollout_record_invalid"); }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new CodexHistoryIntegrityError("history_rollout_record_invalid");
+  }
+  const record = value as Record<string, unknown>;
+  const payload = record.payload;
+  if (Object.hasOwn(record, "ordinal") || (payload !== null && typeof payload === "object" && (payload as Record<string, unknown>).history_mode === "paginated")) {
+    throw new CodexHistoryIntegrityError(HISTORY_RELABEL_STANDS_DOWN);
+  }
+}
+
+function assertHistoryDescriptorIdentity(path: string, fd: number): void {
+  const held = fstatSync(fd);
+  let current: ReturnType<typeof lstatSync>;
+  try { current = lstatSync(path); } catch { throw new CodexHistoryIntegrityError("history_rollout_identity_changed"); }
+  if (!current.isFile() || current.isSymbolicLink() || current.dev !== held.dev || current.ino !== held.ino) {
+    throw new CodexHistoryIntegrityError("history_rollout_identity_changed");
+  }
+}
+
+let historyAppendHooks: {
+  beforeWrite?: (path: string) => void;
+  afterWrite?: (path: string) => void;
+  beforeFirstLineOpen?: (path: string) => void;
+  beforeFirstLineWrite?: (path: string) => void;
+  afterFirstLineWrite?: (path: string) => void;
+} | undefined;
+export function setHistoryAppendHooksForTests(hooks: typeof historyAppendHooks): void { historyAppendHooks = hooks; }
+
+function assertLegacyHistoryWritable(path: string, heldFd?: number): void {
+  if (!path || !existsSync(path)) return;
+  const fd = heldFd ?? openSync(path, "r");
+  try {
+    assertHistoryDescriptorIdentity(path, fd);
+    const first = readFirstRolloutLine(fd);
+    if (!first) throw new CodexHistoryIntegrityError("history_rollout_record_invalid");
+    assertLegacyHistoryRecord(first);
+    // Line 1 is not enough: a newer Codex can migrate a live rollout in place,
+    // leaving the original session_meta and writing ordinals / history_mode only
+    // onto later records (#4311). The native projector then stops at the first
+    // cloned ordinal-0 append. Inspect a bounded window of the newest records
+    // and refuse before any mutation of the rollout, the row, or the manifest.
+    const tail = readRolloutTailCompleteLines(fd);
+    if (tail === null) throw new CodexHistoryIntegrityError("history_rollout_record_invalid");
+    if (tail.length === 0) return;
+    const last = tail[tail.length - 1];
+    if (!last) throw new CodexHistoryIntegrityError("history_rollout_record_invalid");
+    if (last !== first) assertLegacyHistoryRecord(last);
+    // Cheap filter: only re-parse tail lines that look paginated. Needed because
+    // a compensating append can make the last line look legacy again while an
+    // earlier-in-tail native conversion still carries ordinals (#4311).
+    for (const line of tail) {
+      if (line === first || line === last) continue;
+      if (line.includes("\"ordinal\"") || line.includes("\"history_mode\"")) {
+        assertLegacyHistoryRecord(line);
+      }
+    }
+  } finally {
+    if (heldFd === undefined) closeSync(fd);
+  }
+}
+
+/** A store with history_mode can migrate legacy rows while Codex is running.
+ * Refuse the entire external mutation, not only rows already marked paginated.
+ */
+function assertLegacyHistoryStore(db: Database): void {
+  const columns = db.query<{ name: string }, []>("PRAGMA table_info(threads)").all();
+  if (columns.some(column => column.name === "history_mode")) {
+    throw new CodexHistoryIntegrityError(HISTORY_RELABEL_STANDS_DOWN);
+  }
+}
+
+/** Read-only preflight before the injector changes provider definitions.
+ * Native paginated history cannot participate in the legacy relabel protocol.
+ * Returning a refusal preserves the existing config as well as the rollout.
+ */
+export function preflightCodexHistoryInjection(
+  providerTableMode: boolean,
+  resumeHistory: boolean,
+  stateDbPath?: string,
+): string | null {
+  let db: Database | undefined;
+  try {
+    const resolvedPath = stateDbPath ?? resolveCodexStateDbPath();
+    // A partially restored row may already be native while its manifest still
+    // owns work. Match the restore worker's target set before removing routing.
+    const restoreEntries = providerTableMode ? []
+      : Object.values(readBackup(resolveExistingHistoryBackupPath(resolvedPath), resolvedPath).manifest.entries);
+    if (!existsSync(resolvedPath)) {
+      return restoreEntries.length > 0 ? "history_state_database_missing" : null;
+    }
+    // Read-only, and narrowed so a cleanly-closed WAL store is inspected rather than refused
+    // (#4943). The open order is the safety property; see history-state-open.ts.
+    db = openCodexStateForPreflight(resolvedPath);
+    const columns = db.query<{ name: string }, []>("PRAGMA table_info(threads)").all();
+    const paginatedColumn = columns.some(column => column.name === "history_mode");
+    if (paginatedColumn && restoreEntries.length > 0) return HISTORY_RELABEL_STANDS_DOWN;
+    for (const entry of restoreEntries) assertLegacyHistoryWritable(entry.rolloutPath);
+    const rows = db.query<{ rollout_path: string; history_mode: string | null; model_provider: string }, []>(`
+      SELECT rollout_path, ${paginatedColumn ? "history_mode" : "NULL AS history_mode"}, model_provider
+      FROM threads
+      WHERE ${providerTableMode
+        ? resumeHistory ? "model_provider IN ('openai', 'opencodex')" : "0"
+        : "model_provider = 'opencodex'"}
+    `).all();
+    // No ORDER BY: a paginated opencodex row can precede a paginated openai one, so the
+    // verdict waits for the full scan instead of standing down on the first paginated row.
+    let foundPaginatedRow = false;
+    let foundPaginatedOpenaiRow = false;
+    for (const row of rows) {
+      if (paginatedColumn || row.history_mode === "paginated") {
+        foundPaginatedRow = true;
+        // A provider-table transition removes the root openai_base_url, and a row already
+        // paginated cannot be relabeled: standing it down would route the openai-tagged
+        // thread to Codex's built-in OpenAI endpoint. A still-legacy row only stands down.
+        if (providerTableMode && row.history_mode === "paginated" && row.model_provider === "openai") {
+          foundPaginatedOpenaiRow = true;
+        }
+        continue;
+      }
+      assertLegacyHistoryWritable(row.rollout_path);
+    }
+    if (foundPaginatedOpenaiRow) return "history_paginated_openai_requires_native_writer";
+    return foundPaginatedRow ? HISTORY_RELABEL_STANDS_DOWN : null;
+  } catch (error) {
+    return error instanceof CodexHistoryIntegrityError
+      ? error.message
+      : "history_injection_preflight_unavailable";
+  } finally {
+    db?.close();
+  }
+}
+
+function integrityFailureResult(error: CodexHistoryIntegrityError): CodexHistorySyncResult {
+  return {
+    rows: error.progress.rows,
+    files: error.progress.files,
+    failed: true,
+    failureReason: "integrity",
+    // The specific code, so an operator sees WHICH integrity condition stopped the
+    // transition rather than a generic "run doctor". `history_apply_ambiguous_reroute` in
+    // particular needs manual resolution: the manifest is intact and the safe move is to
+    // inspect it, not to retry.
+    integrityCode: error.message,
+  };
+}
 
 export interface CodexHistorySyncResult {
+  /** Rows/files changed before a last-moment integrity race; may be nonzero with `failed`. */
   rows: number;
   files: number;
   ejectedRows?: number;
@@ -174,6 +493,15 @@ export interface CodexHistorySyncResult {
   failed?: true;
   /** Why the retry budget was exhausted when `failed` is set. */
   failureReason?: CodexHistoryFailureReason;
+  /**
+   * The specific integrity condition, when `failureReason` is `"integrity"`.
+   *
+   * `failureReason` alone tells an operator only that something was inconsistent, which
+   * reads as "retry or run doctor". Some of these are not retryable —
+   * `history_apply_ambiguous_reroute` means two histories produced the same row and the
+   * manifest needs a human — so the code travels with the result.
+   */
+  integrityCode?: string;
 }
 
 interface ThreadRow {
@@ -184,18 +512,16 @@ interface ThreadRow {
   has_user_event: number;
 }
 
-interface BackupEntry {
-  id: string;
-  rolloutPath: string;
-  modelProvider: string;
-  source: string;
-  hasUserEvent: number;
+interface RestoreRowSnapshot extends ThreadRow {
+  first_user_message: string | null;
 }
 
-interface BackupManifest {
-  version: 1;
-  stateDbPath?: string;
-  entries: Record<string, BackupEntry>;
+interface ApplyRowSnapshot extends ThreadRow {
+  first_user_message: string | null;
+}
+
+function hasFirstUserMessage(value: string | null): boolean {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 export interface CodexHistoryVerifiedNoopProof {
@@ -232,69 +558,126 @@ export type CodexHistoryNoopSnapshot =
 
 type StrictBackupInspection =
   | { readonly kind: "known"; readonly present: boolean; readonly entries: number; readonly fingerprint: string }
-  | { readonly kind: "unknown"; readonly present: boolean; readonly reason: "manifest-read" | "manifest-schema" | "manifest-foreign" };
+  | { readonly kind: "unknown"; readonly present: boolean; readonly reason: "manifest-read" | "manifest-schema" | "manifest-foreign";
+      readonly failureReason?: "busy" | "permission" };
+
+type StrictBackupRead =
+  | {
+      readonly kind: "known";
+      readonly present: boolean;
+      readonly manifest: CodexHistoryBackupManifest;
+      readonly fingerprint: string;
+    }
+  | {
+      readonly kind: "unknown";
+      readonly present: true;
+      readonly reason: "manifest-read" | "manifest-schema" | "manifest-foreign";
+      readonly failureReason?: "busy" | "permission";
+    };
 
 let afterNoopPendingCountForTests: (() => void) | undefined;
+let beforeHistoryBackupConsumeForTests: (() => void) | undefined;
+let beforeStrictHistoryRolloutAppendForTests: (() => void) | undefined;
+let afterStrictHistoryRolloutAppendForTests: (() => void) | undefined;
+let beforeHistoryApplyTransactionForTests: (() => void) | undefined;
 
 /** Test seam: runs after the pending count and before stability validation. */
 export function setAfterNoopPendingCountForTests(hook: (() => void) | undefined): void {
   afterNoopPendingCountForTests = hook;
 }
 
-interface NativeRestoreTarget {
-  modelProvider: string;
-  source: string;
-  hasUserEvent: number;
+/** Test seam: runs after exact DB/rollout readback and before manifest fingerprint CAS. */
+export function setBeforeHistoryBackupConsumeForTests(hook: (() => void) | undefined): void {
+  beforeHistoryBackupConsumeForTests = hook;
 }
 
-function samePath(a: string, b: string): boolean {
-  const left = resolve(a);
-  const right = resolve(b);
-  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+/** Test seam: models a same-file append after strict snapshot validation but before our append. */
+export function setBeforeStrictHistoryRolloutAppendForTests(hook: (() => void) | undefined): void {
+  beforeStrictHistoryRolloutAppendForTests = hook;
 }
 
-function inspectBackupForNoop(path: string, stateDbPath: string): StrictBackupInspection {
-  if (!existsSync(path)) return { kind: "known", present: false, entries: 0, fingerprint: "absent" };
-  let parsed: unknown;
+/** Test seam: models a write/finalization failure after the strict append reached disk. */
+export function setAfterStrictHistoryRolloutAppendForTests(hook: (() => void) | undefined): void {
+  afterStrictHistoryRolloutAppendForTests = hook;
+}
+
+/** Test seam: runs after manifest snapshot publication and before apply's database CAS. */
+export function setBeforeHistoryApplyTransactionForTests(hook: (() => void) | undefined): void {
+  beforeHistoryApplyTransactionForTests = hook;
+}
+
+function readBackupStrict(path: string, stateDbPath: string): StrictBackupRead {
+  let pathStat: ReturnType<typeof lstatSync>;
+  try {
+    pathStat = lstatSync(path);
+  } catch (error) {
+    const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+    if (code !== "ENOENT") {
+      const failureReason = classifyRecoverableHistoryError(error);
+      return {
+        kind: "unknown",
+        present: true,
+        reason: "manifest-read",
+        ...(failureReason === "busy" || failureReason === "permission" ? { failureReason } : {}),
+      };
+    }
+    return {
+      kind: "known",
+      present: false,
+      // New manifests carry the snapshot and relabel fields, so they are v2. v1 stays
+      // readable: an entry written before those fields existed falls back to the
+      // current-row reading, which is the behaviour it was written under.
+      manifest: { version: 2, stateDbPath, entries: {} },
+      fingerprint: "absent",
+    };
+  }
+  if (!pathStat.isFile() || pathStat.isSymbolicLink()) {
+    return { kind: "unknown", present: true, reason: "manifest-read" };
+  }
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
+  } catch (error) {
+    const failureReason = classifyRecoverableHistoryError(error);
+    return {
+      kind: "unknown",
+      present: true,
+      reason: "manifest-read",
+      ...(failureReason === "busy" || failureReason === "permission" ? { failureReason } : {}),
+    };
+  }
+  let parsed: unknown;
+  try {
     parsed = JSON.parse(raw);
   } catch {
     return { kind: "unknown", present: true, reason: "manifest-read" };
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { kind: "unknown", present: true, reason: "manifest-schema" };
-  }
-  const manifest = parsed as Partial<BackupManifest>;
-  if (manifest.version !== 1 || typeof manifest.stateDbPath !== "string") {
-    return { kind: "unknown", present: true, reason: "manifest-schema" };
-  }
-  if (!samePath(manifest.stateDbPath, stateDbPath)) {
-    return { kind: "unknown", present: true, reason: "manifest-foreign" };
-  }
-  if (!manifest.entries || typeof manifest.entries !== "object" || Array.isArray(manifest.entries)) {
-    return { kind: "unknown", present: true, reason: "manifest-schema" };
-  }
-  for (const [id, value] of Object.entries(manifest.entries)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return { kind: "unknown", present: true, reason: "manifest-schema" };
-    }
-    const entry = value as Partial<BackupEntry>;
-    if (entry.id !== id
-      || typeof entry.rolloutPath !== "string"
-      || typeof entry.modelProvider !== "string"
-      || typeof entry.source !== "string"
-      || typeof entry.hasUserEvent !== "number") {
-      return { kind: "unknown", present: true, reason: "manifest-schema" };
-    }
+  const validated = validateCodexHistoryBackupManifest(parsed, stateDbPath);
+  if (!validated.ok) {
+    return {
+      kind: "unknown",
+      present: true,
+      reason: validated.reason === "foreign-database" ? "manifest-foreign" : "manifest-schema",
+    };
   }
   return {
     kind: "known",
     present: true,
-    entries: Object.keys(manifest.entries).length,
+    manifest: validated.manifest,
     fingerprint: createHash("sha256").update(raw).digest("hex"),
   };
+}
+
+function inspectBackupForNoop(path: string, stateDbPath: string): StrictBackupInspection {
+  const read = readBackupStrict(path, stateDbPath);
+  return read.kind === "unknown"
+    ? read
+    : {
+        kind: "known",
+        present: read.present,
+        entries: Object.keys(read.manifest.entries).length,
+        fingerprint: read.fingerprint,
+      };
 }
 
 function historyFileIdentity(path: string): string | null {
@@ -312,23 +695,31 @@ function readHistoryDataVersion(db: Database): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
 }
 
-function readBackup(path: string, stateDbPath?: string): BackupManifest {
-  if (!existsSync(path)) return { version: 1, stateDbPath, entries: {} };
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<BackupManifest>;
-    if (parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== "object") {
-      return { version: 1, stateDbPath, entries: {} };
+function readBackup(path: string, stateDbPath: string): Extract<StrictBackupRead, { kind: "known" }> {
+  const read = readBackupStrict(path, stateDbPath);
+  if (read.kind === "unknown") {
+    if (read.failureReason) {
+      throw Object.assign(
+        new Error(read.failureReason === "busy" ? "history backup is busy" : "history backup permission denied"),
+        { code: read.failureReason === "busy" ? "EBUSY" : "EACCES" },
+      );
     }
-    if (stateDbPath && typeof parsed.stateDbPath === "string" && !samePath(parsed.stateDbPath, stateDbPath)) {
-      return { version: 1, stateDbPath, entries: {} };
-    }
-    return { version: 1, stateDbPath: parsed.stateDbPath ?? stateDbPath, entries: parsed.entries };
-  } catch {
-    return { version: 1, stateDbPath, entries: {} };
+    throw new CodexHistoryIntegrityError(`history_backup_${read.reason.replaceAll("-", "_")}`);
   }
+  return read;
 }
 
-function writeBackup(path: string, manifest: BackupManifest, stateDbPath?: string): void {
+function consumeBackupIfUnchanged(path: string, stateDbPath: string, expectedFingerprint: string): void {
+  const current = readBackupStrict(path, stateDbPath);
+  if (current.kind !== "known"
+    || !current.present
+    || current.fingerprint !== expectedFingerprint) {
+    throw new CodexHistoryIntegrityError("history_backup_changed_during_restore");
+  }
+  unlinkSync(path);
+}
+
+function writeBackup(path: string, manifest: CodexHistoryBackupManifest, stateDbPath?: string): void {
   if (Object.keys(manifest.entries).length === 0) {
     if (existsSync(path)) unlinkSync(path);
     return;
@@ -337,33 +728,305 @@ function writeBackup(path: string, manifest: BackupManifest, stateDbPath?: strin
   atomicWriteFile(path, JSON.stringify({ ...manifest, stateDbPath: manifest.stateDbPath ?? stateDbPath }, null, 2) + "\n");
 }
 
-function rememberOriginal(manifest: BackupManifest, row: ThreadRow): void {
-  if (manifest.entries[row.id]) return;
+function rememberOriginal(manifest: CodexHistoryBackupManifest, row: ApplyRowSnapshot): void {
+  const existing = manifest.entries[row.id];
+  if (existing) {
+    // A surviving entry means a previous route/restore cycle did not consume its manifest.
+    // Its `relabel` describes THAT attempt, and this one has not written yet, so a stale
+    // `committed` would let a later restore treat the marker as proof that OpenCodex
+    // authored an event flag the user had since set.
+    //
+    // The provenance tuple stays — it is the ORIGINAL, and a routed row must never
+    // overwrite it. But `hadFirstUserMessage` is not provenance: it describes the input to
+    // one routing write, and this attempt has its own. Leaving the previous attempt's value
+    // makes the new routed row match the expected post-image and erases activity that
+    // arrived in between. Re-record it, and promote the manifest so the field is covered by
+    // the schema that declares it.
+    const previousRelabel = existing.relabel;
+    const previousHadFirstUserMessage = existing.hadFirstUserMessage;
+    existing.relabel = "pending";
+    existing.hadFirstUserMessage = hasFirstUserMessage(row.first_user_message);
+    // `hasUserEvent` is the value restore returns to, and the previous attempt's can be two
+    // events stale — a restore that already landed, plus whatever the user did afterwards.
+    // Refreshing it needs proof that the previous relabel was UNDONE, because the original
+    // tuple alone is not proof: route-then-legacy-recovery lands on that same tuple, so
+    // refreshing there would adopt OpenCodex's own write as the user's baseline.
+    //
+    const atOriginalTuple = row.model_provider === existing.modelProvider
+      && row.source === existing.source;
+    const observedEvent: 0 | 1 = Number(row.has_user_event) === 1 ? 1 : 0;
+    if (observedEvent !== existing.hasUserEvent) {
+      // The row's event disagrees with the recorded baseline. Whether that is decidable is
+      // a function of DIRECTION and ORIGIN, not of one flag:
+      //
+      // - `1 -> 0` is always foreign. Nothing in this system clears the flag: routing only
+      //   ever sets it, the user only ever sets it, and legacy recovery sets it to 1. A
+      //   baseline that moved down is a decision this manifest does not own.
+      // - `0 -> 1` on an exec-origin entry is the user's. `routeExec` moves `source` to
+      //   `cli` and legacy recovery does not move it back, so an exec-origin row wearing
+      //   its original tuple was never routed away and back.
+      // - `0 -> 1` with `relabel: "none"` is the user's: a restore landed and undid the
+      //   previous relabel, so the observed row is the honest pre-route state.
+      // - `0 -> 1` where the previous route would have written 0 is the user's, because
+      //   OpenCodex could not have authored a 1 it never writes.
+      // - `0 -> 1` where the previous route WOULD have written 1, or where a legacy entry
+      //   records nothing about it, is undecidable: routing-never-landed-plus-activity and
+      //   routing-landed-then-legacy-recovery produce the same row. Refuse rather than pick.
+      const reverseDrift = observedEvent === 0;
+      const execOrigin = existing.modelProvider !== "openai";
+      const priorRouteWroteZero = previousHadFirstUserMessage === false;
+      const decidable = !reverseDrift
+        && atOriginalTuple
+        && (execOrigin || previousRelabel === "none" || priorRouteWroteZero);
+      if (!decidable) {
+        throw new CodexHistoryIntegrityError("history_apply_ambiguous_reroute");
+      }
+      existing.hasUserEvent = observedEvent;
+    }
+    manifest.version = 2;
+    return;
+  }
+  manifest.version = 2;
   manifest.entries[row.id] = {
     id: row.id,
     rolloutPath: row.rollout_path,
     modelProvider: row.model_provider,
     source: row.source,
-    hasUserEvent: Number(row.has_user_event) || 0,
+    hasUserEvent: Number(row.has_user_event) === 1 ? 1 : 0,
+    // Emptiness only, never the text: the manifest is a file on disk and the message is
+    // user content. Routing derives the post-image event flag from the message as it was
+    // HERE, so a restore that re-reads the current message would mistake later user
+    // activity for OpenCodex's own write.
+    hadFirstUserMessage: hasFirstUserMessage(row.first_user_message),
+    // The routing write has not happened yet. Resolved to "committed" after it lands, or
+    // left pending if the process dies between the two - in which case the observed row
+    // is what decides.
+    relabel: "pending",
   };
 }
 
-interface ParsedSessionMeta {
-  record: { type?: unknown; timestamp?: unknown; payload: { model_provider?: unknown; source?: unknown } & Record<string, unknown> };
+function rowMatchesRestoreTuple(
+  row: RestoreRowSnapshot,
+  modelProvider: string,
+  source: string,
+  hasUserEvent: number,
+): boolean {
+  return row.model_provider === modelProvider
+    && row.source === source
+    && row.has_user_event === hasUserEvent;
 }
 
-/** Parse one JSONL line into a `session_meta` record, or null if it isn't one. */
-function parseSessionMetaLine(line: string): ParsedSessionMeta | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return null;
+function rowMatchesExpectedPostImage(row: RestoreRowSnapshot, entry: CodexHistoryBackupEntry): boolean {
+  if (entry.modelProvider === "openai") {
+    // Routing derived this from the message AT SNAPSHOT TIME (`routeOpenai`), so read the
+    // recorded flag when the manifest has one. Recomputing from the row's CURRENT message
+    // mistakes a first message the user sent after routing for OpenCodex's own write, and
+    // restore then erases it. Manifests written before the flag existed fall back to the
+    // current reading, which is exactly the behaviour this replaces and no worse.
+    const hadMessage = entry.hadFirstUserMessage ?? hasFirstUserMessage(row.first_user_message);
+    const postHasUserEvent = hadMessage ? 1 : entry.hasUserEvent;
+    return rowMatchesRestoreTuple(row, "opencodex", entry.source, postHasUserEvent);
   }
-  if (!parsed || typeof parsed !== "object") return null;
-  const record = parsed as ParsedSessionMeta["record"];
-  if (record.type !== "session_meta" || !record.payload || typeof record.payload !== "object") return null;
-  return { record };
+  return hasFirstUserMessage(row.first_user_message)
+    && (
+      rowMatchesRestoreTuple(row, "opencodex", "cli", 1)
+      // Older restore code coerced an opencodex/exec original into this exact tuple before
+      // consuming its manifest. Accept that one known post-image so an interrupted old restore
+      // can use its preserved first-line padding to recover exact provenance.
+      || rowMatchesRestoreTuple(row, "openai", "cli", 1)
+  );
+}
+
+/**
+ * What `has_user_event` should read after restore, or `null` when the row is not one this
+ * manifest owns.
+ *
+ * The field has two writers, so a final state cannot establish authorship on its own. Four
+ * shapes cover every row reachable in practice, and the tuple the row wears says which:
+ *
+ * - **A** exactly the recorded original: untouched, or already restored.
+ * - **B** the expected post-image: OpenCodex wrote it, so the recorded value is authoritative.
+ * - **C** the original tuple with the flag moved 0 to 1: either Codex-side user activity, or
+ *   OpenCodex routing that legacy recovery has since pulled back to the original provider.
+ * - **D** the post-image tuple with the flag moved 0 to 1: a routed row the user then touched.
+ *   No provenance needed - a row wearing the routed tuple was written by OpenCodex, so drift
+ *   on top of it can only be what followed.
+ *
+ * Only C is ambiguous, and only when the route's own expected event was 1: then "routing
+ * never landed and the user typed" and "routing landed and legacy recovery pulled it back"
+ * produce an identical row, and nothing durable separates them. That one cell refuses. A
+ * guess there either erases real activity or fabricates it.
+ */
+export function restoredUserEventFor(row: RestoreRowSnapshot, entry: CodexHistoryBackupEntry): 0 | 1 | null {
+  if (rowMatchesRestoreTuple(row, entry.modelProvider, entry.source, entry.hasUserEvent)) {
+    return entry.hasUserEvent;                                   // A
+  }
+  if (rowMatchesExpectedPostImage(row, entry)) return entry.hasUserEvent;  // B
+
+  const drifted = Number(row.has_user_event) === 1 && entry.hasUserEvent === 0;
+  if (!drifted) return null;
+
+  const routeExpectedEvent = entry.hadFirstUserMessage ?? hasFirstUserMessage(row.first_user_message) ? 1 : 0;
+
+  // D: wearing the routed tuple, so the 1 arrived after OpenCodex wrote the row. The tuple
+  // is the one routing actually produces — `routeOpenai` keeps the source, `routeExec`
+  // moves exec to cli — so D and C cannot both match rather than merely being ordered.
+  const routedSource = entry.modelProvider === "openai" ? entry.source : "cli";
+  if (rowMatchesRestoreTuple(row, "opencodex", routedSource, 1)) return 1;
+
+  // C: wearing the original tuple.
+  if (rowMatchesRestoreTuple(row, entry.modelProvider, entry.source, 1)) {
+    // An exec-origin entry cannot reach here by legacy recovery: routeExec moves source to
+    // cli and recovery does not move it back, so the original tuple is unreachable that way.
+    if (entry.modelProvider !== "openai") return 1;
+    if (entry.relabel === "none") return 1;
+    if (entry.relabel === "committed") {
+      // OpenCodex authored the 1 only if its own routing write would have produced one.
+      return routeExpectedEvent === 1 ? 0 : 1;
+    }
+    if (entry.relabel === undefined) return null;  // legacy manifest: the pre-existing refusal
+    // pending: two histories reach this exact row and nothing durable tells them apart.
+    return routeExpectedEvent === 1 ? null : 1;
+  }
+  return null;
+}
+
+interface RestoreRolloutSnapshot {
+  readonly identity: string;
+  readonly latestProvider: string;
+  readonly latestSource: string;
+}
+
+function normalizedSessionMetaTuple(meta: ParsedSessionMeta): { provider: string; source: string } {
+  const payload = meta.record.payload;
+  return {
+    provider: typeof payload.model_provider === "string" && payload.model_provider
+      ? payload.model_provider
+      : "openai",
+    source: typeof payload.source === "string" && payload.source ? payload.source : "cli",
+  };
+}
+
+function rolloutMatchesRestoreTuple(
+  meta: ParsedSessionMeta,
+  entry: CodexHistoryBackupEntry,
+  provider: string,
+  source: string,
+): boolean {
+  const tuple = normalizedSessionMetaTuple(meta);
+  return meta.record.payload.id === entry.id
+    && tuple.provider === provider
+    && tuple.source === source;
+}
+
+function rolloutMatchesExpectedPostImage(meta: ParsedSessionMeta, entry: CodexHistoryBackupEntry): boolean {
+  if (entry.modelProvider === "openai") {
+    const tuple = normalizedSessionMetaTuple(meta);
+    const rawSource = meta.record.payload.source;
+    return meta.record.payload.id === entry.id
+      && tuple.provider === "opencodex"
+      // Older/native session_meta records can omit source even when SQLite identifies the
+      // surface as vscode. Apply changes only the provider, so absence is a valid post-image;
+      // restore appends the exact manifest source before consuming provenance.
+      && ((typeof rawSource !== "string" || !rawSource) || tuple.source === entry.source);
+  }
+  return rolloutMatchesRestoreTuple(meta, entry, "opencodex", "cli")
+    // Keep the same one-version recovery bridge as the database tuple check: older forced
+    // restore code could already have produced openai/cli before consuming this manifest.
+    || rolloutMatchesRestoreTuple(meta, entry, "openai", "cli");
+}
+
+function snapshotRolloutForRestore(entry: CodexHistoryBackupEntry): RestoreRolloutSnapshot {
+  const identityBefore = historyFileIdentity(entry.rolloutPath);
+  if (identityBefore === null) {
+    throw new CodexHistoryIntegrityError("history_backup_rollout_unrestorable");
+  }
+  const latest = readLatestSessionMetaForId(entry.rolloutPath, entry.id);
+  if (!latest
+    || (!rolloutMatchesRestoreTuple(latest, entry, entry.modelProvider, entry.source)
+      && !rolloutMatchesExpectedPostImage(latest, entry))) {
+    throw new CodexHistoryIntegrityError("history_backup_rollout_postimage_mismatch");
+  }
+  const firstProvider = readFirstLineProviderValue(entry.rolloutPath, entry.id);
+  if (firstProvider !== "openai" && firstProvider !== "opencodex") {
+    throw new CodexHistoryIntegrityError("history_backup_rollout_postimage_mismatch");
+  }
+  if (inspectFirstLineProvider(entry.rolloutPath, entry.id, entry.modelProvider) === "unsafe") {
+    throw new CodexHistoryIntegrityError("history_backup_rollout_unrestorable");
+  }
+  if (historyFileIdentity(entry.rolloutPath) !== identityBefore) {
+    throw new CodexHistoryIntegrityError("history_backup_rollout_changed_during_restore");
+  }
+  const tuple = normalizedSessionMetaTuple(latest);
+  return {
+    identity: identityBefore,
+    latestProvider: tuple.provider,
+    latestSource: tuple.source,
+  };
+}
+
+interface RestoreTargetPreflight {
+  readonly snapshots: Map<string, RestoreRowSnapshot>;
+  readonly rolloutSnapshots: Map<string, RestoreRolloutSnapshot>;
+}
+
+/**
+ * Read-only authority shared by restore and status/doctor. Every manifest entry must still
+ * identify either its exact target tuple or the one OpenCodex post-image, and its rollout
+ * must be present, stable, same-id, and durably restorable before callers call it pending.
+ */
+function preflightRestoreTargets(
+  getCurrent: (id: string) => RestoreRowSnapshot | null,
+  entries: CodexHistoryBackupEntry[],
+): RestoreTargetPreflight {
+  const snapshots = preflightRestoreRows(getCurrent, entries);
+  const rolloutSnapshots = new Map<string, RestoreRolloutSnapshot>();
+  for (const entry of entries) {
+    // Validate every rollout before the first mutation. A later missing, foreign, or
+    // unpatchable entry must not leave an earlier file partially restored.
+    rolloutSnapshots.set(entry.id, snapshotRolloutForRestore(entry));
+  }
+  return { snapshots, rolloutSnapshots };
+}
+
+/** Cheap manifest-to-database authority check used by recurring no-op probes. */
+function preflightRestoreRows(
+  getCurrent: (id: string) => RestoreRowSnapshot | null,
+  entries: CodexHistoryBackupEntry[],
+): Map<string, RestoreRowSnapshot> {
+  const snapshots = new Map<string, RestoreRowSnapshot>();
+  for (const entry of entries) {
+    const row = getCurrent(entry.id);
+    if (!row || typeof row.rollout_path !== "string" || !sameCodexHistoryPath(row.rollout_path, entry.rolloutPath)) {
+      throw new CodexHistoryIntegrityError("history_backup_target_mismatch");
+    }
+    if (restoredUserEventFor(row, entry) === null) {
+      throw new CodexHistoryIntegrityError("history_backup_postimage_mismatch");
+    }
+    snapshots.set(entry.id, row);
+  }
+  return snapshots;
+}
+
+function assertRestoreReadback(
+  getCurrent: (id: string) => RestoreRowSnapshot | null,
+  entries: CodexHistoryBackupEntry[],
+): void {
+  for (const entry of entries) {
+    const row = getCurrent(entry.id);
+    if (!row
+      || !sameCodexHistoryPath(row.rollout_path, entry.rolloutPath)
+      || !rowMatchesRestoreTuple(row, entry.modelProvider, entry.source, Number(row.has_user_event) === 1 ? 1 : 0)
+      || restoredUserEventFor(row, entry) === null) {
+      throw new CodexHistoryIntegrityError("history_backup_database_readback_mismatch");
+    }
+    const latest = readLatestSessionMetaForId(entry.rolloutPath, entry.id);
+    if (inspectFirstLineProvider(entry.rolloutPath, entry.id, entry.modelProvider) !== "current"
+      || !latest
+      || !rolloutMatchesRestoreTuple(latest, entry, entry.modelProvider, entry.source)) {
+      throw new CodexHistoryIntegrityError("history_backup_rollout_readback_mismatch");
+    }
+  }
 }
 
 /**
@@ -373,6 +1036,23 @@ function parseSessionMetaLine(line: string): ParsedSessionMeta | null {
  */
 export function readLatestSessionMeta(path: string): ParsedSessionMeta | null {
   const raw = readFileSync(path, "utf8");
+  return readLatestSessionMetaFromText(raw);
+}
+
+/**
+ * Same fold as {@link readLatestSessionMeta}, restricted to this thread's own metadata.
+ *
+ * A forked/branched rollout appends the SOURCE thread's `session_meta` after its own, and the
+ * app discards any record whose payload id is not the canonical thread id (codex-rs
+ * `apply_session_meta_from_item`). Reading the last line regardless of id therefore answers
+ * with a foreign thread's provider, which is neither what the app honors nor what we may patch.
+ */
+function readLatestSessionMetaForId(path: string, expectedId: string): ParsedSessionMeta | null {
+  const raw = readFileSync(path, "utf8");
+  return readLatestSessionMetaForIdFromText(raw, expectedId);
+}
+
+function readLatestSessionMetaFromText(raw: string): ParsedSessionMeta | null {
   const lines = raw.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -384,163 +1064,97 @@ export function readLatestSessionMeta(path: string): ParsedSessionMeta | null {
   return null;
 }
 
-/**
- * Fields needed to re-insert a production-shaped `threads` row from a rollout JSONL when a
- * Phase-2 quarantine predates full `satellite-backup.json` thread snapshots.
- *
- * Uses the same last-writer-wins `session_meta` fold as {@link readLatestSessionMeta}, plus the
- * first user-message preview (codex-rs `list.rs` / `EventMsg::UserMessage` path).
- */
-export interface RolloutThreadFields {
-  id: string;
-  modelProvider: string;
-  source: string;
-  firstUserMessage: string;
-  hasUserEvent: number;
-  cwd?: string;
-  historyMode?: string;
-  cliVersion?: string;
-}
-
-function textFromContentParts(content: unknown): string | null {
-  if (typeof content === "string" && content.trim()) return content.trim();
-  if (!Array.isArray(content)) return null;
-  const parts: string[] = [];
-  for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-    const p = part as Record<string, unknown>;
-    if (typeof p.text === "string" && p.text.trim()) parts.push(p.text.trim());
-    else if (typeof p.input_text === "string" && p.input_text.trim()) parts.push(p.input_text.trim());
-  }
-  const joined = parts.join("\n").trim();
-  return joined || null;
-}
-
-/** Extract the first user-message preview from a rollout line, or null. */
-function extractUserMessagePreview(line: string): string | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
-  const record = parsed as { type?: unknown; payload?: unknown };
-  const payload = record.payload;
-  if (!payload || typeof payload !== "object") return null;
-  const p = payload as Record<string, unknown>;
-
-  if (record.type === "event_msg") {
-    // codex-rs EventMsg::UserMessage — payload.type is "user_message" (or omitted in fixtures).
-    if (p.type === "user_message" || typeof p.message === "string") {
-      if (typeof p.message === "string" && p.message.trim()) return p.message.trim();
-      const fromContent = textFromContentParts(p.content);
-      if (fromContent) return fromContent;
-    }
-    return null;
-  }
-
-  if (record.type === "response_item") {
-    if (p.type === "message" && p.role === "user") {
-      return textFromContentParts(p.content);
-    }
+function readLatestSessionMetaForIdFromText(raw: string, expectedId: string): ParsedSessionMeta | null {
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || !line.includes("\"session_meta\"")) continue;
+    const meta = parseSessionMetaLine(line);
+    if (meta?.record.payload.id === expectedId) return meta;
   }
   return null;
 }
 
-/**
- * Reconstruct thread identity + listing fields from a staged/restored rollout JSONL.
- * Returns null when the file is missing or has no parseable `session_meta`.
- *
- * Accepts plain `.jsonl` or a lone `.jsonl.zst` (legacy Phase-2 quarantine). Compressed
- * rollouts are decompressed in memory with {@link MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES};
- * no decompressed copy is written to disk.
- */
-export function readThreadFieldsFromRollout(path: string): RolloutThreadFields | null {
-  if (!path || !existsSync(path)) return null;
-  let raw: string;
-  try {
-    raw = path.endsWith(".zst")
-      ? decompressRolloutZstUtf8(path)
-      : readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
-  return parseThreadFieldsFromRolloutText(raw);
-}
-
-function decompressRolloutZstUtf8(
+function compensateConcurrentSessionMetaAppend(
   path: string,
-  maxBytes: number = MAX_ROLLOUT_ZST_DECOMPRESSED_BYTES,
-): string {
-  const compressed = readFileSync(path);
-  const decoded = zstdDecompressSync(compressed as Uint8Array<ArrayBuffer>, {
-    maxOutputLength: maxBytes,
-  });
-  if (decoded.byteLength > maxBytes) {
-    throw new Error("rollout_zst_too_large");
+  expectedId: string,
+  appended: Buffer,
+  minimumOffset: number,
+): void {
+  try {
+    const raw = readFileSync(path);
+    const ownOffset = raw.lastIndexOf(appended);
+    if (ownOffset < minimumOffset) return;
+    const withoutOwnAppend = Buffer.concat([
+      raw.subarray(0, ownOffset),
+      raw.subarray(ownOffset + appended.length),
+    ]).toString("utf8");
+    const prior = readLatestSessionMetaForIdFromText(withoutOwnAppend, expectedId);
+    if (prior) appendRolloutLine(path, JSON.stringify(prior.record));
+  } catch {
+    // The caller reports an integrity conflict and retains the manifest. Compensation is
+    // best-effort because a second write failure must not erase the original failure evidence.
   }
-  return new TextDecoder().decode(decoded);
-}
-
-function parseThreadFieldsFromRolloutText(raw: string): RolloutThreadFields | null {
-  const lines = raw.split("\n");
-  let latest: ParsedSessionMeta | null = null;
-  let firstUserMessage = "";
-  for (const line of lines) {
-    if (!line) continue;
-    if (line.includes("\"session_meta\"")) {
-      const meta = parseSessionMetaLine(line);
-      if (meta) latest = meta;
-    }
-    if (!firstUserMessage) {
-      const preview = extractUserMessagePreview(line);
-      if (preview) firstUserMessage = preview;
-    }
-  }
-  if (!latest) return null;
-  const payload = latest.record.payload;
-  const id = typeof payload.id === "string" ? payload.id : "";
-  if (!id) return null;
-  const modelProvider = typeof payload.model_provider === "string" && payload.model_provider
-    ? payload.model_provider
-    : "openai";
-  const source = typeof payload.source === "string" && payload.source
-    ? payload.source
-    : "cli";
-  return {
-    id,
-    modelProvider,
-    source,
-    firstUserMessage,
-    hasUserEvent: firstUserMessage.trim() ? 1 : 0,
-    ...(typeof payload.cwd === "string" ? { cwd: payload.cwd } : {}),
-    ...(typeof payload.history_mode === "string" ? { historyMode: payload.history_mode } : {}),
-    ...(typeof payload.cli_version === "string" ? { cliVersion: payload.cli_version } : {}),
-  };
 }
 
 /**
  * Make a thread's rollout reflect a provider/source change by APPENDING a new `session_meta` line,
  * rather than rewriting line 1. The appended line clones the latest metadata payload (so no field
- * is accidentally reset to empty) and applies only the requested changes. Returns false when the
- * rollout is missing, has no parseable `session_meta`, its latest `session_meta` belongs to a
- * different thread id, or it already matches the desired values.
+ * is accidentally reset to empty) and applies only the requested changes. `durableProvider`
+ * reports whether line 1 already carried (or was safely patched to) the requested provider.
  */
-function updateSessionMeta(path: string, expectedId: string, patch: { provider?: string; source?: string }): boolean {
-  if (!path || !existsSync(path)) return false;
+interface SessionMetaUpdateResult {
+  changed: boolean;
+  durableProvider: boolean;
+  conflict?: true;
+}
 
-  const latest = readLatestSessionMeta(path);
-  if (!latest) return false;
+function updateSessionMeta(
+  path: string,
+  expectedId: string,
+  patch: { provider?: string; source?: string },
+  options: {
+    requireDurableProvider?: boolean;
+    expectedFileIdentity?: string;
+    expectedLatestProvider?: string;
+    expectedLatestSource?: string;
+  } = {},
+): SessionMetaUpdateResult {
+  if (!path || !existsSync(path)) return { changed: false, durableProvider: false };
+  const validatedIdentity = lstatSync(path);
+  if (options.expectedFileIdentity !== undefined
+    && historyFileIdentity(path) !== options.expectedFileIdentity) {
+    return { changed: false, durableProvider: false, conflict: true };
+  }
+
+  // Resolve by id. The app ignores `session_meta` lines whose payload id != the canonical
+  // thread id (codex-rs `apply_session_meta_from_item`), and a forked rollout trails the source
+  // session's metadata, so the last line is not necessarily this thread's. Patching that record
+  // would clone the wrong thread's meta into a line the app discards; skipping the file entirely
+  // left forked threads unroutable and, once routed, unrestorable.
+  const latest = readLatestSessionMetaForId(path, expectedId);
+  if (!latest) return { changed: false, durableProvider: false };
   const record = latest.record;
 
-  // The app ignores `session_meta` lines whose payload id != the canonical thread id
-  // (codex-rs `apply_session_meta_from_item`). Forked rollouts can embed a source session's
-  // metadata, so an id-mismatched latest line means we'd be cloning the wrong thread's meta and
-  // appending a line the app would discard. Skip rather than write a no-op/misleading line.
-  const payloadId = record.payload.id;
-  if (typeof payloadId !== "string" || payloadId !== expectedId) return false;
+  assertLegacyHistoryWritable(path);
+  if (Object.hasOwn(record, "ordinal") || record.payload.history_mode === "paginated") {
+    throw new CodexHistoryIntegrityError("history_paginated_requires_native_writer");
+  }
 
+  const latestProvider = typeof record.payload.model_provider === "string" && record.payload.model_provider
+    ? record.payload.model_provider
+    : "openai";
+  const latestSource = typeof record.payload.source === "string" && record.payload.source
+    ? record.payload.source
+    : "cli";
+  if ((options.expectedLatestProvider !== undefined && latestProvider !== options.expectedLatestProvider)
+    || (options.expectedLatestSource !== undefined && latestSource !== options.expectedLatestSource)
+    || (options.expectedFileIdentity !== undefined
+      && historyFileIdentity(path) !== options.expectedFileIdentity)) {
+    return { changed: false, durableProvider: false, conflict: true };
+  }
+
+  const previousRecord = JSON.stringify(record);
   let changed = false;
   if (patch.provider !== undefined && record.payload.model_provider !== patch.provider) {
     record.payload.model_provider = patch.provider;
@@ -550,40 +1164,87 @@ function updateSessionMeta(path: string, expectedId: string, patch: { provider?:
     record.payload.source = patch.source;
     changed = true;
   }
-  if (!changed) return false;
+  const strictRestore = options.expectedFileIdentity !== undefined;
+  if (strictRestore) {
+    if (historyFileIdentity(path) !== options.expectedFileIdentity) {
+      return { changed: false, durableProvider: false, conflict: true };
+    }
+
+    let appended: Buffer | null = null;
+    let beforeSize = 0;
+    if (changed) {
+      beforeSize = statSync(path).size;
+      beforeStrictHistoryRolloutAppendForTests?.();
+      record.timestamp = new Date().toISOString();
+      appended = appendRolloutLine(path, JSON.stringify(record));
+      afterStrictHistoryRolloutAppendForTests?.();
+      let cleanAppend = false;
+      try {
+        const raw = readFileSync(path);
+        cleanAppend = raw.length === beforeSize + appended.length
+          && raw.subarray(beforeSize).equals(appended);
+      } catch {
+        cleanAppend = false;
+      }
+      if (!cleanAppend) {
+        compensateConcurrentSessionMetaAppend(path, expectedId, appended, beforeSize);
+        return { changed: true, durableProvider: false, conflict: true };
+      }
+    }
+
+    let firstLine: FirstLineProviderResult = "current";
+    if (patch.provider !== undefined) {
+      try {
+        firstLine = patchFirstLineProviderInPlace(path, expectedId, patch.provider, validatedIdentity);
+      } catch (error) {
+        if (error instanceof CodexHistoryIntegrityError) throw error;
+        firstLine = "unsafe";
+      }
+    }
+    if (options.requireDurableProvider && firstLine === "unsafe") {
+      // Restore the pre-operation last-writer-wins tuple after an append succeeded but the
+      // first-line durability repair failed. The extra lines remain audit evidence; the manifest
+      // remains authoritative and the retry cannot mistake this for convergence.
+      if (appended) appendRolloutLine(path, previousRecord);
+      return {
+        changed: changed || historyFileIdentity(path) !== options.expectedFileIdentity,
+        durableProvider: false,
+      };
+    }
+    return {
+      changed: changed || firstLine === "patched",
+      durableProvider: firstLine !== "unsafe",
+    };
+  }
 
   // Cover Codex's *other* provider reader: `read_session_meta_line` reads only line 1, and the
   // app clones it when writing later git/memory-mode metadata. Appending alone leaves a stale
-  // line-1 provider that the clone would re-append, so for a length-preserving provider change we
-  // also patch line 1 in place (no inode swap, no truncate). Best-effort: when it can't be done
-  // safely (e.g. a length-growing change), the trailing append below is still correct for the
-  // SQLite replay path.
+  // line-1 provider that the clone would re-append. Exact restore requires this repair before it
+  // may update SQLite or consume the only provenance manifest; forward routing remains best-effort.
+  let firstLine: FirstLineProviderResult = "current";
   if (patch.provider !== undefined) {
-    try { patchFirstLineProviderInPlace(path, expectedId, patch.provider); } catch { /* best-effort line-1 patch */ }
+    try {
+      firstLine = patchFirstLineProviderInPlace(path, expectedId, patch.provider, validatedIdentity);
+    } catch (error) {
+      if (error instanceof CodexHistoryIntegrityError) throw error;
+      firstLine = "unsafe";
+    }
+    if (options.requireDurableProvider && firstLine === "unsafe") {
+      return { changed: false, durableProvider: false };
+    }
   }
 
-  // Refresh the line timestamp so the appended record reads as the newest metadata.
+  const firstLineChanged = firstLine === "patched";
+  if (!changed) return { changed: firstLineChanged, durableProvider: firstLine !== "unsafe" };
+
+  // Forward/legacy mode remains best-effort. Strict manifest restore uses the CAS-style append
+  // branch above so a concurrent same-id provider decision cannot be overwritten.
   record.timestamp = new Date().toISOString();
   appendRolloutLine(path, JSON.stringify(record));
-  return true;
+  return { changed: true, durableProvider: firstLine !== "unsafe" };
 }
 
-function toNativeRestoreTarget(entry: BackupEntry): NativeRestoreTarget {
-  if (entry.modelProvider !== "opencodex") {
-    return {
-      modelProvider: entry.modelProvider,
-      source: entry.source,
-      hasUserEvent: entry.hasUserEvent,
-    };
-  }
-  return {
-    modelProvider: "openai",
-    source: entry.source === "exec" ? "cli" : entry.source,
-    hasUserEvent: 1,
-  };
-}
-
-function ejectRemainingOpencodexHistory(db: Database): { rows: number; files: number } {
+function relabelAllRoutedHistoryToOpenai(db: Database): { rows: number; files: number } {
   const rows = db
     .query<ThreadRow, []>(`
       SELECT id, rollout_path, model_provider, source, has_user_event
@@ -593,15 +1254,17 @@ function ejectRemainingOpencodexHistory(db: Database): { rows: number; files: nu
     `)
     .all();
 
+  if (rows.length > 0) assertLegacyHistoryStore(db);
+  for (const row of rows) assertLegacyHistoryWritable(row.rollout_path);
   let files = 0;
   for (const row of rows) {
     try {
       if (updateSessionMeta(row.rollout_path, row.id, {
         provider: "openai",
         source: row.source === "exec" ? "cli" : undefined,
-      })) files++;
-    } catch {
-      /* native restore should continue even if an old rollout is missing */
+      }).changed) files++;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
     }
   }
 
@@ -673,8 +1336,10 @@ export function withHistoryRetry<T>(fn: () => T, io: { sleepFn?: (ms: number) =>
 }
 
 /**
- * True when a READONLY probe proves the openai-direction restore would be a no-op:
- * zero threads still tagged opencodex AND an empty backup manifest. Used to skip the
+ * True when a READONLY probe proves the native-direction restore would be a no-op:
+ * the history database is readable and the backup manifest has no restore entries. Bare
+ * opencodex-tagged rows are not actionable: without a manifest their original provider is
+ * unknown, so only the explicit legacy recovery command may relabel them. Used to skip the
  * write-open entirely in the Design B steady state — on Windows the Codex app holds
  * `state_5.sqlite` (WAL, busy_timeout 5s), so an unnecessary write open can stall for
  * seconds and surface a false lock warning, while WAL always admits readers. A failed
@@ -682,14 +1347,16 @@ export function withHistoryRetry<T>(fn: () => T, io: { sleepFn?: (ms: number) =>
  * to the write attempt and keep today's behavior for genuinely unknown state.
  */
 function openaiRestoreIsNoop(stateDbPath: string, backupPath: string): boolean {
-  const pending = countPendingOpencodexHistory(stateDbPath, backupPath);
+  const pending = countPendingOpencodexHistory(stateDbPath, backupPath, {
+    validateRestoreTargets: false,
+  });
   return !pending.failed && pending.pendingRows === 0 && pending.backupEntries === 0;
 }
 
 export function syncCodexHistoryProvider(
   provider: CodexHistoryProvider,
   stateDbPath = resolveCodexStateDbPath(),
-  backupPath = historyBackupPathFor(stateDbPath),
+  backupPath = resolveExistingHistoryBackupPath(stateDbPath),
   opts: { skipWhenProvablyNoop?: boolean } = {},
 ): CodexHistorySyncResult {
   // Opt-in steady-state gate (Design B loopback callers only): default semantics of
@@ -698,28 +1365,41 @@ export function syncCodexHistoryProvider(
     && openaiRestoreIsNoop(stateDbPath, backupPath)) {
     return { rows: 0, files: 0 };
   }
-  const retried = withHistoryRetryResult(() => syncCodexHistoryProviderUnsafe(provider, stateDbPath, backupPath));
-  return retried.ok ? retried.value : { rows: 0, files: 0, failed: true, failureReason: retried.reason };
+  try {
+    const retried = withHistoryRetryResult(() => syncCodexHistoryProviderUnsafe(provider, stateDbPath, backupPath));
+    return retried.ok ? retried.value : { rows: 0, files: 0, failed: true, failureReason: retried.reason };
+  } catch (error) {
+    if (error instanceof CodexHistoryIntegrityError) {
+      return integrityFailureResult(error);
+    }
+    throw error;
+  }
 }
 
 function syncCodexHistoryProviderUnsafe(provider: CodexHistoryProvider, stateDbPath: string, backupPath: string): CodexHistorySyncResult {
-  if (!existsSync(stateDbPath)) return { rows: 0, files: 0 };
+  if (!existsSync(stateDbPath)) {
+    const backup = readBackup(backupPath, stateDbPath);
+    if (provider === "openai" && Object.keys(backup.manifest.entries).length > 0) {
+      throw new CodexHistoryIntegrityError("history_state_database_missing");
+    }
+    return { rows: 0, files: 0 };
+  }
   if (provider === "openai") return restoreCodexHistoryProvider(stateDbPath, backupPath);
 
   const db = openStateDb(stateDbPath);
   try {
-    const placeholders = RESUMABLE_SOURCES.map(() => "?").join(",");
+    const placeholders = CODEX_HISTORY_RESUMABLE_SOURCES.map(() => "?").join(",");
     const openaiRows = db
-      .query<ThreadRow, string[]>(`
-        SELECT id, rollout_path, model_provider, source, has_user_event
+      .query<ApplyRowSnapshot, string[]>(`
+        SELECT id, rollout_path, model_provider, source, has_user_event, first_user_message
         FROM threads
         WHERE model_provider = 'openai'
           AND source IN (${placeholders})
       `)
-      .all(...RESUMABLE_SOURCES);
+      .all(...CODEX_HISTORY_RESUMABLE_SOURCES);
     const execRows = db
-      .query<ThreadRow, []>(`
-        SELECT id, rollout_path, model_provider, source, has_user_event
+      .query<ApplyRowSnapshot, []>(`
+        SELECT id, rollout_path, model_provider, source, has_user_event, first_user_message
         FROM threads
         WHERE model_provider = 'opencodex'
           AND source = 'exec'
@@ -727,49 +1407,103 @@ function syncCodexHistoryProviderUnsafe(provider: CodexHistoryProvider, stateDbP
       `)
       .all();
 
-    const manifest = readBackup(backupPath, stateDbPath);
+    if (openaiRows.length + execRows.length > 0) assertLegacyHistoryStore(db);
+    for (const row of [...openaiRows, ...execRows]) assertLegacyHistoryWritable(row.rollout_path);
+    const manifest = readBackup(backupPath, stateDbPath).manifest;
     for (const row of [...openaiRows, ...execRows]) rememberOriginal(manifest, row);
     writeBackup(backupPath, manifest, stateDbPath);
 
     let files = 0;
-    for (const row of openaiRows) {
-      try {
-        if (updateSessionMeta(row.rollout_path, row.id, { provider: "opencodex" })) files++;
-      } catch {
-        /* best-effort; keep DB migration moving even if one old rollout is malformed */
-      }
-    }
-    for (const row of execRows) {
-      try {
-        if (updateSessionMeta(row.rollout_path, row.id, { source: "cli" })) files++;
-      } catch {
-        /* best-effort; keep DB migration moving even if one old rollout is malformed */
-      }
-    }
-
     const update = db.transaction(() => {
-      const markUserEvent = db.query(`
+      const routeOpenai = db.query(`
         UPDATE threads
-        SET has_user_event = 1
+        SET model_provider = 'opencodex',
+            has_user_event = ?
         WHERE id = ?
+          AND rollout_path = ?
+          AND model_provider = ?
+          AND source = ?
+          AND has_user_event = ?
+          AND first_user_message IS ?
+      `);
+      const routeExec = db.query(`
+        UPDATE threads
+        SET source = 'cli',
+            has_user_event = 1
+        WHERE id = ?
+          AND rollout_path = ?
+          AND model_provider = ?
+          AND source = ?
+          AND has_user_event = ?
+          AND first_user_message IS ?
           AND trim(coalesce(first_user_message, '')) != ''
       `);
-      for (const row of [...openaiRows, ...execRows]) markUserEvent.run(row.id);
-      db.query(`
-        UPDATE threads
-        SET model_provider = 'opencodex'
-        WHERE model_provider = 'openai'
-          AND source IN (${placeholders})
-      `).run(...RESUMABLE_SOURCES);
-      db.query(`
-        UPDATE threads
-        SET source = 'cli'
-        WHERE model_provider = 'opencodex'
-          AND source = 'exec'
-          AND trim(coalesce(first_user_message, '')) != ''
-      `).run();
+      // CAS only the rows that were recorded in this manifest. A thread inserted after the
+      // snapshot must stay native rather than becoming an untracked bare routed row.
+      for (const row of openaiRows) {
+        const targetEvent = hasFirstUserMessage(row.first_user_message) ? 1 : row.has_user_event;
+        const result = routeOpenai.run(
+          targetEvent,
+          row.id,
+          row.rollout_path,
+          row.model_provider,
+          row.source,
+          row.has_user_event,
+          row.first_user_message,
+        );
+        if (result.changes !== 1) {
+          throw new CodexHistoryIntegrityError("history_apply_database_changed_during_route");
+        }
+      }
+      for (const row of execRows) {
+        const result = routeExec.run(
+          row.id,
+          row.rollout_path,
+          row.model_provider,
+          row.source,
+          row.has_user_event,
+          row.first_user_message,
+        );
+        if (result.changes !== 1) {
+          throw new CodexHistoryIntegrityError("history_apply_database_changed_during_route");
+        }
+      }
+
+      // File metadata remains best-effort, but only after every database CAS matched. Thus a
+      // stale snapshot or a newly inserted row cannot be routed before its provenance exists.
+      for (const row of openaiRows) {
+        try {
+          if (updateSessionMeta(row.rollout_path, row.id, { provider: "opencodex" }).changed) files++;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+        }
+      }
+      for (const row of execRows) {
+        try {
+          if (updateSessionMeta(row.rollout_path, row.id, { source: "cli" }).changed) files++;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+        }
+      }
     });
-    update();
+    try {
+      beforeHistoryApplyTransactionForTests?.();
+      update();
+    } catch (error) {
+      if (files > 0) {
+        throw new CodexHistoryIntegrityError("history_apply_partial_route", { rows: 0, files });
+      }
+      throw error;
+    }
+
+    // The routing writes landed. Resolve every pending marker and rewrite the manifest, so a
+    // later restore knows the relabel is OpenCodex's rather than having to infer it. A crash
+    // before this point leaves `pending`, which the observed row resolves at restore time.
+    for (const row of [...openaiRows, ...execRows]) {
+      const entry = manifest.entries[row.id];
+      if (entry?.relabel === "pending") entry.relabel = "committed";
+    }
+    writeBackup(backupPath, manifest, stateDbPath);
 
     return { rows: openaiRows.length + execRows.length, files };
   } finally {
@@ -778,26 +1512,27 @@ function syncCodexHistoryProviderUnsafe(provider: CodexHistoryProvider, stateDbP
 }
 
 function restoreCodexHistoryProvider(stateDbPath: string, backupPath: string): CodexHistorySyncResult {
-  const manifest = readBackup(backupPath, stateDbPath);
+  const backup = readBackup(backupPath, stateDbPath);
+  const manifest = backup.manifest;
   const entries = Object.values(manifest.entries);
+
+  for (const entry of entries) assertLegacyHistoryWritable(entry.rolloutPath);
 
   const db = openStateDb(stateDbPath);
   try {
-    if (entries.length === 0) {
-      const ejected = ejectRemainingOpencodexHistory(db);
-      return ejected.rows > 0 ? { rows: 0, files: ejected.files, ejectedRows: ejected.rows } : { rows: 0, files: 0 };
-    }
+    if (entries.length === 0) return { rows: 0, files: 0 };
+    assertLegacyHistoryStore(db);
+
+    // Validate the whole manifest-to-database target set before touching a rollout. Only the
+    // OpenCodex post-image (or an already-restored target from an interrupted retry) is owned by
+    // this manifest. Any other tuple is a newer/foreign provider decision and must win.
+    const current = db.query<RestoreRowSnapshot, [string]>(`
+      SELECT id, rollout_path, model_provider, source, has_user_event, first_user_message
+      FROM threads WHERE id = ?
+    `);
+    const { snapshots, rolloutSnapshots } = preflightRestoreTargets(id => current.get(id), entries);
 
     let files = 0;
-    for (const entry of entries) {
-      const target = toNativeRestoreTarget(entry);
-      try {
-        if (updateSessionMeta(entry.rolloutPath, entry.id, { provider: target.modelProvider, source: target.source })) files++;
-      } catch {
-        /* best-effort; keep DB restore moving even if one rollout disappeared */
-      }
-    }
-
     const restore = db.transaction(() => {
       const update = db.query(`
         UPDATE threads
@@ -805,18 +1540,116 @@ function restoreCodexHistoryProvider(stateDbPath: string, backupPath: string): C
             source = ?,
             has_user_event = ?
         WHERE id = ?
+          AND rollout_path = ?
+          AND model_provider = ?
+          AND source = ?
+          AND has_user_event = ?
+          AND first_user_message IS ?
       `);
       for (const entry of entries) {
-        const target = toNativeRestoreTarget(entry);
-        update.run(target.modelProvider, target.source, target.hasUserEvent, entry.id);
+        const before = snapshots.get(entry.id);
+        if (!before) throw new CodexHistoryIntegrityError("history_backup_snapshot_missing");
+        // Codex-side activity that arrived after OpenCodex wrote the row is the user's, and
+        // restoring the manifest's snapshot over it would erase it.
+        const restoredEvent = restoredUserEventFor(before, entry) ?? entry.hasUserEvent;
+        const result = update.run(
+          entry.modelProvider,
+          entry.source,
+          restoredEvent,
+          entry.id,
+          before.rollout_path,
+          before.model_provider,
+          before.source,
+          before.has_user_event,
+          before.first_user_message,
+        );
+        if (result.changes !== 1) {
+          throw new CodexHistoryIntegrityError("history_backup_database_changed_during_restore");
+        }
+      }
+      // Only after every database CAS matched may a rollout move. Keeping the SQLite
+      // transaction open means a file-side refusal rolls the database back, while the manifest
+      // remains the durable retry journal for an exceptional I/O failure.
+      for (const entry of entries) {
+        const before = rolloutSnapshots.get(entry.id);
+        if (!before) throw new CodexHistoryIntegrityError("history_backup_rollout_snapshot_missing");
+        let updated: SessionMetaUpdateResult;
+        try {
+          updated = updateSessionMeta(
+            entry.rolloutPath,
+            entry.id,
+            { provider: entry.modelProvider, source: entry.source },
+            {
+              requireDurableProvider: true,
+              expectedFileIdentity: before.identity,
+              expectedLatestProvider: before.latestProvider,
+              expectedLatestSource: before.latestSource,
+            },
+          );
+        } catch (error) {
+          if (historyFileIdentity(entry.rolloutPath) !== before.identity) files++;
+          throw error;
+        }
+        if (updated.changed) files++;
+        if (updated.conflict) {
+          throw new CodexHistoryIntegrityError("history_backup_rollout_changed_during_restore");
+        }
+        if (!updated.durableProvider) {
+          throw new CodexHistoryIntegrityError("history_backup_rollout_unrestorable");
+        }
       }
     });
-    restore();
-    writeBackup(backupPath, { version: 1, stateDbPath, entries: {} }, stateDbPath);
-    const ejected = ejectRemainingOpencodexHistory(db);
-    return ejected.rows > 0
-      ? { rows: entries.length, files: files + ejected.files, ejectedRows: ejected.rows }
-      : { rows: entries.length, files };
+    try {
+      restore();
+    } catch (error) {
+      if (files > 0) {
+        throw new CodexHistoryIntegrityError("history_backup_partial_restore", { rows: 0, files });
+      }
+      throw error;
+    }
+
+    try {
+      const getCurrent = (id: string) => current.get(id);
+      assertRestoreReadback(getCurrent, entries);
+      beforeHistoryBackupConsumeForTests?.();
+      // The hook models the exact last-moment race: neither a newer database decision nor a
+      // same-id foreign session_meta may be hidden by deleting the only provenance manifest.
+      assertRestoreReadback(getCurrent, entries);
+      consumeBackupIfUnchanged(backupPath, stateDbPath, backup.fingerprint);
+    } catch (error) {
+      if (error instanceof CodexHistoryIntegrityError) {
+        throw new CodexHistoryIntegrityError(error.message, { rows: entries.length, files });
+      }
+      // The restore landed and its readback passed; only finalization failed, so the
+      // manifest survives on disk. Record that its relabel is undone, or a later routing
+      // attempt cannot tell this entry from one still mid-route and has to keep a baseline
+      // that is now stale. Best-effort: a failure here leaves exactly the prior state.
+      try {
+        for (const entry of entries) {
+          const stored = manifest.entries[entry.id];
+          if (stored) stored.relabel = "none";
+        }
+        manifest.version = 2;
+        writeBackup(backupPath, manifest, stateDbPath);
+      } catch { /* the surviving manifest keeps its previous marker */ }
+      const failureReason = classifyRecoverableHistoryError(error);
+      if (failureReason) {
+        return {
+          rows: entries.length,
+          files,
+          failed: true,
+          failureReason,
+        };
+      }
+      // Once exact targets were written, an unclassified finalization failure is an
+      // applied-but-not-converged integrity state. Preserve that progress instead of
+      // reporting a zero-change failure that invites an unsafe blind retry.
+      throw new CodexHistoryIntegrityError("history_backup_finalization_failed", {
+        rows: entries.length,
+        files,
+      });
+    }
+    return { rows: entries.length, files };
   } finally {
     db.close();
   }
@@ -824,36 +1657,48 @@ function restoreCodexHistoryProvider(stateDbPath: string, backupPath: string): C
 
 export function restoreLegacyOpenaiHistory(stateDbPath = resolveCodexStateDbPath()): CodexHistorySyncResult {
   if (!existsSync(stateDbPath)) return { rows: 0, files: 0 };
+  try {
   const retried = withHistoryRetryResult(() => {
     const db = openStateDb(stateDbPath);
     try {
-      return ejectRemainingOpencodexHistory(db);
+      return relabelAllRoutedHistoryToOpenai(db);
     } finally {
       db.close();
     }
   });
   return retried.ok ? retried.value : { rows: 0, files: 0, failed: true, failureReason: retried.reason };
+  } catch (error) {
+    if (error instanceof CodexHistoryIntegrityError) return integrityFailureResult(error);
+    throw error;
+  }
 }
 
 /**
- * One-time Design-B migration: restore backed-up originals, then eject any remaining
- * opencodex-tagged threads to openai. Thin wrapper over the restore path with a
+ * One-time Design-B migration: restore only manifest-backed originals. Untracked
+ * opencodex-tagged threads have unknown provider provenance and remain routed unless the
+ * user explicitly invokes legacy OpenAI recovery. Thin wrapper over the restore path with a
  * configurable retry budget — the daemon migration guardian uses `{ attempts: 1 }`
  * per tick so a locked DB never stalls the event loop beyond one sqlite busy wait.
  */
 export function migrateHistoryToOpenai(
   stateDbPath = resolveCodexStateDbPath(),
-  backupPath = historyBackupPathFor(stateDbPath),
+  backupPath = resolveExistingHistoryBackupPath(stateDbPath),
   opts: { attempts?: number; delayMs?: number; sleepFn?: (ms: number) => void } = {},
 ): CodexHistorySyncResult {
-  if (!existsSync(stateDbPath)) return { rows: 0, files: 0 };
   // Steady-state gate: this migration is Design-B-specific (inject + guardian callers),
   // and after the one-time migration every start would otherwise write-open the DB for
   // nothing. A missing DB with a leftover backup manifest does NOT satisfy the gate
   // (backupEntries > 0), so the guardian's fresh-reinstall re-count protection holds.
   if (openaiRestoreIsNoop(stateDbPath, backupPath)) return { rows: 0, files: 0 };
-  const retried = withHistoryRetryResult(() => syncCodexHistoryProviderUnsafe("openai", stateDbPath, backupPath), opts);
-  return retried.ok ? retried.value : { rows: 0, files: 0, failed: true, failureReason: retried.reason };
+  try {
+    const retried = withHistoryRetryResult(() => syncCodexHistoryProviderUnsafe("openai", stateDbPath, backupPath), opts);
+    return retried.ok ? retried.value : { rows: 0, files: 0, failed: true, failureReason: retried.reason };
+  } catch (error) {
+    if (error instanceof CodexHistoryIntegrityError) {
+      return integrityFailureResult(error);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -870,7 +1715,7 @@ export function snapshotCodexHistoryNoop(
   const stateDbPresent = existsSync(stateDbPath);
   const backupPresent = existsSync(backupPath);
   const base = { canonicalStateDbPath, stateDbPresent, canonicalBackupPath, backupPresent };
-  if (!samePath(backupPath, historyBackupPathFor(stateDbPath))) {
+  if (!sameCodexHistoryPath(backupPath, resolveExistingHistoryBackupPath(stateDbPath))) {
     return { kind: "unknown", pendingRows: null, backupEntries: null, ...base, reason: "backup-path" };
   }
   const backup = inspectBackupForNoop(backupPath, stateDbPath);
@@ -894,7 +1739,9 @@ export function snapshotCodexHistoryNoop(
     if (dataVersionBefore === null) {
       return { kind: "unknown", pendingRows: null, backupEntries: null, ...base, reason: "database-query" };
     }
-    const pending = countPendingOpencodexHistory(stateDbPath, backupPath);
+    const pending = countPendingOpencodexHistory(stateDbPath, backupPath, {
+      validateRestoreTargets: false,
+    });
     if (pending.failed) {
       return { kind: "unknown", pendingRows: null, backupEntries: null, ...base, reason: "database-query" };
     }
@@ -932,48 +1779,71 @@ export function snapshotCodexHistoryNoop(
 }
 
 export interface PendingHistoryCount {
-  /** Threads still tagged opencodex that the eject path WOULD move (mirrors its WHERE). */
+  /** Compatibility field; bare routed rows are never automatic restore work. */
   pendingRows: number;
   /** Entries still recorded in the backup manifest (restore targets). */
   backupEntries: number;
-  /** Set when the DB could not be opened/read (locked); counts are then unknown, not zero. */
+  /** Set when the DB/manifest could not be read or their bound identity is invalid. */
   failed?: true;
+  /** Distinguishes retryable contention/access from a manifest or target that needs review. */
+  failureReason?: CodexHistoryFailureReason;
 }
 
 /**
  * Read-only migration progress probe for the guardian and `ocx doctor`. Opens sqlite
- * readonly with a SHORT busy timeout so a locked DB cannot stall a daemon tick. The
- * pending predicate mirrors ejectRemainingOpencodexHistory exactly — rows eject ignores
- * (empty first_user_message) are not counted, so 0 really means "migration done".
+ * readonly with a SHORT busy timeout so a locked DB cannot stall a daemon tick. Only a
+ * valid, database-bound backup manifest is actionable work; bare routed rows remain
+ * untouched because their original provider is not known. Operator diagnostics keep the
+ * default deep rollout validation. Recurring no-op probes explicitly opt out because any
+ * nonempty manifest already prevents a no-op and the mutation path always preflights files.
  */
 export function countPendingOpencodexHistory(
   stateDbPath = resolveCodexStateDbPath(),
-  backupPath = historyBackupPathFor(stateDbPath),
+  backupPath = resolveExistingHistoryBackupPath(stateDbPath),
+  opts: { validateRestoreTargets?: boolean } = {},
 ): PendingHistoryCount {
-  let backupEntries = 0;
-  try {
-    const manifest = readBackup(backupPath, stateDbPath);
-    backupEntries = Object.keys(manifest.entries).length;
-  } catch { /* unreadable manifest counts as 0 — restore treats it the same way */ }
+  const backup = readBackupStrict(backupPath, stateDbPath);
+  if (backup.kind === "unknown") {
+    return {
+      pendingRows: 0,
+      backupEntries: 0,
+      failed: true,
+      failureReason: backup.failureReason ?? "integrity",
+    };
+  }
+  const entries = Object.values(backup.manifest.entries);
+  const backupEntries = entries.length;
 
-  if (!existsSync(stateDbPath)) return { pendingRows: 0, backupEntries };
+  if (!existsSync(stateDbPath)) {
+    return backupEntries > 0
+      ? { pendingRows: 0, backupEntries, failed: true, failureReason: "integrity" }
+      : { pendingRows: 0, backupEntries };
+  }
   try {
     const db = new Database(stateDbPath, { readonly: true });
     try {
       db.exec("PRAGMA busy_timeout = 100");
-      const row = db.query<{ n: number }, []>(`
-        SELECT count(*) AS n
-        FROM threads
-        WHERE model_provider = 'opencodex'
-          AND trim(coalesce(first_user_message, '')) != ''
-      `).get();
-      return { pendingRows: row?.n ?? 0, backupEntries };
+      // Prove the expected history schema is readable without counting unowned routed rows.
+      db.query("SELECT 1 FROM threads LIMIT 1").get();
+      if (entries.length > 0) {
+        const current = db.query<RestoreRowSnapshot, [string]>(`
+          SELECT id, rollout_path, model_provider, source, has_user_event, first_user_message
+          FROM threads WHERE id = ?
+        `);
+        if (opts.validateRestoreTargets === false) {
+          preflightRestoreRows(id => current.get(id), entries);
+        } else {
+          preflightRestoreTargets(id => current.get(id), entries);
+        }
+      }
+      return { pendingRows: 0, backupEntries };
     } finally {
       db.close();
     }
   } catch (error) {
-    if (isRecoverableHistoryError(error)) return { pendingRows: 0, backupEntries, failed: true };
+    const reason = classifyRecoverableHistoryError(error);
+    if (reason) return { pendingRows: 0, backupEntries, failed: true, failureReason: reason };
     // Schema drift (e.g. a future codex renames the table) is a "cannot know" too, not a crash.
-    return { pendingRows: 0, backupEntries, failed: true };
+    return { pendingRows: 0, backupEntries, failed: true, failureReason: "integrity" };
   }
 }

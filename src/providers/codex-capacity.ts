@@ -8,12 +8,43 @@ export const CODEX_CONFIGURED_CAPACITY_WEIGHTS = {
   pro: 20,
 } as const;
 
+/**
+ * Weight for a plan the map above has not calibrated.
+ *
+ * `CodexAccount.plan` is an unrestricted upstream string and cannot be enumerated: the
+ * bundled model snapshot alone carries 21 distinct plan names (`edu_plus`, `finserv`,
+ * `k12`, `quorum`, `self_serve_business_usage_based`, …) against the five listed above.
+ * Treating an unlisted plan as unknown dropped the account from the estimate entirely and
+ * reported "incomplete coverage" — which is how a Business seat upgraded to Premium
+ * disappeared from its own capacity report (#3155), and it was already happening to the
+ * other sixteen snapshot plans without anyone noticing.
+ *
+ * `src/codex/quota.ts` reached the same conclusion about the same field: an allowlist is a
+ * list of the plans someone remembered. Counting an unfamiliar plan at the baseline seat
+ * weight — the value `plus`, `team`, and `business` already carry — under-states a large
+ * seat, which is a visibly conservative estimate. Excluding it silently overstates coverage
+ * the operator does not have, which is worse.
+ *
+ * Uncalibrated plans are still counted in `unknownPlanAccounts` so the estimate's
+ * uncertainty stays on screen.
+ */
+export const CODEX_DEFAULT_CAPACITY_WEIGHT = 1;
+
 /** Match the provider-report last-good freshness bound. */
 export const CODEX_CAPACITY_MAX_QUOTA_AGE_MS = 30 * 60_000;
 
 export type CodexCapacityQuota = {
   fiveHourPercent?: number;
   fiveHourResetAt?: number;
+  /**
+   * Local observation time for the burst-window percentage.
+   *
+   * Carried because the terminal-short-window rule needs it whenever the reading has no reset
+   * instant, and the dashboard's account-switch warning evaluates that rule against this DTO.
+   * Dropping it here made the warning return "no opinion" for a snapshot routing was already
+   * refusing on (#5045).
+   */
+  shortObservedAt?: number;
   weeklyPercent?: number;
   weeklyResetAt?: number;
   monthlyPercent?: number;
@@ -85,11 +116,17 @@ type MutableWindow = {
   oldestUpdatedAt: number;
 };
 
-function configuredWeight(plan: unknown): number | undefined {
+/** True when this plan has a calibrated weight rather than falling back to the default. */
+function isCalibratedPlan(plan: unknown): boolean {
+  const normalized = codexPlanKey(plan);
+  return !!normalized && Object.hasOwn(CODEX_CONFIGURED_CAPACITY_WEIGHTS, normalized);
+}
+
+function configuredWeight(plan: unknown): number {
   const normalized = codexPlanKey(plan);
   return normalized && Object.hasOwn(CODEX_CONFIGURED_CAPACITY_WEIGHTS, normalized)
     ? CODEX_CONFIGURED_CAPACITY_WEIGHTS[normalized as keyof typeof CODEX_CONFIGURED_CAPACITY_WEIGHTS]
-    : undefined;
+    : CODEX_DEFAULT_CAPACITY_WEIGHT;
 }
 
 function normalizedPercent(value: unknown): number | undefined {
@@ -188,7 +225,9 @@ export function aggregateCodexPoolCapacity(
 
   for (const account of accounts) {
     const weight = configuredWeight(account.plan);
-    if (weight === undefined) unknownPlanAccounts += 1;
+    // Still reported, so the operator can see the estimate is conservative for this seat —
+    // but no longer a reason to drop the account from the aggregate (#3155).
+    if (!isCalibratedPlan(account.plan)) unknownPlanAccounts += 1;
     if (account.paused) pausedAccounts += 1;
     if (account.needsReauth) reauthAccounts += 1;
     const quota = account.quota;
@@ -204,7 +243,7 @@ export function aggregateCodexPoolCapacity(
     const custom = quota?.customWindows ?? [];
     const hasQuota = hasKnownQuotaWindow(quota);
     if (!hasQuota) missingQuotaAccounts += 1;
-    if (account.paused || account.needsReauth || weight === undefined || !quota || !hasQuota || !quotaFresh) continue;
+    if (account.paused || account.needsReauth || !quota || !hasQuota || !quotaFresh) continue;
 
     let contributed = false;
     const contributionKeys = new Set<string>();

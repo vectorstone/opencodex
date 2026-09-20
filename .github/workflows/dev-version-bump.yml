@@ -1,0 +1,239 @@
+name: Dev version bump
+
+# Before a release publishes, open a pull request that moves `dev` past the intended
+# version. Merge that pull request before promoting and publishing so `dev` and pull
+# requests based on it never inherit a version-line failure from the new tag.
+#
+# That has been repaired by hand four times: 32529c2b2, e4a85d134, 076ad3036, befcac3e1.
+# The workflow now prepares the move before publication. Explicit repair mode retains
+# the old catch-up capability if a release somehow publishes without the pre-move.
+#
+# WHAT THIS DOES NOT DO. It does not push to `dev`. It opens a pull request and a human
+# merges it, because ruleset `Protect dev` requires an approving review and code-owner
+# sign-off that a bot cannot supply. `release.yml` independently refuses publication
+# until `dev` already outranks the intended version.
+#
+# WHY THIS IS DISPATCHED. The intended version is known before publication, and this
+# workflow's purpose is to queue the reviewed `dev` move first. It is not called by the
+# release workflow after an irreversible publish, and it does not react to release events.
+#
+# A branch-selected dispatch executes that branch's workflow body with write permission.
+# The in-job guard therefore rejects accidental non-default-ref dispatches. It is an early
+# warning, not a security boundary: a writer could remove it on their branch. Protected
+# release branches and the required review on `dev` remain the enforcement boundaries.
+on:
+  workflow_dispatch:
+    inputs:
+      intended-version:
+        description: "Version about to be released (pre-move), or one already published (repair)"
+        required: true
+        type: string
+      mode:
+        description: "pre-move (default) or repair — repair allows an already-published version"
+        required: false
+        default: pre-move
+        type: choice
+        options:
+          - pre-move
+          - repair
+
+permissions: {}
+
+concurrency:
+  group: dev-version-bump
+  cancel-in-progress: false
+
+jobs:
+  open-bump-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      # Push the new codex/dev-version-* branch. Ruleset `Protect dev` covers only
+      # refs/heads/dev, so the bump branch is unprotected and this token cannot
+      # bypass dev review. It is the ruleset that keeps this job off dev, not the
+      # permission name.
+      contents: write
+      # Open the pull request.
+      pull-requests: write
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: dev
+          # Tags are load-bearing, not decoration: the freeness gate below is a bun
+          # test that reads the local tag set, and release-version-line.test.ts
+          # returns EARLY on an empty set. A shallow checkout would make that gate
+          # silently vacuous instead of failing loudly.
+          fetch-depth: 0
+          # Do NOT set persist-credentials: false here as the read-only workflows do.
+          # This job has to push its bump branch.
+
+      # The repository-owned composite action, not a hand-pinned setup-bun SHA: it
+      # resolves the Bun version from package.json so the runtime SOT stays in one
+      # place. An independently pinned action here would drift from every other job.
+      - name: Setup project Bun
+        uses: ./.github/actions/setup-project-bun
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Refuse a dispatch from a non-default ref
+        run: |
+          test "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}" || {
+            echo "::error::this workflow may only be dispatched from the default branch"
+            exit 1
+          }
+
+      - name: Resolve the target version
+        id: target
+        env:
+          INTENDED: ${{ inputs.intended-version }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          target="${INTENDED:-}"
+          if [ -z "$target" ]; then
+            echo "::error::intended-version was not supplied"
+            exit 1
+          fi
+          echo "version=${target}" >> "$GITHUB_OUTPUT"
+          if [ "${MODE:-pre-move}" = "repair" ]; then
+            echo "mode=repair" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=pre-move" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide the version dev should carry
+        id: decide
+        env:
+          RELEASED_VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          bun scripts/bump-dev-version.ts "${RELEASED_VERSION}" package.json
+
+      - name: Prove the intended version is not already released
+        if: ${{ steps.target.outputs.mode == 'pre-move' }}
+        env:
+          INTENDED: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          if git rev-parse -q --verify "refs/tags/v${INTENDED#v}" >/dev/null; then
+            echo "::error::v${INTENDED#v} already exists; this is a catch-up, not a pre-move"
+            exit 1
+          fi
+          if npm view "@bitkyc08/opencodex@${INTENDED#v}" version >/dev/null 2>&1; then
+            echo "::error::${INTENDED#v} is already on npm"
+            exit 1
+          fi
+
+      - name: Prove the chosen version is unused
+        if: ${{ steps.decide.outputs.changed == 'true' }}
+        # The script decides the candidate from the target version SHAPE, which is all
+        # a pure function can see. Whether that candidate is actually FREE is a property
+        # of the tag set, so it is settled here by the detector that already owns the
+        # question. If this fails, no pull request is opened and the job goes red asking
+        # for a human decision - which is the correct outcome, not a fallback.
+        run: bun test tests/ci-workflows/release-version-line.test.ts
+
+      - name: Open the bump pull request
+        if: ${{ steps.decide.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.target.outputs.mode }}
+          NEXT_VERSION: ${{ steps.decide.outputs.version }}
+          TARGET_VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          branch="codex/dev-version-${NEXT_VERSION}"
+          if [ "${MODE}" = "repair" ]; then
+            subject="fix(release): move dev to ${NEXT_VERSION} after ${TARGET_VERSION}"
+            reason="\`${TARGET_VERSION}\` has published, so \`dev\` is carrying a version at or behind a released one and \`tests/ci-workflows/release-version-line.test.ts\` fails on \`dev\` and on every pull request opened against it. This is the post-publish repair."
+            freeness="\`bun test tests/ci-workflows/release-version-line.test.ts\` proved the chosen development version is unused."
+          else
+            subject="chore(release): open dev at ${NEXT_VERSION} before releasing ${TARGET_VERSION}"
+            reason="\`${TARGET_VERSION}\` is about to be released. Merging this first means \`dev\` already outranks the new tag when it lands, so neither \`dev\` nor any open pull request ever inherits the version-line failure. \`release.yml\` refuses to publish until this has merged."
+            freeness="The workflow proved \`${TARGET_VERSION}\` has neither a Git tag nor an npm publication, and \`bun test tests/ci-workflows/release-version-line.test.ts\` proved the chosen development version is unused."
+          fi
+
+          # Idempotent: a repeated dispatch, a re-run, or a manual repair must not turn
+          # an already-queued version move into a red job.
+          #
+          # Check the PULL REQUEST as well as the branch, not just the branch. A security
+          # review caught that: an open bump pull request whose head branch was deleted
+          # leaves the branch check passing, so the job would recreate the branch and then
+          # fail on `gh pr create` with "already exists" — turning a successful run red
+          # for a move that was already queued.
+          # Apply the repository owner and branch filter on the server. Filtering a
+          # paginated `gh pr list` result locally can miss this repository's pull request
+          # when newer same-named fork pull requests fill the fetched page (#3325).
+          open_prs="$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f state=open \
+              -f base=dev \
+              -f "head=${GITHUB_REPOSITORY_OWNER}:${branch}" \
+              -F per_page=1 \
+              --jq 'length'
+          )"
+          if [ "${open_prs}" != "0" ]; then
+            echo "::notice::a bump pull request for ${branch} is already open; nothing to do"
+            exit 0
+          fi
+
+          # An existing branch is NOT terminal. If a previous run pushed the branch and then
+          # failed at `gh pr create`, exiting here would leave the move permanently unqueued
+          # while every rerun reports success - the exact failure mode a reviewer caught. So
+          # reuse the branch and fall through to pull-request creation instead.
+          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
+            echo "::notice::${branch} exists without an open pull request; validating it"
+            git fetch origin "${branch}"
+
+            # Fail closed on unexpected content. The branch carries the bot's own one-line
+            # bump, so anything else on it means a human or another job is using that name and
+            # this job must not push to it or open a pull request from it.
+            changed_files="$(git diff --name-only "origin/dev...origin/${branch}")"
+            if [ "${changed_files}" != "package.json" ]; then
+              echo "::error::${branch} touches unexpected files: ${changed_files:-<none>}"
+              exit 1
+            fi
+            branch_version="$(git show "origin/${branch}:package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")"
+            if [ "${branch_version}" != "${NEXT_VERSION}" ]; then
+              echo "::error::${branch} carries ${branch_version}, expected ${NEXT_VERSION}"
+              exit 1
+            fi
+            git checkout -B "${branch}" "origin/${branch}"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -b "${branch}"
+            git add package.json
+            git commit -m "${subject}"
+            git push origin "${branch}"
+          fi
+
+          gh pr create \
+            --base dev \
+            --head "${branch}" \
+            --title "${subject}" \
+            --body "$(cat <<BODY
+          ## Summary
+
+          ${reason}
+
+          This moves \`dev\` to \`${NEXT_VERSION}\`.
+
+          Opened automatically by \`.github/workflows/dev-version-bump.yml\`. The same
+          version-line move was previously done by hand in 32529c2b2, e4a85d134, 076ad3036, and
+          befcac3e1.
+
+          ## Verification
+
+          ${freeness}
+
+          ## Checklist
+
+          - [x] Scope stays focused and avoids unrelated cleanup.
+          - [x] Docs or release notes were updated when needed.
+          - [x] Security-sensitive changes were reviewed for secrets, auth, and unsafe defaults.
+          BODY
+          )"

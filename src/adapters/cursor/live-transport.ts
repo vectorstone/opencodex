@@ -13,10 +13,14 @@ import {
   type TranslatorBudget,
 } from "../../lib/translator-budget";
 import { activePromptText, prepareCursorRunRequest } from "./protobuf-request";
+import { prepareCursorRawMessages, resolveActiveCursorImages } from "./images";
+import { isCursorExternalWireModel } from "./discovery";
+import { cursorRequestMessagesFromRaw } from "./request-builder";
 import {
   createCursorContextUsageTracker,
   createCursorProtobufEventState,
   finalizeTurnEvents,
+  hasBufferedTextToolCalls,
   mapCursorProtobufServerMessage,
   mapSyntheticMcpExecToToolEvents,
   reportableContextTokens,
@@ -33,6 +37,7 @@ import {
   CreatePlanRequestResponseSchema,
   CreatePlanResultSchema,
   CreatePlanSuccessSchema,
+  ConversationStateStructureSchema,
   ExaFetchRequestResponseSchema,
   ExaFetchRequestResponse_ApprovedSchema,
   ExaSearchRequestResponseSchema,
@@ -49,9 +54,11 @@ import {
 } from "./gen/agent_pb";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import { classifyCursorError, CursorUnexpectedCancelError, isCursorAbortError, isCursorBenignCancelError, safeCursorErrorMessage } from "./cursor-errors";
+import { cursorPolicyErrorExplanation } from "./policy-error";
 import { mcpArgsFromToolCall } from "./protobuf-events";
 import { OCX_RESPONSES_TOOL_PROVIDER } from "./tool-definitions";
 import {
+  cursorNativeExecRedirectHint,
   handleCursorNativeExec,
   handleCursorNativeKv,
   releaseCursorBlobRequestScope,
@@ -80,7 +87,7 @@ import {
   type BackgroundShellTerminationReport,
 } from "./native-exec-shell";
 import type { CursorClientMessage, CursorRunRequest, CursorServerMessage } from "./types";
-import type { CursorTransport, CursorTransportFactoryInput } from "./transport";
+import type { CursorStreamHealthClock, CursorTransport, CursorTransportFactoryInput } from "./transport";
 import { CursorHttp1BidiConnection } from "./http1-bidi";
 import { isPinnedHttp1 } from "../../lib/upstream-http-version";
 
@@ -88,11 +95,48 @@ const CURSOR_RUN_PATH = "/agent.v1.AgentService/Run";
 const CURSOR_CLIENT_VERSION = "cli-2026.07.08-0c04a8a";
 const HEARTBEAT_MS = 5_000;
 const CURSOR_FIRST_FRAME_TIMEOUT_MS = 30_000;
+/**
+ * T04 (senpi #1062 second half): after the first frame, a turn with NO inbound decoded
+ * frames for this long is failed instead of waiting for the 300s bridge stall watchdog
+ * (issue #2210). Reset on every decoded AgentServerMessage.
+ */
+const CURSOR_STREAM_SILENCE_FAIL_MS = 30_000;
+/**
+ * A stream that produces ONLY liveness frames (server heartbeat / conversationCheckpointUpdate)
+ * for this long is equally stuck — the server is alive but the turn is not progressing.
+ * Reset on every decoded frame that is not liveness-only.
+ */
+const CURSOR_STREAM_HEARTBEAT_ONLY_FAIL_MS = 90_000;
+/**
+ * The production T04 clock. The watchdog reads time and schedules its one timer through this
+ * object so a test can supply a clock it advances by hand; nothing else about the transport's
+ * timers moves with it.
+ */
+const REAL_STREAM_HEALTH_CLOCK: CursorStreamHealthClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: timer => clearTimeout(timer),
+};
+/**
+ * After `turnEnded` is decoded, the application turn is complete. A server that keeps
+ * HTTP/2 open past this point cannot hold the turn hostage (senpi #1062): we close our side
+ * after a short grace so any trailing frames (late usage, checkpoint) still land.
+ */
+const TURN_ENDED_CLOSE_GRACE_MS = 500;
 const CURSOR_TIMEOUT_DESTROY_GRACE_MS = 1_000;
 const CLIENT_TOOL_FINALIZE_GRACE_MS = 50;
 const GENERIC_TOOL_COUNT_MIN_FINALIZE_GRACE_MS = 750;
 const GENERIC_TOOL_COUNT_MAX_FINALIZE_GRACE_MS = 1_800;
 const GENERIC_TOOL_COUNT_PER_TOOL_GRACE_MS = 125;
+/**
+ * A client-tool turn suspends before `turnEnded`, and upstream sends that turn's conversation
+ * checkpoint right after `toolCallStarted` — after the 50 ms drain grace, so it used to be
+ * cancelled away and every such turn full-replayed with `cached_tokens: 0`. Measured on a live
+ * account with the tool catalog held constant: 50 ms captures nothing, 1500 ms captures 3036
+ * bytes (#4245, devlog 260911_cursor_checkpoint_capture). This window is paid only by a turn
+ * that never sends one; `handleServerMessage` finalizes early as soon as the frame lands.
+ */
+const CHECKPOINT_CAPTURE_GRACE_MS = 1_500;
 const cursorContextUsageTracker = createCursorContextUsageTracker();
 
 /**
@@ -178,7 +222,8 @@ export function parseConnectEndStreamError(payload: Uint8Array): Error | null {
   try {
     const parsed = JSON.parse(new TextDecoder().decode(payload)) as { error?: { code?: string; message?: string } };
     if (parsed?.error) {
-      return new Error(`Cursor Connect error ${parsed.error.code ?? "unknown"}: ${parsed.error.message ?? "Unknown error"}`);
+      const explanation = cursorPolicyErrorExplanation(parsed.error);
+      return new Error(`Cursor Connect error ${parsed.error.code ?? "unknown"}: ${explanation ?? parsed.error.message ?? "Unknown error"}`);
     }
     return null;
   } catch {
@@ -391,9 +436,45 @@ export function finalizeAfterDrain(state: ReturnType<typeof createCursorProtobuf
   return finalizeTurnEvents(state);
 }
 
+/**
+ * Whether a drained client-tool turn should wait one more bounded window for the conversation
+ * checkpoint instead of cancelling now.
+ *
+ * This mirrors `finalizeAfterDrain`'s two guards rather than calling it, and that is load-bearing:
+ * `finalizeAfterDrain` reaches `finalizeTurnEvents`, which sets `state.terminated`, and then returns
+ * `[]` for a terminated state. Draining first and re-arming would make the retry return early at the
+ * length check and leave the stream uncancelled. Pure for unit testing.
+ */
+export function shouldExtendForCheckpointCapture(input: {
+  /** Optional on the event state, so accept its real shape rather than forcing a cast at the call site. */
+  terminated: boolean | undefined;
+  openToolCallCount: number;
+  wantsCheckpointCapture: boolean;
+  hasCapturedCheckpoint: boolean;
+  alreadyExtended: boolean;
+}): boolean {
+  if (input.terminated || input.openToolCallCount > 0) return false;
+  if (!input.wantsCheckpointCapture || input.hasCapturedCheckpoint) return false;
+  return !input.alreadyExtended;
+}
+
 export function clientToolFinalizeGraceMsForRequest(request: CursorRunRequest, baseGraceMs = CLIENT_TOOL_FINALIZE_GRACE_MS): number {
   if (request.rawMessages?.at(-1)?.role === "toolResult") return baseGraceMs;
   const text = activePromptText(request);
+  // Parallel-tool requests with several advertised tools get the expanded window regardless of
+  // prompt shape: external models (grok) assemble sibling calls serially over multiple frames,
+  // and the 50ms drain grace ended the turn after 1-2 of them (devlog 260826_cursor_responses_gap,
+  // live 10-parallel probe: calls=2 then calls=1).
+  if (request.parallelToolCalls === true && (request.tools?.length ?? 0) > 1) {
+    const advertised = request.tools?.length ?? 0;
+    return Math.max(
+      baseGraceMs,
+      Math.min(
+        GENERIC_TOOL_COUNT_MAX_FINALIZE_GRACE_MS,
+        Math.max(GENERIC_TOOL_COUNT_MIN_FINALIZE_GRACE_MS, advertised * GENERIC_TOOL_COUNT_PER_TOOL_GRACE_MS),
+      ),
+    );
+  }
   if (!cursorRequestHasShellAlias(request.tools) || !isGenericToolUseCountDemoPrompt(text)) return baseGraceMs;
   const requestedCount = requestedCursorToolUseCount(text);
   const expandedGraceMs = requestedCount
@@ -411,6 +492,20 @@ class LiveCursorTransport implements CursorTransport {
   private http1Connection?: CursorHttp1BidiConnection;
   private heartbeat?: ReturnType<typeof setInterval>;
   private firstFrameTimer?: ReturnType<typeof setTimeout>;
+  private turnEndedCloseTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * T04 inbound stream-health watchdog. Armed after the request is on the wire, reset by
+   * every DECODED frame (raw chunks deliberately do not count — TLS keepalive noise must not
+   * defeat it), disarmed by any settle/expected-close path. One timer covers both thresholds:
+   * it always fires at min(lastInbound + silence, lastMeaningful + heartbeatOnly) and re-arms
+   * when neither deadline has actually elapsed.
+   */
+  private streamHealthTimer?: ReturnType<typeof setTimeout>;
+  private lastInboundFrameAt = 0;
+  private lastMeaningfulFrameAt = 0;
+  private streamHealthFail?: (error: Error) => void;
+  /** Time source for the T04 watchdog only; the globals unless a test injects one. */
+  private readonly streamHealthClock: CursorStreamHealthClock;
   private committed = false;
   private expectedClose = false;
   /**
@@ -420,6 +515,10 @@ class LiveCursorTransport implements CursorTransport {
    */
   private emittedTerminal = false;
   private pendingFinalize?: ReturnType<typeof setTimeout>;
+  /** The armed finalize body, so the checkpoint frame can run it early instead of waiting out the window. */
+  private pendingFinalizeRun?: () => void;
+  private checkpointGraceExtended = false;
+  private wantsCheckpointCapture = false;
   private readonly clientToolFinalizeGraceMs: number;
   private activeClientToolFinalizeGraceMs: number;
   private readonly token: string;
@@ -439,11 +538,12 @@ class LiveCursorTransport implements CursorTransport {
   private framesReceived = 0;
   private sawAssistantText = false;
  private firstFrameAt?: number;
- private firstFrameLogged = false;
+  private firstFrameLogged = false;
   /** Stable session identifier sent as x-session-id; mirrors IDE session semantics. */
   private readonly sessionId: string;
   /** Per-transport owner for native-exec / background shells. Must not share conversationId. */
   private readonly shellOwnerId = crypto.randomUUID();
+  private capturedCheckpointBytes?: Uint8Array;
 
   constructor(private readonly input: CursorTransportFactoryInput) {
     this.sessionId = input.sessionId?.trim() || crypto.randomUUID();
@@ -454,6 +554,7 @@ class LiveCursorTransport implements CursorTransport {
     // so the transport-level race test can drive it deterministically.
     this.clientToolFinalizeGraceMs = input.clientToolFinalizeGraceMs ?? CLIENT_TOOL_FINALIZE_GRACE_MS;
     this.activeClientToolFinalizeGraceMs = this.clientToolFinalizeGraceMs;
+    this.streamHealthClock = input.streamHealthClock ?? REAL_STREAM_HEALTH_CLOCK;
     // Desktop (computer-use / record-screen) executors are available even with no MCP servers.
     this.desktopDeps = desktopDepsFromConfig(input.provider.desktopExecutor);
     this.execContext = {
@@ -567,10 +668,34 @@ class LiveCursorTransport implements CursorTransport {
 
     // Advertise MCP tools before the stream opens — the server only calls tools it was told about.
     await this.prepareMcp();
-    const activeText = activePromptText(request);
-    this.activeClientToolFinalizeGraceMs = clientToolFinalizeGraceMsForRequest(request, this.clientToolFinalizeGraceMs);
-    const cursorVisibleTools = cursorToolsForActivePrompt(request.tools, activeText, request.toolChoice);
-    const clientToolDefs = buildCursorToolDefinitions(cursorVisibleTools, request.toolChoice);
+    // JPEG soft-cap rewrite for active-turn data: images before encode. Rebuild text
+    // messages from the prepared raw channel so omission markers replace stale
+    // pre-rewrite content that activePromptText and the tool filter would otherwise see.
+    const externalToolImages = isCursorExternalWireModel(request.modelId)
+      && request.rawMessages?.at(-1)?.role === "toolResult";
+    const preparedRaw = await prepareCursorRawMessages(request.rawMessages, signal, {
+      trailingToolImages: externalToolImages,
+    });
+    const preparedRawMessages = preparedRaw.messages;
+    const selectedImages = externalToolImages ? preparedRaw.images : await resolveActiveCursorImages(
+      preparedRawMessages,
+      signal,
+      preparedRaw.images,
+    );
+    const preparedMessages = preparedRawMessages === request.rawMessages
+      ? request.messages
+      : cursorRequestMessagesFromRaw(preparedRawMessages);
+    const activeRequest: CursorRunRequest = {
+      ...request,
+      messages: preparedMessages,
+      rawMessages: preparedRawMessages,
+      selectedImages,
+    };
+    const activeText = activePromptText(activeRequest);
+    this.activeClientToolFinalizeGraceMs = clientToolFinalizeGraceMsForRequest(activeRequest, this.clientToolFinalizeGraceMs);
+    this.wantsCheckpointCapture = activeRequest.contextUsageStoreCheckpoints !== false;
+    const cursorVisibleTools = cursorToolsForActivePrompt(activeRequest.tools, activeText, activeRequest.toolChoice);
+    const clientToolDefs = buildCursorToolDefinitions(cursorVisibleTools, activeRequest.toolChoice);
     // `request.tools` is the catalog already filtered and budgeted by request-builder. Derive
     // conversion provenance only from tagged synthetic tools that also survive this final prompt
     // filter; a client tool with the same wire name can never opt into conversion by collision.
@@ -589,6 +714,7 @@ class LiveCursorTransport implements CursorTransport {
       clientToolDefs,
       rejectNativeFileMutations: cursorRequestAdvertisesApplyPatch(request.tools, request.toolChoice),
       structuredEditAvailable: syntheticStructuredEditToolNames.size > 0,
+      nativeExecRedirectHint: cursorNativeExecRedirectHint(cursorVisibleTools, this.execContext.mcpToolDefs ?? []),
     };
     const toolSchemas = new Map<string, unknown>();
     const cursorToolNameMap = new Map<string, string>();
@@ -606,7 +732,7 @@ class LiveCursorTransport implements CursorTransport {
     });
     // Build the payload once. The estimate is only worth deriving when there is no
     // carry-forward to fall back on — with a carry present it would never be used (#373).
-    const prepared = prepareCursorRunRequest(request, {
+    const prepared = prepareCursorRunRequest(activeRequest, {
       estimateInputTokens: contextUsage.carryForwardTokens === undefined,
     });
     this.blobRequestScope = prepared.blobRequestScope;
@@ -620,6 +746,8 @@ class LiveCursorTransport implements CursorTransport {
         syntheticStructuredEditToolNames,
         translatorBudget: this.translatorBudget,
         contextUsage,
+        wireModelId: request.modelId,
+        identityScope: request._cursorIdentityScope,
         ...(prepared.estimatedInputTokens !== undefined
           ? { estimatedInputTokens: prepared.estimatedInputTokens }
           : {}),
@@ -730,14 +858,104 @@ class LiveCursorTransport implements CursorTransport {
     }
   }
 
+  private clearStreamHealthTimer(): void {
+    if (this.streamHealthTimer) {
+      this.streamHealthClock.clearTimeout(this.streamHealthTimer);
+      this.streamHealthTimer = undefined;
+    }
+    this.streamHealthFail = undefined;
+  }
+
+  /**
+   * T04: arm (or re-arm) the inbound stream-health watchdog. `fail` is the turn's
+   * failAndClear; the timer owns nothing else. Never armed before the first decoded
+   * frame (the first-frame timer covers dial + first response), and disarmed by
+   * every settle / expected-close path alongside the other timers.
+   *
+   * Both clocks and the timer go through `streamHealthClock`, which is the globals in
+   * production. The `elapsedMs` diagnostic below deliberately stays on the wall clock,
+   * because `turnStartedAt` is stamped there and the pair has to subtract coherently.
+   */
+  private armStreamHealthTimer(fail: (error: Error) => void): void {
+    if (this.streamHealthTimer) this.streamHealthClock.clearTimeout(this.streamHealthTimer);
+    if (this.expectedClose) return;
+    this.streamHealthFail = fail;
+    const silenceMs = this.input.streamSilenceFailMs ?? CURSOR_STREAM_SILENCE_FAIL_MS;
+    const heartbeatOnlyMs = this.input.streamHeartbeatOnlyFailMs ?? CURSOR_STREAM_HEARTBEAT_ONLY_FAIL_MS;
+    const now = this.streamHealthClock.now();
+    const deadline = Math.min(
+      this.lastInboundFrameAt + silenceMs,
+      this.lastMeaningfulFrameAt + heartbeatOnlyMs,
+    );
+    this.streamHealthTimer = this.streamHealthClock.setTimeout(() => {
+      this.streamHealthTimer = undefined;
+      const failFn = this.streamHealthFail;
+      if (!failFn || this.expectedClose) return;
+      const stalledFor = this.streamHealthClock.now() - this.lastInboundFrameAt;
+      const meaningfulStalledFor = this.streamHealthClock.now() - this.lastMeaningfulFrameAt;
+      if (stalledFor < silenceMs && meaningfulStalledFor < heartbeatOnlyMs) {
+        // A frame landed between arming and firing — re-arm for the fresh deadline.
+        this.armStreamHealthTimer(failFn);
+        return;
+      }
+      const heartbeatOnly = stalledFor < silenceMs;
+      debugProviderDiagnostic("cursor", "stream-health-timeout", {
+        stalledMs: stalledFor,
+        meaningfulStalledMs: meaningfulStalledFor,
+        heartbeatOnly,
+        framesReceived: this.framesReceived,
+        elapsedMs: Date.now() - this.turnStartedAt,
+      });
+      const reason = heartbeatOnly
+        ? `Cursor stream stalled: heartbeat-only traffic for ${Math.round(meaningfulStalledFor / 1000)}s without turn progress`
+        : `Cursor stream stalled: no inbound frames for ${Math.round(stalledFor / 1000)}s before turnEnded`;
+      failFn(new Error(reason));
+      try { this.stream?.close(); } catch { this.stream?.destroy(); }
+      this.session?.close();
+      this.http1Connection?.close();
+    }, Math.max(0, deadline - now));
+  }
+
+  /**
+   * T04: record a decoded inbound frame. Liveness-only frames (server heartbeat,
+   * conversationCheckpointUpdate) keep the silence clock fresh but not the progress
+   * clock — matching senpi's split so a server that only pings still fails at the
+   * heartbeat-only threshold.
+   */
+  private noteInboundFrame(livenessOnly: boolean): void {
+    const now = this.streamHealthClock.now();
+    this.lastInboundFrameAt = now;
+    if (!livenessOnly) this.lastMeaningfulFrameAt = now;
+    if (this.streamHealthFail) this.armStreamHealthTimer(this.streamHealthFail);
+  }
+
+  /**
+   * A clean Connect END_STREAM owns the turn terminal even when Cursor keeps the
+   * HTTP body open or tears it down with an abort/reset immediately afterward.
+   * Stop client-side liveness work and classify that later transport close as
+   * expected without actively sending an RST_STREAM back to Cursor.
+   */
+  private markProtocolComplete(): void {
+    this.expectedClose = true;
+    this.clearPendingFinalize();
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = undefined;
+    }
+    this.clearFirstFrameTimer();
+    this.clearStreamHealthTimer();
+  }
+
   private startShellCleanup(): Promise<BackgroundShellTerminationReport> {
     return this.shellCleanup ??= terminateBackgroundShellsForSession(this.shellOwnerId);
   }
 
   async close(): Promise<void> {
     if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.turnEndedCloseTimer) clearTimeout(this.turnEndedCloseTimer);
     this.clearPendingFinalize();
     this.clearFirstFrameTimer();
+    this.clearStreamHealthTimer();
     this.stream?.close();
     this.session?.close();
     this.http1Connection?.close();
@@ -753,6 +971,7 @@ class LiveCursorTransport implements CursorTransport {
     this.clearPendingFinalize();
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.clearFirstFrameTimer();
+    this.clearStreamHealthTimer();
     if (this.http1Connection) {
       this.http1Connection.close();
     } else {
@@ -770,6 +989,46 @@ class LiveCursorTransport implements CursorTransport {
     void this.startShellCleanup().catch(() => { /* close() observes the same cleanup promise */ });
   }
 
+  /**
+   * T03 (#1062): after the server sends `turnEnded`, the application turn is complete.
+   * A server that keeps the HTTP/2 stream open past this point cannot hold the turn
+   * hostage until a 300s bridge idle timeout. Close our side after a short grace so any
+   * trailing frames (late usage, checkpoint) still land before we release the socket.
+   */
+  private closeAfterTurnEnded(): void {
+    if (this.turnEndedCloseTimer) return;
+    // The application turn is over: the T03 grace timer owns the socket from here.
+    // The T04 watchdog must disarm NOW, not at the grace close — a watchdog shorter
+    // than the grace would otherwise fail a completed turn.
+    this.clearStreamHealthTimer();
+    this.turnEndedCloseTimer = setTimeout(() => {
+      this.turnEndedCloseTimer = undefined;
+      // Only expectedClose (client-tool suspend cancel) blocks the close.
+      // emittedTerminal is intentionally NOT checked here: finalizeTurnEvents sets it
+      // synchronously during turnEnded mapping, ~500ms before this timer fires, so
+      // checking it would make the close unreachable on every real path (the exact
+      // scenario this PR exists to fix — senpi #1062).
+      if (this.expectedClose) return;
+      debugProviderDiagnostic("cursor", "turn-ended-close", {
+        committed: this.committed,
+        framesReceived: this.framesReceived,
+      });
+      this.expectedClose = true;
+      this.clearFirstFrameTimer();
+      this.clearStreamHealthTimer();
+      if (this.heartbeat) clearInterval(this.heartbeat);
+      if (this.http1Connection) {
+        this.http1Connection.close();
+      } else {
+        try {
+          this.stream?.close();
+        } catch {
+          this.stream?.destroy();
+        }
+      }
+    }, TURN_ENDED_CLOSE_GRACE_MS);
+  }
+
   private releaseBlobRequestScope(): void {
     const scope = this.blobRequestScope;
     if (!scope) return;
@@ -782,6 +1041,7 @@ class LiveCursorTransport implements CursorTransport {
       clearTimeout(this.pendingFinalize);
       this.pendingFinalize = undefined;
     }
+    this.pendingFinalizeRun = undefined;
   }
 
   /**
@@ -802,11 +1062,26 @@ class LiveCursorTransport implements CursorTransport {
   private scheduleClientToolFinalize(
     state: ReturnType<typeof createCursorProtobufEventState>,
     push: (message: CursorServerMessage) => void,
+    graceMsOverride?: number,
   ): void {
     this.clearPendingFinalize();
-    this.pendingFinalize = setTimeout(() => {
+    const run = (): void => {
       this.pendingFinalize = undefined;
+      this.pendingFinalizeRun = undefined;
       if (this.expectedClose) return;
+      // The checkpoint for THIS turn is the one we most want and the one we used to throw
+      // away. Extend once, bounded, before draining (#4245).
+      if (shouldExtendForCheckpointCapture({
+        terminated: state.terminated,
+        openToolCallCount: state.openToolCalls.size,
+        wantsCheckpointCapture: this.wantsCheckpointCapture,
+        hasCapturedCheckpoint: this.capturedCheckpointBytes !== undefined,
+        alreadyExtended: this.checkpointGraceExtended,
+      })) {
+        this.checkpointGraceExtended = true;
+        this.scheduleClientToolFinalize(state, push, CHECKPOINT_CAPTURE_GRACE_MS);
+        return;
+      }
       const terminal = finalizeAfterDrain(state);
       if (terminal.length === 0) return;
       for (const event of terminal) push(event);
@@ -814,9 +1089,13 @@ class LiveCursorTransport implements CursorTransport {
         reason: "Responses bridge owns client tools; ending turn without fake mcpResult",
         framesReceived: this.framesReceived,
         elapsedMs: Date.now() - this.turnStartedAt,
+        graceMs: graceMsOverride ?? this.activeClientToolFinalizeGraceMs,
+        checkpointGraceExtended: this.checkpointGraceExtended,
       });
       this.cancelCursorRun();
-    }, this.activeClientToolFinalizeGraceMs);
+    };
+    this.pendingFinalizeRun = run;
+    this.pendingFinalize = setTimeout(run, graceMsOverride ?? this.activeClientToolFinalizeGraceMs);
   }
 
   private open(
@@ -833,6 +1112,10 @@ class LiveCursorTransport implements CursorTransport {
     }
     this.turnStartedAt = Date.now();
     this.framesReceived = 0;
+    this.checkpointGraceExtended = false;
+    // A turn must not inherit the previous one's snapshot: a stale capture would make
+    // shouldExtendForCheckpointCapture skip the wait this turn actually needs.
+    this.capturedCheckpointBytes = undefined;
     this.sawAssistantText = false;
     this.emittedTerminal = false;
     this.firstFrameAt = undefined;
@@ -880,7 +1163,10 @@ class LiveCursorTransport implements CursorTransport {
     const settler = createTerminalSettler({
       fail,
       finish,
-      clearTimer: () => this.clearFirstFrameTimer(),
+      clearTimer: () => {
+        this.clearFirstFrameTimer();
+        this.clearStreamHealthTimer();
+      },
     });
     const failAndClear = (error: Error) => {
       releaseBacklogLease();
@@ -977,10 +1263,55 @@ class LiveCursorTransport implements CursorTransport {
           framesReceived: this.framesReceived,
           elapsedMs: Date.now() - this.turnStartedAt,
         } : { framesReceived: this.framesReceived, elapsedMs: Date.now() - this.turnStartedAt });
-        if (endError) failAndClear(endError);
+        if (endError) {
+          failAndClear(endError);
+          return;
+        }
+        // Connect's clean END_STREAM envelope is the protocol terminal. Cursor's RunSSE body can
+        // remain open after this frame (or close through an AbortError), so waiting for HTTP EOF
+        // strands an otherwise completed turn until the outer bridge stall watchdog fires.
+        //
+        // Earlier frames in this serialized frameWork chain have already run. Preserve their real
+        // turnEnded terminal when present; otherwise finalize the clean protocol end once so open
+        // tool calls still fail closed, a text-only turn receives its normal done event, and a
+        // drained client-tool turn does not lose the pending terminal when protocol cleanup clears
+        // its grace timer.
+        const hasPendingClientToolFinalization = this.pendingFinalize !== undefined;
+        if (
+          !this.expectedClose
+          && !state.terminated
+          && !this.emittedTerminal
+          && (
+            state.openToolCalls.size > 0
+            || this.sawAssistantText
+            || hasPendingClientToolFinalization
+            || hasBufferedTextToolCalls(state)
+          )
+        ) {
+          const terminal = hasPendingClientToolFinalization && state.openToolCalls.size === 0
+            ? finalizeAfterDrain(state)
+            : finalizeTurnEvents(state);
+          for (const event of terminal) push(event);
+        }
+        this.markProtocolComplete();
+        releaseBacklogLease();
+        settler.settleFinish();
         return;
       }
-      await this.handleServerMessage(fromBinary(AgentServerMessageSchema, frame.payload), state, push);
+      const decoded = fromBinary(AgentServerMessageSchema, frame.payload);
+      // T04: every decoded frame refreshes the silence clock; only non-liveness frames
+      // refresh the progress clock. First decoded frame arms the watchdog (the first-frame
+      // timer owned everything before this point).
+      const decodedUpdate = decoded.message.case === "interactionUpdate" ? decoded.message.value.message?.case : undefined;
+      const livenessOnly = decodedUpdate === "heartbeat" || decoded.message.case === "conversationCheckpointUpdate";
+      if (!this.streamHealthFail) {
+        const now = this.streamHealthClock.now();
+        this.lastInboundFrameAt = now;
+        this.lastMeaningfulFrameAt = now;
+        this.streamHealthFail = failAndClear;
+      }
+      this.noteInboundFrame(livenessOnly);
+      await this.handleServerMessage(decoded, state, push);
     };
     const drainPendingFrames = () => {
       const availableSlots = CURSOR_MAX_PENDING_FRAMES - this.pendingTransportFrames;
@@ -1121,7 +1452,7 @@ class LiveCursorTransport implements CursorTransport {
           settler.settleFinish();
           return;
         }
-        if (this.framesReceived > 0 && this.sawAssistantText) {
+        if (this.framesReceived > 0 && (this.sawAssistantText || hasBufferedTextToolCalls(state))) {
           for (const event of finalizeTurnEvents(state)) push(event);
           releaseBacklogLease();
           settler.settleFinish();
@@ -1129,7 +1460,7 @@ class LiveCursorTransport implements CursorTransport {
         }
         releaseBacklogLease();
         settler.settleFinish();
-      }, (err) => {
+      }).catch((err) => {
         failAndClear(err instanceof Error ? err : new Error(String(err)));
       });
     };
@@ -1187,6 +1518,10 @@ class LiveCursorTransport implements CursorTransport {
     }, HEARTBEAT_MS);
   }
 
+  capturedConversationCheckpoint(): Uint8Array | undefined {
+    return this.capturedCheckpointBytes;
+  }
+
   private async handleServerMessage(
     message: AgentServerMessage,
     state: ReturnType<typeof createCursorProtobufEventState>,
@@ -1194,6 +1529,25 @@ class LiveCursorTransport implements CursorTransport {
   ): Promise<void> {
     if (!this.stream && !this.http1Connection) return;
     debugProviderDiagnostic("cursor", "frame", describeCursorServerFrame(message));
+    if (message.message.case === "conversationCheckpointUpdate") {
+      try {
+        this.capturedCheckpointBytes = toBinary(ConversationStateStructureSchema, message.message.value);
+      } catch {
+        this.capturedCheckpointBytes = undefined;
+      }
+      // We are only still open because the grace was extended waiting for exactly this frame.
+      // Stop waiting, so a turn that does send a checkpoint pays arrival latency rather than the
+      // whole window. Deferred one tick so this frame finishes being mapped and pushed first;
+      // finalizing inline would emit the terminal events ahead of it.
+      if (this.checkpointGraceExtended && this.pendingFinalizeRun && this.capturedCheckpointBytes) {
+        const run = this.pendingFinalizeRun;
+        this.clearPendingFinalize();
+        this.pendingFinalize = setTimeout(run, 0);
+        // Keep the pair in step: clearPendingFinalize() drops the callback, and every other
+        // owner of pendingFinalize expects pendingFinalizeRun to describe it.
+        this.pendingFinalizeRun = run;
+      }
+    }
     if (message.message.case === "kvServerMessage") {
       this.writeConnectFrame(encodeConnectFrame(handleCursorNativeKv(message.message.value, this.blobRequestScope)));
       return;
@@ -1239,6 +1593,12 @@ class LiveCursorTransport implements CursorTransport {
     // A completion may carry only callId. Capture its ownership before mapping removes the open
     // call, because the embedded-tool classifier cannot identify that valid compact frame.
     const update = message.message.case === "interactionUpdate" ? message.message.value.message : undefined;
+    if (update?.case === "turnEnded") {
+      // T03: the application turn is complete. Close our side of HTTP/2 after a short
+      // grace so a held-open server response cannot pin the turn to the bridge's idle
+      // timeout (senpi #1062). finalizeTurnEvents already emitted done via the mapper.
+      this.closeAfterTurnEnded();
+    }
     const completesOpenClientTool = update?.case === "toolCallCompleted"
       && state.openToolCalls.has(update.value.callId);
     const awaitedNativeArgsBeforeMapping = update?.case === "toolCallCompleted"
@@ -1402,4 +1762,8 @@ function cursorConnectErrorCode(payload: Uint8Array): string | undefined {
 
 export function createLiveCursorTransport(input: CursorTransportFactoryInput): CursorTransport {
   return new LiveCursorTransport(input);
+}
+
+export function capturedCursorCheckpointBytes(transport: CursorTransport): Uint8Array | undefined {
+  return transport.capturedConversationCheckpoint?.();
 }

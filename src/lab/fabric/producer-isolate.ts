@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureRestrictedDir } from "../paths";
 import { FABRIC_LIMITS } from "./constants";
 import {
   FABRIC_PRODUCER_PROTOCOL_MAX_BYTES,
@@ -31,12 +32,44 @@ interface IsolateRequest {
   now?: () => number;
 }
 
-function minimalChildEnv(scratchRoot: string): Record<string, string> {
-  return {
+/**
+ * The environment an isolated producer child runs with.
+ *
+ * Exported so a test that spawns `producer-child.ts` directly cannot drift from
+ * the environment production actually uses. The Windows loader state and the
+ * scratch-owned temp paths below are load-bearing, and a test carrying its own
+ * literal copy of this object silently loses them.
+ */
+export function minimalFabricChildEnv(scratchRoot: string): Record<string, string> {
+  const childTempDir = join(scratchRoot, ".tmp");
+  ensureRestrictedDir(childTempDir, scratchRoot);
+  const env: Record<string, string> = {
     TZ: "UTC",
     NO_COLOR: "1",
     OCX_FABRIC_SCRATCH_ROOT: scratchRoot,
+    // Executors commonly use os.tmpdir() through libraries they import. Keep
+    // those writes inside the same scratch boundary instead of forwarding the
+    // user's ambient temp directory (Windows) or falling back to /tmp (POSIX).
+    TEMP: childTempDir,
+    TMP: childTempDir,
+    TMPDIR: childTempDir,
   };
+  if (process.platform !== "win32") return env;
+  // Windows has no equivalent of "run with an (almost) empty environment". A
+  // CreateProcess child inherits nothing here, and the loader itself reads the
+  // environment: without SystemRoot it cannot resolve the system DLLs the Bun
+  // executable links against, so the child dies before its entry module runs.
+  // The parent then sees an immediate non-zero close with no protocol line and
+  // reports harness_failure -- which is what turned every CL-07 producer case
+  // into "inconclusive" on the Windows leg while POSIX stayed green.
+  //
+  // These are OS-owned loader state, not caller-supplied configuration. Temp
+  // state is deliberately not forwarded; it is rooted in scratch above.
+  for (const name of ["SystemRoot", "windir"] as const) {
+    const value = process.env[name];
+    if (value) env[name] = value;
+  }
+  return env;
 }
 
 function killChild(child: ChildProcess): void {
@@ -51,12 +84,17 @@ function killChild(child: ChildProcess): void {
 export async function runIsolatedFabricProducer(request: IsolateRequest): Promise<IsolatedProducerResult> {
   const now = request.now ?? (() => Date.now());
   let lastActivityAt = now();
+  // Budget enforcement must not follow wall-clock adjustments; telemetry still does.
+  const budgetNow = request.now ?? (() => performance.now());
+  const startedAt = request.now ? lastActivityAt : budgetNow();
+  const totalDeadline = startedAt + request.totalTimeoutMs;
+  let inactivityDeadline = startedAt + request.inactivityTimeoutMs;
 
   return await new Promise<IsolatedProducerResult>((resolve, reject) => {
     let child: ChildProcess;
     try {
       child = spawn(process.execPath, ["run", CHILD_ENTRY], {
-        env: minimalChildEnv(request.scratchRoot),
+        env: minimalFabricChildEnv(request.scratchRoot),
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
@@ -71,48 +109,74 @@ export async function runIsolatedFabricProducer(request: IsolateRequest): Promis
     let stdoutBuffer = "";
     let stderrBytes = 0;
     let settled = false;
+    let childClosed = false;
     let receivedResult: SyntheticPatchV1 | undefined;
     let killReason: FabricTaskError | undefined;
 
     const finish = (fn: () => void) => {
-      if (settled) return;
+      // A latched failure owns settlement, but scratch cleanup must wait for close.
+      if (settled || (killReason && !childClosed)) return;
       settled = true;
       clearTimeout(totalTimer);
       clearTimeout(inactivityTimer);
-      fn();
+      if (killReason) reject(killReason);
+      else fn();
     };
 
     const settleTimeout = (error: FabricTaskError) => {
-      if (settled) return;
+      if (settled || killReason) return;
       killReason = error;
-      killChild(child);
+      if (childClosed) finish(() => reject(error));
+      else killChild(child);
+    };
+
+    const expiredDeadline = (at: number): FabricTaskError | undefined => {
+      // Choose the earliest deadline, regardless of which timer/data callback ran first.
+      if (at >= inactivityDeadline && inactivityDeadline <= totalDeadline) {
+        return new FabricTaskError("inactivity timeout exceeded", "inactivity_timeout", "environment");
+      }
+      if (at >= totalDeadline) {
+        return new FabricTaskError("total timeout exceeded", "timeout", "environment");
+      }
+      return undefined;
+    };
+
+    const onInactivityTimeout = () => {
+      settleTimeout(expiredDeadline(budgetNow())
+        ?? new FabricTaskError("inactivity timeout exceeded", "inactivity_timeout", "environment"));
     };
 
     const armInactivity = () => {
       clearTimeout(inactivityTimer);
-      inactivityTimer = setTimeout(() => {
-        settleTimeout(new FabricTaskError("inactivity timeout exceeded", "inactivity_timeout", "environment"));
-      }, request.inactivityTimeoutMs);
+      inactivityTimer = setTimeout(onInactivityTimeout, request.inactivityTimeoutMs);
     };
 
-    let inactivityTimer: ReturnType<typeof setTimeout> = setTimeout(() => {
-      settleTimeout(new FabricTaskError("inactivity timeout exceeded", "inactivity_timeout", "environment"));
-    }, request.inactivityTimeoutMs);
+    let inactivityTimer: ReturnType<typeof setTimeout> = setTimeout(onInactivityTimeout, request.inactivityTimeoutMs);
 
     const totalTimer = setTimeout(() => {
-      settleTimeout(new FabricTaskError("total timeout exceeded", "timeout", "environment"));
+      settleTimeout(expiredDeadline(budgetNow())
+        ?? new FabricTaskError("total timeout exceeded", "timeout", "environment"));
     }, request.totalTimeoutMs);
 
     const handleProtocolLine = (line: string) => {
+      if (settled || killReason) return;
       try {
         const message = parseProducerProtocolLine(line);
-        if (message.type === "activity") {
-          lastActivityAt = now();
-          armInactivity();
-          return;
+        if (message.type === "activity" || message.type === "result") {
+          const at = budgetNow();
+          const expired = expiredDeadline(at);
+          if (expired) {
+            settleTimeout(expired);
+            return;
+          }
+          if (message.type === "activity") {
+            lastActivityAt = request.now ? at : now();
+            inactivityDeadline = at + request.inactivityTimeoutMs;
+            armInactivity();
+            return;
+          }
         }
         if (message.type === "result") {
-          if (settled) return;
           receivedResult = message.patch;
           finish(() => resolve({ patch: message.patch, lastActivityAt }));
           return;
@@ -143,6 +207,7 @@ export async function runIsolatedFabricProducer(request: IsolateRequest): Promis
     };
 
     const consumeStdout = (chunk: string) => {
+      if (settled || killReason) return;
       stdoutBuffer += chunk;
       if (Buffer.byteLength(stdoutBuffer, "utf8") > FABRIC_PRODUCER_PROTOCOL_MAX_BYTES) {
         settleTimeout(new FabricTaskError("producer protocol output exceeded limit", "budget_exhausted", "environment"));
@@ -174,14 +239,48 @@ export async function runIsolatedFabricProducer(request: IsolateRequest): Promis
       }
     });
 
+    child.stderr?.on("error", (error) => {
+      settleTimeout(new FabricTaskError(error.message, "harness_failure", "harness"));
+    });
+
     child.on("error", (error) => {
       finish(() => reject(new FabricTaskError(error.message, "harness_failure", "harness")));
     });
 
     child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
-      if (settled || error.code === "EPIPE") return;
+      if (settled || killReason || error.code === "EPIPE") return;
       killChild(child);
       finish(() => reject(new FabricTaskError(error.message, "harness_failure", "harness")));
+    });
+
+    child.on("close", (code, signal) => {
+      childClosed = true;
+      if (settled) return;
+      if (killReason) {
+        finish(() => reject(killReason!));
+        return;
+      }
+      if (receivedResult) {
+        finish(() => resolve({ patch: receivedResult!, lastActivityAt }));
+        return;
+      }
+      if (stdoutBuffer.trim()) {
+        try {
+          handleProtocolLine(stdoutBuffer.trim());
+          if (settled) return;
+        } catch {
+          /* fall through */
+        }
+      }
+      if (signal === "SIGKILL") {
+        finish(() => reject(new FabricTaskError("total timeout exceeded", "timeout", "environment")));
+        return;
+      }
+      finish(() => reject(new FabricTaskError(
+        code === 0 ? "isolated producer returned no result" : `isolated producer exited (${code ?? signal ?? "unknown"})`,
+        "harness_failure",
+        "harness",
+      )));
     });
 
     const payload = JSON.stringify({
@@ -209,6 +308,7 @@ export async function runIsolatedFabricProducer(request: IsolateRequest): Promis
       child.stdin?.write(payload);
       child.stdin?.end();
     } catch (error) {
+      if (killReason) return;
       killChild(child);
       finish(() => reject(new FabricTaskError(
         error instanceof Error ? error.message : String(error),
@@ -217,35 +317,6 @@ export async function runIsolatedFabricProducer(request: IsolateRequest): Promis
       )));
       return;
     }
-
-    child.on("close", (code, signal) => {
-      if (settled) return;
-      if (killReason) {
-        finish(() => reject(killReason!));
-        return;
-      }
-      if (receivedResult) {
-        finish(() => resolve({ patch: receivedResult!, lastActivityAt }));
-        return;
-      }
-      if (stdoutBuffer.trim()) {
-        try {
-          handleProtocolLine(stdoutBuffer.trim());
-          if (receivedResult) return;
-        } catch {
-          /* fall through */
-        }
-      }
-      if (signal === "SIGKILL") {
-        finish(() => reject(new FabricTaskError("total timeout exceeded", "timeout", "environment")));
-        return;
-      }
-      finish(() => reject(new FabricTaskError(
-        code === 0 ? "isolated producer returned no result" : `isolated producer exited (${code ?? signal ?? "unknown"})`,
-        "harness_failure",
-        "harness",
-      )));
-    });
   });
 }
 

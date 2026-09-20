@@ -3,14 +3,25 @@ import { FORWARD_HEADERS } from "../adapters/openai-responses";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { redactSecretString } from "../lib/redact";
 import { sidecarEnter } from "../lib/sidecar-tracker";
-import { fetchWithResetRetry } from "../lib/upstream-retry";
+import {
+  applyUpstreamRecoveryInit,
+  fetchWithResetRetry,
+  releaseResponseBodyBestEffort,
+  retryBackoffDelayMs,
+  sleepWithAbort,
+  RETRY_AFTER_CEILING_MS,
+} from "../lib/upstream-retry";
+import { withUpstreamHttpVersion } from "../lib/upstream-http-version";
 import { parseSidecarSSE, type WebSearchResult } from "./parse";
 import type { CodexUpstreamOutcome } from "../codex/routing";
+import { NATIVE_RESERVE_MODEL } from "../codex/catalog/native-models";
 
 export interface SidecarSettings {
   model: string;
   reasoning: string;
   timeoutMs: number;
+  /** Effective Desktop authless compatibility does not grant auxiliary model use. */
+  reserveCompatibility?: boolean;
   /**
    * True when the routed (downstream) model is text-only. The search model CAN see images, so it's
    * told to verbalize any relevant image results and include their URLs — otherwise a non-vision model
@@ -31,6 +42,22 @@ export const IMAGE_INSTRUCTION =
 
 /** A search result, or an `error` string when the search couldn't run (surfaced as a tool result). */
 export type SidecarOutcome = WebSearchResult & { error?: string };
+
+/**
+ * Bounded same-search 429 replays for the sidecar POST.
+ *
+ * The forward backend throttles burst sidecar traffic, and without a replay the 429 becomes a
+ * failed tool result that poisons the query for the whole turn (see failedQueries in loop.ts).
+ * 1 initial send + 2 replays; Retry-After is honored as a lower bound and capped by
+ * RETRY_AFTER_CEILING_MS (an instruction past the ceiling ends with the 429 instead of
+ * parking the search). Each wait releases the unread 429 body first so sockets do not
+ * accumulate under a rate-limit storm. Abort or timeout ends the wait through the existing
+ * catch, exactly like an abort during the SSE parse.
+ */
+const SIDECAR_429_MAX_ATTEMPTS = 3;
+const SIDECAR_429_BASE_DELAY_MS = 1_000;
+const SIDECAR_429_MAX_DELAY_MS = 10_000;
+
 export type SidecarOutcomeRecorder = (outcome: CodexUpstreamOutcome) => void;
 
 /**
@@ -48,6 +75,9 @@ export async function runWebSearch(
   abortSignal?: AbortSignal,
   recordOutcome?: SidecarOutcomeRecorder,
 ): Promise<SidecarOutcome> {
+  if (settings.reserveCompatibility && settings.model === NATIVE_RESERVE_MODEL) {
+    return { text: "", sources: [], error: "Luna Reserve compatibility is only available as a conversation model, not a search helper. Choose another search helper model." };
+  }
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (forwardProvider.headers) Object.assign(headers, forwardProvider.headers);
   for (const h of FORWARD_HEADERS) {
@@ -72,8 +102,12 @@ export async function runWebSearch(
   const sidecarExit = sidecarEnter("web-search");
   const t0 = Date.now();
   try {
-    const res = await fetchWithResetRetry(
-      () => fetch(url, {
+    const sendOnce = () => fetchWithResetRetry(
+      // Recovery nests INSIDE the version helper: applyUpstreamRecoveryInit then always receives a
+      // defined init, and withUpstreamHttpVersion spreads the result, so `protocol` and the
+      // recovery fields (`connection: close` + Bun's transport-level `keepalive: false`) survive
+      // together. The reverse order needs a `?? init` fallback to type-check at all.
+      recovery => fetch(url, withUpstreamHttpVersion(url, applyUpstreamRecoveryInit({
         method: "POST",
         headers,
         body: JSON.stringify(body),
@@ -82,28 +116,51 @@ export async function runWebSearch(
         // across origins but forwards nonstandard headers such as `chatgpt-account-id`,
         // `session_id`, and `x-codex-turn-metadata` to the redirect target.
         redirect: "manual",
-      }),
-      { abortSignal: linkedSignal.signal, label: "web-search-sidecar" },
+      }, recovery), forwardProvider)),
+      { replaySafe: true, abortSignal: linkedSignal.signal, label: "web-search-sidecar" },
     );
-    recordOutcome?.(res.status);
+    let res = await sendOnce();
+    for (let attempt = 0; res.status === 429 && attempt + 1 < SIDECAR_429_MAX_ATTEMPTS; attempt++) {
+      const delay = retryBackoffDelayMs(attempt, {
+        baseDelayMs: SIDECAR_429_BASE_DELAY_MS,
+        maxDelayMs: SIDECAR_429_MAX_DELAY_MS,
+        headers: res.headers,
+        retryAfterIsLowerBound: true,
+      });
+      // A deadline, not a clamp: an instruction past the ceiling ends the search with the
+      // 429 instead of parking it at a provider that already said it would refuse.
+      if (delay > RETRY_AFTER_CEILING_MS) break;
+      console.warn(`[web-search] sidecar HTTP 429 — retrying (${attempt + 2}/${SIDECAR_429_MAX_ATTEMPTS}) after ${delay}ms`);
+      await releaseResponseBodyBestEffort(res.body, linkedSignal.signal);
+      await sleepWithAbort(delay, linkedSignal.signal);
+      res = await sendOnce();
+    }
     // Attach the body guard before ANY branch reads it. The success path guarded itself below,
     // but the failure branch's `res.text()` runs first, so a cancel landing between fetch
     // resolution and reader attach orphaned the internal rejection (found investigating #1419).
     const detachBodyGuard = cancelBodyOnAbort(res.body, linkedSignal.signal);
     if (!res.ok) {
+      recordOutcome?.(res.status);
       const t = await res.text().catch(() => "");
       detachBodyGuard();
       console.warn(`[web-search] sidecar HTTP ${res.status} for query "${query.slice(0, 80)}" (${Date.now() - t0}ms)`);
       return { text: "", sources: [], error: `sidecar HTTP ${res.status}: ${redactSecretString(t.slice(0, 200))}` };
     }
     try {
-      return await parseSidecarSSE(res);
+      const parsed = await parseSidecarSSE(res);
+      if (linkedSignal.signal.aborted) throw linkedSignal.signal.reason;
+      recordOutcome?.(res.status);
+      return parsed;
     } finally {
       detachBodyGuard();
     }
   } catch (e) {
-    recordOutcome?.(e instanceof Error && e.name === "TimeoutError" ? "timeout" : "connect_error");
     const kind = e instanceof Error && e.name === "TimeoutError" ? "timeout" : "connect_error";
+    const callerAborted = abortSignal?.aborted === true
+      && linkedSignal.signal.aborted
+      && linkedSignal.signal.reason === abortSignal.reason
+      && e === linkedSignal.signal.reason;
+    recordOutcome?.(callerAborted ? "connect_neutral" : kind);
     console.warn(`[web-search] sidecar ${kind} for query "${query.slice(0, 80)}" (${Date.now() - t0}ms)`);
     return { text: "", sources: [], error: e instanceof Error ? e.message : String(e) };
   } finally {

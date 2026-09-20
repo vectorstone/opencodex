@@ -4,16 +4,31 @@ description: Give routed models real web search and text-only models image under
 ---
 
 Routed models do not all expose hosted **web search** or native **image input**. opencodex backfills
-those capabilities with two sidecars. Each can run through a ChatGPT-login (`forward`) provider or a
-stored Anthropic OAuth provider. Sidecar errors become bounded tool results or image markers instead
-of failing the whole turn.
+those capabilities with two sidecars. Both support a ChatGPT-login (`forward`) provider or stored
+Anthropic OAuth provider; web search can additionally use stored Grok OAuth through the explicit
+`xai` backend. Sidecar errors become bounded tool results or image markers instead of failing the
+whole turn.
 
 :::note[Automatic backend selection]
-Explicit `backend` config wins. When unset, opencodex uses `anthropic` if an enabled Anthropic OAuth
-provider has an active account not marked `needsReauth`; otherwise it uses `openai`. Explicit
-`anthropic` without that credential fails closed. `openai` requires both ChatGPT login auth and an
-enabled `forward` provider.
+Explicit `backend` config wins. The two sidecars default differently when `backend` is unset:
+**web search** always defaults to `openai` — `anthropic` runs only when explicitly configured.
+**Vision** defaults to `anthropic` if an enabled Anthropic OAuth provider has an active account not
+marked `needsReauth`, otherwise `openai`. Explicit `anthropic` without that credential fails
+closed. Explicit `xai` requires a usable stored Grok OAuth account and does not fall back. `openai`
+requires both ChatGPT login auth and an enabled `forward` provider.
 :::
+
+### Additional web-search backends (explicit-only)
+
+Three more web-search backends exist beyond the ChatGPT and Claude paths. Each is
+**explicit-only** — it never activates from credential presence — and **fails closed**:
+a missing credential produces no sidecar plan and the request takes the normal routed path.
+
+| Backend | Runs | Credential | Notes |
+| --- | --- | --- | --- |
+| `xai` | Grok hosted `web_search` (+ opt-in `x_search`) on `api.x.ai` Responses | Stored Grok OAuth (`ocx login xai`) | `webSearchSidecar.xSearch` enables X search with `allowedXHandles`/`excludedXHandles` (max 20, mutually exclusive) and ISO `fromDate`/`toDate`. Default model `grok-4.6`. |
+| `gemini` | `google_search` grounding on the Antigravity transport | Stored Antigravity OAuth with a discovered project (`ocx login google-antigravity`) | Default model `gemini-3.8-flash`; reasoning selects the matching tier. |
+| `exa` | Exa Search API (non-LLM result digest) | `webSearchSidecar.exaApiKey` | The key is write-only through the management API (never echoed, redacted from logs). No sidecar model applies. |
 
 ## Web-search sidecar
 
@@ -24,7 +39,8 @@ When Codex requests hosted `web_search` for a non-passthrough routed model, open
 2. Runs the routed model in a small **agentic loop**. When it calls `web_search`, opencodex uses the
    selected sidecar backend: OpenAI runs hosted `web_search` with `gpt-5.6-luna` by default;
    Anthropic runs `web_search_20250305` with `claude-sonnet-5` by default. The streamed answer and
-   citations become a tool result.
+   citations become a tool result. xAI runs Grok hosted `web_search` with `grok-4.6` by default and,
+   when enabled, adds hosted `x_search` to the same request.
 3. **Loops** until the model answers or the total real-query budget reaches `maxSearchesPerTurn`
    (default 3), then removes the search tool and forces a final answer. Real client tools such as
    `apply_patch` or shell finalize the turn so those calls reach Codex.
@@ -69,6 +85,28 @@ relevant images in words and include their source URLs.
 }
 ```
 
+The explicit xAI backend uses the stored credential created by `ocx login xai`. Its optional
+`xSearch` block enables X search and may restrict it to one handle list and an ISO date range:
+
+```json
+{
+  "webSearchSidecar": {
+    "backend": "xai",
+    "model": "grok-4.6",
+    "xSearch": {
+      "enabled": true,
+      "allowedXHandles": ["xai"],
+      "fromDate": "2026-08-01",
+      "toDate": "2026-08-21"
+    }
+  }
+}
+```
+
+`allowedXHandles` and `excludedXHandles` are mutually exclusive and each accepts at most 20
+strings. Dates use `YYYY-MM-DD`. Malformed management writes return `400`; persisted malformed
+blocks fail closed at planning time instead of silently broadening the search.
+
 `minimal` reasoning is not used because the hosted backend rejects tools at that effort. A failed
 search is returned to the routed model as a bounded error result, allowing it to answer from the
 context it already has.
@@ -85,12 +123,20 @@ failures after response headers have started are delivered as `response.failed` 
 
 ## Vision sidecar
 
-When the routed model is listed in its provider's `noVisionModels` and a request carries an image,
-opencodex describes each image **before** the main call and replaces it with text. When
+Image routing is capability-aware. Before an image-bearing upstream send, opencodex resolves the selected model's effective input modalities from runtime provider evidence, explicit operator declarations, backend/registry metadata, and generated vendor metadata. A target positively known to be text-only goes through the Vision Sidecar first; the image is described **before** the main call and replaced inline with text. A target positively known to support images receives the image directly. Unknown custom models keep the existing compatibility behavior rather than being guessed text-only.
+
+For the canonical ChatGPT Codex route, opencodex uses the `openai-codex` metadata bundle rather than public OpenAI API metadata, so backend-specific modality differences are respected. The native Chat fast path uses the same gate and cannot bypass a known text-only verdict. Without an available sidecar plan, raw images are stripped before a proven text-only backend.
+Combos advertise image input only when every member accepts images, either natively or through a
+sidecar, and the combo's `imageInput` setting is not disabled, so clients such as the Codex app
+allow attachments instead of blocking them before the sidecar runs. When
 `visionSidecar.model` is absent or blank, the OpenAI execution path, Dashboard, and management API
-use the `gpt-5.4-mini` fallback. Startup still migrates an explicitly persisted legacy
+use the `gpt-5.6-luna` fallback. Startup still migrates an explicitly persisted legacy
 `gpt-5.4-mini` value to `gpt-5.6-luna`; that migration applies to a stored value, not to an absent
 model field.
+The first-party DeepSeek `deepseek-flash` model is native multimodal (`text` and `image`) and does
+not use this sidecar by default. Explicit `noVisionModels` or text-only declarations remain
+authoritative. First-party `deepseek-chat`, `deepseek-reasoner`, and `deepseek-v4-flash` remain
+sidecar-backed by default; Zen routes are unchanged and were not probed in this update.
 
 - Images can come from user, developer, and tool-result messages, including Codex's `view_image`.
 - On the OpenAI path (ChatGPT-login passthrough), each image is sent to the configured vision model
@@ -108,18 +154,20 @@ model field.
   remote `https` images are fetched by the OpenAI backend, not by the proxy.
 - `noVisionModels` matching ignores an Ollama-style `:size` suffix, so a `gpt-oss` entry also covers
   `gpt-oss:120b`.
-- If description fails, the model receives a short processing-error marker. If no sidecar plan is
-  available, the raw image is stripped rather than forwarded to a text-only backend.
+- If description fails, the model receives a short processing-error marker. (Without an available
+  sidecar plan, no description is attempted — the raw image is stripped, as described above.)
 - `maxDescriptionsPerTurn` (default 8) limits new descriptions per main-model turn. Cache hits and
   same-turn duplicates do not consume it. Successful `data:` image descriptions are cached by
   backend, model, detail, image bytes, and message context — plus the reasoning effort on OpenAI
   keys (Anthropic keys omit it, since that field is ignored there); mutable `https:` images are not
   cached.
 
-The management API and Dashboard picker now list models that can actually accept image input.
-When the matching backend is available, `gpt-5.6-luna` (OpenAI) and `claude-haiku-4-5` (Anthropic)
-are always offered as baseline options. `PUT /api/sidecar-settings` rejects a model known to be
-text-only, but still accepts an unknown id so custom or ahead-of-catalog names keep working.
+The management API and Dashboard picker list models that can accept image input. When the matching
+backend is available, `gpt-5.6-luna` (OpenAI) and `claude-haiku-4-5` (Anthropic) are always offered
+as baseline options. `PUT /api/sidecar-settings` may retain an unknown custom/ahead-of-catalog id.
+An explicitly configured routed Vision Sidecar is therefore usable unless capability evidence proves
+that model cannot accept images; this preserves operator-selected custom sidecars without allowing a
+known text-only sidecar to receive image bytes.
 
 ```json
 {
@@ -140,9 +188,8 @@ A model is marked text-only per provider:
 {
   "providers": {
     "ollama-cloud": {
-      "adapter": "openai-chat",
       "baseUrl": "https://ollama.com/v1",
-      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
+      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-flash"]
     }
   }
 }

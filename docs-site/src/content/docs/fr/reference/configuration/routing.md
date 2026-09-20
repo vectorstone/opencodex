@@ -29,6 +29,16 @@ opencodex résout le modèle demandé dans l’ordre suivant :
 
 Les fournisseurs désactivés sont exclus. Un espace de noms explicite qui désigne un fournisseur désactivé échoue au lieu de passer aux règles suivantes. Pour les règles susceptibles de correspondre à plusieurs fournisseurs, les entrées sont examinées dans leur ordre d’insertion JSON. Utilisez donc un espace de noms explicite lorsqu’un modèle non qualifié peut être ambigu.
 
+### Redirections des modèles bloqués
+
+`blockedModelRedirects` est un `Record<string, string>` facultatif de premier niveau associant des remplacements exacts d’identifiants de modèle résolus ; il est non défini par défaut. Il s’applique après l’ordre de résolution ci-dessus : une correspondance conserve la route du fournisseur et du compte déjà sélectionnée, ne remplace que l’identifiant du modèle en amont et enregistre le motif de routage `blocked-model-redirect`. L’omission de la clé ne modifie pas le routage.
+
+```json
+{
+  "blockedModelRedirects": { "gpt-5.6-terra": "gpt-5.6-luna" }
+}
+```
+
 ## Sélecteurs exacts de comptes Codex
 
 `codexAccountNamespaces` associe un sélecteur public, par exemple `side`, à un compte Codex enregistré. Une requête pour `side/gpt-5.6-sol` utilise uniquement ce compte, même lorsque le fournisseur canonique `openai` fonctionne en mode Direct, et envoie en amont l’identifiant non qualifié `gpt-5.6-sol`. Seuls les identifiants natifs non qualifiés de la famille OpenAI sont valides après le sélecteur.
@@ -46,9 +56,10 @@ Chaque clé de combinaison est un identifiant conforme à `[A-Za-z0-9][A-Za-z0-9
 | Clé | Type | Valeur par défaut | Signification |
 | --- | --- | --- | --- |
 | `targets` | `{ provider: string; model: string; weight?: number }[]` | requis | Routes concrètes ordonnées. `weight` est compris entre 1 et 10000 et vaut `1` par défaut. |
-| `strategy?` | `"failover" \| "round-robin"` | `"failover"` | Stratégie de sélection. L’ordre des cibles définit la priorité de repli ; les poids produisent une rotation pondérée régulière. |
+| `strategy?` | `"failover" \| "round-robin" \| "random" \| "least-used" \| "reset-window"` | `"failover"` | Stratégie de sélection. L’ordre des cibles définit la priorité de `failover` ; les poids déterminent les sélections de `round-robin` et de `random` ; `least-used` suit les réussites enregistrées ; `reset-window` suit la réinitialisation de quota la plus proche. |
 | `stickyLimit?` | `number` | `1` | Nombre de requêtes réussies conservées dans un même lot de rotation. Plage de 1 à 100. |
-| `defaultEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra" \| null` | non défini | Appliqué uniquement lorsque l’appelant ne précise aucun effort et que la cible sélectionnée annonce le niveau demandé. |
+| `defaultEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra" \| null` | non défini | `defaultEffort` complète un `reasoning.effort` absent si le combo possède une valeur par défaut non nulle et si la liste des niveaux acceptés par la cible est connue et non vide. La valeur configurée est conservée si elle est acceptée ; sinon, le niveau accepté le plus élevé ne la dépassant pas est choisi, ou le niveau le plus bas si aucun n’est inférieur. Une liste inconnue ou vide n’ajoute aucune valeur par défaut. |
+| `reasoningEffortMode?` | `"strict" \| "adaptive"` | `"strict"` | `"strict"` calcule l’intersection des listes connues, y compris les listes vides ; `"adaptive"` exclut les listes vides. Les listes inconnues ne limitent l’intersection dans aucun des deux modes. À l’envoi, les listes explicitement vides suppriment les paramètres effort/thinking dans les deux modes ; les listes inconnues les suppriment seulement en adaptive. `reasoning.summary` est conservé. La résolution des listes connues non vides ainsi que le choix et l’ordre des cibles restent inchangés. |
 | `imageInput?` | `"auto" \| "disabled"` | `"auto"` | `"auto"` publie les images uniquement lorsque toutes les cibles les prennent en charge ; `"disabled"` impose le texte seul, retire les images des modalités publiées et rejette les requêtes qui en contiennent avant leur distribution. |
 | `alias?` | `string` | — | Identifiant public facultatif du modèle, à la place du slug canonique du sélecteur. |
 | `nativeAlias?` | `boolean` | `false` | Permet à un identifiant natif non qualifié actuellement pris en charge de prendre la priorité uniquement pour cet identifiant. Les identifiants non qualifiés `gpt-5.6-*` utilisent les identifiants Codex Pool/Direct. Les routes qualifiées par un compte restent distinctes. Les routes qualifiées par un fournisseur, telles que `openai-apikey/gpt-5.6-*`, utilisent la route configurée avec sa clé d’API et ne passent jamais par l’alias natif. |
@@ -127,7 +138,7 @@ Les preuves de quota ne modifient jamais la sélection du compte, l’affinité 
 
 ### Combinaisons et profils de politique
 
-- Une **combinaison** applique un routage explicite, ordonné ou pondéré, avec repli : l’ordre configuré — ou la rotation pondérée régulière — détermine la cible, et les échecs font avancer dans la liste.
+- Une **combinaison** applique un routage explicite des cibles avec une stratégie configurable (`failover` ordonné, répartition pondérée avec `round-robin`, répartition aléatoire avec `random`, `least-used` ou `reset-window`) : la stratégie configurée détermine la cible, et les échecs pouvant être relancés font avancer dans la liste.
 - Un **profil de politique** sélectionne un candidat configuré selon les preuves disponibles : les exigences strictes de capacité filtrent d’abord les candidats, puis une notation déterministe classe ceux qui restent.
 
 Les deux mécanismes sont des espaces de noms virtuels, avec des alias et une validation des collisions ; ils diffèrent par la méthode de sélection. La notation d’un profil combine la composante de priorité configurée avec les dimensions de santé (RI-06), de quota (RI-07) et de coût (RI-08) lorsque les preuves existent. Le poids `latency` est intégré à la part de priorité plutôt que noté séparément.

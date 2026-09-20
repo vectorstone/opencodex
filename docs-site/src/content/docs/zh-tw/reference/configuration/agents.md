@@ -10,7 +10,7 @@ Agent 設定控制要廣告哪個 Codex 協作介面，以及 opencodex 如何�
 | 欄位 | 型別 | 預設值 | 意義 |
 | --- | --- | --- | --- |
 | `multiAgentMode?` | `"v1" \| "default" \| "v2"` | `"default"` | `v1` 將每個目錄模型標記為 v1；`v2` 將每個模型標記為 v2。`default` 還原上游 pin（Sol/Terra v2、Luna v1），否則遵循原生的 `multi_agent_v2` 旗標。套用於新 session。 |
-| `subagentModels?` | `string[]` | `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` | 最多五個原生或路由 id，在子代理 picker 中優先顯示。明確的空清單會被保留。 |
+| `subagentModels?` | `string[]` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5` | 最多五個原生或路由 id，在子代理 picker 中優先顯示。[Astra 一次性升級](/reference/configuration/agents/#astra-roster-upgrade)後，明確的空清單會被保留。 |
 | `injectionModel?` | `string` | — | 在代理撰寫的 v2 委派指引中使用的偏好原生或路由子代理模型。 |
 | `injectionEffort?` | `string` | — | 偏好 effort（`low` 到 `ultra`），僅在搭配 `injectionModel` 時有意義。 |
 | `injectionPrompt?` | `string` | — | 取代內建指引本文。支援 `{{model}}`、`{{effort}}`、`{{roster}}` 與 `{{fallback}}`。觸發閘門保持不變。 |
@@ -44,10 +44,13 @@ V1 指引僅在 `max` 或 `ultra` 時為主動文字。V2 僅在存在偏好模�
 生成子任務的 fallback 順序為：
 
 1. 請求的主模型；
-2. 來自 `$CODEX_HOME/agents/*.toml` 的角色級 `model_fallback`；然後
-3. 全域 `subagentModelFallback` 項目。
+2. 以請求的主模型為索引的 `subagentModelFallbackByModel` 每模型項目；
+3. 全域 `subagentModelFallback` 項目；然後
+4. 為向後相容而讀取的 `$CODEX_HOME/agents/*.toml` 舊版角色級 `model_fallback`。
 
-opencodex 會跳過已停用、不可路由、不健康、冷卻中或達到配額閾值的候選項。可用性快取保存 `subagentModelFallbackPollMs`。加密的子任務可將鏈限制為規範的原生 ChatGPT 目標；若無任何目標可讀取加密 payload，請求會失敗，而不會將無法讀取的密文路由到別處。
+Codex 0.146+ 會將角色檔案中的 `model_fallback` 視為未知欄位並略過整個角色；`ocx doctor` 也會對此發出警告。因此新的角色級 fallback 應設定在 opencodex，而不是角色 TOML 中。
+
+opencodex 會跳過已停用、不可路由、不健康、冷卻中或達到配額閾值的候選項。可用性快取保存 `subagentModelFallbackPollMs`。對於加密的子任務，候選鏈僅包含規範的原生 ChatGPT 目標，以及透過 `allowEncryptedV2AgentTasks: true` 明確信任的直接金鑰驗證 Responses 路由。若無目標可處理加密 payload，且選用的恢復功能無法支援路由傳送，請求會失敗，不會轉送無法讀取的密文。組合會先嘗試可用的規範原生目標；若沒有可選擇的原生目標或原生嘗試已耗盡，且已啟用 `agentTaskRecovery`，會在路由到組合目標前對加密的 `NEW_TASK` 恢復一次。組合恢復僅在 spawn 出的子回合生效；直接路由路徑也會恢復對話中途的模型切換。
 
 ```json
 {
@@ -56,7 +59,7 @@ opencodex 會跳過已停用、不可路由、不健康、冷卻中或達到配�
   "injectionModel": "gpt-5.5",
   "injectionEffort": "high",
   "syncCodexSubagentDefaults": true,
-  "subagentModelFallback": ["gpt-5.4-mini"],
+  "subagentModelFallback": ["gpt-5.6-luna"],
   "subagentModelFallbackPollMs": 60000,
   "subagentEffortCap": "high"
 }
@@ -67,5 +70,7 @@ opencodex 會跳過已停用、不可路由、不健康、冷卻中或達到配�
 上限僅套用於 v2 協作功能：當主回合的工具暴露 v2 時該回合合格，而子回合在 `x-codex-turn-metadata` 中帶有精確的 codex-rs `x-openai-subagent: collab_spawn` 或 `"subagent_kind": "thread_spawn"` 標記時合格，即使葉工具不再暴露協作。V1 主回合、`multiAgentMode: "v1"`、壓縮、審查與記憶整合回合會略過上限。
 
 上限僅會降低 effort。它們吸附到上限或以下的最高宣告級別。若模型沒有 effort 控制或沒有支援的級別符合，opencodex 會移除 effort 並讓供應商預設值套用。`max` 與 `ultra` 被接受，而儀表板提供 `low` 到 `xhigh`。
+
+即使沒有設定模型 effort pin，符合條件的原生 Chat Completions 回合也會套用設定的上限。套用 pin 或上限改變值時才會對應為供應商的傳輸值；兩者皆未發生時，原生呼叫端值保留原始寫法。
 
 關於 v1、default 與 v2 行為的入門導向說明，請見[子代理介面](/zh-tw/guides/sub-agent-surface/)。

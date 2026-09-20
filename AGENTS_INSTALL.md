@@ -22,7 +22,7 @@ install or operations task authorizes, and an agent must never perform or
 auto-answer them — even when the surrounding task is approved, even when the
 credential is sitting right there.
 
-The current one is **starring the repository on GitHub**.
+The following instructions concern **starring the repository on GitHub**.
 
 ### Do not
 
@@ -69,8 +69,16 @@ agent-driven callers regardless:
 - [`src/server/management/sidebar-routes.ts`](./src/server/management/sidebar-routes.ts)
   — the `403 agent_consent_required` refusal.
 
-Regression coverage: `tests/startup-prompt.test.ts`,
-`tests/agent-driven.test.ts`, `tests/sidebar-routes.test.ts`.
+Regression coverage: `tests/server/startup-prompt.test.ts`,
+`tests/cli/agent-driven.test.ts`, `tests/server/sidebar-routes.test.ts`.
+
+### Pending Codex account validation
+
+Completing deferred account validation spends model quota. Only a human's
+dashboard **Refresh quotas** action authorizes it. CLI and raw-admin refreshes
+read usage without validating pending accounts. Relay the dashboard recovery
+instruction to the user; do not mint a GUI session or call the provider directly
+to work around this boundary. This also applies when operating a headless host.
 
 If a future action spends the user's identity, credits, or reputation, gate it
 the same way rather than relying on a prompt an agent can answer, and document

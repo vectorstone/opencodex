@@ -11,7 +11,7 @@ Les paramètres des agents déterminent la surface de collaboration Codex annonc
 | --- | --- | --- | --- |
 | `multiAgentMode?` | `"v1" \| "default" \| "v2"` | `"default"` | `v1` marque tous les modèles du catalogue comme compatibles v1 ; `v2` les marque tous comme compatibles v2. `default` rétablit les choix imposés en amont (Sol/Terra en v2, Luna en v1) et suit sinon l’indicateur natif `multi_agent_v2`. S’applique aux nouvelles sessions. |
 | `keepNativeChatGptOnV1?` | `boolean` | `false` | Lorsque `multiAgentMode` vaut `"v2"`, marque les lignes natives ChatGPT (Sol/Terra et les autres modèles du backend ChatGPT) comme v1. Les parents routés restent en v2. Utilisez cette option pour qu'un parent ChatGPT puisse encore lancer Grok ou Claude — les tâches enfants v2 natives sont chiffrées par le service en amont ([#92](https://github.com/lidge-jun/opencodex/issues/92)). Ignoré en `v1` et `default`. |
-| `subagentModels?` | `string[]` | `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini` | Jusqu’à cinq identifiants de modèles natifs non qualifiés, qualifiés par un compte sous la forme `<selector>/<native-openai-model>`, ou routés sous la forme `provider/model`, affichés en tête du sélecteur de sous-agents. Le tableau de bord ne propose que les identifiants natifs non qualifiés et les identifiants routés ; lors de l’enregistrement, il omet les choix exacts qualifiés par un compte. Pour les définir, utilisez `ocx agent subagents set` ou modifiez la configuration. Une liste explicitement vide est conservée. |
+| `subagentModels?` | `string[]` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5` | Jusqu’à cinq identifiants de modèles natifs non qualifiés, qualifiés par un compte sous la forme `<selector>/<native-openai-model>`, ou routés sous la forme `provider/model`, affichés en tête du sélecteur de sous-agents. Le tableau de bord ne propose que les identifiants natifs non qualifiés et les identifiants routés ; lors de l’enregistrement, il omet les choix exacts qualifiés par un compte. Pour les définir, utilisez `ocx agent subagents set` ou modifiez la configuration. Après la [migration unique vers Astra](/reference/configuration/agents/#astra-roster-upgrade), une liste explicitement vide est conservée. |
 | `injectionModel?` | `string` | — | Modèle de sous-agent natif ou routé privilégié dans les consignes de délégation v2 produites par le proxy. |
 | `injectionEffort?` | `string` | — | Niveau d’effort privilégié (de `low` à `ultra`), pertinent uniquement avec `injectionModel`. |
 | `injectionPrompt?` | `string` | — | Remplace le corps des consignes v2 intégrées. Accepte `{{model}}`, `{{effort}}`, `{{roster}}` et `{{fallback}}`. La présence d’un `injectionModel` suffit pour produire le prompt personnalisé. |
@@ -58,7 +58,7 @@ Pour un tour enfant créé, l’ordre de repli est le suivant :
 
 Les chaînes de repli propres à un rôle doivent résider dans la configuration d’opencodex. L’ajout de `model_fallback` dans `$CODEX_HOME/agents/*.toml` amène Codex 0.146+ à rejeter le fichier de rôle entier à cause de ce champ inconnu, puis à ignorer le rôle (#1190). Une ancienne ligne `model_fallback` dans le fichier TOML reste lue par souci de rétrocompatibilité, mais `ocx doctor` la signale.
 
-opencodex ignore les candidats désactivés, non routables, en mauvais état, en période de temporisation ou ayant atteint le seuil de quota. L’instantané de disponibilité est mis en cache pendant `subagentModelFallbackPollMs`. Les tâches enfants chiffrées peuvent limiter la chaîne aux cibles ChatGPT natives canoniques ; si aucune ne peut lire la charge chiffrée, la requête échoue au lieu d’envoyer un texte chiffré illisible à une autre destination.
+opencodex ignore les candidats désactivés, non routables, en mauvais état, en période de temporisation ou ayant atteint le seuil de quota. L’instantané de disponibilité est mis en cache pendant `subagentModelFallbackPollMs`. Les tâches enfants chiffrées limitent la chaîne aux cibles ChatGPT natives canoniques et aux routes Responses directes avec authentification par clé explicitement approuvées via `allowEncryptedV2AgentTasks: true` ; si aucune ne peut consommer la charge chiffrée et que la récupération facultative ne permet pas un envoi routé, la requête échoue sans transmettre de texte chiffré illisible. Un combo essaie d’abord une cible native canonique disponible ; si aucune n’est sélectionnable ou si les tentatives natives sont épuisées, et que `agentTaskRecovery` est activé, un `NEW_TASK` chiffré est récupéré une fois avant l’envoi routé du combo. La récupération par combo ne s’applique qu’aux tours d’enfant créés par spawn ; la voie routée directe couvre aussi un changement de modèle en cours de conversation.
 
 ```json
 {
@@ -67,9 +67,9 @@ opencodex ignore les candidats désactivés, non routables, en mauvais état, en
   "injectionModel": "gpt-5.5",
   "injectionEffort": "high",
   "syncCodexSubagentDefaults": true,
-  "subagentModelFallback": ["gpt-5.4-mini"],
+  "subagentModelFallback": ["gpt-5.6-luna"],
   "subagentModelFallbackByModel": {
-    "gpt-5.5": ["gpt-5.4-mini"]
+    "gpt-5.5": ["gpt-5.6-luna"]
   },
   "subagentModelFallbackPollMs": 60000,
   "subagentEffortCap": "high"
@@ -78,7 +78,7 @@ opencodex ignore les candidats désactivés, non routables, en mauvais état, en
 
 ## Récupération des tâches v2 chiffrées
 
-`agentTaskRecovery` est un mécanisme expérimental de compatibilité destiné au cas où un parent ChatGPT natif crée un enfant v2 routé. Il est désactivé par défaut. Lorsqu’il est explicitement activé et que la tâche finale destinée à l’enfant routé contient une charge Fernet autrement illisible, opencodex envoie une requête Responses brute en mode relais vers le point de terminaison fixe `https://chatgpt.com/backend-api/codex/responses`, avec une authentification en mode transmission. ChatGPT renvoie l’instruction en clair au moyen d’un appel de fonction imposé ; avant d’envoyer la requête au fournisseur routé, opencodex convertit uniquement cet élément de tâche en message utilisateur standard.
+`agentTaskRecovery` est un mécanisme expérimental de compatibilité destiné aux tâches v2 chiffrées par le service en amont qui parviennent à un fournisseur routé. Deux formes de requête sont concernées : un parent ChatGPT natif qui crée un enfant v2 routé, et une conversation en cours basculée d’un modèle ChatGPT natif vers un modèle routé, dont l’historique rejoue à chaque tour suivant un message d’agent chiffré émis par le service en amont ([#4089](https://github.com/lidge-jun/opencodex/issues/4089)). Il est désactivé par défaut. Lorsqu’il est explicitement activé et que la tâche routée finale contient une charge Fernet autrement illisible, opencodex envoie une requête Responses brute en mode relais vers le point de terminaison fixe `https://chatgpt.com/backend-api/codex/responses`, avec une authentification en mode transmission. ChatGPT renvoie l’instruction en clair au moyen d’un appel de fonction imposé ; avant d’envoyer la requête au fournisseur routé, opencodex convertit uniquement cet élément de tâche en message utilisateur standard.
 
 Il ne s’agit pas d’un déchiffrement local et ce mécanisme ne corrige pas le protocole Codex. Il dépend d’un comportement non documenté du service ChatGPT et peut cesser de fonctionner après une modification de ce service. L’instruction récupérée est une sortie de modèle, et non un texte en clair vérifié cryptographiquement : sa fidélité octet par octet n’est donc pas garantie. En cas d’absence dans le cache propre à cette portée, une requête ChatGPT authentifiée supplémentaire peut être envoyée, consommer le quota du compte et ajouter de la latence avant la requête routée. Les requêtes concurrentes visant la même tâche et la même portée partagent une seule requête de récupération. Un avertissement est affiché au démarrage chaque fois que la fonctionnalité est activée.
 
@@ -111,12 +111,14 @@ Ce mécanisme ne protège pas contre un autre processus exécuté sous le même 
 
 N’activez cette option que si la requête authentifiée supplémentaire, la consommation de quota, la présence de texte en clair dans le processus et la dépendance à un service privé sont acceptables. Dans le cas contraire, privilégiez un enfant ChatGPT natif ou une délégation hétérogène v1.
 
-Ce mécanisme de récupération s’applique aux enfants routés directement. Au maximum 32 requêtes de récupération peuvent être actives simultanément ; toute absence supplémentaire dans le cache échoue de manière sûre. Pour les tâches chiffrées, le routage par combinaison conserve son filtre existant limité aux cibles natives et n’utilise pas la récupération.
+Ce mécanisme de récupération s’applique aux enfants routés directement et aux `NEW_TASK` chiffrés d’un combo. Au maximum 32 requêtes de récupération peuvent être actives simultanément ; toute absence supplémentaire dans le cache échoue de manière sûre. Un combo disposant d’une cible native canonique disponible continue d’envoyer directement le texte chiffré ; la récupération peut s’exécuter si aucune cible native n’est sélectionnable ou si les tentatives natives sont épuisées. Si la récupération est désactivée ou échoue, ou si aucune cible routée n’est disponible, le texte chiffré illisible n’est pas transmis à un fournisseur routé.
 
 ## Plafonds d’effort
 
 Les plafonds s’appliquent uniquement à la fonctionnalité de collaboration v2. Un tour principal est admissible lorsque ses outils exposent v2. Un tour enfant l’est lorsqu’il porte exactement le marqueur codex-rs `x-openai-subagent: collab_spawn` ou `"subagent_kind": "thread_spawn"` dans `x-codex-turn-metadata`, même si les outils terminaux n’exposent plus la collaboration. Les tours principaux v1, `multiAgentMode: "v1"`, ainsi que les tours de compactage, de révision et de consolidation de la mémoire ne sont pas plafonnés.
 
 Un plafond ne peut que réduire l’effort. Le niveau retenu est le niveau annoncé le plus élevé qui ne dépasse pas le plafond. Si le modèle ne propose aucun contrôle d’effort ou si aucun niveau pris en charge ne convient, opencodex supprime le paramètre d’effort et laisse le fournisseur appliquer sa valeur par défaut. `max` et `ultra` sont acceptés, tandis que le tableau de bord propose les niveaux de `low` à `xhigh`.
+
+Les plafonds configurés s’appliquent aussi aux tours Chat Completions natifs admissibles sans effort épinglé pour le modèle. La conversion vers la valeur du fournisseur intervient lorsqu’un épinglage est appliqué ou qu’un plafond modifie la valeur ; sinon, la valeur de l’appelant natif conserve sa forme d’origine.
 
 Pour une présentation destinée aux débutants des comportements v1, default et v2, consultez [Surfaces de sous-agents](/fr/guides/sub-agent-surface/).

@@ -7,13 +7,16 @@ import type {
 } from "../types";
 import { MODEL_ADAPTER_OVERRIDE_ALLOWED } from "../types";
 import { sanitizeLogMetadataString } from "../lib/redact";
-import type { InboundWire, ModelWireDefault } from "./registry";
+import type { InboundWire, ModelWireDefault, ProviderAuthKind } from "./registry";
 
 const SERVICE_TIER_ADAPTERS = new Set(["openai-chat", "openai-responses"]);
 const FAST_WIRE_ADAPTERS: Readonly<Record<FastWire["kind"], ReadonlySet<string>>> = {
   "service-tier": SERVICE_TIER_ADAPTERS,
   // A1 deliberately has no adapter implementation for Anthropic speed.
   "anthropic-speed": new Set(),
+  // Cursor expresses Fast as a variant dimension of the picked model, resolved in the
+  // request builder, so the adapter set is exactly the cursor adapter.
+  "cursor-variant": new Set(["cursor"]),
 };
 
 const DEFAULT_SERVICE_TIER_FAST_WIRE: FastWire = Object.freeze({
@@ -31,7 +34,9 @@ export type FastPolicyAuthTransport =
 
 export interface FastPolicyAuthority {
   readonly providerAdapter: string;
+  readonly providerAuthMode?: ProviderAuthKind;
   readonly fastWireDeclaration: FastWire | null | undefined;
+  readonly fastTierDescription?: string;
   readonly modelWireOverrideAllowed: boolean;
   readonly authTransport: FastPolicyAuthTransport;
   readonly capability: {
@@ -54,6 +59,7 @@ export interface ResolvedFastPolicy {
     | "pin-unavailable";
   readonly adapter: string;
   readonly fastWire: FastWire | null;
+  readonly fastTierDescription?: string;
   readonly forwardCallerTier: boolean;
 }
 
@@ -114,37 +120,68 @@ function registryDefaultForModel(
   defaults: Readonly<Record<string, ModelWireDefault>>,
   modelId: string,
   inbound: InboundWire,
-): string | undefined {
+  authMode: ProviderAuthKind | undefined,
+): { adapter: string; forwardCallerServiceTier?: boolean } | undefined {
   const normalizedModelId = modelId.trim().toLowerCase();
   if (!Object.hasOwn(defaults, normalizedModelId)) return undefined;
   const declared = defaults[normalizedModelId];
   if (declared === undefined) return undefined;
-  if (typeof declared !== "string" && !declared.inbound.includes(inbound)) return undefined;
+  if (typeof declared !== "string") {
+    if (!declared.inbound.includes(inbound)) return undefined;
+    if (declared.authModes && (authMode === undefined || !declared.authModes.includes(authMode))) {
+      return undefined;
+    }
+  }
   const wire = typeof declared === "string" ? declared : declared.wire;
-  return MODEL_ADAPTER_OVERRIDE_ALLOWED.has(wire) ? wire : undefined;
+  if (!MODEL_ADAPTER_OVERRIDE_ALLOWED.has(wire)) return undefined;
+  return {
+    adapter: wire,
+    ...(typeof declared !== "string" && declared.forwardCallerServiceTier !== undefined
+      ? { forwardCallerServiceTier: declared.forwardCallerServiceTier }
+      : {}),
+  };
 }
 
 function resolvePolicyAdapter(
   authority: FastPolicyAuthority,
   modelId: string,
   inbound: InboundWire,
-): { adapter: string; hardPinned: boolean } {
+): { adapter: string; hardPinned: boolean; forwardCallerServiceTier?: boolean } {
   // Hard pins and configured overrides deliberately use the same exact-key semantics as
-  // resolveWireProtocolOverride(). Registry defaults alone normalize ids at their boundary.
+  // resolveWireProtocolOverride(). Registry route policy normalizes ids at its boundary.
   const hardPin = Object.hasOwn(authority.hardPins, modelId)
     ? authority.hardPins[modelId]
     : undefined;
   if (typeof hardPin === "string") return { adapter: hardPin, hardPinned: true };
   if (authority.modelWireOverrideAllowed) {
+    const registryDefault = MODEL_ADAPTER_OVERRIDE_ALLOWED.has(authority.providerAdapter)
+      ? registryDefaultForModel(
+          authority.registryWireDefaults,
+          modelId,
+          inbound,
+          authority.providerAuthMode,
+        )
+      : undefined;
     const configured = Object.hasOwn(authority.modelAdapters, modelId)
       ? authority.modelAdapters[modelId]
       : undefined;
     if (typeof configured === "string" && MODEL_ADAPTER_OVERRIDE_ALLOWED.has(configured)) {
-      return { adapter: configured, hardPinned: false };
+      return {
+        adapter: configured,
+        hardPinned: false,
+        ...(registryDefault?.forwardCallerServiceTier === false
+          ? { forwardCallerServiceTier: false }
+          : {}),
+      };
     }
-    if (MODEL_ADAPTER_OVERRIDE_ALLOWED.has(authority.providerAdapter)) {
-      const registryDefault = registryDefaultForModel(authority.registryWireDefaults, modelId, inbound);
-      if (registryDefault !== undefined) return { adapter: registryDefault, hardPinned: false };
+    if (registryDefault !== undefined) {
+      return {
+        adapter: registryDefault.adapter,
+        hardPinned: false,
+        ...(registryDefault.forwardCallerServiceTier !== undefined
+          ? { forwardCallerServiceTier: registryDefault.forwardCallerServiceTier }
+          : {}),
+      };
     }
   }
   return { adapter: authority.providerAdapter, hardPinned: false };
@@ -155,7 +192,11 @@ export function resolveFastPolicy(
   modelId: string,
   inbound: InboundWire = "responses",
 ): ResolvedFastPolicy {
-  const { adapter, hardPinned } = resolvePolicyAdapter(authority, modelId, inbound);
+  const { adapter, hardPinned, forwardCallerServiceTier } = resolvePolicyAdapter(
+    authority,
+    modelId,
+    inbound,
+  );
   const exactCapability = exactModelValue(authority.capability.models, modelId);
   const capability = authority.capability.provider === false
     ? false
@@ -171,8 +212,14 @@ export function resolveFastPolicy(
   // On classified routes this permission applies only to a caller's foreign tier: proxy-owned
   // canonical Fast has already passed capability validation. On unclassified routes every caller
   // tier still needs the final wire's forwarding permission.
+  // A wire that declares `foreignCallerTiers: "drop"` cannot carry an arbitrary tier string at
+  // all — cursor-variant resolves a MODEL VARIANT, so there is nothing to forward a foreign
+  // value into. Without this, an unclassified route on such a wire projects "unknown" support
+  // and Codex would show a Fast toggle on a base that has no fast variant.
   const forwardCallerTier = capability !== false
     && callerWireAvailable
+    && fastWire?.foreignCallerTiers !== "drop"
+    && forwardCallerServiceTier !== false
     && (adapter !== "openai-chat" || authority.capability.chatServiceTier === true);
 
   let eligibility: ResolvedFastPolicy["eligibility"];
@@ -185,12 +232,34 @@ export function resolveFastPolicy(
   else if (capability === undefined) eligibility = "unclassified";
   else eligibility = "eligible";
 
-  return { capability, eligibility, adapter, fastWire, forwardCallerTier };
+  return {
+    capability,
+    eligibility,
+    adapter,
+    fastWire,
+    ...(authority.fastTierDescription !== undefined
+      ? { fastTierDescription: authority.fastTierDescription }
+      : {}),
+    forwardCallerTier,
+  };
 }
 
-export function canonicalFastTierMarker(callerTier: string | undefined): "priority" | undefined {
+/**
+ * Fold a caller's service tier onto a canonical fast marker.
+ *
+ * `ultrafast` is recognised as INTENT even though no shipped catalog advertises it and
+ * `DEFAULT_SERVICE_TIER_FAST_WIRE` has no wire mapping for it. That asymmetry is
+ * deliberate: a caller who sends `ultrafast` (which #3429's reporter did, via their own
+ * catalog edit) was previously folded to `undefined`, which made `fastIntent` false and
+ * recorded `fastOutcome: "not-requested"` — the log asserting the user asked for nothing.
+ * Recognising the intent without a wire mapping lands the attempt on `unknown` instead,
+ * which is the truth: the tier was requested, and we cannot confirm it was honored.
+ */
+export function canonicalFastTierMarker(callerTier: string | undefined): "priority" | "ultrafast" | undefined {
   const folded = callerTier?.trim().toLowerCase();
-  return folded === "priority" || folded === "fast" ? "priority" : undefined;
+  if (folded === "priority" || folded === "fast") return "priority";
+  if (folded === "ultrafast") return "ultrafast";
+  return undefined;
 }
 
 /** Capture Fast demand before the final A1 serialization action rewrites the parsed tier view. */
@@ -198,6 +267,7 @@ export function tierObservationContext(
   policy: ResolvedFastPolicy,
   fastMode: boolean | undefined,
   callerTier: string | undefined,
+  responseTierAuthoritative?: boolean,
 ): TierObservationContext {
   return {
     capability: policy.capability,
@@ -205,6 +275,7 @@ export function tierObservationContext(
     fastWire: policy.fastWire,
     demandDecision: fastMode === true ? "force-fast" : fastMode === false ? "force-default" : "inherit",
     ...(callerTier !== undefined ? { callerTier } : {}),
+    ...(responseTierAuthoritative !== undefined ? { responseTierAuthoritative } : {}),
   };
 }
 
@@ -240,7 +311,18 @@ export function createAdapterTierMetadata(
 ): AdapterTierMetadata | undefined {
   if (!context || !decision) return undefined;
 
-  const callerCanonicalFast = canonicalFastTierMarker(context.callerTier) === "priority";
+  const callerMarker = canonicalFastTierMarker(context.callerTier);
+  // Two different questions, and conflating them mislabels the record.
+  //
+  // "Did the caller ask for FAST?" governs the drop and suppression facts: the Fast
+  // toggle suppressing a request is only true of the 1.5x Fast tier, so an `ultrafast`
+  // caller turned away by `fastMode: false` was NOT a suppressed Fast request and must
+  // still read as `callerTierDropped`.
+  //
+  // "Did the caller ask for SOME fast-family tier?" is the wider question, and only
+  // `fastIntent` below is entitled to it.
+  const callerCanonicalFast = callerMarker === "priority";
+  const callerFastFamilyIntent = callerMarker !== undefined;
   const callerTierDropped = context.callerTier !== undefined
     && !callerCanonicalFast
     && wireValue === null;
@@ -280,7 +362,7 @@ export function createAdapterTierMetadata(
   // Known-unsupported routes still need a downgrade when the caller/config expressed Fast intent,
   // but they are deliberately outside the effective-demand calculation above.
   const fastIntent = context.demandDecision === "force-fast"
-    || (context.demandDecision === "inherit" && callerCanonicalFast);
+    || (context.demandDecision === "inherit" && callerFastFamilyIntent);
 
   if (!fastIntent) {
     outcome.fastOutcome = "not-requested";
@@ -296,7 +378,11 @@ export function createAdapterTierMetadata(
 
   const responseCanConfirmFast = effectiveFastRequested
     && context.eligibility === "eligible"
-    && wireValue !== null;
+    && wireValue !== null
+    // A destination whose echo is not authoritative can neither confirm nor deny Fast. The
+    // ChatGPT-internal Codex backend echoes "default" on priority-scheduled turns, so believing
+    // it reported every Fast request as `response-declined` (#2558).
+    && context.responseTierAuthoritative !== false;
   return {
     outcome,
     observeResponseServiceTier(value: unknown) {
@@ -359,9 +445,14 @@ export function decideTier(
   const callerCanonicalFast = canonicalFastTierMarker(callerTier);
   if (callerCanonicalFast !== undefined) {
     const value = policy.fastWire.canonicalToWire[callerCanonicalFast];
-    return typeof value === "string" && value.length > 0
-      ? { kind: "set", value }
-      : { kind: "drop" };
+    if (typeof value === "string" && value.length > 0) return { kind: "set", value };
+    // A canonical marker with NO wire mapping is not a reason to drop the tier.
+    //
+    // `ultrafast` is recognised as intent but deliberately unmapped, because no wire
+    // advertises it. Dropping here would have made recognition strictly worse than not
+    // recognising it at all: before, `ultrafast` was a foreign tier and
+    // `foreignCallerTiers: "verbatim"` forwarded it untouched. Falling through keeps that
+    // behavior, so an operator-supplied tier still reaches the provider.
   }
   if (callerTier !== undefined && !policy.forwardCallerTier) return { kind: "drop" };
   if (
@@ -413,8 +504,8 @@ export function fastWireDeclarationError(source: {
   }
   if (value === null) return null;
   if (!isPlainRecord(value)) return "fastWire must be an object, null, or absent";
-  if (value.kind !== "service-tier" && value.kind !== "anthropic-speed") {
-    return "fastWire.kind must be service-tier or anthropic-speed";
+  if (value.kind !== "service-tier" && value.kind !== "anthropic-speed" && value.kind !== "cursor-variant") {
+    return "fastWire.kind must be service-tier, anthropic-speed, or cursor-variant";
   }
   if (value.foreignCallerTiers !== "verbatim" && value.foreignCallerTiers !== "drop") {
     return "fastWire.foreignCallerTiers must be verbatim or drop";

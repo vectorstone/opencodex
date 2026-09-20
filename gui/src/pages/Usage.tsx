@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useI18n, type TFn, type Locale } from "../i18n/shared";
+import type { UsageReadMetadata } from "../usage-summary-resource";
+import { UsageIncompleteNotice } from "../components/usage-incomplete-notice";
 import { formatProviderDisplayName } from "../provider-icons";
 import { formatTokens } from "../format-tokens";
 import { formatEstimatedUsdValue as formatUsdEstimate } from "../intl-formatters";
 import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
 import { EmptyState, Notice } from "../ui";
+import { IconChevron } from "../icons";
 import { modelLabel } from "../model-display";
 import { useDataSurface } from "../data-surface";
 import { DataSurfaceSkeleton } from "../components/data-surface";
 import { SectionTabs } from "../components/section-tabs";
 import { sectionAnchorId } from "../section-anchors";
+import { parseUsageTimeRange, type UsageRangeError, type UsageTimeWindow } from "../usage-time-range";
 
 type Range = "all" | "30d" | "7d";
 type UsageSurface = "all" | "codex" | "claude" | "grok";
@@ -62,6 +67,12 @@ interface UsageModel {
   totalTokens: number;
   inputTokens: number;
   outputTokens: number;
+  /** API list-price estimate for the priced portion of this row. */
+  estimatedCostUsd?: number;
+  /** Requests included in the API list-price estimate. */
+  pricedRequests?: number;
+  /** Requests excluded from the estimate because price or usable usage is unavailable. */
+  unpricedRequests?: number;
   shareRatio: number;
 }
 
@@ -72,13 +83,23 @@ interface UsageProvider {
   reportedRequests: number;
   estimatedRequests: number;
   totalTokens: number;
+  /** API list-price estimate for the priced portion of this row. */
+  estimatedCostUsd?: number;
+  /** Requests included in the API list-price estimate. */
+  pricedRequests?: number;
+  /** Requests excluded from the estimate because price or usable usage is unavailable. */
+  unpricedRequests?: number;
   shareRatio: number;
 }
 
-interface UsageResponse {
+class UsageWindowMismatchError extends Error {}
+
+interface UsageResponse extends UsageReadMetadata {
   range: Range;
   surface: UsageSurface;
   since: number | null;
+  until?: number;
+  customWindow?: boolean;
   generatedAt: number;
   summary: UsageSummaryTotals;
   days: UsageDay[];
@@ -98,6 +119,45 @@ interface UsageResponse {
 
 function formatPct(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
+}
+
+type UsageCostRow = Pick<UsageModel, "estimatedCostUsd" | "pricedRequests" | "unpricedRequests">;
+
+/**
+ * Renders a row's API list-price estimate with explicit pricing coverage.
+ * Newer proxies return the coverage fields even when every request is
+ * unpriced; older proxies have none of them, so their cells stay unavailable
+ * rather than making an unknown amount look free.
+ */
+function UsageListPrice({ row, locale, t }: { row: UsageCostRow; locale: Locale; t: TFn }) {
+  const hasPriceData = row.estimatedCostUsd !== undefined
+    || row.pricedRequests !== undefined
+    || row.unpricedRequests !== undefined;
+  if (!hasPriceData) return <span className="muted">—</span>;
+
+  const excludedRequests = row.unpricedRequests ?? 0;
+  const excludedCaption = t(
+    excludedRequests === 1 ? "usage.cost.excludedOne" : "usage.cost.excluded",
+    { count: excludedRequests },
+  );
+  if (row.estimatedCostUsd === undefined) {
+    return (
+      <>
+        <span className="muted">—</span>
+        {excludedRequests > 0 && (
+          <span className="muted text-caption"> {excludedCaption}</span>
+        )}
+      </>
+    );
+  }
+  return (
+    <>
+      <span className="mono">{formatUsdEstimate(row.estimatedCostUsd ?? 0, locale)}</span>
+      {excludedRequests > 0 && (
+        <span className="muted text-caption"> {excludedCaption}</span>
+      )}
+    </>
+  );
 }
 
 // Stable per-model bar color: hash the provider/model id to a hue so the same model keeps its color
@@ -133,6 +193,52 @@ function lastSevenDays(days: UsageDay[]): UsageDay[] {
   return out;
 }
 
+function formatCalendarDate(date: string, locale: Locale): string {
+  return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(new Date(`${date}T12:00:00`));
+}
+
+function chartTipPosition(rect: DOMRect): CSSProperties {
+  const gutter = 8;
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const maxWidth = Math.min(240, Math.max(0, viewportWidth - gutter * 2));
+  const left = Math.max(gutter, Math.min(rect.left + rect.width / 2 - maxWidth / 2, viewportWidth - gutter - maxWidth));
+  const above = rect.top - gutter > viewportHeight - rect.bottom - gutter;
+  const vertical = above
+    ? (() => {
+        const bottom = Math.max(gutter, Math.min(viewportHeight - gutter, viewportHeight - rect.top + gutter));
+        return { bottom, maxHeight: Math.max(0, viewportHeight - bottom - gutter) };
+      })()
+    : (() => {
+        const top = Math.max(gutter, Math.min(viewportHeight - gutter, rect.bottom + gutter));
+        return { top, maxHeight: Math.max(0, viewportHeight - top - gutter) };
+      })();
+  return { left, maxWidth, ...vertical };
+}
+
+function UsageChartOverlay({
+  anchor,
+  className,
+  children,
+}: {
+  anchor: DOMRect;
+  className: string;
+  children: ReactNode;
+}) {
+  return createPortal(
+    <div className={`${className} chart-overlay`} role="tooltip" style={chartTipPosition(anchor)}>{children}</div>,
+    document.body,
+  );
+}
+
+function dayDetail(day: Pick<UsageDay, "date" | "requests" | "totalTokens">, locale: Locale, t: TFn): string {
+  return t("usage.chart.dayDetail", {
+    date: formatCalendarDate(day.date, locale),
+    requests: day.requests,
+    tokens: formatTokens(day.totalTokens, locale),
+  });
+}
+
 function quantileBuckets(values: number[]): number[] {
   const positive = values.filter(v => v > 0).sort((a, b) => a - b);
   if (positive.length === 0) return [0, 0, 0, 0];
@@ -156,20 +262,54 @@ interface HeatmapCell {
   dayOfWeek: number;
 }
 
-function buildHeatmap(days: UsageDay[]): { weeks: HeatmapCell[][]; months: { label: string; col: number }[]; buckets: number[] } {
+function buildHeatmap(days: UsageDay[], customWindow = false): { weeks: HeatmapCell[][]; months: { label: string; col: number }[]; buckets: number[] } {
   const buckets = quantileBuckets(days.map(d => d.totalTokens));
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  if (customWindow) {
+    const weeks: HeatmapCell[][] = [];
+    const months: { label: string; col: number }[] = [];
+    let week: HeatmapCell[] = [];
+    let weekStart: number | undefined;
+    let previousMonth = -1;
+    let lastMonthCol = -4;
+    const pad = (length: number) => {
+      while (week.length < length) week.push({ date: "", requests: 0, totalTokens: 0, level: 0, dayOfWeek: week.length });
+    };
+    // The server already supplied the bounded civil dates. Local midnight stepping
+    // can retain a shifted hour across DST and omit the final day of the report.
+    for (const day of days) {
+      const [year, month, date] = day.date.split("-").map(Number);
+      const calendar = new Date(Date.UTC(year, month - 1, date));
+      const weekday = calendar.getUTCDay();
+      const nextWeekStart = calendar.getTime() - weekday * 86_400_000;
+      if (weekStart !== nextWeekStart) {
+        if (week.length > 0) { pad(7); weeks.push(week); }
+        week = [];
+        weekStart = nextWeekStart;
+      }
+      const monthIndex = calendar.getUTCMonth();
+      if (monthIndex !== previousMonth && weeks.length - lastMonthCol >= 4) {
+        months.push({ label: monthNames[monthIndex], col: weeks.length });
+        previousMonth = monthIndex;
+        lastMonthCol = weeks.length;
+      }
+      pad(weekday);
+      week.push({ date: day.date, requests: day.requests, totalTokens: day.totalTokens,
+        level: bucketLevel(day.totalTokens, buckets), dayOfWeek: weekday });
+    }
+    if (week.length > 0) { pad(7); weeks.push(week); }
+    return { weeks, months, buckets };
+  }
   const dayMap = new Map(days.map(d => [d.date, d]));
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const start = new Date(today);
   start.setDate(start.getDate() - 364);
-  // Align to Sunday
   start.setDate(start.getDate() - start.getDay());
 
   const weeks: HeatmapCell[][] = [];
   const months: { label: string; col: number }[] = [];
-  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   let lastMonthCol = -4;
   let prevMonthIdx = -1;
   let week: HeatmapCell[] = [];
@@ -214,7 +354,7 @@ function UsageFilters({
   t,
 }: {
   surface: UsageSurface;
-  range: Range;
+  range: Range | null;
   onSurface: (surface: UsageSurface) => void;
   onRange: (range: Range) => void;
   t: TFn;
@@ -318,20 +458,33 @@ function UsageSummaryCards({
 }
 
 function WeekDayBars({ weekBars, locale, t }: { weekBars: UsageDay[]; locale: Locale; t: TFn }) {
-  const [hoverDay, setHoverDay] = useState<string | null>(null);
+  const [active, setActive] = useState<{ date: string; anchor: DOMRect } | null>(null);
   const max = Math.max(1, ...weekBars.map(day => day.totalTokens));
+  const activeDay = weekBars.find(day => day.date === active?.date);
+  const show = (day: UsageDay, element: HTMLElement) => {
+    setActive({ date: day.date, anchor: element.getBoundingClientRect() });
+  };
 
   return (
-    <div className="daybars" role="img" aria-label={t("usage.section.heatmap")}>
+    <div className="daybars" role="group" aria-label={t("usage.section.heatmap")}>
       {weekBars.map(day => {
         const percentage = Math.round((day.totalTokens / max) * 100);
-        const label = day.date.slice(5);
+        const label = new Intl.DateTimeFormat(locale, { weekday: "short" }).format(new Date(`${day.date}T12:00:00`));
         return (
-          <div
+          <button
+            type="button"
             key={day.date}
             className="daybar"
-            onMouseEnter={() => setHoverDay(day.date)}
-            onMouseLeave={() => setHoverDay(current => (current === day.date ? null : current))}
+            aria-label={dayDetail(day, locale, t)}
+            onFocus={event => show(day, event.currentTarget)}
+            onBlur={() => setActive(current => current?.date === day.date ? null : current)}
+            onPointerEnter={event => show(day, event.currentTarget)}
+            onPointerDown={event => show(day, event.currentTarget)}
+            onPointerLeave={event => {
+              if (event.pointerType !== "touch" && document.activeElement !== event.currentTarget) {
+                setActive(current => current?.date === day.date ? null : current);
+              }
+            }}
           >
             <div className="daybar-track">
               <div
@@ -350,23 +503,27 @@ function WeekDayBars({ weekBars, locale, t }: { weekBars: UsageDay[]; locale: Lo
                 )}
               </div>
             </div>
-            {hoverDay === day.date && day.totalTokens > 0 && (
-              <div className="daybar-tip" role="tooltip">
-                <div className="daybar-tip-date">{day.date}</div>
-                {day.models.slice(0, 8).map(model => (
-                  <div key={`${model.provider}/${model.model}`} className="daybar-tip-row">
-                    <span className="daybar-tip-swatch" style={{ background: modelColor(model.model, model.provider) }} />
-                    <span className="daybar-tip-name">{modelLabel(model.model)}</span>
-                    <span className="daybar-tip-val">{formatTokens(model.totalTokens, locale)}</span>
-                  </div>
-                ))}
-              </div>
-            )}
             <span className="daybar-count">{formatTokens(day.totalTokens, locale)}</span>
             <span className="daybar-label muted">{label}</span>
-          </div>
+          </button>
         );
       })}
+      {active && activeDay && (
+        <UsageChartOverlay className="daybar-tip" anchor={active.anchor}>
+          <div className="daybar-tip-date">{formatCalendarDate(activeDay.date, locale)}</div>
+          <div className="daybar-tip-row">
+            <span>{t("usage.heatmap.tooltipRequests", { requests: activeDay.requests })}</span>
+            <span className="daybar-tip-val">{t("usage.heatmap.tooltipTokens", { tokens: formatTokens(activeDay.totalTokens, locale) })}</span>
+          </div>
+          {activeDay.models.slice(0, 8).map(model => (
+            <div key={`${model.provider}/${model.model}`} className="daybar-tip-row">
+              <span className="daybar-tip-swatch" style={{ background: modelColor(model.model, model.provider) }} />
+              <span className="daybar-tip-name">{modelLabel(model.model)}</span>
+              <span className="daybar-tip-val">{formatTokens(model.totalTokens, locale)}</span>
+            </div>
+          ))}
+        </UsageChartOverlay>
+      )}
     </div>
   );
 }
@@ -378,14 +535,41 @@ function UsageHeatmapPanel({
   locale,
   t,
 }: {
-  range: Range;
+  range: Range | null;
   heatmap: ReturnType<typeof buildHeatmap>;
   weekBars: UsageDay[];
   locale: Locale;
   t: TFn;
 }) {
   const heatmapRef = useRef<HTMLDivElement | null>(null);
-  const [hoverCell, setHoverCell] = useState<{ weekIndex: number; dayIndex: number; x: number; y: number } | null>(null);
+  const cells = useMemo(() => heatmap.weeks.flat().filter(cell => cell.date), [heatmap]);
+  const [selectedDate, setSelectedDate] = useState(() => cells.at(-1)?.date ?? "");
+  const [tip, setTip] = useState<{ date: string; anchor: DOMRect } | null>(null);
+  const hintId = useId();
+  const rovingDate = cells.some(cell => cell.date === selectedDate) ? selectedDate : (cells.at(-1)?.date ?? "");
+
+  const selectCell = (cell: HeatmapCell, element: HTMLElement) => {
+    setSelectedDate(cell.date);
+    setTip({ date: cell.date, anchor: element.getBoundingClientRect() });
+  };
+
+  const onCellKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, cell: HeatmapCell) => {
+    const index = cells.findIndex(candidate => candidate.date === cell.date);
+    const offset = event.key === "ArrowUp" ? -1
+      : event.key === "ArrowDown" ? 1
+        : event.key === "ArrowLeft" ? -7
+          : event.key === "ArrowRight" ? 7
+            : 0;
+    if (!offset || index < 0) return;
+    event.preventDefault();
+    const next = cells[Math.max(0, Math.min(cells.length - 1, index + offset))]!;
+    setSelectedDate(next.date);
+    const element = heatmapRef.current?.querySelector<HTMLElement>(`[data-date="${next.date}"]`);
+    if (element) {
+      element.focus();
+      setTip({ date: next.date, anchor: element.getBoundingClientRect() });
+    }
+  };
 
   useEffect(() => {
     const element = heatmapRef.current;
@@ -403,7 +587,7 @@ function UsageHeatmapPanel({
       {range === "7d" ? (
         <WeekDayBars weekBars={weekBars} locale={locale} t={t} />
       ) : (
-        <div className="heatmap" ref={heatmapRef} role="img" aria-labelledby="usage-heatmap-title">
+        <div className="heatmap" ref={heatmapRef}>
           <div className="heatmap-months" style={{ gridTemplateColumns: `28px repeat(${heatmap.weeks.length}, calc(var(--hm-cell) + var(--hm-gap)))` }}>
             <span className="heatmap-day-spacer" />
             {heatmap.months.map(month => (
@@ -414,36 +598,54 @@ function UsageHeatmapPanel({
             <div className="heatmap-days">
               <span /><span>{t("usage.dayMon")}</span><span /><span>{t("usage.dayWed")}</span><span /><span>{t("usage.dayFri")}</span><span />
             </div>
-            <div className="heatmap-grid" style={{ gridTemplateColumns: `repeat(${heatmap.weeks.length}, var(--hm-cell))` }}>
+            <div
+              className="heatmap-grid"
+              role="group"
+              aria-labelledby="usage-heatmap-title"
+              aria-describedby={hintId}
+              style={{ gridTemplateColumns: `repeat(${heatmap.weeks.length}, var(--hm-cell))` }}
+            >
               {heatmap.weeks.map((week, weekIndex) => (
                 <div key={week[0]?.date || `week-${weekIndex}`} className="heatmap-week">
-                  {week.map((cell, dayIndex) => (
-                    <div
-                      key={cell.date || `pad-${weekIndex}-${dayIndex}`}
+                  {week.map((cell, dayIndex) => cell.date ? (
+                    <button
+                      type="button"
+                      key={cell.date}
                       className={`heatmap-cell heatmap-cell-${cell.level}`}
-                      onMouseEnter={event => {
-                        if (!cell.date) return;
-                        const rect = event.currentTarget.getBoundingClientRect();
-                        setHoverCell({ weekIndex, dayIndex, x: rect.left + rect.width / 2, y: rect.top });
+                      data-date={cell.date}
+                      tabIndex={rovingDate === cell.date ? 0 : -1}
+                      aria-label={dayDetail(cell, locale, t)}
+                      onFocus={event => selectCell(cell, event.currentTarget)}
+                      onBlur={() => setTip(current => current?.date === cell.date ? null : current)}
+                      onKeyDown={event => onCellKeyDown(event, cell)}
+                      onPointerEnter={event => selectCell(cell, event.currentTarget)}
+                      onPointerDown={event => selectCell(cell, event.currentTarget)}
+                      onPointerLeave={event => {
+                        if (event.pointerType !== "touch" && document.activeElement !== event.currentTarget) {
+                          setTip(current => current?.date === cell.date ? null : current);
+                        }
                       }}
-                      onMouseLeave={() => setHoverCell(current => (
-                        current?.weekIndex === weekIndex && current.dayIndex === dayIndex ? null : current
-                      ))}
                     />
+                  ) : (
+                    <span key={`pad-${weekIndex}-${dayIndex}`} className="heatmap-cell heatmap-cell-0" aria-hidden="true" />
                   ))}
                 </div>
               ))}
             </div>
           </div>
-          {hoverCell && (() => {
-            const cell = heatmap.weeks[hoverCell.weekIndex]?.[hoverCell.dayIndex];
+          <span id={hintId} className="sr-only">{t("usage.heatmap.keyboardLabel")}</span>
+          <span className="sr-only" aria-live="polite">
+            {cells.find(cell => cell.date === rovingDate) ? dayDetail(cells.find(cell => cell.date === rovingDate)!, locale, t) : ""}
+          </span>
+          {tip && (() => {
+            const cell = cells.find(candidate => candidate.date === tip.date);
             if (!cell?.date) return null;
             return (
-              <div className="heatmap-tip" role="tooltip" style={{ left: hoverCell.x, top: hoverCell.y }}>
-                <div className="heatmap-tip-date">{cell.date}</div>
+              <UsageChartOverlay className="heatmap-tip" anchor={tip.anchor}>
+                <div className="heatmap-tip-date">{formatCalendarDate(cell.date, locale)}</div>
                 <div className="heatmap-tip-val">{t("usage.heatmap.tooltipTokens", { tokens: formatTokens(cell.totalTokens, locale) })}</div>
                 <div className="heatmap-tip-req muted">{t("usage.heatmap.tooltipRequests", { requests: cell.requests })}</div>
-              </div>
+              </UsageChartOverlay>
             );
           })()}
           <div className="heatmap-legend muted">
@@ -492,6 +694,7 @@ function UsageModelsTable({
   const searchLabel = t("usage.search.models");
   const sectionLabel = t("usage.section.models");
   const titleId = "usage-models-title";
+  const listPriceDisclaimerId = "usage-models-list-price-disclaimer";
   const searchInput = (
     <input
       className="input"
@@ -511,6 +714,7 @@ function UsageModelsTable({
             <th className="num">{t("usage.col.requests")}</th>
             <th className="num">{t("usage.col.measured")}</th>
             <th className="num">{t("usage.col.tokens")}</th>
+            <th className="num" aria-describedby={listPriceDisclaimerId}>{t("usage.col.apiListPrice")}</th>
             <th>{t("usage.col.share")}</th>
           </tr>
         </thead>
@@ -522,11 +726,13 @@ function UsageModelsTable({
               <td className="num">{model.requests}</td>
               <td className="num">{model.measuredRequests}</td>
               <td className="num mono">{formatTokens(model.totalTokens, locale)}</td>
+              <td className="num"><UsageListPrice row={model} locale={locale} t={t} /></td>
               <td><div className="usage-bar"><div className="usage-bar-fill" style={{ width: `${Math.round(model.shareRatio * 100)}%` }} /></div></td>
             </tr>
           ))}
         </tbody>
       </table>
+      <p id={listPriceDisclaimerId} className="muted text-caption">{t("usage.cost.disclaimer")}</p>
     </div>
   );
 
@@ -563,6 +769,7 @@ function UsageProvidersTable({
 }) {
   const sectionLabel = t("usage.section.providers");
   const titleId = "usage-providers-title";
+  const listPriceDisclaimerId = "usage-providers-list-price-disclaimer";
   const table = (
     <div className="tbl-wrap">
       <table className="tbl">
@@ -572,6 +779,7 @@ function UsageProvidersTable({
             <th className="num">{t("usage.col.requests")}</th>
             <th className="num">{t("usage.col.measured")}</th>
             <th className="num">{t("usage.col.tokens")}</th>
+            <th className="num" aria-describedby={listPriceDisclaimerId}>{t("usage.col.apiListPrice")}</th>
             <th>{t("usage.col.share")}</th>
           </tr>
         </thead>
@@ -582,11 +790,13 @@ function UsageProvidersTable({
               <td className="num">{provider.requests}</td>
               <td className="num">{provider.measuredRequests}</td>
               <td className="num mono">{formatTokens(provider.totalTokens, locale)}</td>
+              <td className="num"><UsageListPrice row={provider} locale={locale} t={t} /></td>
               <td><div className="usage-bar"><div className="usage-bar-fill" style={{ width: `${Math.round(provider.shareRatio * 100)}%` }} /></div></td>
             </tr>
           ))}
         </tbody>
       </table>
+      <p id={listPriceDisclaimerId} className="muted text-caption">{t("usage.cost.disclaimer")}</p>
     </div>
   );
 
@@ -671,7 +881,7 @@ function UsageWorkspaceBody({
   modelQuery: string;
   onModelQuery: (query: string) => void;
   sortedProviders: UsageProvider[];
-  range: Range;
+  range: Range | null;
   locale: Locale;
   t: TFn;
 }) {
@@ -739,49 +949,80 @@ function UsageWorkspaceBody({
 /** Held usage payloads so provider/surface tab switches skip a cold ~5s refetch. */
 const usageMemoryCache = new Map<string, UsageResponse>();
 
-function usageCacheKey(apiBase: string, range: Range, surface: UsageSurface): string {
-  return `ocx.usage.v1:${apiBase}:${range}:${surface}`;
+type UsageScope = "machine" | "hub";
+
+function usageCacheKey(apiBase: string, range: Range, surface: UsageSurface, connected: boolean, scope: UsageScope, apiKeyId?: string): string {
+  return `ocx.usage.v2:${apiBase}:${connected ? "connected" : "standalone"}:${scope}:${apiKeyId ?? ""}:${range}:${surface}`;
 }
 
-function readHeldUsage(apiBase: string, range: Range, surface: UsageSurface): UsageResponse | null {
-  const key = usageCacheKey(apiBase, range, surface);
+function readHeldUsage(apiBase: string, range: Range, surface: UsageSurface, connected: boolean, scope: UsageScope, apiKeyId?: string): UsageResponse | null {
+  const key = usageCacheKey(apiBase, range, surface, connected, scope, apiKeyId);
   return usageMemoryCache.get(key) ?? readSessionListCache<UsageResponse>(key);
 }
 
-function writeHeldUsage(apiBase: string, range: Range, surface: UsageSurface, value: UsageResponse) {
-  const key = usageCacheKey(apiBase, range, surface);
+function writeHeldUsage(apiBase: string, range: Range, surface: UsageSurface, connected: boolean, scope: UsageScope, apiKeyId: string | undefined, value: UsageResponse) {
+  const key = usageCacheKey(apiBase, range, surface, connected, scope, apiKeyId);
   usageMemoryCache.set(key, value);
   writeSessionListCache(key, value);
 }
 
-export default function Usage({ apiBase }: { apiBase: string }) {
+export default function Usage({ apiBase, connected = false, apiKeyId }: { apiBase: string; connected?: boolean; apiKeyId?: string }) {
   const { t, locale } = useI18n();
   const [range, setRange] = useState<Range>("30d");
   const [surface, setSurface] = useState<UsageSurface>("all");
+  const [scope, setScope] = useState<UsageScope>("machine");
   const [modelQuery, setModelQuery] = useState("");
+  const [draftWindow, setDraftWindow] = useState({ since: "", until: "" });
+  const [customWindow, setCustomWindow] = useState<UsageTimeWindow | null>(null);
+  const [rangeError, setRangeError] = useState<UsageRangeError | null>(null);
+  const [rangeOpen, setRangeOpen] = useState(false);
+  const since = customWindow?.since;
+  const until = customWindow?.until;
+
+  const clearCustomWindow = () => {
+    setCustomWindow(null);
+    setDraftWindow({ since: "", until: "" });
+    setRangeError(null);
+  };
+  const selectRange = (next: Range) => {
+    setRange(next);
+    clearCustomWindow();
+  };
 
   const loadUsage = useCallback(async (signal: AbortSignal): Promise<UsageResponse> => {
-    const response = await fetch(`${apiBase}/api/usage?range=${range}&surface=${surface}`, { signal });
+    const query = new URLSearchParams({ range, surface });
+    if (connected && scope === "machine" && apiKeyId) query.set("apiKeyId", apiKeyId);
+    if (since !== undefined && until !== undefined) {
+      query.set("since", String(since));
+      query.set("until", String(until));
+    }
+    const response = await fetch(`${apiBase}/api/usage?${query}`, { signal });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`.trim());
     const next = await response.json() as UsageResponse;
-    writeHeldUsage(apiBase, range, surface, next);
+    // HTTP 200 alone does not prove an older daemon honored the custom bounds.
+    if (since !== undefined && (next?.customWindow !== true || next.since !== since || next.until !== until)) {
+      throw new UsageWindowMismatchError();
+    }
+    if (since === undefined) writeHeldUsage(apiBase, range, surface, connected, scope, apiKeyId, next);
     return next;
-  }, [apiBase, range, surface]);
+  }, [apiBase, apiKeyId, connected, range, scope, surface, since, until]);
 
-  const resourceKey = usageCacheKey(apiBase, range, surface);
-  const cached = readHeldUsage(apiBase, range, surface);
+  const presetKey = usageCacheKey(apiBase, range, surface, connected, scope, apiKeyId);
+  const resourceKey = customWindow ? JSON.stringify([presetKey, since, until]) : presetKey;
+  // Arbitrary custom windows belong only to the subscription-scoped resource store.
+  const cached = customWindow ? null : readHeldUsage(apiBase, range, surface, connected, scope, apiKeyId);
   // Range and surface identify different reports, so the key changes with both. That prevents
   // a force-loading dependency revalidation from ever showing a previous report as this one.
   const resource = useDataSurface<UsageResponse>(
     resourceKey,
-    [apiBase, range, surface],
+    [apiBase, apiKeyId, connected, range, scope, surface, since, until],
     loadUsage,
     { isEmpty: () => false, initialData: cached ?? undefined },
   );
   const { state } = resource;
   const data = state.data ?? cached ?? null;
 
-  const heatmap = useMemo(() => buildHeatmap(data?.days ?? []), [data?.days]);
+  const heatmap = useMemo(() => buildHeatmap(data?.days ?? [], !!customWindow), [data?.days, customWindow]);
   const weekBars = useMemo(() => lastSevenDays(data?.days ?? []), [data?.days]);
   const activeDays = useMemo(() => (data?.days ?? []).filter(d => d.requests > 0).length, [data?.days]);
   const filteredModels = useMemo(() => {
@@ -805,22 +1046,120 @@ export default function Usage({ apiBase }: { apiBase: string }) {
     <>
       <div className="page-head usage-head">
         <h2 id="usage-page-title">{t("usage.title")}</h2>
-        <UsageFilters surface={surface} range={range} onSurface={setSurface} onRange={setRange} t={t} />
+        <UsageFilters surface={surface} range={customWindow ? null : range} onSurface={setSurface} onRange={selectRange} t={t} />
       </div>
       <p className="page-sub">{t("usage.subtitle")}</p>
+      {/*
+        An explicit interval is the rare path — the presets answer the question almost every
+        time — so the two date fields open on request instead of greeting every visit as the
+        second thing on the page. The applied interval stays outside the panel: collapsing the
+        controls must never hide which window the totals below actually cover.
+      */}
+      <section className="usage-range">
+        <div className="usage-range-bar">
+          <button
+            type="button"
+            className={`usage-range-toggle${customWindow ? " is-active" : ""}`}
+            aria-expanded={rangeOpen}
+            // The panel is unmounted while closed, so naming it then would leave a dangling IDREF.
+            aria-controls={rangeOpen ? "usage-range-panel" : undefined}
+            // A validation failure is only legible next to the fields that caused it. Closing the
+            // panel would otherwise park an invisible error on a trigger that looks untouched, and
+            // re-render the alert on reopen for a draft the user walked away from. The check reads
+            // the rendered value rather than an updater argument: a setState updater has to stay
+            // pure, and this one would fire the second setState twice under StrictMode.
+            onClick={() => {
+              if (rangeOpen) setRangeError(null);
+              setRangeOpen(!rangeOpen);
+            }}
+          >
+            <span>{t("usage.range.custom")}</span>
+            <IconChevron width={12} height={12} aria-hidden="true" className="usage-range-chevron" />
+          </button>
+          {customWindow && <p className="usage-range-applied muted text-control" role="status">{(() => {
+            const formatter = new Intl.DateTimeFormat(locale, {
+              year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+              second: "2-digit", fractionalSecondDigits: 3, timeZoneName: "short",
+            });
+            return t("usage.range.applied", { start: formatter.format(customWindow.since), end: formatter.format(customWindow.until) });
+          })()}</p>}
+        </div>
+        {rangeOpen && (
+          <form id="usage-range-panel" className="usage-range-panel" aria-label={t("usage.range.custom")} noValidate onSubmit={event => {
+            event.preventDefault();
+            const result = parseUsageTimeRange(draftWindow.since, draftWindow.until);
+            if (result.ok === false) {
+              setRangeError(result.error);
+              return;
+            }
+            setRangeError(null);
+            setCustomWindow(result.window);
+          }}>
+            <div className="usage-range-fields">
+              <label className="usage-range-field">
+                <span className="field-label">{t("usage.range.start")}</span>
+                <input className="input" type="datetime-local" step="60" required
+                  value={draftWindow.since}
+                  aria-invalid={rangeError !== null}
+                  aria-describedby={rangeError ? "usage-range-help usage-range-error" : "usage-range-help"}
+                  onChange={event => {
+                    const value = event.currentTarget.value;
+                    setDraftWindow(current => ({ ...current, since: value }));
+                    setRangeError(null);
+                  }} />
+              </label>
+              <label className="usage-range-field">
+                <span className="field-label">{t("usage.range.end")}</span>
+                <input className="input" type="datetime-local" step="60" required
+                  value={draftWindow.until}
+                  aria-invalid={rangeError !== null}
+                  aria-describedby={rangeError ? "usage-range-help usage-range-error" : "usage-range-help"}
+                  onChange={event => {
+                    const value = event.currentTarget.value;
+                    setDraftWindow(current => ({ ...current, until: value }));
+                    setRangeError(null);
+                  }} />
+              </label>
+              <button type="submit" className="btn btn-primary btn-sm usage-range-action">{t("usage.range.apply")}</button>
+              <button type="button" className="btn btn-ghost btn-sm usage-range-action" onClick={clearCustomWindow}>{t("usage.range.clear")}</button>
+            </div>
+            <p id="usage-range-help" className="muted text-caption">{t("usage.range.help")}</p>
+            {rangeError && <p id="usage-range-error" role="alert" className="notice notice-err">{t(`usage.range.${rangeError}`)}</p>}
+          </form>
+        )}
+      </section>
+      {/*
+        Only shown when connected. Naming the source is a two-plane concept: it answers
+        "which store served these numbers", and that question only exists once there are
+        two. A standalone install has exactly one, so the row says nothing the page does
+        not already imply — while still being a line about topology that a user who never
+        enabled remote hub has to read past.
+      */}
+      {connected && (
+        <div className="usage-source-row">
+          <span>{t("usage.source.connected")}</span>
+          <div className="usage-scope-control" role="group" aria-label={t("usage.scope.label")}>
+            <button type="button" className={`btn btn-sm${scope === "machine" ? " btn-primary" : " btn-ghost"}`} aria-pressed={scope === "machine"} onClick={() => setScope("machine")}>{t("usage.scope.machine")}</button>
+            <button type="button" className={`btn btn-sm${scope === "hub" ? " btn-primary" : " btn-ghost"}`} aria-pressed={scope === "hub"} onClick={() => setScope("hub")}>{t("usage.scope.hub")}</button>
+          </div>
+        </div>
+      )}
 
       {state.showSkeleton && !data ? (
         <DataSurfaceSkeleton label={t("usage.loading")} rows={5} />
       ) : state.kind === "failed-cold" ? (
         <Notice tone="err">
-          {state.error instanceof Error ? `${t("usage.loadError")} ${state.error.message}` : t("usage.loadError")}{" "}
+          {state.error instanceof UsageWindowMismatchError
+            ? `${t("usage.loadError")} ${t("dash.codexRestartMalformed")}`
+            : connected ? t("usage.hubOffline") : state.error instanceof Error ? `${t("usage.loadError")} ${state.error.message}` : t("usage.loadError")}{" "}
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => resource.refresh()}>
             {t("common.retry")}
           </button>
         </Notice>
       ) : (
         <>
-          {state.showError && <Notice tone="err">{t("usage.loadError")}</Notice>}
+          {state.showError && <Notice tone="err">{t(connected ? "usage.hubOffline" : "usage.loadError")}</Notice>}
+          <UsageIncompleteNotice data={data} />
           {data?.historyTruncated && (
             // Naming the loaded window is the point: without it, `30d` and "Available history"
             // look identical on a busy installation even though both may cover far less than
@@ -848,7 +1187,7 @@ export default function Usage({ apiBase }: { apiBase: string }) {
             modelQuery={modelQuery}
             onModelQuery={setModelQuery}
             sortedProviders={sortedProviders}
-            range={range}
+            range={customWindow ? null : range}
             locale={locale}
             t={t}
           />

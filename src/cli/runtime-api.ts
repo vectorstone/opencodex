@@ -9,7 +9,7 @@
  * - 다른 대안 대신 이 방식을 선택한 이유: GUI/CLI의 검증 규칙이 갈라지지 않고 fallback port도 안전하게 찾는다.
  * - 장점, 단점 및 영향: 동작 일관성이 높아지는 대신 live 관리 명령은 실행 중인 proxy가 필요하다.
  */
-import { findLiveProxy, probeHostname } from "../server/proxy-liveness";
+import { findLiveProxy, probeHostname, type LivenessIo, type LiveProxy } from "../server/proxy-liveness";
 import { runningProxyUpdateHeaders } from "../oauth/login-cli";
 
 export type CliStdin = NodeJS.ReadableStream & { isTTY?: boolean; readableEnded?: boolean };
@@ -20,6 +20,8 @@ export interface RuntimeApiDeps {
   /** Test injection for commands that read a secret from stdin instead of argv. */
   stdinImpl?: CliStdin;
   stdinTimeoutMs?: number;
+  /** Optional proxy liveness probe injection for commands that check or fall back around live runtime state. */
+  findLiveProxy?: (io?: LivenessIo) => Promise<LiveProxy | null>;
 }
 
 export class CliUsageError extends Error {
@@ -40,22 +42,93 @@ export class RuntimeApiError extends Error {
   }
 }
 
+/**
+ * Refusal for a management request that resolved to a connected-client machine listener.
+ *
+ * A connected client runs `src/client/machine-listener.ts`, which binds the SAME address the
+ * standalone proxy would (`port ?? config.port ?? 10100`) and answers `/healthz` as opencodex.
+ * Liveness therefore finds it — correctly, it is our process — but it serves only
+ * `/api/machine/*` and returns a JSON 404 for every other `/api/*` path. Before this refusal
+ * every management-backed subcommand on such a machine died on that opaque 404:
+ * `{"error":"not_found","method":"PUT","path":"/api/custom-models/<id>"}`, one character away
+ * from the real handler's unknown-id `{"error":"not found"}` and indistinguishable from it
+ * (#4662). The role was already on the wire; only the parser was throwing it away.
+ *
+ * 503 rather than 404: the management plane is unavailable here, the resource is not missing,
+ * and `runCliAction` maps 404 to exit 4 ("no such thing") — the wrong answer to give a script.
+ */
+function clientRoleManagementRefusal(port: number): string {
+  return [
+    `The opencodex listener on port ${port} is running in the client role. It serves only the machine routes (/api/machine/*), so this machine has no management API to call.`,
+    "Custom-model edits and other management changes are made on the hub this machine is connected to: run the command there, or use the hub dashboard (the dashboard on this machine relays to it when the connection uses the relay transport).",
+    "To change this machine's own configuration instead: edit customModels in config.json, then run: ocx sync",
+  ].join("\n");
+}
+
 export async function runtimeBaseUrl(deps: RuntimeApiDeps = {}): Promise<string> {
   if (deps.baseUrl) return deps.baseUrl.replace(/\/$/, "");
-  const live = await findLiveProxy();
+  const live = await (deps.findLiveProxy ?? findLiveProxy)();
   if (!live) throw new RuntimeApiError("Proxy is not running. Start it with: ocx start", 503, null);
+  // The role comes from the same identity-checked /healthz body liveness already parsed, so
+  // this costs no extra request. Only the client role is refused: an absent role is a
+  // standalone or hub proxy (or a legacy body that predates the field), and both serve /api/*.
+  if (live.role === "client") {
+    throw new RuntimeApiError(clientRoleManagementRefusal(live.port), 503, null);
+  }
   return `http://${probeHostname(live.hostname)}:${live.port}`;
 }
 
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * Compose the operator-facing message from a management error body.
+ *
+ * The server states WHY a request was refused under `reason` and WHAT TO DO under
+ * `hint` (see management-auth.ts, which sets both on a 503 when the management plane
+ * is unavailable). Both were dropped here, so a fenced management plane was
+ * indistinguishable from a generic failure and an operator had no way to tell a port
+ * collision from an ACL refusal from a stopped proxy (#2698).
+ *
+ * A 404 body that carries both `method` and `path` is a different statement again: some
+ * opencodex listener answered, and it does not route that request at all. Only the
+ * connected-client machine listener emits that shape today (`json404` in
+ * src/client/machine-listener.ts), and printing its bare `not_found` token read as though the
+ * resource were missing — a real handler's unknown-id 404 says `not found`, one space apart
+ * (#4662). Name the route instead, so any listener that does not serve a path stays legible
+ * even if another one starts answering this way.
+ */
 function responseMessage(body: unknown, status: number): string {
-  if (body && typeof body === "object") {
-    const record = body as Record<string, unknown>;
-    for (const key of ["error", "message", "detail"]) {
-      if (typeof record[key] === "string" && record[key]) return record[key];
+  if (typeof body === "string" && body.trim()) return body.trim().slice(0, 400);
+  if (!body || typeof body !== "object") return `Management request failed (${status})`;
+  const record = body as Record<string, unknown>;
+  if (status === 404) {
+    const method = stringField(record, "method");
+    const path = stringField(record, "path");
+    if (method && path) {
+      return `This opencodex listener does not serve ${method.slice(0, 16)} ${path.slice(0, 200)}, so the request was refused before any handler ran (it is not a missing record). Check that the command is pointed at a proxy that serves the management API.`;
     }
   }
-  if (typeof body === "string" && body.trim()) return body.trim().slice(0, 400);
-  return `Management request failed (${status})`;
+  let primary: string | undefined;
+  for (const key of ["error", "message", "detail"]) {
+    primary = stringField(record, key);
+    if (primary) break;
+  }
+  const parts = [primary ?? `Management request failed (${status})`];
+  const reason = stringField(record, "reason");
+  // A body of {ok:false, reason:"…"} with no `error` key used to degrade to the
+  // generic line, discarding the only actionable field.
+  if (reason && reason !== primary) parts.push(`reason: ${reason}`);
+  const hint = stringField(record, "hint");
+  if (hint && hint !== primary) parts.push(`hint: ${hint}`);
+  const snapshotPath = stringField(record, "snapshotPath");
+  const recovery = [
+    ...(snapshotPath ? [`Backup: ${snapshotPath.slice(0, 32768)}`] : []),
+    ...(record.residual === true ? ["Automatic recovery did not finish; check the client configuration before retrying."] : []),
+  ];
+  return [parts.join("\n").slice(0, 1200), ...recovery].join("\n");
 }
 
 export async function runtimeRequest<T = unknown>(
@@ -89,6 +162,28 @@ export async function runtimeRequest<T = unknown>(
 
 export function takeFlag(args: string[], flag: string): boolean {
   const index = args.indexOf(flag);
+  if (index === -1) return false;
+  args.splice(index, 1);
+  return true;
+}
+
+/** Unicode dashes that copy-paste and IME input substitute for ASCII `-`. */
+const DASH_CLASS = /[\u2010-\u2015\u2212]/g;
+
+/**
+ * True for `--json`, `--json=true`, `-json`, and Unicode-dash spellings.
+ * Matching only the exact token `--json` is the same defect logout had: each
+ * spelling that slips through is a silent success (or, for doctor, prose on
+ * stdout after the caller asked for JSON).
+ */
+export function isJsonOption(arg: string): boolean {
+  const body = arg.replace(DASH_CLASS, "-").replace(/^-+/, "");
+  return body === "json" || body.startsWith("json=");
+}
+
+/** Remove one JSON-request spelling from `args`. Returns whether one was present. */
+export function takeJsonFlag(args: string[]): boolean {
+  const index = args.findIndex(isJsonOption);
   if (index === -1) return false;
   args.splice(index, 1);
   return true;
@@ -138,7 +233,16 @@ export function csv(value: string | undefined): string[] | undefined {
  * `--code=https://…?code=SECRET` that writes the authorization code to stderr,
  * which is the exact exposure the stdin path exists to avoid.
  */
-const SECRET_OPTIONS = ["--code", "--headers"];
+const SECRET_OPTIONS = [
+  "--code",
+  "--headers",
+  "--token",
+  "--admin-token",
+  "--pairing-code",
+  "--credential-env",
+  "--admin-token-env",
+  "--pairing-code-env",
+];
 
 /**
  * Replace credential values before they are reported back.
@@ -288,6 +392,31 @@ export async function readSecretLine(deps: RuntimeApiDeps, label: string): Promi
 export function printData(value: unknown, wantsJson: boolean, lines?: string[]): void {
   if (wantsJson || !lines) console.log(JSON.stringify(value, null, 2));
   else for (const line of lines) console.log(line);
+}
+
+/**
+ * Render untrusted diagnostic text without letting it control the operator's terminal. Catalog
+ * values are hub-supplied and surface on more than one CLI path -- first-time `ocx connect` and the
+ * connected `ocx sync` refresh both print them -- so the escaping sits beside `printData`, at the
+ * one boundary that already separates human output from structured output. Structured output keeps
+ * the exact value: escaping is a rendering decision for a tty, not a change to the data.
+ */
+export function terminalSafeText(value: string): string {
+  return value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, character => {
+    const code = character.charCodeAt(0);
+    return code <= 0x7f
+      ? `\\x${code.toString(16).padStart(2, "0")}`
+      : `\\u${code.toString(16).padStart(4, "0")}`;
+  });
+}
+
+/**
+ * The same rendering for a failure about to be printed or rethrown. The original is kept as
+ * `cause` rather than discarded, so a caller that inspects the domain error still reads the exact
+ * message and fields it threw.
+ */
+export function terminalSafeError(error: unknown): Error {
+  return new Error(terminalSafeText(error instanceof Error ? error.message : String(error)), { cause: error });
 }
 
 /** Compact human view for safe management DTOs; JSON remains available for complete fidelity. */

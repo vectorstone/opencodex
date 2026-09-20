@@ -23,6 +23,16 @@ test("a provider with no native rows is not a native group", () => {
   expect(groups[0]!.nativeProviderGroup).toBe(false);
 });
 
+test("the native provider group carries the additive entitlement diagnostic", () => {
+  const entitlement = { status: "failed", reason: "timeout" } as const;
+  const groups = buildProviderModelGroups(
+    [nativeRow("gpt-5.6-sol")],
+    [{ name: "openai", entitlement }],
+  );
+
+  expect(groups[0]!.entitlement).toEqual(entitlement);
+});
+
 test("the native card keeps sorting first once a custom row joins it", () => {
   const groups = buildProviderModelGroups(
     [{ provider: "anthropic", id: "opus", native: false }, nativeRow("gpt-5.6-sol"), customRow("gpt-5.4")],
@@ -53,19 +63,18 @@ test("fmtK renders past a million as M, not as four-digit k", () => {
   expect(fmtK(350_000)).toBe("350k");
 });
 
-test("the native group keeps its window readable with the cap switched off", async () => {
+test("every provider keeps its window readable with the cap switched off", async () => {
   const src = await Bun.file(new URL("../src/pages/Models.tsx", import.meta.url)).text();
-  // Routed providers hide the value when the cap is off (off = "no opinion"), but a native
-  // row always advertises some window, so the number stays on screen for that group.
-  expect(src).toContain("{(capOn || nativeProviderGroup) && (");
-  // With the cap off the stored value is only what a future toggle would apply — the 350k
-  // default — so the display falls back to the widest window the rows actually advertise.
-  // Matched as separate fragments because the expression is wrapped across lines now, and
-  // it grew a native branch: with the cap off the native group shows its default window
-  // rather than the widest advertised row. A single-line literal pinned the formatting
-  // instead of the behaviour and broke on the reflow that introduced that branch.
-  expect(src).toContain("const capDisplayValue = capOn");
-  expect(src).toContain("nativeProviderGroup ? NATIVE_GPT56_DEFAULT_WINDOW : (widestRowWindow ?? providerCap)");
+  // This used to be the native group ALONE: routed providers hid the value when the cap
+  // was off, and only a native row kept its number on screen. That asymmetry is the defect
+  // the user reported — openai showed 1.05M while anthropic showed nothing, so the two
+  // cards started their control rows at different left edges. The guard is gone and the
+  // slot is occupied on every card (040_cap_cluster_and_occupied_slot.md), which makes the
+  // property this test protects strictly wider than it was.
+  expect(src).not.toContain("{(capOn || nativeProviderGroup) && (");
+  // The disabled select previews the persisted choice or global default used by enable.
+  expect(src).toContain("contextCaps[provider] ?? contextCapValues[provider] ?? contextCapValue");
+  expect(src).not.toContain("value: NATIVE_GPT56_OPT_IN_WINDOW");
   // The select is inert until the cap is actually on: showing a number is not the same as
   // offering to change one.
   expect(src).toContain("disabled={busy || !capOn}");
@@ -83,4 +92,10 @@ test("the native group exposes the context modal alongside the custom-model and 
   expect(src).toContain("{nativeProviderGroup && <p");
   // The custom-add and cap controls no longer sit behind an isNative guard.
   expect(src).not.toMatch(/\{!isNative && </);
+});
+
+test("the canonical OpenAI card keeps its identity when every visible row is custom", () => {
+  const groups = buildProviderModelGroups([customRow("gpt-5.5")], [{name:"openai",authMode:"forward"}]);
+  expect(groups[0]!.nativeProviderGroup).toBe(true);
+  expect(groups[0]!.native).toBe(false);
 });

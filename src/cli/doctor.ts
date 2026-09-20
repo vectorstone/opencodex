@@ -10,11 +10,15 @@
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { getConfigDir, getConfigPath, readConfigDiagnostics, readPid, resolveEnvValue } from "../config";
-import { findLiveProxy, type LiveProxy } from "../server/proxy-liveness";
+import { getConfigDir, getConfigPath, readConfigDiagnostics } from "../config";
+import { readPid } from "../config/process-state";
+import { probeUncleanExitState } from "./status";
+import { findLiveProxy, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import { BUN_RUNTIME_SOURCES } from "../lib/bun-runtime";
 import type { BunRuntimeSource } from "../lib/bun-runtime";
 import { maskAccountId } from "../lib/privacy";
+import { tokenCollidesWithAdmin } from "../lib/admin-secrets";
+import { readInstalledServiceToken } from "../lib/service-secrets";
 import { PROXY_ENV_KEYS, proxyEnvPresent } from "../lib/proxy-env";
 import { LOCAL_MANAGEMENT_READ_PATHS } from "../lib/local-management-capability";
 import { readCodexTokens } from "../codex/auth-collision";
@@ -22,9 +26,19 @@ import { withNativeMainSharedClaim } from "../codex/native-main-claim";
 import { probeNativeProfileRecoveryState, resolveNativeProfileContext } from "../codex/native-profile-store";
 import { NativeProfileError } from "../codex/native-profile-types";
 import { collectOrcaCodexHomeDiagnostic, resolveCodexHomeDir as resolveCodexHomeDirImpl, isWslRuntime, listWslWindowsCodexHomes, wslAutomountRoot, type CodexHomeDeps } from "../codex/home";
-import { scanCodexAgentRolesWithTomlModelFallback } from "../codex/subagent-model-fallback";
-import { findCodexOnPath, isWindowsInteropDir } from "../codex/shim";
+import {
+  scanCodexAgentRolesWithTomlModelFallback,
+  scanOpencodexDerivedCodexAgentRolesWithoutModelPin,
+} from "../codex/subagent-model-fallback";
+import { readCatalog, readCodexCatalogPath, readConfiguredDefaultModel } from "../codex/catalog/parsing";
+import { diagnoseCodexShim, findCodexOnPath, isWindowsInteropDir, type CodexShimDiagnostic } from "../codex/shim";
+import { providerTableString, rootTomlString } from "../codex/injected-marker";
 import { countPendingOpencodexHistory } from "../codex/history-provider";
+import {
+  inspectCodexCoordinator,
+  recoverZeroByteCodexCoordinator,
+  type CodexCoordinatorDiagnostic,
+} from "../codex/coordinator-doctor";
 import {
   inspectAbandonedResponseStateTemps,
   reclaimAbandonedResponseStateTemps,
@@ -35,10 +49,19 @@ import {
   probeCodexCoordinatorNamespace,
   resolveEffectiveUserIdentity,
 } from "../codex/user-identity";
+import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers-destination";
+import type { OcxProviderConfig } from "../types/provider";
+import { routedProviderConfig } from "../router";
 import { collectProjectCodexConfigWarnings, formatProjectCodexConfigWarningsForDoctor } from "../codex/project-config-warnings";
-import { collectStartupHealth, startupHealthSummary } from "../codex/autostart-health";
+import {
+  collectLegacyCodexConfigKeyDiagnostics,
+  formatLegacyCodexConfigKeyDiagnosticsForDoctor,
+} from "../codex/legacy-config-keys";
+import { collectStartupHealth, formatStartupRoutingDetail, startupHealthSummary } from "../codex/autostart-health";
 import {
   displayCodexRuntimePath,
+  effortClampAppliesToRuntime,
+  liveRemovedEfforts,
   loadLastEffortClamp,
   persistCodexRuntime,
   resolveAndPersistCodexRuntime,
@@ -52,7 +75,35 @@ import {
 } from "../server/local-management-read-client";
 export { resolveCodexHomeDir } from "../codex/home";
 
-export type OAuthDoctorCheck = { level: "OK" | "WARN"; message: string };
+/**
+ * `FAIL` exists for a condition that makes the surface unusable rather than degraded.
+ * A review of the #2696 work pointed out that reporting a fully fenced management plane
+ * — every `/api/*` returning 503 — at the same level as a directory-permission note
+ * misleads the reader about severity.
+ *
+ * Doctor's own exit code still belongs to the uniform contract in wp3b (devlog 025);
+ * this type only fixes what the operator is told.
+ */
+export type OAuthDoctorCheck = { level: "OK" | "WARN" | "FAIL"; message: string };
+
+/**
+ * Whether any FAIL-level condition was seen during this `runDoctor` pass.
+ *
+ * Module-scoped and reset at the top of `runDoctor` rather than threaded through, because
+ * `runDoctor` reports by direct `console.log` across a dozen sections and has no checks
+ * collection to inspect. Reset matters for the test suite, which calls `runDoctor` several
+ * times in one process; a sticky flag would make the second call fail because the first did.
+ */
+let doctorSawFailure = false;
+
+function recordDoctorFailure(): void {
+  doctorSawFailure = true;
+}
+
+/** True when the last `runDoctor` pass saw a FAIL-level condition. */
+export function doctorFailed(): boolean {
+  return doctorSawFailure;
+}
 
 function pathIsWritable(path: string): boolean {
   try {
@@ -132,6 +183,50 @@ function describeDoctorHealth(entry: OAuthHealthEntry): string {
 }
 
 /**
+ * Detect the management/data-plane credential collision behind #2696.
+ *
+ * The service exports the service token file as `OPENCODEX_API_AUTH_TOKEN` before
+ * starting the proxy. When that value is the admin token, the server treats the
+ * management credential as a data-plane admission secret and fences the ENTIRE
+ * management plane closed at boot: every `/api/*` returns 503, including on a loopback
+ * install that never needed a data-plane secret.
+ *
+ * `assertNotAdminToken` in src/service.ts now refuses to create this state, but an
+ * install made before that guard existed is already broken on disk, and the symptom
+ * (every management command failing) points nowhere. This is the check that names it.
+ *
+ * Observe-only, like the rest of doctor: it compares shapes and never prints, logs, or
+ * returns a credential value.
+ */
+export function dataPlaneCredentialCollisionCheck(
+  env: NodeJS.ProcessEnv = process.env,
+  installedServiceToken: string | null = readInstalledServiceToken(),
+): OAuthDoctorCheck {
+  const dataPlane = env.OPENCODEX_API_AUTH_TOKEN?.trim() || installedServiceToken?.trim() || "";
+  if (!dataPlane) {
+    return { level: "OK", message: "No data-plane token is set, so it cannot collide with the management token." };
+  }
+  // Same comparison as assertNotAdminToken: minted prefix or configuredAdminToken
+  // (env or admin-api-token file). The file token is the one the service wrapper
+  // actually exports; inspecting only the doctor process env reported OK on every
+  // already-broken install (#2696).
+  if (!tokenCollidesWithAdmin(dataPlane, env)) {
+    return { level: "OK", message: "Data-plane and management credentials are distinct." };
+  }
+  return {
+    // Not a degradation: while this holds, every /api/* returns 503 and no ocx
+    // management command can work at all.
+    level: "FAIL",
+    message:
+      "The data-plane secret (OPENCODEX_API_AUTH_TOKEN or the service token file) holds the "
+      + "management (admin) token, so the proxy fences the whole management API closed and "
+      + "every ocx management command fails with 503. "
+      + "Action: unset OPENCODEX_API_AUTH_TOKEN, replace the service token file with a distinct "
+      + "data-plane key, then re-run `ocx service install` and restart the proxy",
+  };
+}
+
+/**
  * OAuth reliability checks for `ocx doctor`. Observe-only: never mutates
  * credentials, locks, or networking. Every WARN includes a recovery Action.
  */
@@ -140,6 +235,8 @@ export async function collectOAuthDoctorChecks(
   deps: Parameters<typeof collectOAuthHealthEntriesForCli>[1] = {},
 ): Promise<OAuthDoctorCheck[]> {
   const checks: OAuthDoctorCheck[] = [];
+
+  checks.push(dataPlaneCredentialCollisionCheck());
 
   if (isOAuthCredentialStorageWritable()) {
     checks.push({ level: "OK", message: "OAuth credential storage directory is writable for atomic auth.json updates." });
@@ -321,6 +418,10 @@ export function collectWslDualInstall(deps: WslDualInstallDeps = {}): WslDualIns
 export type ProxyEnvRow = { key: string; present: boolean };
 export type EnvMap = Record<string, string | undefined>;
 
+function ownEnvValue(env: EnvMap, name: string): string | undefined {
+  return Object.hasOwn(env, name) ? env[name] : undefined;
+}
+
 /** Report only presence/absence of proxy env vars - never the value (it may
  * embed credentials). Checks both upper- and lower-case forms. */
 export function collectProxyEnv(env: EnvMap = process.env): ProxyEnvRow[] {
@@ -356,11 +457,6 @@ export function collectProviderApiKeyDiagnostics(
   providers: Record<string, { authMode?: string; apiKey?: string }> = readConfigDiagnostics().config.providers ?? {},
   env: EnvMap = process.env,
 ): ProviderApiKeyDiagnostic[] {
-  const resolveInEnv = (value: string): string | undefined => {
-    const name = envReferenceName(value);
-    if (!name) return value;
-    return env[name];
-  };
   const rows: ProviderApiKeyDiagnostic[] = [];
   for (const [provider, config] of Object.entries(providers)) {
     if (config.authMode !== "key") continue;
@@ -368,7 +464,7 @@ export function collectProviderApiKeyDiagnostics(
     if (!raw) continue;
     const envName = envReferenceName(raw);
     if (!envName) continue;
-    const resolved = resolveInEnv(raw);
+    const resolved = ownEnvValue(env, envName);
     if (resolved?.trim()) continue;
     rows.push({
       provider,
@@ -377,6 +473,33 @@ export function collectProviderApiKeyDiagnostics(
     });
   }
   return rows;
+}
+
+export type CodexEnvKeyReadinessDiagnostic = {
+  envName: string;
+  shimState: "missing" | "unhealthy";
+  detail: string;
+  action: string;
+};
+
+/** Warn when routed Codex cannot obtain its configured admission token at launch. */
+export function collectCodexEnvKeyReadiness(
+  configText: string | null,
+  env: EnvMap,
+  shim: CodexShimDiagnostic,
+  serviceTokenPresent: boolean,
+): CodexEnvKeyReadinessDiagnostic | null {
+  if (!configText || rootTomlString(configText, "model_provider") !== "opencodex") return null;
+  const envName = providerTableString(configText, "opencodex", "env_key")?.trim();
+  const envValue = envName ? ownEnvValue(env, envName) : undefined;
+  if (!envName || envValue?.trim() || shim.healthy || !serviceTokenPresent) return null;
+  const shimState = shim.installed ? "unhealthy" : "missing";
+  return {
+    envName,
+    shimState,
+    detail: `Codex uses env_key ${envName}, but that variable is unset and the OpenCodex shim is ${shimState}; the service token file exists but plain Codex does not load it`,
+    action: `Run 'ocx codex-shim install' to repair launch-time token injection, or export ${envName} in the process that starts Codex`,
+  };
 }
 
 export function collectConfiguredProxy(): ConfiguredProxyDiagnostic {
@@ -402,7 +525,9 @@ export function collectConfiguredProxy(): ConfiguredProxyDiagnostic {
   }
 
   const envName = envReferenceName(rawProxy);
-  const resolved = resolveEnvValue(rawProxy);
+  const resolved = rawProxy.startsWith("$")
+    ? ownEnvValue(process.env, envName ?? rawProxy.slice(1))
+    : rawProxy;
   if (resolved?.trim()) {
     return {
       key: "config.proxy",
@@ -423,7 +548,7 @@ export function collectConfiguredProxy(): ConfiguredProxyDiagnostic {
 }
 
 export function parseProcessEnvBlock(content: string): EnvMap {
-  const env: EnvMap = {};
+  const env: EnvMap = Object.create(null);
   for (const entry of content.split("\0")) {
     if (!entry) continue;
     const separator = entry.indexOf("=");
@@ -684,6 +809,7 @@ export async function fetchServiceMemory(
 const mb = (bytes: number): string => `${Math.round(bytes / (1024 * 1024))}MB`;
 
 export const RECLAIM_RESPONSE_TEMPS_FLAG = "--reclaim-response-temps";
+export const RECOVER_ZERO_BYTE_COORDINATOR_FLAG = "--recover-zero-byte-coordinator";
 /** Matches the dry run's entry bound so report and reclaim agree on a large backlog. */
 const RESPONSE_TEMP_RECLAIM_MAX_CLEANUPS = 4_096;
 /** Names the subsystem: other components mint temps with the same shape and are not covered. */
@@ -732,6 +858,60 @@ export function formatResponseTempLines(
   // operator size the problem from a truncated count.
   if (result.truncated) lines.push("      Scan stopped at its entry budget; the real total is higher.");
   return lines;
+}
+
+export function formatCoordinatorDoctorLines(diagnostic: CodexCoordinatorDiagnostic): string[] {
+  const pathLine = diagnostic.path ? [`       path: ${diagnostic.path}`] : [];
+  const evidenceLines = "evidence" in diagnostic && diagnostic.evidence
+    ? [
+      `       size: ${diagnostic.evidence.sizeBytes} bytes; user_version: ${diagnostic.evidence.schemaVersion}`,
+      `       tables: ${diagnostic.evidence.tables.length === 0 ? "none" : diagnostic.evidence.tables.join(", ")}`,
+      `       transition rows: ${diagnostic.evidence.transitionRows ?? "not inspected"}; singleton=1 rows: ${diagnostic.evidence.singletonRows ?? "not inspected"}`,
+    ]
+    : [];
+  switch (diagnostic.kind) {
+    case "absent":
+      return ["  ok     native-write coordinator not created yet", ...pathLine];
+    case "ready":
+      return ["  ok     native-write coordinator has an authoritative transition row", ...pathLine, ...evidenceLines];
+    case "zero-byte":
+      return [
+        "  !!     native-write coordinator is a zero-byte remnant and has no authority",
+        ...pathLine,
+        ...evidenceLines,
+        `       Action: stop the OpenCodex proxy/service, then run ocx doctor ${RECOVER_ZERO_BYTE_COORDINATOR_FLAG} --yes`,
+      ];
+    case "unversioned-empty":
+      return [
+        "  !!     native-write coordinator is a non-empty unversioned database; automatic recovery is refused",
+        ...pathLine,
+        ...evidenceLines,
+      ];
+    case "rowless":
+      return [
+        "  !!     native-write coordinator has schema version 1 but no authoritative row; automatic recovery is refused",
+        ...pathLine,
+        ...evidenceLines,
+      ];
+    case "unversioned-nonempty":
+      return [
+        "  !!     native-write coordinator is unversioned and contains unknown tables; automatic recovery is refused",
+        ...pathLine,
+        ...evidenceLines,
+      ];
+    case "unsupported":
+      return [
+        `  !!     native-write coordinator schema version ${diagnostic.version} is unsupported; automatic recovery is refused`,
+        ...pathLine,
+        ...evidenceLines,
+      ];
+    case "changed":
+      return ["  --     native-write coordinator changed during diagnosis; re-run ocx doctor", ...pathLine];
+    case "unsafe":
+      return [`  !!     native-write coordinator path is unsafe: ${diagnostic.reason}`, ...pathLine];
+    case "unreadable":
+      return [`  !!     native-write coordinator is unreadable: ${diagnostic.reason}`, ...pathLine, ...evidenceLines];
+  }
 }
 
 /** Render the doctor "Memory / runtime" section lines (testable without console capture). */
@@ -806,6 +986,11 @@ export function proxyDownRestartHint(input: {
   /** Absent means "unknown"; the hint then keeps its pre-repair wording. */
   serviceInstalled?: boolean;
   serviceConflict?: boolean;
+  /**
+   * Persisted owner records outlived their process (#1419). Cause-neutral: what is on
+   * disk proves an unclean exit, not which signal caused it.
+   */
+  staleProcessState?: boolean;
 }): string | null {
   if (input.proxyRunning) return null;
   // `serviceViable` alone conflates "no service at all" with "registered but stale or
@@ -818,7 +1003,200 @@ export function proxyDownRestartHint(input: {
     : installedButBroken
       ? "Restart it with 'ocx start', or refresh the installed service: 'ocx service repair'."
       : "Restart it with 'ocx start', or install the persistent service: 'ocx service install'.";
-  return `The ocx proxy is not running. Codex/Claude clients pinned to 127.0.0.1:${input.port} fail with errors like "error sending request for url (http://127.0.0.1:${input.port}/v1/responses)". ${restart}`;
+  const uncleanExit = input.staleProcessState === true
+    ? "Stale process records remain, so the previous run may have exited unexpectedly. "
+    : "";
+  return `The ocx proxy is not running. ${uncleanExit}Codex/Claude clients pinned to 127.0.0.1:${input.port} fail with errors like "error sending request for url (http://127.0.0.1:${input.port}/v1/responses)". ${restart}`;
+}
+
+/** Explain the expected channel and latency trade-off for native ChatGPT routing. */
+export function chatgptPublicEndpointHint(
+  providers: Record<string, unknown> | undefined,
+): string | null {
+  const openai = providers?.openai;
+  if (!openai || typeof openai !== "object") {
+    return null;
+  }
+  // A disabled row never routes, so it must not be described as the route in use.
+  const configured = openai as OcxProviderConfig;
+  if (configured.disabled === true) {
+    return null;
+  }
+  // Classify the destination the router resolves, not the raw config text. Two things follow
+  // from the registry entry for the built-in `openai` id: a row that omits `authMode` still
+  // forwards, and a row carrying some other `baseUrl` has it discarded in favour of the
+  // canonical ChatGPT endpoint. Both keep using the public endpoint, so both want this hint;
+  // reading the raw row would have suppressed the first and misjudged the second.
+  //
+  // `routedProviderConfig` throws for an unresolved URL only when the registry entry allows a
+  // baseUrl override, which this entry does not, so no input reaches that path today. The guard
+  // is here because doctor is read-only diagnostics: a later registry change must not turn a
+  // diagnostic into a crash.
+  let routed: OcxProviderConfig;
+  try {
+    routed = routedProviderConfig("openai", configured);
+  } catch {
+    return null;
+  }
+  if (!isCanonicalOpenAiForwardProvider(routed)) {
+    return null;
+  }
+  return "ChatGPT-family requests use the public ChatGPT endpoint through this proxy, in both Pool and Direct modes. Eligible streaming turns dial the ChatGPT websocket transport (the same responses_websockets lane Codex CLI defaults to) and fall back to SSE over HTTP when a turn is not eligible - an unsupported Bun runtime, an oversized create frame, or a proxy route that cannot carry the socket - and local provider pacing can hold a request before it is dispatched at all. This hint classifies configuration only and measures nothing, so upstream queueing is one possible contributor to a slow first output: compare actual transport, pacing, network, and provider observations before concluding. service_tier=priority is a request preference: this backend can echo service_tier \"default\" even on turns it scheduled as priority (#2558), so the echoed response tier in request logs stays an observation with confirmation \"assumed\" and cannot confirm or deny the granted tier.";
+}
+
+/**
+ * Bound for the doctor-side `/v1/models` read (#4646). A diagnostic must not hang on a proxy
+ * that is listening but wedged mid-gather; when the read does not land in time the on-disk
+ * catalog answers instead, and if that is unreadable too the verdict is "could not determine"
+ * rather than a guess.
+ */
+const EXPOSED_MODELS_TIMEOUT_MS = 8000;
+
+/**
+ * Whether Codex's pinned default model is one this proxy exposes (#4646).
+ *
+ * Three states, not two. Reporting "not exposed" when the exposed set could not be read would
+ * be a fabricated failure on exactly the installs least able to check it (proxy down, catalog
+ * never synced), so an unreadable set is its own verdict.
+ */
+export type DefaultModelExposureStatus = "not_configured" | "exposed" | "not_exposed" | "undeterminable";
+
+export interface DefaultModelExposure {
+  status: DefaultModelExposureStatus;
+  /** The configured pin, or null when Codex's config.toml has no root `model`. */
+  model: string | null;
+  /** Which surface answered; null when neither could be read. */
+  source: "proxy" | "catalog" | null;
+  detail: string;
+  action?: string;
+}
+
+/** Exactly the catalog's own `RawEntry` shape, so an on-disk row needs no conversion. */
+type CatalogVisibilityRow = Record<string, unknown>;
+
+export interface DefaultModelExposureDeps {
+  readConfiguredModelFn?: () => string | null;
+  /** The live proxy doctor already resolved, or null/absent when none is running. */
+  live?: LiveProxy | null;
+  fetchFn?: typeof fetch;
+  readCatalogModelsFn?: () => readonly CatalogVisibilityRow[] | null;
+}
+
+/**
+ * Ids the running proxy advertises, or null when the read did not produce a usable answer.
+ *
+ * Null is deliberately indistinguishable across transport failure, a non-200, and a malformed
+ * body, because every one of them means the same thing to the caller: this surface did not
+ * answer, ask the next one. The 401 case is real rather than theoretical — `/v1/models` requires
+ * data-plane admission on a non-loopback bind (`isApiAuthRequired`), and doctor deliberately
+ * holds no data-plane key, so a remote-bound proxy always falls through to the catalog.
+ */
+async function fetchExposedModelIds(live: LiveProxy, fetchFn: typeof fetch): Promise<Set<string> | null> {
+  try {
+    const res = await fetchFn(`http://${probeHostname(live.hostname)}:${live.port}/v1/models`, {
+      signal: AbortSignal.timeout(EXPOSED_MODELS_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const body = await res.json() as { data?: unknown };
+    if (!Array.isArray(body?.data)) return null;
+    const ids = new Set<string>();
+    for (const row of body.data) {
+      const id = (row as { id?: unknown } | null)?.id;
+      if (typeof id === "string" && id.length > 0) ids.add(id);
+    }
+    return ids;
+  } catch {
+    return null;
+  }
+}
+
+/** Picker-visible catalog slugs, or null when the catalog is absent or unparseable. */
+function catalogExposedModelIds(rows: readonly CatalogVisibilityRow[] | null): Set<string> | null {
+  if (rows === null) return null;
+  const ids = new Set<string>();
+  for (const row of rows) {
+    // `visibility: "hide"` rows are retained on purpose (see the native-toggle contract in
+    // structure/catalog.md); they are exactly the rows a pin must not resolve to.
+    if (!row || row.visibility !== "list") continue;
+    const slug = row.slug;
+    if (typeof slug === "string" && slug.length > 0) ids.add(slug);
+  }
+  return ids;
+}
+
+function defaultCatalogModels(): readonly CatalogVisibilityRow[] | null {
+  const models = readCatalog(readCodexCatalogPath())?.models;
+  return Array.isArray(models) ? models : null;
+}
+
+/**
+ * Compare Codex's root `model` pin against the models this install actually exposes (#4646).
+ *
+ * The exposed set is read, never recomputed. Reproducing the live assembly in the CLI would mean
+ * duplicating an entitlements snapshot, a provider gather and account-selector expansion, and the
+ * duplicate would drift — the same failure `formatStartupRoutingDetail` and `computeVersionSkew`
+ * were extracted to prevent. So the running proxy answers when there is one, the on-disk catalog
+ * answers otherwise, and neither is reconstructed here.
+ *
+ * Both surfaces are consulted before any negative verdict. They name a routed row through the
+ * same `<provider>/<id>` slug space, but they are built by different code at different times, so
+ * requiring both to disagree is what keeps an encoding or staleness difference from being
+ * reported to the operator as a broken pin.
+ */
+export async function collectDefaultModelExposure(
+  deps: DefaultModelExposureDeps = {},
+): Promise<DefaultModelExposure> {
+  const configured = (deps.readConfiguredModelFn ?? readConfiguredDefaultModel)();
+  const model = typeof configured === "string" ? configured.trim() : "";
+  if (!model) {
+    return {
+      status: "not_configured",
+      model: null,
+      source: null,
+      detail: "Codex config.toml pins no root `model`, so Codex picks from the exposed catalog",
+    };
+  }
+
+  const live = deps.live ?? null;
+  const proxyIds = live ? await fetchExposedModelIds(live, deps.fetchFn ?? fetch) : null;
+  const catalogIds = catalogExposedModelIds((deps.readCatalogModelsFn ?? defaultCatalogModels)());
+  if (proxyIds === null && catalogIds === null) {
+    return {
+      status: "undeterminable",
+      model,
+      source: null,
+      detail: `could not read the exposed model set, so Codex \`model = "${model}"\` was not checked`,
+      action: "Start the proxy with 'ocx start', or run 'ocx sync' to write the Codex catalog, then re-run 'ocx doctor'",
+    };
+  }
+
+  const source = proxyIds !== null ? "proxy" as const : "catalog" as const;
+  // `source` reports which surface produced the verdict, so a match names the surface that
+  // matched rather than the one we happened to read first.
+  const matched = proxyIds?.has(model) === true
+    ? "proxy" as const
+    : catalogIds?.has(model) === true ? "catalog" as const : null;
+  if (matched !== null) {
+    return {
+      status: "exposed",
+      model,
+      source: matched,
+      detail: `Codex \`model = "${model}"\` is exposed by this install`,
+    };
+  }
+  // Name only the surfaces that actually answered: claiming a check that did not happen is the
+  // same defect as claiming an exposure verdict we could not reach.
+  const checked = [
+    ...(proxyIds !== null ? ["the running proxy's /v1/models"] : []),
+    ...(catalogIds !== null ? ["the on-disk Codex catalog"] : []),
+  ].join(" and ");
+  return {
+    status: "not_exposed",
+    model,
+    source,
+    detail: `Codex \`model = "${model}"\` is NOT exposed by this install (checked ${checked}), so every new Codex session starts on a model this proxy does not serve`,
+    action: "Expose that model (enable it in the dashboard or drop it from 'disabledModels') and run 'ocx sync', or pin an exposed id as 'model' in CODEX_HOME/config.toml",
+  };
 }
 
 export async function runDoctor(args: string[] = []): Promise<void> {
@@ -846,7 +1224,37 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     return;
   }
 
+  if (args.includes(RECOVER_ZERO_BYTE_COORDINATOR_FLAG)) {
+    if (!args.includes("--yes")) {
+      console.log(`Recovery is explicit and creates a same-directory backup. Re-run: ocx doctor ${RECOVER_ZERO_BYTE_COORDINATOR_FLAG} --yes`);
+      process.exitCode = 1;
+      return;
+    }
+    const diagnostics = readConfigDiagnostics().config;
+    const live = await findLiveProxy({
+      configFn: () => ({ port: diagnostics.port, hostname: diagnostics.hostname }),
+    });
+    if (live) {
+      console.log(`Recovery refused: OpenCodex proxy pid ${live.pid} is still running. Stop the proxy/service and retry.`);
+      process.exitCode = 1;
+      return;
+    }
+    const recovered = recoverZeroByteCodexCoordinator();
+    if (!recovered.ok) {
+      console.log(`Recovery refused: ${recovered.reason}.`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`Moved the non-authoritative coordinator to ${recovered.backupPath}`);
+    console.log("Run `ocx sync` to retry Codex config injection. The backup was preserved and no Codex config/catalog file was changed by recovery.");
+    process.exitCode = 0;
+    return;
+  }
+
   console.log("opencodex doctor\n");
+  // Reset per pass: the suite drives runDoctor several times in one process, and a sticky
+  // flag would fail the second call because the first saw a problem.
+  doctorSawFailure = false;
 
   // Ordering note: the memory/runtime section renders after "Running proxy
   // process proxy env" below; helpers live above runDoctor for testability.
@@ -892,10 +1300,21 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   }
 
   const doctorConfig = readConfigDiagnostics().config;
+  const codexConfigPath = join(resolveCodexHomeDirImpl(), "config.toml");
+  const codexConfigText = (() => {
+    try { return readFileSync(codexConfigPath, "utf8"); } catch { return null; }
+  })();
+  const serviceTokenPresent = Boolean(readInstalledServiceToken()?.trim());
+  const codexEnvKeyReadiness = collectCodexEnvKeyReadiness(
+    codexConfigText,
+    process.env,
+    diagnoseCodexShim(),
+    serviceTokenPresent,
+  );
   const startup = collectStartupHealth(doctorConfig);
   console.log("\nCodex restart safety");
   console.log(`  ${startup.rebootSafe ? "ok " : "!! "} ${startupHealthSummary(startup)}`);
-  console.log(`       routing=${startup.routingKind}, service=${startup.serviceViable ? "viable" : startup.serviceInstalled ? "installed-but-unhealthy" : "absent"}, shim=${startup.shimHealthy ? "healthy" : startup.shimInstalled ? "stale" : "absent"}`);
+  console.log(`       ${formatStartupRoutingDetail(startup)}`);
 
   console.log("\nCodex runtime selection");
   {
@@ -919,9 +1338,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
       console.log("       Suggested: set CODEX_CLI_PATH to the desired binary and run ocx sync.");
       console.log("       Optional: ocx doctor --fix-codex-runtime");
     }
+    // Doctor used to warn on any non-empty `removedEfforts`, while `ocx status` asked
+    // `effortClampAppliesToRuntime` — so the two could disagree about the same file, and doctor
+    // would tell an operator to install a newer Codex while the resolved runtime was already
+    // newer than the one the diagnostic described. Both surfaces now read the same predicate.
     const lastClamp = loadLastEffortClamp();
-    if (lastClamp && lastClamp.removedEfforts.length > 0) {
-      console.log(`  !!  ${lastClamp.removedEfforts.join(" and ")} were removed during catalog sync.`);
+    if (effortClampAppliesToRuntime(lastClamp, resolved.runtime)) {
+      const live = liveRemovedEfforts(lastClamp);
+      console.log(`  !!  ${live.join(" and ")} were removed during catalog sync.`);
       console.log("       Suggested: set CODEX_CLI_PATH to a newer Codex binary and run ocx sync.");
     }
   }
@@ -931,6 +1355,20 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   const live = await findLiveProxy({
     configFn: () => ({ port: doctorConfig.port, hostname: doctorConfig.hostname }),
   });
+
+  // Mirrors `ocx status` through the same comparison rather than a second implementation:
+  // two diagnostics disagreeing about whether an install is stale is worse than one (#2701).
+  // No extra probe -- findLiveProxy already carried the version back.
+  {
+    const { packageVersion } = await import("./help");
+    const { computeVersionSkew, isConfirmedVersionMatch } = await import("./version-skew");
+    const skew = computeVersionSkew(packageVersion(), live?.version);
+    if (skew.skewed && skew.warning) {
+      console.log(`!! ${skew.warning}`);
+    } else if (isConfirmedVersionMatch(skew)) {
+      console.log(`ok ocx ${skew.cliVersion} matches the running proxy`);
+    }
+  }
 
   const currentProxyEnv = collectProxyEnv();
   const configuredProxy = collectConfiguredProxy();
@@ -954,6 +1392,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     for (const row of providerApiKeys) {
       console.log(`  !!     ${row.detail}`);
     }
+  }
+
+  console.log("\nCodex env_key launch readiness");
+  if (codexEnvKeyReadiness) {
+    console.log(`  !!     ${codexEnvKeyReadiness.detail}`);
+    console.log(`         Action: ${codexEnvKeyReadiness.action}`);
+  } else {
+    console.log("  ok     no broken OpenCodex env_key launch path detected");
   }
 
   console.log("\nRunning proxy process proxy env (presence only)");
@@ -985,10 +1431,10 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   console.log(`  ${probe.ok ? "ok " : "-- "} ${WHAM_USAGE_URL}`);
   console.log(`       ${detail}, ${probe.durationMs}ms, ${probe.authenticated ? "authenticated" : "unauthenticated"}`);
 
-  // Design B upgrade visibility: threads still tagged opencodex are invisible to the native
-  // Codex app until the one-time migration lands. Read-only probe (readonly sqlite, 100ms
-  // busy timeout) — reports state, never mutates.
-  console.log("\nCodex history migration");
+  // Design B upgrade visibility: only the backup manifest authorizes restoring provider
+  // metadata. Bare routed rows have unknown provenance and remain unchanged. This read-only
+  // probe reports manifest work and database readability; it never mutates.
+  console.log("\nCodex history metadata restore");
   // The history failure messages point here; make the visit worthwhile by
   // probing the coordinator namespace the locks live in. The probe exercises
   // identity, runtime-root, and permission checks without taking any lock or
@@ -1005,13 +1451,21 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     const reason = cause instanceof CodexUserIdentityRefusal ? cause.message : String(cause);
     console.log(`  --     history coordinator namespace refused: ${reason}`);
   }
+  console.log("\nCodex native-write coordinator");
+  for (const line of formatCoordinatorDoctorLines(inspectCodexCoordinator())) console.log(line);
   const pending = countPendingOpencodexHistory();
   if (pending.failed) {
-    console.log("  --     state DB locked or unreadable (Codex app open?) — migration state unknown");
+    if (pending.failureReason === "busy") {
+      console.log("  --     history database, backup manifest, or rollout file is busy — exact metadata restore is pending");
+    } else if (pending.failureReason === "permission") {
+      console.log("  --     state DB or backup manifest access was denied — restore state unknown");
+    } else {
+      console.log("  --     backup manifest or restore target failed integrity checks — manual review required");
+    }
   } else if (pending.pendingRows === 0 && pending.backupEntries === 0) {
-    console.log("  ok     no legacy opencodex-tagged threads pending");
+    console.log("  ok     no manifest-backed provider metadata pending; untracked routed history is unchanged");
   } else {
-    console.log(`  --     ${pending.pendingRows} thread(s) still tagged opencodex, ${pending.backupEntries} backup manifest entr${pending.backupEntries === 1 ? "y" : "ies"}`);
+    console.log(`  --     ${pending.backupEntries} backup manifest entr${pending.backupEntries === 1 ? "y" : "ies"} pending exact metadata restore`);
   }
 
   console.log("\nProject Codex configs");
@@ -1024,13 +1478,68 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     }
   }
 
+  console.log("\nCodex config compatibility");
+  const legacyKeyResult = collectLegacyCodexConfigKeyDiagnostics();
+  for (const line of formatLegacyCodexConfigKeyDiagnosticsForDoctor(legacyKeyResult)) {
+    console.log(line);
+  }
+
+  // Adjacent to the section above because both read Codex's config.toml, and an operator
+  // debugging "Codex config" wants the pinned model checked in the same place.
+  console.log("\nCodex default model exposure");
+  const defaultModelExposure = await collectDefaultModelExposure({ live });
+  if (defaultModelExposure.status === "not_exposed") {
+    console.log(`  !!     ${defaultModelExposure.detail}`);
+    console.log(`         Action: ${defaultModelExposure.action}`);
+  } else if (defaultModelExposure.status === "undeterminable") {
+    // Not `!!`: nothing is known to be wrong. The one thing this must never do is report an
+    // unread set as a broken pin.
+    console.log(`  --     ${defaultModelExposure.detail}`);
+    console.log(`         Action: ${defaultModelExposure.action}`);
+  } else {
+    console.log(`  ok     ${defaultModelExposure.detail}`);
+  }
+  // Deliberately no `recordDoctorFailure()` and no `process.exitCode` write. A pin that is not
+  // exposed is a degraded install, not an unusable one — the operator can still pick another
+  // model in the session — and the rule above reserves FAIL for an unusable surface so a warning
+  // cannot break a legitimately green pipeline.
+
   console.log("\nCodex agent role files");
-  const tomlFallbackRoles = scanCodexAgentRolesWithTomlModelFallback(resolveCodexHomeDirImpl());
-  if (tomlFallbackRoles.length === 0) {
+  let roleScanError: unknown;
+  const tomlFallbackRoles = scanCodexAgentRolesWithTomlModelFallback(
+    resolveCodexHomeDirImpl(),
+    cause => {
+      roleScanError = cause;
+    },
+  );
+  if (roleScanError) {
+    console.log(`  [WARN] unable to scan $CODEX_HOME/agents/*.toml: ${String(roleScanError)}`);
+  } else if (tomlFallbackRoles.length === 0) {
     console.log("  ok     no per-role model_fallback fields in $CODEX_HOME/agents/*.toml");
   } else {
     console.log(`  [WARN] ${tomlFallbackRoles.length} agent role file${tomlFallbackRoles.length === 1 ? "" : "s"} contain${tomlFallbackRoles.length === 1 ? "s" : ""} \`model_fallback\`: ${tomlFallbackRoles.join(", ")}`);
     console.log("        Codex >= 0.146 rejects that field as unknown and skips the whole role. Move the chains to opencodex config `subagentModelFallbackByModel` (keyed by primary model) and remove the field from the TOML files.");
+  }
+  // opencodex does not write these files; the Codex desktop external-agent import does, and it
+  // drops the model pin on the way in. Observe-only: doctor never repairs or removes them.
+  // Both role scans share the same directory listing, so a failure above already reported the
+  // cause; skip the second scan rather than warn twice or print a false "ok".
+  if (!roleScanError) {
+    const unpinnedDerivedRoles = scanOpencodexDerivedCodexAgentRolesWithoutModelPin(
+      resolveCodexHomeDirImpl(),
+      cause => {
+        roleScanError = cause;
+      },
+    );
+    if (roleScanError) {
+      console.log(`  [WARN] unable to scan $CODEX_HOME/agents/*.toml: ${String(roleScanError)}`);
+    } else if (unpinnedDerivedRoles.length === 0) {
+      console.log("  ok     every opencodex-derived role file in $CODEX_HOME/agents/*.toml pins a model");
+    } else {
+      console.log(`  [WARN] ${unpinnedDerivedRoles.length} opencodex-derived role file${unpinnedDerivedRoles.length === 1 ? "" : "s"} without a \`model\` pin: ${unpinnedDerivedRoles.map(role => `${role}.toml`).join(", ")}`);
+      console.log("        Codex runs these roles on the parent model, so a spawn records one role and another model. The `ocx-route` directive in the file cannot pin them: it is honoured only on the Claude Code `/v1/messages` path and is inert on `/v1/responses`.");
+      console.log("        Add `model = \"<id>\"` to each file, or remove them. They usually come from the Codex desktop external-agent import of ~/.claude/agents/ocx-*.md; set `[desktop] external-agent-import-sync-item-types` with `SUBAGENTS = false` to stop it recreating them.");
+    }
   }
 
   const dual = collectWslDualInstall();
@@ -1052,6 +1561,12 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   console.log("\nOAuth reliability");
   for (const check of await collectOAuthDoctorChecks()) {
     console.log(`  [${check.level}] ${check.message}`);
+    // A diagnostic that always exits 0 cannot gate anything, which defeats the point of
+    // running it from a script (#2697's sibling defect). FAIL is the level reserved for a
+    // surface that is unusable rather than degraded, so it -- and only it -- fails the
+    // command. WARN stays exit 0 on purpose: warning on a degraded-but-working install
+    // must not break a pipeline that is legitimately green.
+    if (check.level === "FAIL") recordDoctorFailure();
   }
 
   // #857: a running Codex app-server can keep an older in-memory catalog than
@@ -1059,7 +1574,7 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   const { collectCodexAppServerCatalogState } = await import("../codex/app-server-processes");
   const catalogState = collectCodexAppServerCatalogState();
   if (catalogState.state === "stale") {
-    console.log(`  [WARN] Codex app-server (PID(s): ${catalogState.processes.map(p => p.pid).join(", ")}) started before the on-disk catalog changed; its in-memory model list disagrees with ocx. Action: restart Codex (or run \`ocx sync --restart-codex\`)`);
+    console.log(`  [WARN] Codex app-server (PID(s): ${catalogState.processes.map(p => p.pid).join(", ")}) started before the on-disk catalog changed; its in-memory model list disagrees with ocx. Action: run \`ocx sync --restart-codex\`, which restarts the app-servers and the Codex desktop app`);
   } else if (catalogState.state === "unknown") {
     console.log("  [WARN] Could not verify whether the running Codex app-server's model catalog is current (start time or catalog unreadable). Action: if the model list looks stale, restart Codex");
   } else if (catalogState.state === "fresh") {
@@ -1068,16 +1583,33 @@ export async function runDoctor(args: string[] = []): Promise<void> {
 
   // Hints, not fixes.
   const hints: string[] = [];
+  const chatgptHint = chatgptPublicEndpointHint(doctorConfig.providers);
+  if (chatgptHint) hints.push(chatgptHint);
   const proxyDown = proxyDownRestartHint({
     proxyRunning: Boolean(live),
     port: live?.port ?? doctorConfig.port ?? 10100,
     serviceViable: startup.serviceViable,
     serviceInstalled: startup.serviceInstalled,
     serviceConflict: startup.serviceConflict,
+    // Threaded through the same decision helper `ocx status` uses, so the two
+    // diagnostics cannot drift. A helper-only change would satisfy a unit test while
+    // real `ocx doctor` output never mentioned the crash (#1419).
+    staleProcessState: await probeUncleanExitState({
+      live: Boolean(live),
+      port: doctorConfig.port,
+      hostname: doctorConfig.hostname,
+    }),
   });
   if (proxyDown) hints.push(proxyDown);
   for (const row of providerApiKeys) {
     hints.push(`${row.detail}. Set ${row.envName} in the shell that starts the proxy, or store a literal key in config (value hidden here).`);
+  }
+  if (codexEnvKeyReadiness) hints.push(`${codexEnvKeyReadiness.detail}. ${codexEnvKeyReadiness.action}.`);
+  // Only the negative verdict becomes a hint. "Could not determine" is usually just a proxy that
+  // is not running, which `proxyDownRestartHint` already reports; repeating it here would put a
+  // second line in the hint list for one fact.
+  if (defaultModelExposure.status === "not_exposed") {
+    hints.push(`${defaultModelExposure.detail}. ${defaultModelExposure.action}.`);
   }
   const anyDrvfs = paths.some(p => detectFsType(p.path, mounts).isDrvfs || detectFsType(p.path, mounts).isMntDrive);
   const noProxy = currentProxyEnv.every(p => !p.present) && !configuredProxy.present;
@@ -1096,8 +1628,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
       }
     }
   }
-  if (pending.failed || pending.pendingRows > 0 || pending.backupEntries > 0) {
-    hints.push("Legacy chat threads are still tagged opencodex (or the DB was locked). The running proxy retries the migration automatically; to force it now, close the Codex app and run 'ocx sync'.");
+  if (pending.failed && pending.failureReason === "busy") {
+    hints.push("Backed-up history metadata is pending or its state is unreadable. The running proxy retries exact restoration automatically; to force it now, close the Codex app and run 'ocx sync'. Untracked routed history is not relabeled.");
+  } else if (pending.failed && pending.failureReason === "permission") {
+    hints.push("Backed-up history metadata could not be inspected because access was denied. Fix access to the reported Codex history paths, then run 'ocx sync'; repeated retries do not repair permissions.");
+  } else if (pending.failed) {
+    hints.push("The history manifest or its target is invalid or changed. Preserve both, inspect the manifest/database/rollout identity, and do not repeatedly run 'ocx sync' until the mismatch is understood. Untracked routed history is not relabeled.");
+  } else if (pending.backupEntries > 0) {
+    hints.push("Backed-up history metadata is pending. The running proxy retries exact restoration automatically; to force it now, close the Codex app and run 'ocx sync'. Untracked routed history is not relabeled.");
   }
   if (dual.dualInstall && !dual.effectiveIsWindowsMount) {
     hints.push(`Codex is installed on BOTH WSL and Windows. Each side keeps its own ~/.codex (logins, config, catalog are separate); ocx here manages the Linux one. To share a single home, set CODEX_HOME=${dual.windowsCodexHomes[0] ?? `${dual.automountRoot}/c/Users/<you>/.codex`} in WSL (drvfs file locking is less reliable).`);

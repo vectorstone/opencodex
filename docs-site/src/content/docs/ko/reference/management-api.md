@@ -64,12 +64,72 @@ Authorization: Bearer <admin-token>
 | `GET /api/grok` | Grok 관리 구성 상태와 후보 모델을 읽습니다 | 400 상태 읽기 실패 |
 | `PUT /api/grok/selection` | 제외할 Grok 모델을 영속화합니다 | 400 잘못되었거나 너무 큰 선택 |
 | `POST /api/grok/apply` | 관리형 동기화를 통해 영속화된 Grok 구성을 적용합니다 | 409 `grok_apply_busy`; 400/500 적용 실패 |
+| `GET /api/grok/reset-coupons?accountId=...` | 활성 또는 지정된 xAI 계정의 남은 Grok billing reset 토큰과 유효 기간을 읽습니다 | 400 누락된 account; 401 인증되지 않음; 502 upstream gRPC-Web 오류 |
+| `POST /api/grok/reset-coupons/consume` | 사용할 수 있는 reset coupon을 교환합니다. 본문은 `{ accountId?, tokenId?, operationId? }`. 선택적 `operationId`(UUIDv4)는 교환을 멱등하게 만듭니다 — 같은 id를 반복하면 이중 교환 없이 저장된 결과를 재생합니다. | 400 잘못된 JSON/UUID; 401 인증되지 않음; 409 `identity_mismatch`; 502 upstream 오류; 503 ledger 용량 |
 | `GET, PUT /api/claude-desktop` | Claude Desktop 라우팅/네이티브 프로필을 읽거나 저장합니다 | 400 잘못되었거나 사용할 수 없는 할당 |
 | `POST /api/claude-desktop/apply` | 저장된 프로필을 Claude Desktop의 관리형 구성에 기록합니다 | 400/500 기록 실패 |
 | `GET /api/claude-desktop/status` | 저장된 프로필과 적용된 프로필, Desktop 상태를 확인합니다 | 400 상태 읽기 실패 |
 | `GET, PUT /api/claude-code` | Claude Code gateway, auth-mode, model-map, context, agent, sidecar 설정을 읽거나 갱신합니다 | 400 잘못된 필드 또는 형태 |
 
+대시보드는 **Providers > xAI Grok > Accounts**에서 두 coupon 경로를 모두 사용합니다. 로그인한 각
+계정 행에는 남은 coupon 개수가 표시된 티켓 배지가 있으며, 이 배지는 유효 기간을 나열하고 만료가
+가장 가까운 coupon을 교환하는 대화 상자를 엽니다. 대화 상자는 클라이언트가 생성한 `operationId`를
+보내며, 재시도하는 대신 타임아웃 후 전송을 중단합니다. 저널 기록이 아직 열린 교환이 다시 실행되기
+때문입니다. `ocx account grok-reset-coupons`는 터미널 대응 명령으로 그대로 남습니다.
+
 모델 목록과 암호화된 worker-task 동작의 개념은 [Sub-agent Surface](/guides/sub-agent-surface/)를 참고하십시오.
+
+### 클라이언트 연동 롤백 저널
+
+| 메서드 및 경로 | 목적 | 주요 오류 |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | 롤백 작업을 조회합니다. 특정 클라이언트로 제한할 수 있으며 각 행에는 서버가 계산한 `deletable` 값이 포함됩니다. | 400 잘못된 클라이언트 |
+| `DELETE /api/client-integrations/journal?opId=...` | 이전 롤백 작업을 폐기하고 가능한 경우 스냅샷도 제거합니다. 성공 응답의 `snapshotRemoved`가 `false`면 유지보수 재시도를 위해 정리 작업이 보존됩니다. | 400 `opId` 누락, 404 없거나 이미 폐기된 작업, 409 해당 클라이언트의 최신 작업 |
+
+## 통합 변경 미리 보기
+
+미리 보기는 변경 내용을 적용하지 않고 보여 줍니다. 스냅샷도, 소유권 기록도, 저널도, 잠금도,
+복구도 남기지 않습니다.
+
+| 메서드 및 경로 | 목적 | 주요 오류 |
+| --- | --- | --- |
+| `POST /api/client-integrations/preview` | 클라이언트 하나의 `apply`, `overwrite`, `disable`을 계획합니다. 본문은 `{ "clientId": "...", "operation": "..." }` | 400 잘못된 클라이언트나 작업, 400 `invalid_aside_profile_path`, 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/restore/preview` | 실행 취소를 계획합니다. 본문은 `{ "opId": "...", "confirmDrift": false }` | 404 없는 작업, 400 `invalid_aside_profile_path`, 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/aside/profiles/{profileId}/preview` | Aside 프로필 하나의 변경을 계획합니다. `restore`에는 `opId`가 필요합니다 | 400 잘못된 본문이나 프로필 미지정, 404 없는 프로필이나 작업, 409 `integration_preview_unavailable` |
+
+계획에는 `version`, `clientId`, `operation`, `state`, `foreignEdit`, `kind`와 `path` 쌍으로 이루어진
+`changes`, 불투명한 `fingerprint`, `canApply`, `willChange`가 담기고 `refusalReason`과
+`profileId`는 선택 항목입니다. 경로는 관리 대상 스키마 경로이거나 `$snapshot`, `$ownership`,
+`$journal` 표식이며, 실행 중에 정해지는 자리는 `*`로 적습니다. 설정 값이나 파일 위치, 선택된
+항목의 이름은 돌려주지 않습니다.
+
+`canApply`가 참인데 `willChange`가 거짓이면 작업은 성공하지만 관리 대상 클라이언트 문서에서는
+아무것도 바뀌지 않습니다. 이미 적용된 것을 다시 적용하는 경우가 그렇습니다.
+
+Aside 프로필 변경은 이때도 한 가지를 저장합니다. 확인을 보내면 클라이언트 문서에 손대기 전에 그
+프로필의 동기화 설정이 먼저 기록되므로, 관리 블록이 이미 없는 프로필을 끄면 설정만 저장되고
+문서와 기록은 그대로 남습니다.
+
+`integration_preview_unavailable`은 지금 쓸 수 있는 모델 목록이 없다는 뜻입니다. 프록시를 막
+시작했을 때도 그렇고, 설정이나 공급자 캐시가 바뀌어 기존 목록을 버린 경우에도 그렇습니다.
+`GET /api/client-integrations`를 읽으면 조회가 성공하고 설정을 확인할 수 있을 때 목록이
+준비되므로, 보통은 이렇게 해결되지만 항상 보장되지는 않습니다.
+
+## 미리 본 변경 확정하기
+
+변경 요청 본문에 `operation`과 `planFingerprint`를 함께 보냅니다. 둘 다 보내거나 둘 다
+생략해야 하며, 하나만 보내거나 요청과 다른 작업을 적으면 거부합니다. Aside는 프로필 하나에만
+묶을 수 있습니다. 지문 하나로 여러 파일의 변경을 설명할 수는 없기 때문입니다.
+
+서버는 쓰기 전에 다시 계획해 보고, 확인한 내용이 더 이상 맞지 않으면 새 계획을 담아
+`409 integration_preview_stale`을 돌려줍니다. 자동으로 다시 시도하지 않으니 새 계획을 보고
+다시 결정하면 됩니다.
+
+지문은 낙관적 확인일 뿐 권한이 아닙니다. 변경을 허용할지는 관리 인증과 소유권 규칙이
+결정합니다.
+
+삭제는 저널을 다시 쓰지 않고 툼스톤을 추가합니다. 현재 실행 취소 지점을 유지하기 위해
+각 클라이언트의 최신 작업은 서버에서 삭제하지 못하게 보호합니다.
 
 ### 콤보
 
@@ -110,6 +170,7 @@ Authorization: Bearer <admin-token>
 | `GET /api/debug/injection-logs` | 제한된 guidance-injection debug 항목을 읽습니다 | — |
 | `GET /api/claude/inbound-debug` | Claude inbound debug 상태와 항목을 읽습니다 | — |
 | `GET /api/usage` | 범위와 클라이언트 surface별 사용량을 요약합니다 | 저장소를 읽을 수 없으면 `error: "read_failed"` 요약을 반환합니다 |
+| `GET /api/metrics` | 논리 요청, 실제 송신, 복구 종류, 소요 시간, TTFT에 대한 프로세스 로컬 Prometheus 텍스트 메트릭을 반환합니다. label은 protocol, result, recovery class의 닫힌 집합만 사용하며 요청·자격 증명 식별자는 내보내지 않습니다. | 시작 시 `metricsExport.enabled`가 true가 아니면 404; 일반 관리 인증이 필요하며 데이터 플레인 자격 증명으로는 접근할 수 없습니다 |
 | `GET /api/storage` | bucket별 Codex 저장소 사용량을 검사합니다 | 검사 실패 시 `error: "scan_failed"` payload를 반환합니다 |
 | `POST /api/storage/cleanup/preview` | archived-session cleanup을 미리 보고 binding digest를 반환합니다 | 400 `invalid_json` 또는 `invalid_percent` |
 | `POST /api/storage/cleanup` | 미리 본 archived set을 격리하거나 영구적으로 제거합니다 | 400 잘못된 입력; 409 오래되었음/바쁨/참조됨 상태; 500 파일 시스템/데이터베이스 실패 |
@@ -119,6 +180,13 @@ Authorization: Bearer <admin-token>
 | `GET, PUT /api/storage/cleanup-policy` | 예약된 cleanup policy와 작업 상태를 읽거나 업데이트합니다 | 400 잘못된 policy |
 | `POST /api/storage/cleanup-policy/run` | 수동 cleanup-policy 실행을 시작합니다 | 409 `already_running`; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | 테스트 전용 policy stream 훅입니다 | 사용할 수 없으면 404 `not_found` |
+
+행이 기존 파서의 크기 제한을 넘으면 `GET /api/usage`와 `GET /api/keys`는 읽을 수 있는 행의 집계를 유지하고 응답 전체에 `usageIncomplete: true`, `usageIncompleteReason: "oversized_rows"`를 추가합니다. 이 진단은 캐시와 증분 추가에서도 유지되며, 빈 결과나 필터 일치 결과가 없는 경우에도 반환됩니다. 재구축 시에는 다시 계산합니다. 행을 맞추기 위해 공급자·모델·API 키 식별자를 줄이지 않습니다. 플래그가 없다고 모든 기록이 유효했다는 뜻은 아닙니다. `historyTruncated`, `entriesTruncated`, 토큰 측정 커버리지와는 별개입니다.
+
+`models`, `providers`, `days[].models`의 행에도 `cacheHitRate`가 포함됩니다. 이 값은 공급자의 프롬프트 캐시에서
+제공된 입력 토큰의 비율이며 `[0, 1]` 범위로 제한됩니다. 공급자가 캐시 텔레메트리를 보고하지 않았거나 행에 입력
+토큰이 없으면 `0`이 아니라 항상 `null`입니다. "캐시 데이터 없음"과 "실제 적중률 0%"는 서로 다른 사실이며,
+이를 똑같이 표시하는 차트는 오해를 부르기 때문입니다.
 
 :::caution
 저장소 cleanup 엔드포인트는 archived session 데이터를 이동하거나 영구적으로 제거할 수 있습니다. 항상 먼저 미리 보고, 반환된 digest를 제출하십시오. 복구가 필요할 수 있으면 quarantine를 우선하십시오.
@@ -132,10 +200,16 @@ Authorization: Bearer <admin-token>
 | `GET /api/models` | 대시보드/CLI model 행을 반환합니다 | 수집이 포화 상태이면 `catalog_busy` |
 | `GET /api/client-config?client=...` | 지원되는 파일 연동의 읽기 전용 client config를 만듭니다 | 400 지원되지 않는 client; 503 catalog 사용 불가 |
 | `PUT /api/disabled-models` | 공유 disabled-model 목록을 교체합니다 | 400 잘못된 JSON |
-| `PUT /api/model-visibility` | provider 또는 model 수준의 visibility를 원자적으로 변경합니다 | 400 잘못된 provider, scope, target, 또는 본문 |
+| `PUT /api/model-visibility` | provider 또는 model 수준의 visibility를 원자적으로 변경합니다 | 400 잘못된 provider, scope, target, 또는 본문; 409 `initial_model_selection_pending` (목록을 새로고침한 뒤 다시 시도하세요.) |
 | `GET, POST /api/custom-models` | custom model을 나열하거나 하나를 추가합니다 | 400 잘못된 필드; 404 provider 없음; 409 중복 model |
 | `PUT, DELETE /api/custom-models/{id}` | custom model 하나를 수정하거나 삭제합니다 | 400 잘못된 id/필드; 404 찾을 수 없음; 409 중복 model |
-| `GET, PUT /api/selected-models` | provider allowlist와 가용성을 읽거나 allowlist 하나를 교체합니다 | 400 provider/body 누락; 404 알 수 없는 provider |
+| `GET, PUT /api/selected-models` | provider allowlist와 가용성을 읽거나 allowlist 하나를 교체합니다 | 400 provider/body 누락; 404 알 수 없는 provider; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | 프리셋 정보를 읽거나 preset/all/custom 모드를 선택합니다 | 400 잘못된 mode 또는 지원하지 않는 프리셋; 404 알 수 없는 provider; PUT 409 `initial_model_selection_pending` |
+
+수동 모델은 Models 대시보드에서 provider와 model ID가 같은 행을 대체합니다. OpenAI 수동 행은 `openai/<model>`을 유지하며 표시 여부를 바꿀 수 있습니다. 수동 행을 삭제하면 계정 한정자가 없는 네이티브 행이 다시 나타납니다. 계정 한정자가 있는 네이티브 행은 별도로 유지됩니다. 네이티브 경로나 계정 권한은 바뀌지 않습니다. OpenAI의 비네이티브 표시 대상은 설정된 수동 모델과 일치해야 합니다.
+
+
+신뢰할 수 있는 초기 모델 목록을 확보하기 전에는 유효한 `PUT /api/selected-models`와 `PUT /api/model-presets` 요청도 HTTP 409와 `initial_model_selection_pending` 코드를 반환합니다. `GET /api/models` 등으로 모델 목록을 정상적으로 갱신한 뒤 재시도하세요.
 
 ### OAuth 계정, provider key, 데이터 평면 키
 
@@ -150,7 +224,8 @@ Authorization: Bearer <admin-token>
 | `POST /api/oauth/logout` | 선택된 provider 자격 증명을 제거합니다 | 400 알 수 없는 provider; `oauth_mutation_busy` |
 | `GET, DELETE /api/oauth/accounts` | 마스킹된 계정을 나열하거나 계정 하나를 제거합니다 | 400 잘못된 provider/id; 404 계정 없음; `oauth_mutation_busy` |
 | `PUT /api/oauth/accounts/active` | 활성 OAuth 계정을 선택합니다 | 400 잘못된 provider/account; `oauth_mutation_busy` |
-| `GET, PUT, PATCH /api/oauth/accounts/pool` | Anthropic OAuth pool policy를 읽거나 업데이트합니다 | 400 Anthropic이 아닌 provider 또는 잘못된 policy |
+| `GET, PUT, PATCH /api/pool/settings` | 모든 pool 종류(codex, anthropic, generic)의 policy를 읽거나 업데이트합니다. 세 종류 모두 같은 키로 응답하고, 해당 종류가 실제로 적용하는 필드는 `supported`에 나옵니다 | 400 알 수 없는 provider, 해당 종류가 지원하지 않는 필드, 잘못된 값 |
+| `GET, PUT, PATCH /api/oauth/accounts/pool` | Anthropic과 일반 OAuth provider의 기존 pool policy입니다. `/api/pool/settings`로 대체되었고 기존 클라이언트를 위해 유지합니다 | 400 codex 또는 API 키 provider, 잘못된 policy |
 | `POST /api/oauth/accounts/clear-cooldown` | OAuth 계정 하나의 런타임 cooldown을 지웁니다 | 400 잘못된 provider/account |
 | `PUT /api/oauth/accounts/alias` | OAuth 계정 alias를 설정하거나 지웁니다 | 400 잘못된 provider/account/alias |
 | `GET, POST, DELETE /api/providers/keys` | 마스킹된 provider key를 나열, 추가/활성화, 또는 제거합니다 | 400 잘못된 입력; 404 provider/key 없음 |
@@ -173,6 +248,15 @@ Authorization: Bearer <admin-token>
 | `GET, PUT /api/provider-context-caps` | 전역, 모든 provider, 또는 하나의 provider context cap을 읽거나 업데이트합니다 | 400 잘못된 요청; 404 알 수 없는 provider |
 | `GET /api/provider-presets` | 런타임 registry에서 파생된 GUI provider preset을 반환합니다 | — |
 
+컨텍스트 상한 응답에는 `caps`(활성 상한)와 `values`(꺼도 유지되는 마지막 선택값)가 포함됩니다.
+`value` 없이 공급자의 상한을 켜면 선택값을 복원하고, 처음 켤 때는 전역 `contextCapValue`를 씁니다.
+OpenAI도 같은 규칙을 따르며, 스위치를 켠다고 별도의 922k 모드가 선택되지는 않습니다.
+활성 상한은 모든 네이티브 윈도에 적용됩니다. 장문 컨텍스트를 지원하는 모델은 해당 모델의 지원 상한까지만
+확장할 수 있습니다. `{ "value": 600000, "setAll": true }`는 전역 값과 활성 상한만 갱신합니다.
+상한이 꺼진 공급자는 선택값을 유지하고, 나중에 켜면 그 값을 복원합니다.
+`value` 없이 `{ "setAll": true }`를 보내면 설정된 모든 공급자의 상한을 현재 전역 값으로 켜고,
+저장된 선택값도 바꿉니다. 상한을 꺼도 선택값은 다시 불러온 뒤까지 유지되지만 제한으로 적용되지는 않습니다.
+
 `provider_has_dependent_combos`는 안전 장치입니다. provider를 삭제하기 전에 종속된 combo를 제거하거나 수정하십시오.
 
 ### 사이드바 및 동의가 필요한 작업
@@ -193,7 +277,7 @@ Authorization: Bearer <admin-token>
 | --- | --- | --- |
 | `GET /api/system/memory` | 프로세스, heap, stream, response-state, watchdog, active-turn의 스칼라 메트릭을 반환합니다 | — |
 | `POST /api/system/restart` | 클라이언트 injection을 제거하지 않고 drain-aware 프로세스 재시작을 시작합니다 | 202 반환; 반복 호출은 기존 drain을 보고합니다 |
-| `POST /api/stop` | 서비스를 중지하고, native Codex를 복원하며, 관리형 Grok injection을 제거하고, 프록시를 drain합니다 | 409 서비스 소유권 충돌 |
+| `POST /api/stop` | 서비스를 중지하고, native Codex를 복원하며, 관리형 Grok injection을 제거하고, 프록시를 drain합니다 | 409 서비스 소유권 충돌; Windows 작업 스케줄러 래퍼가 프록시를 다시 띄울 수 있고 호출자가 `ocx stop`이 아니면 409 `respawnable_service`(아무것도 바뀌지 않음); 설치된 관리자가 정지를 거부하면 409; 작업 스케줄러 상태를 읽을 수 없으면 409 `service_state_unknown`(아무것도 바뀌지 않음, 조회를 고친 뒤 재시도) |
 
 ### Codex 인증 위임
 
@@ -217,11 +301,25 @@ Authorization: Bearer <admin-token>
 | `PUT /api/codex-auth/failover` | account failover threshold를 설정합니다 | 400 잘못된 threshold |
 | `GET /api/codex-auth/quota` | 계정별 캐시된 quota 상태를 읽습니다 | — |
 | `GET /api/codex-auth/reset-credits` | 계정의 reset-credit 자격을 확인합니다 | 400 누락된 account id; upstream 상태 전달; 500 조회 실패 |
-| `POST /api/codex-auth/reset-credits/consume` | 사용할 수 있는 reset credit을 소비합니다 | 400 누락된 account id; upstream 상태 전달; 503 `server_busy`; 500 소비 실패 |
+| `POST /api/codex-auth/reset-credits/consume` | 사용할 수 있는 reset credit을 소비합니다. 선택적 `operationId`(UUIDv4)를 보내면 소비가 멱등해집니다 — 같은 id는 크레딧을 다시 쓰지 않고 저장된 결과 하나를 재생합니다. | 400 누락된 account id 또는 잘못된 `operationId`; id가 다른 계정 소유이면 409 `identity_mismatch`; upstream 상태 전달; 503 `server_busy`/`capacity`/`unavailable`; 500 소비 실패 |
 | `POST /api/codex-auth/login` | Codex 로그인 또는 재인증을 시작합니다 | 400 잘못된 요청; 충돌/바쁨 로그인 상태 |
 | `POST /api/codex-auth/login/code` | Codex 로그인 흐름용 수동 코드를 제출합니다 | 400 잘못된 흐름/code |
 | `POST /api/codex-auth/login/cancel` | Codex 로그인 흐름을 취소합니다 | — |
 | `GET /api/codex-auth/login-status` | 흐름 또는 account 로그인 상태를 조회합니다. 새 계정 완료 시 복구가 필요할 때만 `catalogRefreshPending: true`를 포함합니다. | 알 수 없는 흐름은 `expired`로 보고되며, 활성 흐름이 없으면 `idle`로 보고됩니다 |
+
+수동 소비가 `reset`으로 확인되면 같은 계정의 새 usage를 조회하여 기존 shared reset-derived
+쿨다운을 즉시 복구할 수 있습니다. 복구는 조건부입니다. 계정이 일시 정지되었거나 재인증이
+필요하거나 다른 진행 중인 probe가 쿨다운을 소유하면 쿨다운은 유지됩니다. reset 이전에 시작한
+조회, 불완전하거나 소진된 usage, 신원이 바뀐 계정, 더 최근의 quota 실패로는 복구하지 않습니다.
+오래된 main usage 응답은 더 최근에 반영한 관측을 덮어쓰지 않습니다. credential 갱신을 거쳤다면
+해당 인증에서 이어진 갱신인지 확인되어야 하며, 외부에서 교체된 credential은 같은 계정이어도
+복구 근거가 되지 않습니다. 명시적 `Retry-After`, Reserve 쿨다운, pause·pin·선택
+설정도 보존됩니다. `already_redeemed`와 저장된 결과 재생은 새 reset을 증명하지 않습니다.
+
+`reset` 또는 `already_redeemed`가 확인된 뒤 usage 조회가 실패하거나 바쁘더라도 소비 응답은
+HTTP 200과 원래 `code`를 유지합니다. 새 잔여 수를 얻지 못하면 `remaining`을 생략합니다.
+이는 소비 결과의 확인이며 라우팅 가능 상태를 보장하지 않습니다. usage를 다시 조회하십시오.
+usage 조회 실패를 재시도하기 위해 reset credit을 다시 소비하지 마십시오.
 
 새 account의 config row는 저장되었지만 credential setup을 완료하지 못하면 OAuth `login-status`는
 `status: "error"`를 보고하며
@@ -238,3 +336,7 @@ account의 selector binding은 남아 있어 계정이 없을 때 exact route가
 ## 클라이언트 선택
 
 일반적인 관리 작업에는 [Web Dashboard](/guides/web-dashboard/)가 가장 안전한 안내형 워크플로를 제공합니다. 헤드리스 호스트와 자동화에는 대응하는 `ocx` 명령을 사용하십시오. 이 명령들은 동일한 실시간 API를 호출하며, 프록시에 접근할 수 없거나 작업이 실패하면 0이 아닌 결과를 반환합니다. 직접 HTTP는 위의 정확한 엔드포인트 계약이 필요한 통합에 가장 유용합니다.
+
+## 원격 세션과 데이터 키 교체
+
+`POST /api/keys/rotate {id}`는 최대 10분의 전환을 시작하며 새 데이터 키를 한 번만 반환합니다. `POST /api/keys/rotate/commit {id,rotationId}`는 확정하고, `DELETE /api/keys/rotate {id,rotationId}`는 취소합니다. 모두 관리 인증이 필요하며 데이터 키로 호출할 수 없습니다. `POST /api/session/logout`은 현재 `gui-session`, 일치하는 Origin, CSRF가 필요합니다. 관리자 토큰은 403을 받고 동의 세션을 만들거나 교환할 수 없습니다.

@@ -24,7 +24,15 @@
  * up to the drain window.
  */
 
-import { buildFailedTailPayload, createSseTerminalOutputBoundary } from "./relay";
+import {
+  adapterEofIncompleteFrame,
+  type CodexSafetyBufferingFilterOptions,
+  createSseTerminalOutputBoundary,
+  doneFrame,
+  failedTailFrame,
+  refusalFailedTailFrame,
+  upstreamErrorTailFrame,
+} from "./relay";
 import {
   nextSseBlock,
   payloadRewriteAsBlockRewrite,
@@ -58,7 +66,7 @@ export type EagerRelayHooks = {
   /** True once inspection has reported a protocol terminal (inspector.reported). */
   sawTerminal: () => boolean;
   /** Record a synthetic terminal (caller decides incomplete vs failed-502). */
-  onSynthetic: (kind: "incomplete" | "failed") => void;
+  onSynthetic: (kind: "incomplete" | "failed", reason?: "upstream_error") => void;
   /** Client cancelled and NO terminal arrived within the drain bounds. */
   onClientCancel: () => void;
   /** Exactly once, after the producer fully stops (unregisterTurn parity). */
@@ -66,6 +74,8 @@ export type EagerRelayHooks = {
 };
 
 export type EagerRelayOptions = {
+  /** Caller cancellation, independent of the turn/shutdown controller. */
+  clientGoneSignal?: AbortSignal;
   /** Bounded client queue in bytes; producer pauses above it. Default 8 MiB. */
   maxQueueBytes?: number;
   /** Transient-budget owner for the inline-rewrite frame buffer. */
@@ -74,6 +84,10 @@ export type EagerRelayOptions = {
   postCancelDrainMs?: number;
   /** Post-cancel discard-drain byte bound. Default 32 MiB. */
   postCancelDrainBytes?: number;
+  /** Last known upstream failure to preserve when EOF would otherwise become adapter_eof. */
+  upstreamError?: string;
+  /** Optional client-facing hint policy; inspection retains original frames. */
+  terminalBoundary?: CodexSafetyBufferingFilterOptions;
   /** Injectable clock for tests. */
   now?: () => number;
 };
@@ -98,11 +112,39 @@ export function relaySseEagerBounded(
   const drainMs = opts?.postCancelDrainMs ?? DEFAULT_DRAIN_MS;
   const drainBytes = opts?.postCancelDrainBytes ?? DEFAULT_DRAIN_BYTES;
   const now = opts?.now ?? Date.now;
+  const clientGoneSignal = opts?.clientGoneSignal;
 
   const reader = body.getReader();
-  const terminalBoundary = createSseTerminalOutputBoundary();
+  const terminalEncoder = new TextEncoder();
+  const adapterEofFrame = adapterEofIncompleteFrame(terminalEncoder);
+  const terminalSentinel = doneFrame(terminalEncoder);
+  const terminalBoundary = createSseTerminalOutputBoundary(opts?.terminalBoundary);
   const activeRewrite: SseBlockRewrite | undefined = hooks.rewriteBlocks
     ?? (hooks.rewritePayload ? payloadRewriteAsBlockRewrite(hooks.rewritePayload) : undefined);
+  const encodeFailedTail = (error: unknown): Uint8Array | null => {
+    try {
+      return failedTailFrame(terminalEncoder, error);
+    } catch {
+      return null;
+    }
+  };
+  /**
+   * Same tail, except that a refusal the boundary already captured outranks the
+   * read failure that followed it — the upstream ended the turn before the
+   * socket did (#5176).
+   */
+  const encodeTerminalTail = (error: unknown): Uint8Array | null => {
+    const refusalCode = terminalBoundary.upstreamRefusalCode();
+    const refusalMessage = terminalBoundary.upstreamError();
+    if (refusalCode === undefined || refusalMessage === undefined) {
+      return encodeFailedTail(error);
+    }
+    try {
+      return refusalFailedTailFrame(terminalEncoder, refusalMessage, refusalCode);
+    } catch {
+      return null;
+    }
+  };
   const rewriteDecoder = activeRewrite ? new TextDecoder() : null;
   const rewriteEncoder = activeRewrite ? new TextEncoder() : null;
   const rewriteBudget = opts?.rewriteBudget;
@@ -164,13 +206,23 @@ export function relaySseEagerBounded(
   let queuedBytes = 0;
   let cancelled = false;
   let done = false;
-  const terminalSentinel = new TextEncoder().encode("data: [DONE]\n\n");
+  let drainedBytes = 0;
+  let drainDeadline = Number.POSITIVE_INFINITY;
   // Pause gate: resolved by client pull, client cancel, or upstream abort so a
   // paused producer ALWAYS resumes (audit blocker 2 — no deadlock; onDone and
   // turn unregistration stay reachable, drainAndShutdown never hangs).
   let wake: (() => void) | null = null;
   const wakeUp = () => { const w = wake; wake = null; w?.(); };
-  const paused = () => new Promise<void>(resolve => { wake = resolve; });
+  const paused = () => new Promise<void>(resolve => {
+    wake = resolve;
+    // A pull, cancel, or abort can win the tiny window between the loop's
+    // predicate check and installing this resolver. Re-check every wake
+    // predicate after installation so that an already-fired wake cannot leave
+    // the producer parked forever.
+    if (queuedBytes <= maxQueueBytes || cancelled || upstream.signal.aborted) {
+      wakeUp();
+    }
+  });
   upstream.signal.addEventListener("abort", wakeUp, { once: true });
 
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -179,6 +231,7 @@ export function relaySseEagerBounded(
   const fireDone = () => {
     if (doneFired) return;
     doneFired = true;
+    clientGoneSignal?.removeEventListener("abort", markClientGone);
     if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     try { hooks.onDone(); } catch { /* lifecycle callbacks must not break teardown */ }
   };
@@ -194,8 +247,26 @@ export function relaySseEagerBounded(
     (drainTimer as { unref?: () => void }).unref?.();
   };
 
+  const markClientGone = () => {
+    if (cancelled || doneFired) return;
+    cancelled = true;
+    drainDeadline = now() + drainMs;
+    armDrainTimer();
+    wakeUp();
+  };
+  const canDeliver = () => {
+    // A rejected fetch read can settle before every abort listener is dispatched.
+    // Also re-check after error serialization, which can re-enter caller abort.
+    if (clientGoneSignal?.aborted) markClientGone();
+    return !cancelled && !upstream.signal.aborted;
+  };
+
   const producer = async () => {
     let syntheticKind: "incomplete" | "failed" | null = null;
+    let syntheticReason: "upstream_error" | undefined;
+    let deliveryFallbackSent = false;
+    let priorRewriteFailure = false;
+    let priorRewriteError: unknown;
     // reader.read() is not intrinsically tied to the upstream AbortController
     // (a fetch body usually rejects on abort, but that coupling is the fetch
     // implementation's, not the stream's), so abort must break a parked read on
@@ -211,6 +282,7 @@ export function relaySseEagerBounded(
       for (;;) {
         const result = await reader.read();
         const { done: upstreamDone, value } = result;
+        if (clientGoneSignal?.aborted) markClientGone();
         // A chunk that already settled is INSPECTED before abort is honored. A read
         // can settle with a real chunk in the same tick the signal fires (post-cancel
         // drain: the terminal frame arrives, then the drain timer aborts upstream).
@@ -221,19 +293,56 @@ export function relaySseEagerBounded(
         if (upstreamDone) {
           hooks.finishInspection();
           const boundedTail = terminalBoundary.finish();
+          let clientTail = boundedTail;
+          let rewriteFailed = false;
+          let rewriteError: unknown;
           if (activeRewrite) {
-            const rewritten = rewriteOutbound(boundedTail);
-            const tail = joinUint8Arrays(rewritten, flushRewriteTail());
-            if (tail.byteLength > 0 && !cancelled) {
-              queuedBytes += tail.byteLength;
-              try { controllerRef?.enqueue(tail); } catch { /* client already gone */ }
+            try {
+              const rewritten = rewriteOutbound(boundedTail);
+              clientTail = joinUint8Arrays(rewritten, flushRewriteTail());
+            } catch (error) {
+              rewriteFailed = true;
+              rewriteError = error;
+              clientTail = new Uint8Array(0);
             }
-          } else if (boundedTail.byteLength > 0 && !cancelled) {
-            queuedBytes += boundedTail.byteLength;
-            try { controllerRef?.enqueue(boundedTail); } catch { /* client already gone */ }
           }
-          if (!hooks.sawTerminal() && !cancelled && !upstream.signal.aborted) {
-            syntheticKind = "incomplete";
+          if (rewriteFailed) {
+            const safeTail = encodeFailedTail(rewriteError);
+            if (safeTail && canDeliver()) {
+              if (!hooks.sawTerminal()) syntheticKind = "failed";
+              queuedBytes += safeTail.byteLength;
+              try { controllerRef?.enqueue(safeTail); } catch { /* client already torn down */ }
+              try { controllerRef?.close(); } catch { /* client already gone */ }
+            }
+            break;
+          }
+          if (clientTail.byteLength > 0 && !cancelled) {
+            queuedBytes += clientTail.byteLength;
+            try { controllerRef?.enqueue(clientTail); } catch { /* client already gone */ }
+          }
+          if (terminalBoundary.terminalSeen()) {
+            if (!terminalBoundary.doneSeen() && !cancelled) {
+              queuedBytes += terminalSentinel.byteLength;
+              try { controllerRef?.enqueue(terminalSentinel); } catch { /* client already gone */ }
+            }
+          } else if (!hooks.sawTerminal() && canDeliver()) {
+            // A clean 200 EOF without a Responses terminal must be visible to
+            // Codex as one incomplete turn, followed by the normal sentinel.
+            const upstreamError = terminalBoundary.upstreamError() ?? opts?.upstreamError;
+            const upstreamErrorFrame = upstreamError === undefined
+              ? adapterEofFrame
+              : upstreamErrorTailFrame(
+                terminalEncoder,
+                upstreamError,
+                terminalBoundary.upstreamRefusalCode(),
+              );
+            queuedBytes += upstreamErrorFrame.byteLength + terminalSentinel.byteLength;
+            try {
+              controllerRef?.enqueue(upstreamErrorFrame);
+              controllerRef?.enqueue(terminalSentinel);
+            } catch { /* client already gone */ }
+            syntheticKind = upstreamError === undefined ? "incomplete" : "failed";
+            syntheticReason = upstreamError === undefined ? undefined : "upstream_error";
           }
           break;
         }
@@ -247,16 +356,28 @@ export function relaySseEagerBounded(
           continue;
         }
         const terminalBounded = terminalBoundary.feed(value);
-        const outbound = activeRewrite ? rewriteOutbound(terminalBounded) : terminalBounded;
+        let outbound: Uint8Array;
+        if (activeRewrite) {
+          try {
+            outbound = rewriteOutbound(terminalBounded);
+          } catch (error) {
+            // Preserve the first rewrite failure across the teardown flush. A
+            // second empty flush may succeed, but the terminal bytes still
+            // must not bypass the failed rewrite or become DONE-only output.
+            priorRewriteFailure = true;
+            priorRewriteError = error;
+            throw error;
+          }
+        } else {
+          outbound = terminalBounded;
+        }
         if (outbound.byteLength > 0) {
           queuedBytes += outbound.byteLength;
           try {
             controllerRef?.enqueue(outbound);
           } catch {
             // Controller already torn down (client went away without cancel()).
-            cancelled = true;
-            drainDeadline = now() + drainMs;
-            armDrainTimer();
+            markClientGone();
             continue;
           }
         }
@@ -271,23 +392,83 @@ export function relaySseEagerBounded(
           reader.cancel("Responses terminal event received").catch(() => {});
           break;
         }
-        while (queuedBytes > maxQueueBytes && !cancelled && !upstream.signal.aborted) {
+        while (queuedBytes > maxQueueBytes && canDeliver()) {
           await paused();
         }
       }
     } catch (err) {
+      if (clientGoneSignal?.aborted) markClientGone();
       // Upstream read failure. Distinguish genuine mid-stream reset from
       // abort-driven teardown (shutdown/cancel-expiry) — audit M3.
-      if (!hooks.sawTerminal() && !cancelled && !upstream.signal.aborted) {
+      // A read can fail after delivering an unterminated terminal block. Flush
+      // both observers before deciding whether this is a synthetic reset so
+      // eager mode matches the tee/pull boundary semantics at EOF.
+      let boundedTail: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+      let tailTerminal = false;
+      let tailDone = false;
+      try { hooks.finishInspection(); } catch { /* preserve the original read failure */ }
+      try {
+        boundedTail = terminalBoundary.finish();
+        tailTerminal = terminalBoundary.terminalSeen();
+        tailDone = terminalBoundary.doneSeen();
+      } catch {
+        // A near-cap ambiguous delimiter tail may itself overflow at EOF.
+        // Preserve the original read/framing failure and continue emitting
+        // the bounded failed tail instead of letting cleanup throw again.
+      }
+      let clientTail: Uint8Array<ArrayBufferLike> = boundedTail;
+      let rewriteFailed = false;
+      let rewriteError: unknown;
+      if (priorRewriteFailure) {
+        rewriteFailed = true;
+        rewriteError = priorRewriteError;
+        clientTail = new Uint8Array(0);
+      } else if (activeRewrite) {
+        try {
+          const rewritten = rewriteOutbound(boundedTail);
+          clientTail = joinUint8Arrays(rewritten, flushRewriteTail());
+        } catch (error) {
+          rewriteFailed = true;
+          rewriteError = error;
+          clientTail = new Uint8Array(0);
+        }
+      }
+      if (clientTail.byteLength > 0 && canDeliver()) {
+        queuedBytes += clientTail.byteLength;
+        try { controllerRef?.enqueue(clientTail); } catch { /* client already torn down */ }
+      }
+      if (rewriteFailed && canDeliver()) {
+        // Never bypass a client rewrite after it fails: boundedTail can contain
+        // provider metadata or content that the active rewrite was required to
+        // remove. Emit one safe failed envelope instead. When inspection has
+        // already reported the real upstream terminal, this is a delivery
+        // fallback only and must not create a second accounting outcome.
+        const safeTail = encodeFailedTail(rewriteError ?? err);
+        if (safeTail && canDeliver()) {
+          if (!hooks.sawTerminal()) syntheticKind = "failed";
+          deliveryFallbackSent = true;
+          queuedBytes += safeTail.byteLength;
+          try { controllerRef?.enqueue(safeTail); } catch { /* client already torn down */ }
+          try { controllerRef?.close(); } catch { /* client already gone */ }
+        }
+      } else if (tailTerminal && canDeliver()) {
+        if (!tailDone) {
+          queuedBytes += terminalSentinel.byteLength;
+          try { controllerRef?.enqueue(terminalSentinel); } catch { /* client already gone */ }
+        }
+      } else if (!tailTerminal && canDeliver()) {
         // Serializing `err` can run user-defined accessors (Error.message
         // getters, toString) that re-entrantly cancel the client or abort the
         // upstream. Build the tail FIRST, then re-check eligibility before
         // committing to the synthetic terminal (adversarial review blocker).
-        const tail = new TextEncoder().encode(
-          `\n\nevent: response.failed\ndata: ${buildFailedTailPayload(err)}\n\ndata: [DONE]\n\n`,
-        );
-        if (!hooks.sawTerminal() && !cancelled && !upstream.signal.aborted) {
-          syntheticKind = "failed";
+        const tail = encodeTerminalTail(err);
+        if (tail && canDeliver()) {
+          // Inspection and client framing have separate bounded parsers. If
+          // inspection resynchronized after an oversized frame and observed a
+          // later real terminal, it still must not suppress a terminal delivery
+          // to the client. Only accounting remains tied to the inspected result.
+          if (!hooks.sawTerminal()) syntheticKind = "failed";
+          deliveryFallbackSent = true;
           queuedBytes += tail.byteLength;
           try { controllerRef?.enqueue(tail); } catch { /* client already torn down */ }
           try { controllerRef?.close(); } catch { /* client already torn down */ }
@@ -302,29 +483,32 @@ export function relaySseEagerBounded(
         frameBufferBytes = 0;
       }
       terminalBoundary.dispose();
-      if (syntheticKind) hooks.onSynthetic(syntheticKind);
+      if (syntheticKind && canDeliver()) {
+        if (syntheticReason === undefined) hooks.onSynthetic(syntheticKind);
+        else hooks.onSynthetic(syntheticKind, syntheticReason);
+      }
       if (cancelled && !hooks.sawTerminal()) {
+        // Finalize transport telemetry before the cancellation hook persists its usage row.
+        upstream.abort();
         hooks.onClientCancel();
       }
-      if (cancelled || upstream.signal.aborted || syntheticKind === "failed") {
+      if (cancelled || upstream.signal.aborted || syntheticKind === "failed" || deliveryFallbackSent) {
         upstream.abort();
         reader.cancel().catch(() => {});
       }
-      if (!cancelled) {
-        try { controllerRef?.close(); } catch { /* already closed/errored */ }
-      }
+      // Signal-driven cancellation need not have invoked the body's cancel hook.
+      try { controllerRef?.close(); } catch { /* already closed/errored */ }
       try { hooks.disposeInspection?.(); } catch { /* inspection teardown must not block lifecycle cleanup */ }
       try { activeRewrite?.dispose?.(); } catch { /* rewrite teardown must not block lifecycle cleanup */ }
       fireDone();
     }
   };
 
-  let drainedBytes = 0;
-  let drainDeadline = Number.POSITIVE_INFINITY;
-
   return new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
+      clientGoneSignal?.addEventListener("abort", markClientGone, { once: true });
+      if (clientGoneSignal?.aborted) markClientGone();
       void producer();
     },
     pull() {
@@ -335,10 +519,7 @@ export function relaySseEagerBounded(
       wakeUp();
     },
     cancel() {
-      cancelled = true;
-      drainDeadline = now() + drainMs;
-      armDrainTimer();
-      wakeUp();
+      markClientGone();
     },
   });
 }

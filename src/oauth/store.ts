@@ -19,16 +19,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getConfigDir, atomicWriteFile, backupInvalidConfig, hardenConfigDir, hardenExistingSecret } from "../config";
+import { getConfigDir, atomicWriteFile, backupInvalidConfig, hardenConfigDir, hardenExistingSecret, withConfigMutationLockSync } from "../config";
 import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import { recordOwnedConfigPath } from "../lib/config-ownership";
 import { MAX_PENDING_OAUTH_MUTATIONS } from "../lib/translator-budget";
+import { publishAccountSelection } from "../lib/account-selection-events";
 import {
   captureConfigGeneration,
   type GenerationContext,
 } from "../lib/state-store-sweeper";
 import { validateCopilotApiBaseUrl } from "./github-copilot";
-import type { OAuthCredentialSource, OAuthCredentials, ProviderAccount, ProviderAccountSet } from "./types";
+import { validateDevinApiBaseUrl } from "./devin/api-base";
+import type { OAuthAccountSelection, OAuthCredentialSource, OAuthCredentials, ProviderAccount, ProviderAccountSet } from "./types";
 
 export type AuthStore = Record<string, ProviderAccountSet>;
 
@@ -67,23 +69,93 @@ export function getAuthRefreshIntentLockPath(provider: string, accountId: string
 export function getAuthRefreshIntentPath(provider: string, accountId: string): string {
   return `${getAuthRefreshIntentLockPath(provider, accountId)}.json`;
 }
-export interface OAuthRefreshIntent { version: 1; provider: string; accountId: string; generation: string; createdAt: number; flightId?: string; staleOwner?: true; uncertain?: true }
+export type OAuthRefreshIntentCleanupPending = "pre-dispatch" | "definitive-rejection";
+export interface OAuthRefreshIntent {
+  version: 1;
+  provider: string;
+  accountId: string;
+  generation: string;
+  createdAt: number;
+  attemptId?: string;
+  flightId?: string;
+  staleOwner?: true;
+  uncertain?: true;
+  cleanupPending?: OAuthRefreshIntentCleanupPending;
+}
+
+export class OAuthRefreshIntentIOError extends Error {
+  readonly code = "OAUTH_REFRESH_INTENT_IO";
+  constructor(
+    readonly operation: "write-intent" | "mark-cleanup-pending" | "clear-cleanup-pending" | "resume-cleanup",
+    cause?: unknown,
+    readonly refreshError?: unknown,
+  ) {
+    super(`OAuth refresh intent ${operation} failed`, cause ? { cause } : undefined);
+    this.name = "OAuthRefreshIntentIOError";
+  }
+}
+
+// Both compare-and-swap sites in this file — the OAuth file lock and the refresh-intent
+// file — must agree on what "the same file" means, so they share one snapshot shape and
+// one identity check (`snapshot`/`sameSnapshot` below) rather than two copies that can drift.
+type OAuthRefreshIntentFileSnapshot = LockSnapshot;
+
+export interface OAuthRefreshIntentMutationHooks {
+  beforeMarkCommit?: () => void;
+  beforeClearRecheck?: () => void;
+}
+
+class OAuthRefreshIntentChangedError extends Error {}
+
+function uncertainOAuthRefreshIntent(provider: string, accountId: string): OAuthRefreshIntent {
+  return { version: 1, provider, accountId, generation: "", createdAt: 0, uncertain: true };
+}
+
 function parseOAuthRefreshIntent(
   provider: string,
   accountId: string,
   raw: string,
 ): OAuthRefreshIntent {
-  const value = JSON.parse(raw) as Partial<OAuthRefreshIntent>;
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return uncertainOAuthRefreshIntent(provider, accountId);
+  }
+  const value = parsed as Partial<OAuthRefreshIntent>;
   if (
     value.version !== 1
     || value.provider !== provider
     || value.accountId !== accountId
     || typeof value.generation !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.generation)
     || typeof value.createdAt !== "number"
-    || (value.flightId !== undefined && typeof value.flightId !== "string")
+    || !Number.isFinite(value.createdAt)
+    || !Number.isInteger(value.createdAt)
+    || value.createdAt < 0
+    || (
+      value.attemptId !== undefined
+      && (typeof value.attemptId !== "string" || value.attemptId.length === 0 || value.attemptId.length > 128)
+    )
+    || (
+      value.flightId !== undefined
+      && (typeof value.flightId !== "string" || value.flightId.length === 0 || value.flightId.length > 128)
+    )
     || (value.staleOwner !== undefined && value.staleOwner !== true)
+    || (value.uncertain !== undefined && value.uncertain !== true)
+    || (
+      value.cleanupPending !== undefined
+      && value.cleanupPending !== "pre-dispatch"
+      && value.cleanupPending !== "definitive-rejection"
+    )
+    || (
+      value.cleanupPending !== undefined
+      && (
+        value.attemptId === undefined
+        || value.uncertain === true
+        || value.staleOwner === true
+      )
+    )
   ) {
-    return { version: 1, provider, accountId, generation: "", createdAt: 0, uncertain: true };
+    return uncertainOAuthRefreshIntent(provider, accountId);
   }
   return value as OAuthRefreshIntent;
 }
@@ -96,7 +168,7 @@ export function readOAuthRefreshIntent(provider: string, accountId: string): OAu
     return parseOAuthRefreshIntent(provider, accountId, readFileSync(path, "utf8"));
   } catch (error) {
     if (errorCode(error) === "ENOENT") return undefined;
-    return { version: 1, provider, accountId, generation: "", createdAt: 0, uncertain: true };
+    return uncertainOAuthRefreshIntent(provider, accountId);
   }
 }
 
@@ -107,27 +179,159 @@ export function peekOAuthRefreshIntent(provider: string, accountId: string): OAu
     return parseOAuthRefreshIntent(provider, accountId, readFileSync(path, "utf8"));
   } catch (error) {
     if (errorCode(error) === "ENOENT") return undefined;
-    return { version: 1, provider, accountId, generation: "", createdAt: 0, uncertain: true };
+    return uncertainOAuthRefreshIntent(provider, accountId);
   }
 }
-export function writeOAuthRefreshIntent(provider: string, accountId: string, generation: string, createdAt = Date.now(), flightId?: string): void {
+export function writeOAuthRefreshIntent(provider: string, accountId: string, generation: string, createdAt = Date.now(), flightId?: string): OAuthRefreshIntent {
   const dir = getConfigDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   hardenConfigDir();
-  const intent: OAuthRefreshIntent = { version: 1, provider, accountId, generation, createdAt, ...(flightId ? { flightId } : {}) };
-  atomicWriteFile(getAuthRefreshIntentPath(provider, accountId), `${JSON.stringify(intent)}\n`);
+  const intent: OAuthRefreshIntent = {
+    version: 1,
+    provider,
+    accountId,
+    generation,
+    createdAt,
+    attemptId: randomUUID(),
+    ...(flightId ? { flightId } : {}),
+  };
+  return withConfigMutationLockSync(() => {
+    if (readOAuthRefreshIntent(provider, accountId) !== undefined) {
+      throw new OAuthRefreshIntentIOError(
+        "write-intent",
+        new Error("An OAuth refresh intent already exists; refusing to overwrite its replay guard"),
+      );
+    }
+    atomicWriteFile(getAuthRefreshIntentPath(provider, accountId), `${JSON.stringify(intent)}\n`);
+    return intent;
+  });
 }
+
+function sameOAuthRefreshIntentAttempt(current: OAuthRefreshIntent, expected: OAuthRefreshIntent): boolean {
+  return current.provider === expected.provider
+    && current.accountId === expected.accountId
+    && current.generation === expected.generation
+    && current.createdAt === expected.createdAt
+    && current.attemptId === expected.attemptId
+    && current.flightId === expected.flightId;
+}
+
+function exactOAuthRefreshIntentFile(
+  provider: string,
+  accountId: string,
+): { intent: OAuthRefreshIntent; snapshot: OAuthRefreshIntentFileSnapshot } | undefined {
+  const path = getAuthRefreshIntentPath(provider, accountId);
+  try {
+    hardenConfigDir();
+    hardenExistingSecret(path);
+    const file = snapshot(path);
+    let intent: OAuthRefreshIntent;
+    try { intent = parseOAuthRefreshIntent(provider, accountId, file.bytes); }
+    catch { intent = uncertainOAuthRefreshIntent(provider, accountId); }
+    return { intent, snapshot: file };
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+export function markOAuthRefreshIntentCleanupPending(
+  provider: string,
+  accountId: string,
+  expected: OAuthRefreshIntent,
+  cleanupPending: OAuthRefreshIntentCleanupPending,
+  hooks: OAuthRefreshIntentMutationHooks = {},
+): OAuthRefreshIntent | undefined {
+  return withConfigMutationLockSync(() => {
+    const path = getAuthRefreshIntentPath(provider, accountId);
+    const observed = exactOAuthRefreshIntentFile(provider, accountId);
+    const current = observed?.intent;
+    if (
+      !observed
+      || !current
+      || expected.attemptId === undefined
+      || current.uncertain
+      || current.staleOwner
+      || !sameOAuthRefreshIntentAttempt(current, expected)
+      || (current.cleanupPending !== undefined && current.cleanupPending !== cleanupPending)
+    ) return undefined;
+    const marked: OAuthRefreshIntent = { ...current, cleanupPending };
+    try {
+      atomicWriteFile(path, `${JSON.stringify(marked)}\n`, undefined, {
+        beforeRename: hooks.beforeMarkCommit,
+        validateBeforeRename: targetPath => {
+          let latest: OAuthRefreshIntentFileSnapshot;
+          try { latest = snapshot(targetPath); }
+          catch (error) {
+            throw new OAuthRefreshIntentChangedError("OAuth refresh intent changed before marker commit", { cause: error });
+          }
+          if (!sameSnapshot(observed.snapshot, latest)) {
+            throw new OAuthRefreshIntentChangedError("OAuth refresh intent changed before marker commit");
+          }
+        },
+      });
+    } catch (error) {
+      if (error instanceof OAuthRefreshIntentChangedError) return undefined;
+      throw error;
+    }
+    return marked;
+  });
+}
+
+export function clearOAuthRefreshIntentIfMatch(
+  provider: string,
+  accountId: string,
+  expected: OAuthRefreshIntent,
+  hooks: OAuthRefreshIntentMutationHooks = {},
+): boolean {
+  return withConfigMutationLockSync(() => {
+    const path = getAuthRefreshIntentPath(provider, accountId);
+    const observed = exactOAuthRefreshIntentFile(provider, accountId);
+    if (!observed) return true;
+    const current = observed.intent;
+    if (
+      current.uncertain
+      || expected.uncertain
+      || current.attemptId === undefined
+      || expected.attemptId === undefined
+      || current.uncertain !== expected.uncertain
+      || current.staleOwner !== expected.staleOwner
+      || current.cleanupPending !== expected.cleanupPending
+      || !sameOAuthRefreshIntentAttempt(current, expected)
+    ) return false;
+    hooks.beforeClearRecheck?.();
+    let latest: OAuthRefreshIntentFileSnapshot;
+    try { latest = snapshot(path); }
+    catch (error) {
+      if (errorCode(error) === "ENOENT") return true;
+      throw error;
+    }
+    if (!sameSnapshot(observed.snapshot, latest)) return false;
+    try { unlinkSync(path); return true; }
+    catch (error) { if (errorCode(error) === "ENOENT") return true; throw error; }
+  });
+}
+
 export function markOAuthRefreshIntentStaleOwner(provider: string, accountId: string, generation: string, flightId: string): boolean {
-  const current = readOAuthRefreshIntent(provider, accountId);
-  if (current?.uncertain || current?.generation !== generation || current.flightId !== flightId) return false;
-  atomicWriteFile(getAuthRefreshIntentPath(provider, accountId), `${JSON.stringify({ ...current, staleOwner: true })}\n`);
-  return true;
+  return withConfigMutationLockSync(() => {
+    const current = readOAuthRefreshIntent(provider, accountId);
+    if (
+      current?.uncertain
+      || current?.cleanupPending
+      || current?.generation !== generation
+      || current.flightId !== flightId
+    ) return false;
+    atomicWriteFile(getAuthRefreshIntentPath(provider, accountId), `${JSON.stringify({ ...current, staleOwner: true })}\n`);
+    return true;
+  });
 }
 export function clearOAuthRefreshIntent(provider: string, accountId: string, generation: string): boolean {
-  const current = readOAuthRefreshIntent(provider, accountId);
-  if (!current || current.generation !== generation) return false;
-  try { unlinkSync(getAuthRefreshIntentPath(provider, accountId)); return true; }
-  catch (error) { if (errorCode(error) === "ENOENT") return false; throw error; }
+  return withConfigMutationLockSync(() => {
+    const current = readOAuthRefreshIntent(provider, accountId);
+    if (!current || current.generation !== generation) return false;
+    try { unlinkSync(getAuthRefreshIntentPath(provider, accountId)); return true; }
+    catch (error) { if (errorCode(error) === "ENOENT") return false; throw error; }
+  });
 }
 export function credentialGeneration(cred: OAuthCredentials): string {
   return createHash("sha256").update(JSON.stringify([cred.refresh, cred.access, cred.expires])).digest("hex");
@@ -233,6 +437,14 @@ function backupLegacyOnce(): void {
   try {
     copyFileSync(path, backup);
     try { chmodSync(backup, 0o600); } catch { /* best-effort */ }
+    try {
+      // Register only the copy we just created. An unowned home still needs downgrade recovery.
+      if (!recordOwnedConfigPath(getConfigDir(), backup)) {
+        console.warn("[oauth] Recovery backup created, but uninstall ownership registration failed.");
+      }
+    } catch {
+      console.warn("[oauth] Recovery backup created, but uninstall ownership registration failed.");
+    }
   } catch { /* best-effort */ }
 }
 
@@ -256,9 +468,12 @@ function normalizeCredential(cred: unknown): OAuthCredentials | null {
   if (isCredentialSource(candidate.source)) normalized.source = candidate.source;
   if (typeof candidate.projectId === "string" && candidate.projectId.length > 0) normalized.projectId = candidate.projectId;
   if (typeof candidate.apiBaseUrl === "string" && candidate.apiBaseUrl.length > 0) {
-    // Persist only allowlisted Copilot origins; drop anything else so auth.json cannot
-    // become an SSRF springboard across reloads.
-    const validated = validateCopilotApiBaseUrl(candidate.apiBaseUrl);
+    // Persist only allowlisted origins; drop anything else so auth.json cannot
+    // become an SSRF springboard across reloads. Copilot and Devin are the two
+    // providers whose host comes back from the network, and each owns its own
+    // allowlist.
+    const validated =
+      validateCopilotApiBaseUrl(candidate.apiBaseUrl) ?? validateDevinApiBaseUrl(candidate.apiBaseUrl);
     if (validated) normalized.apiBaseUrl = validated;
   }
   if (candidate.kiro && typeof candidate.kiro === "object") {
@@ -280,6 +495,30 @@ function normalizeCredential(cred: unknown): OAuthCredentials | null {
         ...(apiRegion ? { apiRegion } : {}),
         ...(clientId ? { clientId } : {}),
         ...(clientSecret ? { clientSecret } : {}),
+      };
+    }
+  }
+  if (candidate.muse && typeof candidate.muse === "object") {
+    const muse = candidate.muse;
+    const cleanMuse = (value: unknown, max: number): string | undefined => {
+      if (typeof value !== "string") return undefined;
+      const trimmed = value.trim();
+      return trimmed && trimmed.length <= max && !/[\x00-\x1f\x7f]/.test(trimmed) ? trimmed : undefined;
+    };
+    const oauthAccessToken = cleanMuse(muse.oauthAccessToken, 4096);
+    const userId = cleanMuse(muse.userId, 128);
+    const tierName = cleanMuse(muse.tierName, 128);
+    const mintedAt = typeof muse.mintedAt === "number" && Number.isFinite(muse.mintedAt)
+      ? muse.mintedAt
+      : undefined;
+    // oauthAccessToken is the only load-bearing member: without it there is nothing to
+    // mint or probe with, and a row carrying only a tier label would be noise.
+    if (oauthAccessToken) {
+      normalized.muse = {
+        oauthAccessToken,
+        ...(userId ? { userId } : {}),
+        ...(tierName ? { tierName } : {}),
+        ...(mintedAt !== undefined ? { mintedAt } : {}),
       };
     }
   }
@@ -334,7 +573,15 @@ function normalizeAccountSet(raw: unknown): { set: ProviderAccountSet | null; wa
     const active = typeof candidate.activeAccountId === "string" && accounts.some(a => a.id === candidate.activeAccountId)
       ? candidate.activeAccountId
       : accounts[0]!.id;
-    return { set: { activeAccountId: active, accounts }, wasLegacy: false };
+    const set: ProviderAccountSet = { activeAccountId: active, accounts };
+    // Healing a dangling active id invalidates its old selection generation. Reads stay
+    // deterministic; only the serialized writer creates new revisions.
+    if (active === candidate.activeAccountId
+      && typeof candidate.selectionRevision === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate.selectionRevision)) {
+      set.selectionRevision = candidate.selectionRevision;
+    }
+    return { set, wasLegacy: false };
   }
   // Legacy single-credential value.
   const cred = normalizeCredential(raw);
@@ -465,11 +712,38 @@ function serializeMutation<T>(work: () => Promise<T>, retainedValues: readonly u
   drainOAuthMutations();
   return result;
 }
-export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValues: readonly unknown[] = [], options?: { waitMs?: number }):Promise<T>{return serializeMutation(async()=>{const guard=await createOAuthFileLock({path:getAuthStoreLockPath(),staleAfterMs:30000}).acquire();try{
+export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValues: readonly unknown[] = [], options?: { waitMs?: number; assertBeforePersist?: () => void }):Promise<T>{return serializeMutation(async()=>{const guard=await createOAuthFileLock({path:getAuthStoreLockPath(),staleAfterMs:30000}).acquire();try{
     const { store, hadLegacy } = loadAuthStoreInternal();
     if (hadLegacy) backupLegacyOnce();
+    const selections = new Map(Object.entries(store).map(([provider, set]) => [provider, {
+      set,
+      accountId: set.activeAccountId,
+      revision: set.selectionRevision,
+      accountIds: set.accounts.map(account => account.id),
+    }]));
     const result = await fn(store);
+    options?.assertBeforePersist?.();
+    const changedProviders: string[] = [];
+    for (const provider of new Set([...selections.keys(), ...Object.keys(store)])) {
+      const before = selections.get(provider);
+      const after = store[provider];
+      if (!after) {
+        if (before) changedProviders.push(provider);
+        continue;
+      }
+      const replaced = before?.set !== after;
+      const removed = before?.accountIds.some(id => !after.accounts.some(account => account.id === id));
+      if (replaced || removed || before?.accountId !== after.activeAccountId) {
+        // Replacement/rollback must never restore a previous generation. A common
+        // selection commit already assigned its revision before forming its result.
+        if (replaced || before?.revision === after.selectionRevision) after.selectionRevision = randomUUID();
+      }
+      if (!before || before.accountId !== after.activeAccountId || before.revision !== after.selectionRevision) {
+        changedProviders.push(provider);
+      }
+    }
     persist(store);
+    for (const provider of changedProviders) publishAccountSelection(provider, "oauth");
     return result;
   }finally{guard.release();}}, retainedValues, options?.waitMs);
 }
@@ -491,12 +765,14 @@ export function getCredential(provider: string): OAuthCredentials | null {
 export async function saveCredential(
   provider: string,
   cred: OAuthCredentials,
-  opts: { preserveIdentityless?: boolean } = {},
+  opts: { preserveIdentityless?: boolean; assertBeforePersist?: () => void } = {},
 ): Promise<void> {
   const safe = normalizeCredential(cred);
   if (!safe) return;
   await mutateStore(store => {
     const set = store[provider];
+    // Login explicitly selects an account, including a re-login to the same slot.
+    if (set) set.selectionRevision = randomUUID();
     const identity = safe.accountId ?? safe.email;
     if (!set || SINGLE_SLOT_PROVIDERS.has(provider)) {
       const id = newAccountId(safe);
@@ -542,7 +818,7 @@ export async function saveCredential(
       set.accounts.push({ id, credential: safe, addedAt: Date.now() });
       set.activeAccountId = id;
     }
-  }, [provider, safe]);
+  }, [provider, safe], { assertBeforePersist: opts.assertBeforePersist });
 }
 
 /**
@@ -590,17 +866,26 @@ export async function upsertCredentialByIdentity(
   }, [provider, safe]);
 }
 
-/** Remove the ACTIVE account; remaining accounts promote the first one. */
-export async function removeCredential(provider: string): Promise<void> {
-  await mutateStore(store => {
+/**
+ * Remove the ACTIVE account; remaining accounts promote the first one.
+ *
+ * Returns what actually happened, which a caller cannot otherwise know. A read-then-remove
+ * preflight is not equivalent: `mutateStore` serializes mutations, so between a caller's
+ * `getAccountSet` check and its `removeCredential` call another process can remove the same
+ * account, and both callers would then report a removal that only one of them performed.
+ * Deciding inside the mutation is the only place the answer is true when it is returned.
+ */
+export async function removeCredential(provider: string): Promise<"removed" | "not-found"> {
+  return await mutateStore(store => {
     const set = store[provider];
-    if (!set) return;
+    if (!set) return "not-found" as const;
     set.accounts = set.accounts.filter(a => a.id !== set.activeAccountId);
     if (set.accounts.length === 0) {
       delete store[provider];
-      return;
+      return "removed" as const;
     }
     set.activeAccountId = set.accounts[0]!.id;
+    return "removed" as const;
   }, [provider]);
 }
 
@@ -631,8 +916,29 @@ export function getAccountCredential(provider: string, accountId: string): OAuth
   return loadAuthStore()[provider]?.accounts.find(a => a.id === accountId)?.credential ?? null;
 }
 
+/**
+ * Credential plus the account's reauth flag, from ONE store read.
+ *
+ * A caller that checks `needsReauth` separately pays a second `loadAuthStore`, which
+ * chmods and re-parses the whole credential file. Returning both together lets an
+ * account-scoped resolver reject a revoked account without that extra read.
+ */
+export function getAccountCredentialWithStatus(
+  provider: string,
+  accountId: string,
+): { credential: OAuthCredentials; needsReauth: boolean } | null {
+  const account = loadAuthStore()[provider]?.accounts.find(a => a.id === accountId);
+  if (!account?.credential) return null;
+  return { credential: account.credential, needsReauth: account.needsReauth === true };
+}
+
 /** Persist a refreshed credential for a SPECIFIC account without touching activeAccountId. */
-export async function saveAccountCredential(provider: string, accountId: string, cred: OAuthCredentials): Promise<void> {
+export async function saveAccountCredential(
+  provider: string,
+  accountId: string,
+  cred: OAuthCredentials,
+  opts: { assertBeforePersist?: () => void } = {},
+): Promise<void> {
   const safe = normalizeCredential(cred);
   if (!safe) return;
   await mutateStore(store => {
@@ -640,16 +946,63 @@ export async function saveAccountCredential(provider: string, accountId: string,
     if (!account) return;
     account.credential = safe;
     delete account.needsReauth;
-  }, [provider, accountId, safe]);
+  }, [provider, accountId, safe], { assertBeforePersist: opts.assertBeforePersist });
+}
+
+function accountSelection(set: ProviderAccountSet): OAuthAccountSelection {
+  return {
+    accountId: set.activeAccountId,
+    ...(set.selectionRevision !== undefined ? { revision: set.selectionRevision } : {}),
+  };
+}
+
+export function captureOAuthAccountSelection(provider: string): OAuthAccountSelection | null {
+  const set = getAccountSet(provider);
+  return set ? accountSelection(set) : null;
+}
+
+/**
+ * Shared manual/automatic selection owner. An expected snapshot marks an automatic
+ * proposal: validating an unchanged selection preserves its revision. An unconditional
+ * (manual) selection always advances it, even when reselecting the current account.
+ */
+export async function commitOAuthAccountSelection(
+  provider: string,
+  accountId: string,
+  options: {
+    expectedSelection?: OAuthAccountSelection;
+    expectedCredentialGeneration?: string;
+    requireUsableAccount?: boolean;
+  } = {},
+): Promise<OAuthAccountSelection | null> {
+  // Snapshot caller-owned options before waiting for the serialized writer.
+  const expected = options.expectedSelection ? { ...options.expectedSelection } : undefined;
+  const { expectedCredentialGeneration, requireUsableAccount } = options;
+  const valid = (set: ProviderAccountSet): boolean => {
+    if (expected && (set.activeAccountId !== expected.accountId || set.selectionRevision !== expected.revision)) return false;
+    const account = set.accounts.find(account => account.id === accountId);
+    if (!account || (requireUsableAccount && account.needsReauth === true)) return false;
+    return expectedCredentialGeneration === undefined || credentialGeneration(account.credential) === expectedCredentialGeneration;
+  };
+  if (expected?.accountId === accountId) {
+    // Ordinary admission is one synchronous read/validation, with no await, writer
+    // queue, or persistence. A changed selection must still take the guarded writer.
+    const set = getAccountSet(provider);
+    return set && valid(set) ? accountSelection(set) : null;
+  }
+  return await mutateStore(store => {
+    const set = store[provider];
+    if (!set || !valid(set)) return null;
+    if (!expected || set.activeAccountId !== accountId) {
+      set.activeAccountId = accountId;
+      set.selectionRevision = randomUUID();
+    }
+    return accountSelection(set);
+  }, [provider, accountId, expected, expectedCredentialGeneration]);
 }
 
 export async function setActiveAccount(provider: string, accountId: string): Promise<boolean> {
-  return await mutateStore(store => {
-    const set = store[provider];
-    if (!set || !set.accounts.some(a => a.id === accountId)) return false;
-    set.activeAccountId = accountId;
-    return true;
-  }, [provider, accountId]);
+  return (await commitOAuthAccountSelection(provider, accountId)) !== null;
 }
 
 export async function setAccountAlias(provider: string, accountId: string, alias: string | undefined): Promise<boolean> {
@@ -701,6 +1054,39 @@ export async function replaceProviderAccountSet(
       })),
     };
   }, [provider, set]);
+}
+
+export type ProviderCredentialRekeyOutcome = "moved" | "absent" | "conflict";
+
+/**
+ * Move a provider's whole account set to a different provider key.
+ *
+ * Used by provider-id merge migrations (e.g. devin-cli -> devin): the
+ * credential itself stays valid under the canonical id, only the slot name is
+ * stale. The move goes through mutateStore so it takes the same file lock and
+ * revision bookkeeping as every other auth.json write.
+ *
+ * Both slots occupied is a REFUSAL, not a merge: two account sets may belong
+ * to different humans, and picking a survivor is a user decision, so the
+ * outcome is reported and both are left in place.
+ *
+ * Orphaned auth.refresh.<provider>.<hash>.json intent files are not moved.
+ * They are keyed by provider name plus an account-id hash, so a file left
+ * under the old id simply never matches a lookup again — harmless litter, and
+ * rewriting them would have to guess at an intent's in-flight state anyway.
+ */
+export async function rekeyProviderCredentials(
+  from: string,
+  to: string,
+): Promise<ProviderCredentialRekeyOutcome> {
+  return await mutateStore(store => {
+    const source = store[from];
+    if (!source) return "absent";
+    if (store[to]) return "conflict";
+    store[to] = source;
+    delete store[from];
+    return "moved";
+  }, [from, to]);
 }
 
 export async function markAccountNeedsReauth(

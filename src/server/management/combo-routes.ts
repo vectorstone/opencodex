@@ -5,6 +5,7 @@ import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCa
 import {
   DEFAULT_SUBAGENT_MODELS,
   codexAutoStartEnabled,
+  deleteConfigTopLevelKey,
   hasOwnProvider,
   isValidProviderName,
   multiAgentGuidanceEnabled,
@@ -51,7 +52,7 @@ import {
   setDebugSettings,
   type DebugFlag,
 } from "../../lib/debug-settings";
-import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import type { OcxClaudeCodeConfig, OcxComboConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
 import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
@@ -64,14 +65,46 @@ import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostR
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
 import type { ManagementContext } from "./context";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
+import { shadowCallTargetError } from "./shadow-call-validation";
+import { COMBO_DEFAULT_WAIT_FOR_COOLDOWN_MS } from "../../combos";
 
 
-/** Management wire shape: omit default imageInput "auto" (persist/response sparse). */
-function sparseComboConfig<T extends { imageInput?: "auto" | "disabled" }>(combo: T): Omit<T, "imageInput"> & { imageInput?: "disabled" } {
-  const { imageInput, ...rest } = combo;
+/**
+ * Management wire shape: omit fields whose value is the default, so GET responses and
+ * persisted config stay sparse. A default echoed here would be written straight back by
+ * any client that round-trips GET into PUT, which is how an unset option ends up
+ * materialized in every user's config.json.
+ */
+function sparseComboConfig<T extends {
+  cooldownMs?: number;
+  waitForCooldownMs?: number;
+  imageInput?: "auto" | "disabled";
+  reasoningEffortMode?: "strict" | "adaptive";
+  defaultEffortMode?: "fallback" | "force";
+}>(combo: T): Omit<T, "cooldownMs" | "waitForCooldownMs" | "imageInput" | "reasoningEffortMode" | "defaultEffortMode"> & {
+  cooldownMs?: number;
+  waitForCooldownMs?: number;
+  imageInput?: "disabled";
+  reasoningEffortMode?: "adaptive";
+  defaultEffortMode?: "force";
+} {
+  const {
+    cooldownMs,
+    waitForCooldownMs,
+    imageInput,
+    reasoningEffortMode,
+    defaultEffortMode,
+    ...rest
+  } = combo;
   return {
     ...rest,
+    ...(cooldownMs !== undefined ? { cooldownMs } : {}),
+    ...(waitForCooldownMs !== undefined && waitForCooldownMs !== COMBO_DEFAULT_WAIT_FOR_COOLDOWN_MS
+      ? { waitForCooldownMs }
+      : {}),
     ...(imageInput === "disabled" ? { imageInput: "disabled" as const } : {}),
+    ...(reasoningEffortMode === "adaptive" ? { reasoningEffortMode: "adaptive" as const } : {}),
+    ...(defaultEffortMode === "force" ? { defaultEffortMode: "force" as const } : {}),
   };
 }
 
@@ -127,30 +160,48 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
       comboPublicModelId,
       normalizeComboConfig,
     } = await import("../../combos");
-    const error = comboConfigError(id, body.combo, config.providers, {
+    const sourceId = renameFrom ?? id;
+    const previous = config.combos?.[sourceId];
+    if (!isPlainRecord(body.combo)) {
+      return jsonResponse({ error: "combo must be an object" }, 400);
+    }
+    const requestedCombo: Record<string, unknown> = body.combo;
+    const effectiveCombo = {
+      ...requestedCombo,
+      ...(!Object.hasOwn(requestedCombo, "cooldownMs") && previous?.cooldownMs !== undefined
+        ? { cooldownMs: previous.cooldownMs }
+        : {}),
+      ...(!Object.hasOwn(requestedCombo, "waitForCooldownMs") && previous?.waitForCooldownMs !== undefined
+        ? { waitForCooldownMs: previous.waitForCooldownMs }
+        : {}),
+      // The dashboard does not expose this advanced CLI/API policy. Preserve it when
+      // a GUI round-trip omits the field instead of silently downgrading to fallback.
+      ...(!Object.hasOwn(requestedCombo, "defaultEffortMode") && previous?.defaultEffortMode !== undefined
+        ? { defaultEffortMode: previous.defaultEffortMode }
+        : {}),
+    };
+    const error = comboConfigError(id, effectiveCombo, config.providers, {
       requireEnabledTarget: true,
       combos: config.combos,
-      excludeComboId: renameFrom ?? id,
+      excludeComboId: sourceId,
     });
     if (error) return jsonResponse({ error }, 400);
-    const normalized = normalizeComboConfig(body.combo as import("../../types").OcxComboConfig);
+    const normalized = normalizeComboConfig(effectiveCombo as unknown as OcxComboConfig);
     // Persist only non-default identity/capability fields so config stays sparse.
+    // Capability defaults (`imageInput`, `reasoningEffortMode`) go through the same
+    // helper the GET/PUT responses use, so the wire shape and the stored shape cannot drift.
     const {
       alias: normalizedAlias,
       nativeAlias: normalizedNativeAlias,
       displayName: normalizedDisplayName,
-      imageInput: normalizedImageInput,
       ...normalizedBase
-    } = normalized;
-    const stored: import("../../types").OcxComboConfig = {
+    } = sparseComboConfig(normalized);
+    const stored: OcxComboConfig = {
       ...normalizedBase,
       ...(normalizedAlias ? { alias: normalizedAlias } : {}),
       ...(normalizedNativeAlias ? { nativeAlias: true } : {}),
       ...(normalizedDisplayName ? { displayName: normalizedDisplayName } : {}),
-      ...(normalizedImageInput === "disabled" ? { imageInput: "disabled" as const } : {}),
     };
-    const sourceId = renameFrom ?? id;
-    const previous = config.combos?.[sourceId];
     const oldPublicModel = previous ? comboPublicModelId(sourceId, previous) : null;
     const newPublicModel = comboPublicModelId(id, normalized);
     const disabledIdentityChanged = previous !== undefined && (
@@ -168,7 +219,6 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     const nextCombos = { ...(config.combos ?? {}) };
     if (renameFrom) delete nextCombos[renameFrom];
     nextCombos[id] = stored;
-    config.combos = nextCombos;
     let shouldSyncClaudeAgentDefs = false;
     const migratedModels = new Map<string, string>();
     if (oldPublicModel && oldPublicModel !== newPublicModel && previous?.nativeAlias !== true) {
@@ -182,6 +232,15 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
         previous?.nativeAlias === true ? comboModelId(id) : newPublicModel,
       );
     }
+    const currentShadowTarget = config.shadowCallIntercept?.model;
+    const migratedShadowTarget = currentShadowTarget
+      ? migratedModels.get(currentShadowTarget)
+      : undefined;
+    if (migratedShadowTarget) {
+      const targetError = shadowCallTargetError({ ...config, combos: nextCombos }, migratedShadowTarget);
+      if (targetError) return jsonResponse({ error: targetError }, 400);
+    }
+    config.combos = nextCombos;
     if (migratedModels.size > 0) {
       const migrateReference = (model: string): string => migratedModels.get(model) ?? model;
       const migrateAgentReference = (model: string): string => {
@@ -246,7 +305,7 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     }
     const { clearComboSelectionState, clearComboTargetCooldowns } = await import("../../combos");
     delete config.combos![id];
-    if (Object.keys(config.combos!).length === 0) delete config.combos;
+    if (Object.keys(config.combos!).length === 0) deleteConfigTopLevelKey(config, "combos");
     saveConfigPreservingClaudeCode(config);
     reconcileLiveStateStores();
     clearComboSelectionState(id);

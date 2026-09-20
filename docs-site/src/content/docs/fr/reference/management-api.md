@@ -78,13 +78,80 @@ résultats propres à chaque route, sans répéter ce tableau.
 | `GET /api/grok` | Lire l'état de la configuration Grok gérée et les modèles candidats | 400 échec de lecture de l'état |
 | `PUT /api/grok/selection` | Persister les modèles Grok exclus | 400 sélection invalide ou surdimensionnée |
 | `POST /api/grok/apply` | Appliquer la configuration Grok persistante par la synchronisation gérée | 409 `grok_apply_busy` ; 400/500 échec de l'application |
+| `GET /api/grok/reset-coupons?accountId=...` | Lire les jetons de réinitialisation de facturation Grok restants et leurs fenêtres de validité pour le compte xAI actif ou spécifié | 400 compte manquant ; 401 non authentifié ; 502 erreur gRPC-Web en amont |
+| `POST /api/grok/reset-coupons/consume` | Échanger un coupon de réinitialisation éligible. Corps `{ accountId?, tokenId?, operationId? }`. L'`operationId` facultatif (UUIDv4) rend l'échange idempotent : répéter le même identifiant rejoue le résultat durable sans double échange. | 400 JSON/UUID invalide ; 401 non authentifié ; 409 `identity_mismatch` ; 502 erreur en amont ; 503 capacité du registre |
 | `GET, PUT /api/claude-desktop` | Lire ou enregistrer le profil Claude Desktop routé ou natif | 400 affectation invalide ou indisponible |
 | `POST /api/claude-desktop/apply` | Écrire le profil enregistré dans la configuration gérée de Claude Desktop | 400/500 échec d'écriture |
 | `GET /api/claude-desktop/status` | Inspecter le profil enregistré par rapport à celui appliqué et l'état du bureau | 400 échec de lecture de l'état |
 | `GET, PUT /api/claude-code` | Lire ou mettre à jour les paramètres de passerelle, de mode d'authentification, de correspondance des modèles, de contexte, d'agent et de service auxiliaire | 400 champ ou structure invalide |
 
+Le tableau de bord pilote les deux chemins de coupon depuis **Providers > xAI Grok > Accounts** : chaque
+ligne de compte connecté porte un badge de ticket indiquant le nombre de coupons restants, et le
+badge ouvre une boîte de dialogue qui liste les fenêtres de validité et échange le coupon le plus
+proche de l'expiration. La boîte de dialogue envoie un `operationId` émis par le client, et cesse
+d'envoyer après un délai d'attente au lieu de réessayer, car un échange dont l'enregistrement du
+journal est encore ouvert s'exécuterait de nouveau. `ocx account grok-reset-coupons` reste l'équivalent
+en terminal.
+
 Pour comprendre la liste de modèles et le comportement chiffré des tâches confiées aux agents d'exécution, voir
 [Surface des sous-agents](/fr/guides/sub-agent-surface/).
+
+### Journal de restauration des intégrations clientes
+
+| Méthode et chemin | Objectif | Erreurs notables |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | Lister les opérations de restauration, éventuellement pour un seul client. Chaque ligne contient le champ `deletable` calculé par le serveur. | 400 client invalide |
+| `DELETE /api/client-integrations/journal?opId=...` | Retirer une ancienne opération et supprimer son instantané si possible. La réponse contient `snapshotRemoved` ; `false` conserve le nettoyage pour une nouvelle tentative de maintenance. | 400 `opId` absent ; 404 opération absente ou déjà retirée ; 409 opération la plus récente du client |
+
+## Prévisualiser une modification d'intégration
+
+Une prévisualisation montre ce qu'une modification ferait sans la faire. Ces routes n'écrivent
+rien : ni instantané, ni enregistrement de propriété, ni ligne de journal, ni verrou, ni
+maintenance, ni récupération.
+
+| Méthode et chemin | Objet | Erreurs notables |
+| --- | --- | --- |
+| `POST /api/client-integrations/preview` | Planifier `apply`, `overwrite` ou `disable` pour un client ; corps `{ "clientId": "...", "operation": "..." }` | 400 client ou opération invalide ; 400 `invalid_aside_profile_path`; 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/restore/preview` | Planifier une annulation ; corps `{ "opId": "...", "confirmDrift": false }` | 404 opération inconnue ; 400 `invalid_aside_profile_path`; 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/aside/profiles/{profileId}/preview` | Planifier la modification d'un seul profil Aside ; `restore` exige un `opId` | 400 corps invalide ou profil non précisé ; 404 profil ou opération inconnus; 409 `integration_preview_unavailable` |
+
+Un plan contient `version`, `clientId`, `operation`, `state`, `foreignEdit`, une liste `changes`
+de paires `kind` et `path`, une empreinte `fingerprint` opaque, `canApply`, `willChange`, ainsi
+que `refusalReason` et `profileId` facultatifs. Les chemins sont des chemins de schéma gérés ou
+les marqueurs fixes `$snapshot`, `$ownership` et `$journal` ; une position déterminée à
+l'exécution apparaît comme `*`. Aucune valeur de configuration, aucun emplacement de fichier et
+aucune identité d'élément sélectionné n'est renvoyé.
+
+`canApply` à vrai avec `willChange` à faux signifie que l'opération réussit sans rien changer
+dans le document client géré, par exemple appliquer ce qui est déjà appliqué.
+
+Une modification de profil Aside enregistre tout de même une chose dans ce cas : la confirmation
+enregistre la préférence de synchronisation du profil avant de toucher au moindre document client.
+Désactiver un profil dont le bloc géré est déjà absent enregistre donc la préférence et laisse le
+document et son historique intacts.
+
+`integration_preview_unavailable` indique qu'aucune liste de modèles utilisable n'est actuellement
+conservée : un proxy qui vient de démarrer est un cas, une liste abandonnée parce que la
+configuration ou le cache de fournisseurs a changé en est un autre. Lire
+`GET /api/client-integrations` en établit une lorsque la découverte réussit et que la
+configuration peut être identifiée ; c'est le remède habituel, pas une garantie.
+
+## Confirmer une modification prévisualisée
+
+Les routes de modification acceptent `operation` et `planFingerprint` à côté de leur corps
+habituel. Envoyez les deux ou aucun : une requête n'en portant qu'un est rejetée, tout comme une
+requête dont l'`operation` contredit la modification demandée. Une liaison Aside porte sur un seul
+profil, car une empreinte ne peut pas décrire plusieurs fichiers qui changent indépendamment.
+
+Le serveur replanifie avant d'écrire et renvoie `409 integration_preview_stale` avec un `plan`
+recalculé lorsque la confirmation ne décrit plus ce qui se produirait. Décidez de nouveau d'après
+ce plan ; la requête n'est pas réessayée automatiquement.
+
+Une empreinte est une vérification optimiste, jamais une autorisation. L'authentification de l'API
+d'administration et les règles de propriété décident seules si une modification peut avoir lieu.
+
+La suppression ajoute une pierre tombale au lieu de réécrire le journal. Le serveur protège
+l'opération la plus récente de chaque client afin de conserver le point d'annulation actuel.
 
 ### Combinaisons
 
@@ -125,6 +192,7 @@ Voir [Combos](/fr/guides/combos/) pour les stratégies cibles, les temps de rech
 | `GET /api/debug/injection-logs` | Lire un nombre limité d'entrées de débogage de l'injection du guidage | — |
 | `GET /api/claude/inbound-debug` | Lire l'état et les entrées du débogage entrant | — |
 | `GET /api/usage` | Résumer l'utilisation par période et par interface cliente ; les réponses Codex comprennent aussi une ventilation `accounts` indexée par des libellés de journalisation stables ne contenant aucune donnée personnelle | Renvoie un résumé `error: "read_failed"` si le stockage ne peut pas être lu |
+| `GET /api/metrics` | Renvoyer les métriques texte Prometheus locales au processus : requêtes logiques, envois physiques, types de récupération, durée et TTFT. Les libellés sont limités au protocole, au résultat et à la classe de récupération ; aucun identifiant de requête ou d'identifiant secret n'est exporté. | 404 si `metricsExport.enabled` n'était pas vrai au démarrage ; l'authentification de gestion est obligatoire et les identifiants du plan de données ne donnent aucun accès |
 | `GET /api/storage` | Analyser l'utilisation du stockage Codex par catégorie | Renvoie une charge utile `error: "scan_failed"` en cas d'échec de l'analyse |
 | `POST /api/storage/cleanup/preview` | Prévisualiser le nettoyage des sessions archivées et renvoyer une empreinte contraignante | 400 `invalid_json` ou `invalid_percent` |
 | `POST /api/storage/cleanup` | Mettre en quarantaine ou supprimer définitivement l'ensemble archivé prévisualisé | 400 saisie invalide ; 409 état obsolète, occupé ou référencé ; 500 échec du système de fichiers ou de la base de données |
@@ -135,6 +203,8 @@ Voir [Combos](/fr/guides/combos/) pour les stratégies cibles, les temps de rech
 | `POST /api/storage/cleanup-policy/run` | Démarrer une exécution manuelle de la politique de nettoyage | 409 `already_running` ; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | Point d'ancrage du flux de stratégie réservé aux tests | 404 `not_found` en cas d'indisponibilité |
 
+Si une ligne dépasse la limite de taille du parseur, `GET /api/usage` et `GET /api/keys` conservent les agrégats lisibles et ajoutent `usageIncomplete: true` avec `usageIncompleteReason: "oversized_rows"` au niveau de la réponse. Ce diagnostic reste présent dans le cache et après les ajouts incrémentaux, même sans résultat ni correspondance de filtre ; une reconstruction le recalcule. Les identifiants de fournisseur, de modèle et de clé API ne sont pas raccourcis. L’absence du champ ne prouve pas la validité de toutes les lignes. Ce signal est distinct de `historyTruncated`, `entriesTruncated` et de la couverture de mesure des tokens.
+
 Pour `GET /api/usage?range=30d&surface=codex`, `accounts` contient une ligne par libellé de pool Codex
 observé. Chaque ligne indique `accountLogLabel`, le total de jetons, `usageCoverageRatio` et une valeur facultative
 `estimatedCostUsd` calculée selon les tarifs d'affichage actuellement configurés. Les substitutions `modelCosts` actives de l'utilisateur
@@ -142,6 +212,12 @@ sont prioritaires sur le catalogue vérifié fourni et sur les tarifs de repli 
 réestimée d'après la tarification active au moment de la lecture du résumé. Il s'agit d'une estimation équivalente à un usage d'API,
 et non de frais d'abonnement. Les nouvelles requêtes du pool principal utilisent le libellé réservé `main` ; les anciennes lignes
 `openai` sans qualification restent dans une catégorie ambiguë au lieu d'être réaffectées d'après la configuration actuelle.
+
+Les lignes de `models`, `providers` et `days[].models` comportent également `cacheHitRate` : la part des jetons
+d'entrée servis depuis le cache d'invites du fournisseur, limitée à `[0, 1]`. Cette valeur est `null` — jamais `0` —
+lorsque le fournisseur n'a transmis aucune télémétrie de cache ou que la ligne ne contient aucun jeton d'entrée, car
+« aucune donnée de cache » et « un véritable taux de succès de 0 % » sont deux faits distincts, et un graphique qui
+les représente de la même manière est trompeur.
 
 :::caution
 Les points de terminaison de nettoyage du stockage peuvent déplacer ou supprimer définitivement les données de session archivées. Toujours prévisualiser
@@ -156,10 +232,16 @@ d’abord et soumettez le résumé renvoyé. Préférez la quarantaine lorsqu’
 | `GET /api/models` | Renvoyer les lignes de modèles destinées au tableau de bord et à l'interface en ligne de commande | `catalog_busy` lorsque la collecte est saturée |
 | `GET /api/client-config?client=...` | Créez une configuration client en lecture seule pour toute intégration de fichiers prise en charge | 400 client non pris en charge ; 503 catalogue indisponible |
 | `PUT /api/disabled-models` | Remplacer la liste partagée des modèles désactivés | 400 invalide JSON |
-| `PUT /api/model-visibility` | Modifier atomiquement la visibilité au niveau du fournisseur ou du modèle | 400 fournisseur, portée, cible ou corps non valide |
+| `PUT /api/model-visibility` | Modifier atomiquement la visibilité au niveau du fournisseur ou du modèle | 400 fournisseur, portée, cible ou corps non valide; 409 `initial_model_selection_pending` (Actualisez la liste des modèles, puis réessayez.) |
 | `GET, POST /api/custom-models` | Répertoriez les modèles personnalisés ou ajoutez-en un | 400 champs invalides ; 404 fournisseur manquant ; 409 dupliquer le modèle |
 | `PUT, DELETE /api/custom-models/{id}` | Modifier ou supprimer un modèle personnalisé | 400 invalide id/fields ; 404 introuvable ; 409 modèle en double |
-| `GET, PUT /api/selected-models` | Lire les listes autorisées et la disponibilité des fournisseurs, ou remplacer une liste autorisée | 400 fournisseur ou corps manquant ; 404 fournisseur inconnu |
+| `GET, PUT /api/selected-models` | Lire les listes autorisées et la disponibilité des fournisseurs, ou remplacer une liste autorisée | 400 fournisseur ou corps manquant ; 404 fournisseur inconnu; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | Lire les préréglages ou choisir le mode preset/all/custom | 400 mode invalide ou préréglage indisponible; 404 fournisseur inconnu; PUT 409 `initial_model_selection_pending` |
+
+Un modèle manuel remplace la ligne du tableau de bord Models ayant le même fournisseur et identifiant de modèle. Pour OpenAI, la ligne manuelle conserve `openai/<model>` et ses contrôles de visibilité. Sa suppression restaure la ligne native sans qualificatif de compte. Les lignes natives qualifiées par compte restent distinctes. Les routes natives et les droits du compte ne changent pas. Une cible de visibilité OpenAI non native doit correspondre à un modèle manuel configuré.
+
+
+Tant qu’une liste initiale fiable n’est pas disponible, les requêtes PUT valides vers `/api/selected-models` et `/api/model-presets` renvoient HTTP 409 avec le code `initial_model_selection_pending`. Actualisez la découverte des modèles (par exemple, `GET /api/models`), puis réessayez après sa réussite.
 
 ### Comptes OAuth, clés de fournisseur et clés du plan de données
 
@@ -198,6 +280,18 @@ fournisseurs ne sont pas renvoyés aux clients du tableau de bord.
 | `GET, PUT /api/provider-context-caps` | Lire ou mettre à jour les plafonds de contexte globaux, communs à tous les fournisseurs ou propres à un fournisseur | 400 requête invalide ; 404 fournisseur inconnu |
 | `GET /api/provider-presets` | Renvoyer les préréglages de fournisseur de l'interface graphique dérivés du registre d'exécution | — |
 
+La réponse des plafonds de contexte comprend `caps` (limites actives) et `values` (dernières
+sélections, conservées après désactivation). Activer un fournisseur sans `value` restaure sa
+sélection, ou utilise la valeur globale `contextCapValue` lors de la première activation.
+Cela vaut aussi pour OpenAI : le commutateur ne sélectionne pas un mode spécial à 922k.
+Un plafond actif borne chaque fenêtre native ; les modèles prenant en charge un contexte long
+peuvent être étendus uniquement jusqu’à leur propre plafond pris en charge.
+`{ "value": 600000, "setAll": true }` modifie la valeur globale et uniquement les plafonds actifs ;
+les fournisseurs dont le plafond est désactivé conservent leur sélection pour une réactivation ultérieure.
+`{ "setAll": true }` sans `value` active tous les fournisseurs configurés à la valeur globale
+actuelle et remplace leurs sélections mémorisées. La désactivation conserve la sélection,
+même après rechargement, sans l’appliquer comme limite.
+
 `provider_has_dependent_combos` est une barrière de sécurité : supprimez ou modifiez les combinaisons dépendantes avant de
 supprimer leur fournisseur.
 
@@ -221,9 +315,9 @@ lui-même s'il souhaite ajouter une étoile au dépôt.
 | --- | --- | --- |
 | `GET /api/system/memory` | Renvoyer les mesures scalaires du processus, du tas, des flux, de l'état des réponses, du mécanisme de surveillance et des tours actifs | — |
 | `POST /api/system/restart` | Amorcer un redémarrage du processus qui attend l'évacuation des requêtes, sans retirer l'injection du client | Renvoie 202 ; les appels répétés signalent l'évacuation déjà en cours |
-| `POST /api/stop` | Arrêter le service, restaurer Codex en mode natif, retirer l'injection Grok gérée et évacuer les requêtes du proxy | 409 conflit de propriété du service |
+| `POST /api/stop` | Arrêter le service, restaurer Codex en mode natif, retirer l'injection Grok gérée et évacuer les requêtes du proxy | 409 conflit de propriété du service; 409 `respawnable_service` lorsqu'un wrapper du Planificateur de tâches Windows pourrait relancer le proxy et que l'appelant n'est pas `ocx stop` (rien n'est modifié) ; 409 lorsque le gestionnaire installé refuse de s'arrêter ; 409 `service_state_unknown` lorsque l'état du Planificateur de tâches ne peut pas être lu (rien n'est modifié ; réparez la requête puis réessayez) |
 | `GET /api/system/codex-app-server` | Indiquer si les serveurs d'application Codex en cours d'exécution sont antérieurs au catalogue de modèles actuel | — |
-| `POST /api/system/codex-restart` | Actualiser le catalogue, puis demander aux serveurs d'application Codex obsolètes de s'arrêter afin que le sélecteur de modèles se recharge | Renvoie 200 avec `code: partially_stopped` lorsqu'une cible ne s'arrête pas |
+| `POST /api/system/codex-restart` | Actualiser le catalogue, puis redémarrer les serveurs d'application Codex obsolètes et quitter puis relancer entièrement l'application Codex Desktop afin que le sélecteur de modèles se recharge. Lorsque le proxy lui-même s'exécute dans l'application Codex, le redémarrage Desktop est refusé plutôt que transféré. | Renvoie 200 avec `code: partially_stopped` lorsqu'une cible ne s'arrête pas |
 
 ### Délégation de l'authentification Codex
 
@@ -252,7 +346,7 @@ Codex. Ses routes sont les suivantes :
 | `PUT /api/codex-auth/failover` | Définir le seuil de basculement du compte | 400 seuil invalide |
 | `GET /api/codex-auth/quota` | Lire l'état du quota mis en cache par compte | — |
 | `GET /api/codex-auth/reset-credits` | Inspecter l'éligibilité au crédit de réinitialisation pour un compte | 400 identifiant de compte manquant ; transmission du statut en amont ; 500 échec de recherche |
-| `POST /api/codex-auth/reset-credits/consume` | Consommer un crédit de réinitialisation éligible | 400 identifiant de compte manquant ; transmission du statut en amont ; 503 `server_busy` ; 500 consommer l'échec |
+| `POST /api/codex-auth/reset-credits/consume` | Consommer un crédit de réinitialisation éligible. L'`operationId` facultatif (UUIDv4) rend la consommation idempotente : le même id rejoue un unique résultat durable au lieu de consommer un second crédit. | 400 identifiant de compte manquant ou `operationId` invalide ; 409 `identity_mismatch` si l'id appartient à un autre compte ; transmission du statut en amont ; 503 `server_busy`, `capacity` ou `unavailable` ; 500 consommer l'échec |
 | `POST /api/codex-auth/login` | Démarrer une connexion ou une réauthentification Codex | 400 requête invalide ; état de connexion en conflit ou occupé |
 | `POST /api/codex-auth/login/code` | Soumettre manuellement un code pour un flux de connexion Codex | 400 flux ou code invalide |
 | `POST /api/codex-auth/login/cancel` | Annuler un flux de connexion Codex | — |
@@ -280,3 +374,7 @@ Pour l'administration courante, le [tableau de bord web](/fr/guides/web-dashboar
 Pour les hôtes sans interface graphique et l'automatisation, utilisez les commandes `ocx` correspondantes : elles appellent cette
 même API active et renvoient un code différent de zéro lorsque le proxy est inaccessible ou que l'opération échoue.
 L'accès HTTP direct est surtout utile aux intégrations qui exigent les contrats exacts des points de terminaison ci-dessus.
+
+## Sessions distantes et rotation des clés de données
+
+`POST /api/keys/rotate {id}` démarre un chevauchement de dix minutes et renvoie le nouveau secret une seule fois. `POST /api/keys/rotate/commit {id,rotationId}` valide; `DELETE /api/keys/rotate {id,rotationId}` annule. L'authentification de gestion est obligatoire et une clé de données ne suffit pas. `POST /api/session/logout` exige la `gui-session` courante, l'Origin correspondante et CSRF. Un jeton admin reçoit 403 et ne peut jamais créer une session de consentement.

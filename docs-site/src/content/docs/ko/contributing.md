@@ -12,7 +12,9 @@ bun install
 bun run dev:proxy    # 개발 모드 프록시 API
 bun run dev:gui      # 대시보드 dev 서버(다른 터미널)
 bun run typecheck    # bun x tsc --noEmit
-bun run test         # bun test ./tests/
+bun run test:changed              # routine import-graph test selection
+bun test tests/routing/router.test.ts     # routine focused test
+bun run test                      # complete suite (PR-ready / explicit ask)
 ```
 
 `bun run dev`는 계속 `bun run dev:proxy`의 별칭으로 동작합니다. 대시보드 dev 서버는
@@ -27,13 +29,13 @@ bun run test         # bun test ./tests/
 ```bash
 bun run typecheck                 # 엄격한 TypeScript 검사
 bun run test                      # tests/ 전체 스위트
-bun test tests/router.test.ts     # 특정 테스트 파일
+bun test tests/routing/router.test.ts     # 특정 테스트 파일
 bun run build:gui                 # Vite GUI 빌드 + 패키지 준비
 bun run privacy:scan              # CI에서 쓰는 자격 증명/개인정보 검사
 bun run prepare:package           # 패키지 런처/asset 갱신
 ```
 
-대부분의 테스트는 `tests/*.test.ts`에 나란히 놓인 Bun 테스트입니다. 공용 fixture는
+테스트는 `src/`를 따라 나눈 도메인 디렉터리(`tests/<domain>/`)에 놓인 Bun 테스트이며, 지도는 `scripts/test-layout/layout.json`입니다. 공용 fixture는
 `tests/helpers/`, 범위가 넓은 네이티브 동등성 시나리오는 `tests/e2e-style/`에 있습니다. 바꾼
 subsystem의 기존 테스트 근처에 집중된 회귀 테스트를 추가하세요. 공용 라우팅, 어댑터, 설정, 서버
 동작을 건드렸다면 전체 스위트도 실행합니다.
@@ -72,11 +74,24 @@ GitHub Actions는 필요한 작업만 수행합니다.
 
 릴리즈에는 helper를 사용하세요.
 
+
+helper 실행 전에 릴리즈할 버전을 정하고, 기본 브랜치에서
+`.github/workflows/dev-version-bump.yml`을 `intended-version=<version>`,
+`mode=pre-move`로 실행하세요. 생성된 PR을 검토해 `dev`에 머지한 뒤
+`main` 또는 `preview`로 승격하고 helper를 실행하세요. `dev` 버전이 이미 더
+높으면 워크플로가 `changed=false`를 반환하므로 버전 이동 PR은 필요 없습니다.
+배포에는 정확한 릴리즈 커밋의 CI 통과가 여전히 필요합니다.
+
 ```bash
 bun run release <version>           # 버전 bump를 commit/push, publish workflow는 기본 dry-run
+bun run release --bump minor        # tag와 npm channel에서 다음 patch, minor, major 버전을 계산
 bun run release <version> --publish # CI-gated dry-run을 확인한 뒤 실제 publish
 bun run release:watch               # 가장 최근 Release workflow run 감시
 ```
+
+명시적 버전 대신 `--bump patch|minor|major`를 사용할 수 있습니다. 더 높은 core의 preview tag가
+열린 뒤에는 `--bump patch`가 이전 stable patch 라인의 계속을 거부합니다. 해당 수정은 열린 preview
+core에 포함해 릴리즈하세요.
 
 ## 브랜치
 
@@ -107,7 +122,7 @@ Go 네이티브 포트를 담당했던 `dev2-go`는 정리했고, 두 라인을 
 
 ## 카탈로그에 프로바이더 추가하기
 
-모든 프로바이더 선택기와 seed는 canonical registry(`src/providers/registry.ts`)에서 파생됩니다.
+모든 프로바이더 선택기와 seed는 canonical registry(`src/providers/registry/entries-extended.ts`)에서 파생됩니다.
 
 ```ts
 {
@@ -136,6 +151,20 @@ OAuth 설정 seed에 공급합니다. `enrichProviderFromCatalog()`는 모델 �
 어댑터가 전송 재시도를 직접 맡을 때만 `fetchResponse`를 사용하고, Cursor처럼 실제 양방향 전송에는
 `runTurn`을 사용하세요. `tests/` 아래에 집중된 테스트를 추가하고, public package API에 포함되는
 factory라면 `src/index.ts`에서도 export합니다.
+
+### 호환성 주장 추가하기
+
+호환성 주장은 `src/compatibility/`에 둡니다. 주장의 범위는 어댑터보다 좁으며, 검증한 정확한 프로바이더,
+정규화된 upstream base URL, 인증 모드, inbound/upstream 프로토콜과 model id를 지정합니다. 같은 어댑터나
+wire format을 쓴다는 이유만으로 다른 프로바이더 또는 목적지에 주장을 복사하지 마세요.
+
+버전이 지정된 disposition은 `passthrough`, `translated`, `degraded`, `unsupported` 중 하나를 사용합니다.
+`passthrough`가 아닌 주장에는 구체적인 제한을 적고, fixture 기반 주장에는 이를 입증하는 정확한 assertion id를
+명시하세요. 비밀정보가 없는 request vector를 `tests/fixtures/compatibility/`에 추가하고 production adapter를
+대상으로 실행하는 집중 테스트를 작성합니다.
+
+호환성 매니페스트는 수동적인 데이터입니다. 일반 router, Responses handler, server startup path가 manifest
+catalog를 import하거나 Compatibility Lab을 활성화해서는 안 됩니다.
 
 ## 완료를 주장하기 전에 검증하기
 

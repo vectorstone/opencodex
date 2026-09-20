@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import {
+  configureApiTargets,
   installApiAuthFetch,
   resetApiAuthFetchForTests,
   setRebootstrapTimeoutForTests,
   setResolutionWatchdogForTests,
+  SESSION_UNAVAILABLE_EVENT,
 } from "../src/api";
+import { targetsFromMachineStatus, type MachineStatusV1 } from "../src/api-targets";
 
 const globals = ["document", "window", "navigator", "sessionStorage", "fetch"] as const;
 let previousGlobals: Record<(typeof globals)[number], unknown>;
@@ -52,12 +55,35 @@ function sessionDocumentHtml(token: string, csrf: string, origin: string): strin
     `<meta name="opencodex-session-token" content="${token}">`,
     `<meta name="opencodex-session-csrf" content="${csrf}">`,
     `<meta name="opencodex-session-origin" content="${origin}">`,
+    `<meta name="opencodex-session-server-origin" content="${origin}">`,
     "</head><body></body></html>",
   ].join("");
 }
 
 function pathnameOf(input: RequestInfo | URL): string {
   return new URL(input instanceof Request ? input.url : String(input), "http://localhost/").pathname;
+}
+
+/**
+ * Declare the served runtime role, the way `src/server/gui-static.ts` does.
+ *
+ * The admin-token prompt is hub-only: a standalone loopback install mints its own session,
+ * so a refusal there is a Host/Origin misconfiguration no typed token can repair (#3353).
+ * A test that wants to observe the prompt has to say it is a hub.
+ */
+function declareRuntimeRole(role: string): void {
+  const meta = document.createElement("meta");
+  meta.setAttribute("name", "opencodex-runtime-role");
+  meta.setAttribute("content", role);
+  document.head.append(meta);
+}
+
+/** Declare the bind's credential requirement, as `serveGuiFile` does from `isApiAuthRequired`. */
+function declareManagementAuthRequired(required: boolean): void {
+  const meta = document.createElement("meta");
+  meta.setAttribute("name", "opencodex-management-auth-required");
+  meta.setAttribute("content", required ? "1" : "0");
+  document.head.append(meta);
 }
 
 /** A hang that honors the abort signal, like real fetch does. */
@@ -67,9 +93,51 @@ function hangUntilAborted(signal?: AbortSignal | null): Promise<Response> {
   });
 }
 
-const MINTED = () => new Response(sessionDocumentHtml("ocx_session_fresh", "fresh-csrf", "http://localhost"), {
-  status: 200,
-  headers: { "Content-Type": "text/html" },
+const MINTED = () => {
+  const response = new Response(sessionDocumentHtml("ocx_session_fresh", "fresh-csrf", "http://localhost"), {
+    status: 200,
+    headers: { "Content-Type": "text/html" },
+  });
+  Object.defineProperty(response, "url", { configurable: true, value: "http://localhost/opencodex-session" });
+  return response;
+};
+
+test("a shared-target bootstrap watchdog does not block or clear the machine target", async () => {
+  for (const [name, content] of [
+    ["opencodex-session-token", "ocx_session_machine"],
+    ["opencodex-session-csrf", "machine-csrf"],
+    ["opencodex-session-origin", "http://localhost"],
+    ["opencodex-session-server-origin", "http://localhost"],
+  ]) {
+    const meta = document.createElement("meta");
+    meta.setAttribute("name", name);
+    meta.setAttribute("content", content);
+    document.head.append(meta);
+  }
+  const direct: MachineStatusV1 = {
+    mode: "client", connected: true, machineBase: "http://localhost",
+    sharedBase: "https://hub.example.test", sharedServerOrigin: "https://hub.example.test",
+    managementTransport: "direct", apiKeyId: "client-key-a", protocolVersion: 1,
+    connectedAt: "2026-08-28T00:00:00.000Z", hubReachability: "unknown",
+  };
+  configureApiTargets(targetsFromMachineStatus("", direct));
+  setRebootstrapTimeoutForTests(30);
+  const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input), "http://localhost/");
+    if (url.origin === "https://hub.example.test" && url.pathname === "/opencodex-session") {
+      return hangUntilAborted(init?.signal);
+    }
+    if (url.origin === "https://hub.example.test") return new Response("unauthorized", { status: 401 });
+    const token = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).get("x-opencodex-api-key");
+    return new Response("{}", { status: token === "ocx_session_machine" ? 200 : 401 });
+  }) as typeof fetch;
+  await installMockAuthFetch(mockFetch);
+
+  const shared = fetch("https://hub.example.test/api/config");
+  const machine = await fetch("/api/machine/status");
+  expect(machine.status).toBe(200);
+  expect((await shared).status).toBe(401);
+  expect(promptCalls).toBe(0);
 });
 test("hung bootstrap fails the wave within the deadline and a later wave re-bootstraps to success", async () => {
   setRebootstrapTimeoutForTests(50);
@@ -107,6 +175,7 @@ test("hung bootstrap fails the wave within the deadline and a later wave re-boot
 });
 
 test("bootstrap timeout and 5xx never open the admin-token prompt; only refusal does", async () => {
+  declareRuntimeRole("hub");
   setRebootstrapTimeoutForTests(40);
   let mode: "hang" | "bad-gateway" | "refuse" = "hang";
   const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -127,6 +196,74 @@ test("bootstrap timeout and 5xx never open the admin-token prompt; only refusal 
   mode = "refuse";                                          // definitive 4xx -> prompt fallback
   expect((await fetch("/api/config")).status).toBe(401);
   expect(promptCalls).toBe(1);
+});
+
+/*
+ * #3353 / the local-user UX defect.
+ *
+ * A plain loopback install mints its own GUI session, so a definitive bootstrap refusal
+ * there is a Host/Origin misconfiguration — not a missing credential. The dashboard used
+ * to answer it with a password box the user could not fill and that would not have helped
+ * if they could. The published contract already promised loopback "never asks for a token".
+ */
+test("a standalone dashboard is never asked for an admin token, and says why instead", async () => {
+  declareRuntimeRole("standalone");
+  setRebootstrapTimeoutForTests(40);
+  const events: string[] = [];
+  window.addEventListener(SESSION_UNAVAILABLE_EVENT, () => { events.push("notice"); });
+
+  // Definitive refusal on both the API and the bootstrap: the exact shape that used to prompt.
+  const mockFetch = (async () => new Response("unauthorized", { status: 401 })) as typeof fetch;
+  await installMockAuthFetch(mockFetch);
+
+  expect((await fetch("/api/config")).status).toBe(401);
+  expect(promptCalls).toBe(0);
+  expect(events).toEqual(["notice"]);
+
+  // And it must not re-ask on every later failure.
+  expect((await fetch("/api/providers")).status).toBe(401);
+  expect(promptCalls).toBe(0);
+});
+
+/* An absent tag is an older server or the Vite dev server: still not a hub, still no prompt. */
+test("a document with no runtime-role tag is treated as standalone, not hub", async () => {
+  setRebootstrapTimeoutForTests(40);
+  const mockFetch = (async () => new Response("unauthorized", { status: 401 })) as typeof fetch;
+  await installMockAuthFetch(mockFetch);
+
+  expect((await fetch("/api/config")).status).toBe(401);
+  expect(promptCalls).toBe(0);
+});
+
+/*
+ * The operator this fix must NOT lock out.
+ *
+ * `runtimeRole` is a topology signal, not an auth one: a standalone install bound to
+ * 0.0.0.0 deliberately exposed its dashboard and has to type the admin token, while a hub on
+ * loopback still mints its own session. Gating the prompt on the role would have hidden it
+ * from exactly this person, so the gate reads the bind's own requirement instead.
+ */
+test("an exposed standalone bind still gets the prompt", async () => {
+  declareRuntimeRole("standalone");
+  declareManagementAuthRequired(true);
+  setRebootstrapTimeoutForTests(40);
+  const mockFetch = (async () => new Response("unauthorized", { status: 401 })) as typeof fetch;
+  await installMockAuthFetch(mockFetch);
+
+  expect((await fetch("/api/config")).status).toBe(401);
+  expect(promptCalls).toBe(1);
+});
+
+/* And a hub on a loopback bind mints its own session, so it must not be asked. */
+test("a loopback hub is not asked for a token", async () => {
+  declareRuntimeRole("hub");
+  declareManagementAuthRequired(false);
+  setRebootstrapTimeoutForTests(40);
+  const mockFetch = (async () => new Response("unauthorized", { status: 401 })) as typeof fetch;
+  await installMockAuthFetch(mockFetch);
+
+  expect((await fetch("/api/config")).status).toBe(401);
+  expect(promptCalls).toBe(0);
 });
 
 test("caller abort during a pending resolution unwinds only that caller", async () => {
@@ -229,6 +366,7 @@ test("the watchdog never bounds the prompt: slow user input stacks no dialogs an
   // resolution escalates to the prompt. The prompt is user-controlled: the watchdog
   // must NOT fire around it, and later 401 waves must join the pending body instead
   // of opening another dialog (promptForAdminToken has no singleton guard).
+  declareRuntimeRole("hub");
   setRebootstrapTimeoutForTests(50);
   setResolutionWatchdogForTests(120);
   let bootstrapCalls = 0;

@@ -34,6 +34,19 @@ Disabled providers are excluded. An explicit namespace for a disabled provider f
 falling through. Provider entries are checked in their JSON insertion order for rules that can match
 more than one provider, so use explicit namespaces when a bare model could be ambiguous.
 
+### Blocked-model redirects
+
+`blockedModelRedirects` is an optional top-level `Record<string, string>` of exact resolved
+model-id replacements, unset by default. It runs **after** the resolution order above: a match
+keeps the provider and account route already selected, replaces only the upstream model id, and
+records the route reason `blocked-model-redirect`. Omitting the key leaves routing unchanged.
+
+```json
+{
+  "blockedModelRedirects": { "gpt-5.6-terra": "gpt-5.6-luna" }
+}
+```
+
 ## Exact Codex account selectors
 
 `codexAccountNamespaces` maps a public selector such as `side` to one stored Codex account. A
@@ -73,9 +86,13 @@ namespace, and cannot use reserved bare native families such as `gpt-*`, `o1-*`,
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `targets` | `{ provider: string; model: string; weight?: number }[]` | required | Ordered concrete routes. `weight` is 1–10000 and defaults to `1`. |
-| `strategy?` | `"failover" \| "round-robin"` | `"failover"` | Selection strategy. Target order is failover priority; weights shape smooth weighted round-robin. |
-| `stickyLimit?` | `number` | `1` | Successful requests retained in one round-robin batch. Range 1–100. |
-| `defaultEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra" \| null` | unset | Applied only when the caller omits effort and the selected target advertises the requested rung. |
+| `strategy?` | `"failover" \| "round-robin" \| "random" \| "least-used" \| "reset-window"` | `"failover"` | Selection strategy. Target order is failover priority; weights shape round-robin and random draws; least-used follows recorded successes; reset-window follows the soonest quota reset. |
+| `stickyLimit?` | `number` | `1` | Successful requests retained in one round-robin batch. Range 1–100. Applies only to round-robin. |
+| `cooldownMs?` | `number` | unset → upstream fallback (5 s for request-rate 429 codes `1302`/`1305`, otherwise 60 s) | Range 1–600000. When set, applies whenever no usable upstream `Retry-After` or Codex reset signal exists, including request-rate 429s; when unset, uses the upstream fallback. Upstream signals take precedence and all cooldowns are capped at 10 minutes. |
+| `waitForCooldownMs?` | `number` | `0` | Maximum wait for the earliest eligible cooling target on each selection attempt. Range 0–600000; an abort cancels the wait. A single-target combo with a nonzero wait holds the request up to this ceiling and retries the same target instead of failing immediately; if no target was ever dispatched the wait ends in `combo_unavailable`, otherwise the last upstream failure is returned. |
+| `defaultEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra" \| null` | unset | `defaultEffort` fills an absent `reasoning.effort` in fallback mode, or overrides valid caller effort in explicit force mode when the combo has a non-null default and the selected target has a known, nonempty supported ladder. If the target supports the configured value, it is retained; otherwise the highest supported rung at or below it is used, or the lowest supported rung when none is lower. Unknown or empty ladders omit the default. |
+| `defaultEffortMode?` | `"fallback" \| "force"` | `"fallback"` | Preserves caller precedence by default. Explicit force requires a valid non-null default, respects target capability and can increase cost and latency. `reasoningEffortMode` remains independent. |
+| `reasoningEffortMode?` | `"strict" \| "adaptive"` | `"strict"` | `"strict"` intersects all known target ladders, including empty ones; `"adaptive"` excludes empty ladders. Unknown ladders are catalog wildcards in both modes. At dispatch, explicit empty ladders remove effort/thinking controls in both modes; unknown ladders do so only in adaptive. `reasoning.summary` is preserved. Known nonempty targets retain their effort resolution, and target selection/order is unchanged. |
 | `imageInput?` | `"auto" \| "disabled"` | `"auto"` | `"auto"` publishes image only when every target supports images; `"disabled"` forces text-only (drops image from published modalities and rejects image-bearing requests before dispatch). |
 | `alias?` | `string` | — | Optional public model id in place of the canonical picker slug. |
 | `nativeAlias?` | `boolean` | `false` | Let a currently supported bare native id take precedence only for that unqualified id. Bare `gpt-5.6-*` ids use Codex Pool/Direct credentials. Account-qualified routes remain distinct. Provider-qualified routes such as `openai-apikey/gpt-5.6-*` use their configured API-key route and never fall through to the native alias. |
@@ -183,8 +200,9 @@ echoed as given. The CLI dry-run cannot supply these per-candidate account field
 
 ### Combos vs policy profiles
 
-- A **combo** is explicit ordered/weighted target routing and failover: the configured order (or
-  smooth weighted round-robin) decides, and failures advance through the list.
+- A **combo** is explicit target routing with a selectable strategy (ordered failover, smooth
+  weighted or random balancing, least-used, or reset-window): the configured strategy decides,
+  and retryable failures advance through the list.
 - A **policy profile** is evidence-based selection among configured candidates: hard capability
   requirements filter first, then deterministic scoring ranks the survivors.
 

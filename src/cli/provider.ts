@@ -8,7 +8,8 @@
  *   show <name>   Show provider config details (secrets masked)
  *   set-default <name>  Change the default provider
  */
-import { apiKeyTransportConfigError, hasOwnProvider, isValidProviderName, loadConfig, sanitizeModelCostsForDisplay, saveConfig } from "../config";
+import { hasOwnProvider, isValidProviderName, loadConfig, sanitizeModelCostsForDisplay, saveConfig } from "../config";
+import { apiKeyTransportConfigError, modelCapabilitiesConfigError, mergeModelCapabilities } from "../config/provider-validation";
 import { hasHelpFlag } from "./help";
 import { getProviderRegistryEntry, PROVIDER_REGISTRY } from "../providers/registry";
 import { providerConfigSeed } from "../providers/derive";
@@ -17,6 +18,7 @@ import type { OcxProviderConfig } from "../types";
 import { findLiveProxy } from "../server/proxy-liveness";
 import { syncModelsToCodex } from "../codex/sync";
 import { codexAccountNamespaceProviderCollisionError } from "../codex/account-namespace-match";
+import { modelSelectionGuidance, modelSelectionNextSteps } from "./model-selection-guidance";
 
 // ---------------------------------------------------------------------------
 // Arg helpers
@@ -77,26 +79,37 @@ function validateAndSave(config: ReturnType<typeof loadConfig>): void {
 
 function handleList(args: string[]): void {
   const wantsJson = consumeFlag(args, "--json");
-  rejectUnknownArgs(args, "Usage: ocx provider list [--json]");
+  const wantsJsonl = consumeFlag(args, "--jsonl");
+  rejectUnknownArgs(args, "Usage: ocx provider list [--json|--jsonl]");
+
+  if (wantsJson && wantsJsonl) {
+    console.error("Use only one of --json or --jsonl.");
+    process.exit(1);
+  }
 
   const config = loadConfig();
   const configured = Object.keys(config.providers);
+  const entries = configured.map(name => {
+    const prov = config.providers[name];
+    const registryEntry = getProviderRegistryEntry(name);
+    return {
+      name,
+      adapter: prov.adapter,
+      baseUrl: prov.baseUrl,
+      authMode: prov.authMode ?? "key",
+      defaultModel: prov.defaultModel ?? null,
+      isDefault: name === config.defaultProvider,
+      source: registryEntry ? "registry" : "custom",
+      models: prov.models ?? [],
+    };
+  });
+
+  if (wantsJsonl) {
+    for (const entry of entries) console.log(JSON.stringify(entry));
+    return;
+  }
 
   if (wantsJson) {
-    const entries = configured.map(name => {
-      const prov = config.providers[name];
-      const registryEntry = getProviderRegistryEntry(name);
-      return {
-        name,
-        adapter: prov.adapter,
-        baseUrl: prov.baseUrl,
-        authMode: prov.authMode ?? "key",
-        defaultModel: prov.defaultModel ?? null,
-        isDefault: name === config.defaultProvider,
-        source: registryEntry ? "registry" : "custom",
-        models: prov.models ?? [],
-      };
-    });
     console.log(JSON.stringify({ configured: entries, registryCount: PROVIDER_REGISTRY.length }, null, 2));
     return;
   }
@@ -126,7 +139,7 @@ function handleList(args: string[]): void {
 // provider add
 // ---------------------------------------------------------------------------
 
-const ADD_USAGE = "Usage: ocx provider add <name> [--adapter <adapter>] [--base-url <url>] [--api-key <key>] [--api-key-transport <x-api-key|bearer>] [--default-model <model>] [--allow-private-network] [--set-default] [--force] [--json] [--sync]";
+const ADD_USAGE = "Usage: ocx provider add <name> [--adapter <adapter>] [--base-url <url>] [--api-key <key>] [--api-key-transport <x-api-key|bearer>] [--default-model <model>] [--model <id> --text-only] [--google-tool-schema-policy <compatible|reject-lossy>] [--allow-private-network] [--set-default] [--force] [--json] [--sync]";
 
 async function handleAdd(args: string[]): Promise<void> {
   const name = args[0];
@@ -151,7 +164,14 @@ async function handleAdd(args: string[]): Promise<void> {
   const adapter = consumeFlagValue(restArgs, "--adapter");
   const baseUrl = consumeFlagValue(restArgs, "--base-url");
   const defaultModel = consumeFlagValue(restArgs, "--default-model");
+  const googleToolSchemaPolicy = consumeFlagValue(restArgs, "--google-tool-schema-policy");
+  const textOnly = consumeFlag(restArgs, "--text-only");
+  const capabilityModel = consumeFlagValue(restArgs, "--model");
   rejectUnknownArgs(restArgs, ADD_USAGE);
+  if (capabilityModel !== undefined && !textOnly) {
+    console.error("Error: --model requires --text-only for provider add.");
+    process.exit(1);
+  }
 
   const config = loadConfig();
 
@@ -209,8 +229,35 @@ async function handleAdd(args: string[]): Promise<void> {
     }
     provConfig.apiKeyTransport = apiKeyTransport;
   }
+  if (googleToolSchemaPolicy !== undefined) {
+    if (googleToolSchemaPolicy !== "compatible" && googleToolSchemaPolicy !== "reject-lossy") {
+      console.error('Error: --google-tool-schema-policy must be "compatible" or "reject-lossy".');
+      process.exit(1);
+    }
+    if (provConfig.adapter !== "google") {
+      console.error("Error: --google-tool-schema-policy requires the google adapter.");
+      process.exit(1);
+    }
+    provConfig.googleToolSchemaPolicy = googleToolSchemaPolicy;
+  }
 
   const existingProvider = config.providers[name];
+  if (existingProvider?.modelCapabilities !== undefined && provConfig.modelCapabilities === undefined) {
+    provConfig.modelCapabilities = structuredClone(existingProvider.modelCapabilities);
+  }
+  if (textOnly) {
+    const modelId = capabilityModel ?? defaultModel ?? provConfig.defaultModel;
+    if (!modelId) {
+      console.error("Error: --text-only requires --model or a default model.");
+      process.exit(1);
+    }
+    const declaration = { [modelId]: { inputModalities: ["text"] } };
+    const error = modelCapabilitiesConfigError(declaration);
+    if (error) { console.error(`Error: ${error}.`); process.exit(1); }
+    provConfig.modelCapabilities = mergeModelCapabilities(provConfig.modelCapabilities, declaration);
+  }
+  const { initializeProviderModelSelection } = await import("../providers/initial-model-selection");
+  initializeProviderModelSelection(name, provConfig, existingProvider, config);
   config.providers[name] = provConfig;
   // A --force overwrite rotates the key/endpoint but must not drop a
   // user-configured price overlay (same rule as the /api/providers path and
@@ -226,6 +273,7 @@ async function handleAdd(args: string[]): Promise<void> {
   if (wantsJson) {
     console.log(JSON.stringify({
       action: "added",
+      modelSelection: modelSelectionNextSteps(name),
       provider: name,
       adapter: provConfig.adapter,
       baseUrl: provConfig.baseUrl,
@@ -254,6 +302,7 @@ async function handleAdd(args: string[]): Promise<void> {
 
   const registryLabel = registryEntry ? ` (${registryEntry.label})` : "";
   console.log(`✅ Provider "${name}"${registryLabel} added.`);
+  for (const line of modelSelectionGuidance(name)) console.log(line);
   if (setDefault) console.log(`   Set as default provider.`);
   if (registryEntry?.authKind === "oauth") {
     console.log(`   Authenticate with: ocx login ${name}`);
@@ -432,15 +481,19 @@ Subcommands:
   set-default <name>    Change the default provider
   selected <name>       Show or set the provider model allowlist
   quota                 Show provider quota reports
+  resets                Show recently detected quota resets
   presets               List GUI provider presets
   account-mode <mode>   Set OpenAI Codex pool/direct mode
 
 Examples:
   ocx provider list
+  ocx provider list --jsonl
   ocx provider add anthropic --api-key sk-ant-...
   ocx provider add my-ollama --adapter openai-chat --base-url http://localhost:11434/v1
   ocx provider show anthropic --json
   ocx provider set-default anthropic
+  ocx provider edit xai --xai-chat on   # opt Grok 4.5/4.6 into Chat Completions
+  ocx provider edit xai --xai-chat off  # use Responses again
   ocx provider remove my-ollama`;
 
 export async function handleProviderCommand(args: string[]): Promise<void> {

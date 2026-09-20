@@ -6,9 +6,11 @@
  *
  * Deps are injectable (mirrors src/codex/sync.ts) so tests can run without a live proxy.
  */
-import { visibleNativeSlugs, filterCatalogVisibleModels, nativeContextLimits, nativeOpenAiContextWindow, type CatalogModel } from "../codex/catalog";
+import type { CatalogModel } from "../codex/catalog";
+import { standaloneCodexRoutingTarget } from "../codex/inject";
 import type { OcxConfig } from "../types";
-import { injectGrokConfig, type GrokInjectModel, type GrokInjectResult } from "./inject";
+import { projectGrokCatalog } from "./catalog";
+import { injectGrokConfig, type GrokInjectResult } from "./inject";
 
 export interface GrokSyncDeps {
   fetchAllModels: (config: OcxConfig) => Promise<CatalogModel[]>;
@@ -32,22 +34,10 @@ export async function syncGrokConfig(
   opts: { hostname?: string; grokHome?: string } = {},
   deps: GrokSyncDeps = { fetchAllModels: defaultFetchAllModels, injectGrokConfig },
 ): Promise<GrokInjectResult> {
-  let models: GrokInjectModel[];
+  let projection: ReturnType<typeof projectGrokCatalog>;
   try {
-    const routed = filterCatalogVisibleModels(await deps.fetchAllModels(config), config);
-    models = [
-      // Native slugs carry their context window too. Without it Grok falls back to its own
-      // default (200k) and understates models like gpt-5.6-sol, which is 372k. This is the same
-      // accessor the dashboard's native rows use, so the two cannot disagree.
-      ...visibleNativeSlugs(config).map(id => {
-        const contextWindow = nativeOpenAiContextWindow(id, nativeContextLimits(config));
-        return { id, ...(contextWindow !== undefined ? { contextWindow } : {}) };
-      }),
-      ...routed.map(m => ({
-        id: m.alias ?? `${m.provider}/${m.id}`,
-        ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
-      })),
-    ];
+    const allRouted = await deps.fetchAllModels(config);
+    projection = projectGrokCatalog(allRouted, config);
   } catch (err) {
     return {
       ok: false,
@@ -58,9 +48,19 @@ export async function syncGrokConfig(
   // Pass the FULL list plus the exclusion set: the writer allocates aliases over
   // everything and emits only what is switched on, so a model's alias never depends on
   // its neighbours' switches. Absent/empty selection keeps today's behaviour exactly.
-  return deps.injectGrokConfig(port, models, {
-    ...(opts.hostname !== undefined ? { hostname: opts.hostname } : {}),
+  const target = standaloneCodexRoutingTarget(port, {
+    hostname: opts.hostname ?? config.hostname,
+    unauthenticatedLoopbackListener: config.unauthenticatedLoopbackListener,
+  });
+  const targetUrl = new URL(target.baseUrl);
+  return deps.injectGrokConfig(Number(targetUrl.port), projection.models, {
+    hostname: target.requiresAdmissionToken
+      ? (opts.hostname ?? config.hostname)
+      : targetUrl.hostname,
     ...(opts.grokHome !== undefined ? { grokHome: opts.grokHome } : {}),
     excluded: new Set(config.grokExcludedModels ?? []),
+    catalogModelIds: projection.catalogModelIds,
+    disabledProviderNamespaces: projection.disabledProviderNamespaces,
+    comboPublicModelIds: projection.comboPublicModelIds,
   });
 }

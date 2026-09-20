@@ -12,16 +12,19 @@
  */
 import {
   appendOperation,
+  appendTombstone,
   captureSnapshot,
   clearPruneFailure,
   countSnapshots,
   findOperation,
+  findCommittedOperation,
   listOperations,
   markPruneFailure,
   pruneSnapshots,
   readMaintenance,
   readSnapshot,
   type JournalEntry,
+  type JournalTombstone,
   type MaintenanceState,
   type SnapshotRef,
 } from "./journal";
@@ -30,6 +33,7 @@ import {
   deleteRecord,
   integrationsDir,
   readRecords,
+  readRecordsStrict,
   writeRecord,
   type OwnershipRecord,
 } from "./ownership";
@@ -39,11 +43,15 @@ export interface IntegrationStateStore {
   /** The integrations directory itself — never a config root to resolve again. */
   readonly root: string;
   readRecords(): Partial<Record<IntegrationClientId, OwnershipRecord>>;
+  readRecordsStrict(): Partial<Record<IntegrationClientId, OwnershipRecord>>;
   putRecord(record: OwnershipRecord): void;
   dropRecord(clientId: IntegrationClientId): void;
   appendJournal(entry: JournalEntry): void;
+  /** Retire one operation. Append-only; see journal.ts `appendTombstone`. */
+  retireOperation(record: JournalTombstone): void;
   listOperations(clientId?: IntegrationClientId, limit?: number): JournalEntry[];
   findOperation(opId: string): JournalEntry | null;
+  findCommittedOperation(opId: string): JournalEntry | null;
   captureSnapshot(clientId: IntegrationClientId, opId: string, text: string | null): SnapshotRef;
   readSnapshot(entry: JournalEntry):
     | { kind: "none" }
@@ -75,11 +83,14 @@ export function createIntegrationStateStore(root: string = integrationsDir()): I
   const store: IntegrationStateStore = {
     root: dir,
     readRecords: () => readRecords(dir),
+    readRecordsStrict: () => readRecordsStrict(dir),
     putRecord: record => writeRecord(record, dir),
     dropRecord: clientId => deleteRecord(clientId, dir),
     appendJournal: entry => appendOperation(entry, dir),
+    retireOperation: record => appendTombstone(record, dir),
     listOperations: (clientId, limit) => listOperations(clientId, limit, dir),
     findOperation: opId => findOperation(opId, dir),
+    findCommittedOperation: opId => findCommittedOperation(opId, dir),
     captureSnapshot: (clientId, opId, text) => captureSnapshot(clientId, opId, text, dir),
     readSnapshot: entry => readSnapshot(entry, dir),
     countSnapshots: clientId => countSnapshots(clientId, dir),

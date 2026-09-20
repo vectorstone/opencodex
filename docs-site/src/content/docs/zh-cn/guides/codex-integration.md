@@ -54,6 +54,7 @@ ChatGPT bearer auth。由于注入的 `base_url` 指向 opencodex，proxy 会把
   `openai-responses` provider 的 id，该 endpoint 必须实现 OpenAI Images API。显式选择会失败即关闭，
   不会 fallback 到其他付费上游。这里不接受 registry 管理的 provider id；省略 `images.provider`
   即可使用内置的 OpenAI tiers。
+- **xAI Imagine（Grok OAuth）中继：** 当 `images.bridgeEnabled` 为 `true`、未设置 `images.provider`，且配置了 `xai` provider 时，`/v1/images/generations` 和 `/v1/images/edits` 会发到 `https://api.x.ai/v1`。使用哪种凭据由 provider 的 `authMode` 决定：`"oauth"` 时复用 `ocx login xai` 获得的 Grok CLI 授权，其他模式则使用 provider 的 API key。OAuth 登录不会启用 key 方式的 provider，反之亦然。ChatGPT 凭据不会被转发。若凭据缺失，代理返回 400，而不会向 ChatGPT 计费。显式设置 `images.provider` 后，`/v1/images` 由该 provider 接管，其校验错误原样返回，不会再尝试 xAI 中继。该中继会把 Codex 的 `size` / `aspect_ratio` 映射到 xAI Imagine 请求体，并返回同样的 `{created, data:[{b64_json}]}` 形状。整批（inline `b64_json` 与下载的 URL）解码字节与 base64 编码输出合计不超过 100 MiB；超出则返回 502。若 xAI 返回的是图片 URL 而非内联字节，代理会不带凭据自行下载：URL 必须是公开 HTTPS（不允许重定向、`file:`、回环或私有地址），每个文件上限 50 MiB，结果作为本地 artifact 保存，仅通过需认证的管理端点提供。这与仍仅支持 API key 的 Responses Image Bridge 循环相互独立。
 - **Google Antigravity（CCA）fallback：** 当既没有 OpenAI forward 候选，也没有已配置的 keyed
   provider 时，`/v1/images/generations`（不是 `/images/edits`）会 fallback 到 Antigravity
   **Cloud Code Assist** endpoint，并使用 `gemini-3.1-flash-image` 模型。该 fallback 也会在
@@ -159,9 +160,13 @@ opencodex 也会通过 WebSocket 提供 `/v1/responses`。专用 provider 只有
 ## 线程标识与历史记录
 
 默认的 loopback 形式会让新线程继续标记为 Codex 原生的 `openai` provider，因此正常的 resume history 不需要
-重映射。首次 sync 时，它还会把旧版 opencodex 标记过的线程迁回 `openai`。非 loopback 的专用 provider 模式
-在运行期间仍会把历史记录镜像到 `opencodex` provider 名下，并在退出时恢复已备份的 metadata。
-如需保持历史记录完全不变，请设置 `syncResumeHistory: false`。
+重映射。sync 和 restore 只应用与当前状态数据库匹配的备份 manifest，并精确恢复每个线程原来的 provider、
+source 和 event marker。没有 manifest 的 `opencodex` 行会保持不变；只有明确要强制执行旧式重标记时，才使用
+`ocx recover-history --legacy-openai --yes`。此命令的作用范围有意设置得很广：它会把所有包含用户消息且当前标记为
+`opencodex` 的线程改标为 `openai`，将 `exec` 规范化为 `cli`，并设置事件标记；正常的专用提供方历史记录也在
+范围内。请先备份状态，并且仅在确实需要这一完整范围时使用。非 loopback 的专用 provider 模式在运行期间仍会把历史记录镜像到
+`opencodex` provider 名下，并在退出时恢复已备份的 metadata。如需保持历史记录完全不变，请设置
+`syncResumeHistory: false`。
 
 ## 模型目录同步
 
@@ -191,6 +196,12 @@ Codex 显示的模型来自一个磁盘上的 catalog（默认是 `$CODEX_HOME/o
 历史记录编码成上游 function tool，再在 Codex 收到结果前，把流式 function-call lifecycle 还原成
 `custom_tool_call`。原生 OpenAI forward routing 和已支持的 `apply_patch` custom tool 保持不变。
 
+路由的 code-mode 轮次还会在首次调用前收到宿主对嵌套辅助工具的规则：`tools.apply_patch`
+接收一个字符串，首尾必须是没有额外包装的独立补丁标记行；isolate 中没有 `import`，长时间运行的
+命令通过 `write_stdin` 轮询。如果原生路由 Responses、Kiro 或 Cursor 路径上的 code-mode exec
+结果仍包含宿主的某条失败消息，opencodex 会追加一行提示，指出对应规则。此变更不会重写模型的
+代码或补丁文本。
+
 所选 provider 必须支持 function/tool calling。不支持 tool call 的 text-only provider 无法使用 `exec`、
 Browser 或 Computer Use。原生 OpenAI 条目会保持其上游 tool mode 不变。
 
@@ -209,13 +220,13 @@ Browser 或 Computer Use。原生 OpenAI 条目会保持其上游 tool mode 不�
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
-远程 Codex 客户端也可以通过管理 API 拉取同一个生成好的 catalog（与其他 `/api/*` 路由使用相同的 admission token）：
+远程 Codex 客户端可以使用普通的数据面密钥（与 `/v1/responses` 所用凭据相同，而非管理员令牌）拉取同一个生成好的 catalog：
 
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/opencodex-catalog.json"
 tmp="$(mktemp "${dest}.XXXXXX")"
-curl -fsS -H "x-opencodex-api-key: $OPENCODEX_ADMIN_AUTH_TOKEN" \
-  "https://proxy.example.com/api/catalog" > "$tmp" \
+curl -fsS -H "x-opencodex-api-key: $OPENCODEX_API_AUTH_TOKEN" \
+  "https://proxy.example.com/v1/catalog" > "$tmp" \
   && mv "$tmp" "$dest"
 ocx sync-cache
 ```
@@ -226,6 +237,8 @@ ocx sync-cache
 你也可以通过管理 API（`POST /api/custom-models`、带 `displayName` 字符串的 `PUT /api/custom-models/<id>`）
 以及 web dashboard 来设置或编辑它。因为会与路由 slug 分隔符冲突，所以 `/` 会被拒绝。
 
+`GET /v1/catalog` 的存在是为了让读取模型列表不再需要管理员令牌。该路由为只读（`GET` 与 `HEAD`），接受 `x-opencodex-api-key`、bearer 令牌或 `x-api-key`，并返回与管理路由完全相同的字节。响应携带强 `ETag`——通过 `If-None-Match` 回传即可重新验证并获得 `304` 而非完整文档——同时设置 `Cache-Control: private, no-cache`。在此被接纳的数据面密钥在管理面上**不会**获得任何权限：`/api/catalog` 以及所有 `/api/*` 路由仍然要求管理员令牌或仪表板会话。
+
 display name 是 **仅用于显示且在重新生成时保持稳定的**。每一次 `ocx sync` 和 catalog refresh 都会从
 `config.json`（包括 `customModels`）重新派生路由条目，因此配置过的名称会重新应用，而不是漂回路由 slug。
 受管服务重启后也会在 proxy 绑定完成后不久尝试做这次 sync。如果这个尽力而为的启动 sync 失败了，比如在离线登录时，
@@ -235,7 +248,7 @@ display name 是 **仅用于显示且在重新生成时保持稳定的**。每�
 ### 外部 provider 管理器
 
 在默认的 `full` 集成模式下，如果 `config.toml` 已经选择了 `openai` 或 `opencodex` 之外的 provider，
-OpenCodex 会保持文件不变，并跳过 profile 写入、catalog/cache 刷新，以及立即和后台两种 Codex 历史迁移。管理自定义 provider 的工具
+并跳过 profile 写入、catalog/cache 刷新，以及立即和后台两种 Codex 历史元数据恢复。管理自定义 provider 的工具
 通常会把现有会话标记为那个 provider id；如果替换活动 id，Codex 历史视图里那些完整会话可能会消失。
 同样的保护也适用于由旧版 root profile 选择的外部 provider。
 
@@ -278,16 +291,21 @@ provider 形式一样，从 `OPENCODEX_API_AUTH_TOKEN` 传入 `x-opencodex-api-k
    所有发现到的模型。一个不在 allowlist 里的 id 永远不会进入 catalog。
 2. **`disabledModels`**（顶层） - 会同时隐藏 catalog 和 `/v1/models` 中的模型，并把裸原生 GPT slug
    切成 `visibility: "hide"`。
-3. **`liveModels: false` 且 `models` 为空** - 当 live discovery 关闭而 `models` 为空或省略时，opencodex
-   不会为那个 provider 暴露任何路由模型。
+3. **`liveModels: false`** — `liveModels: false` 时，若 `models` 为空或省略，初始列表先加入已配置的 `defaultModel`，
+   再加入 `retainModels`，重复 ID 仅保留首次出现的位置。若显式设置了非空 `models`，则按
+   `models`、`retainModels` 顺序构建，不会自动加入另一个 `defaultModel`；仍可将该模型明确写入
+   `models` 或 `retainModels`。这些字段均未提供 ID 时，初始列表为空。此顺序不保证最终选择器的显示顺序。
+   `selectedModels`、`disabledModels` 和提供商禁用策略仍然适用。`authMode: "forward"` 保留原有独立分支，
+   不使用此静态路由列表。这些规则不改变实时发现失败时的回退行为。
 4. **Cursor `GetUsableModels`** - Cursor adapter 通过它的 protobuf `GetUsableModels` RPC 发现模型，而不是
    `/models`，所以 Cursor 侧的变动会独立于其他 provider 改变哪些 id 可见。
 5. **缓存和 `ocx sync`** - live catalog 的缓存时间大约是五分钟（`modelCacheTtlMs`，默认 `300000`）。
    运行 `ocx sync` 可以强制立即重新抓取并重写 catalog。
 6. **正在运行的 Codex `app-server`** - 当长生命周期的 Codex `app-server`（Desktop / CLI 后台宿主）还在
    内存中保留旧列表时，只重写磁盘上的 catalog 还不够。`ocx sync` 和 `ocx sync-cache` 会在检测到这些进程时给出
-   警告。请用 `ocx sync --restart-codex` 重新启动它们（或者你自己停掉匹配的 `app-server` 进程），然后让 Codex
-   重新创建它们，这样新列表才会出现。
+   警告。`ocx sync --restart-codex` 会重启这些进程，并在 macOS、Linux 和 Windows 上完全退出再重新启动 Codex
+   桌面应用，让选择器重新读取 catalog。若要让桌面应用继续运行，请传入 `--restart-app-server-only`，或自行停掉匹配的
+   `app-server` 进程。
 
 :::caution[其他本地写入者]
 在 opencodex 内部，catalog 写入（`opencodex-catalog.json`、`config.toml`）是原子的，这只能防止两个
@@ -320,18 +338,36 @@ fallback 行为，参见 [Sub-agent Surface](/guides/sub-agent-surface/)。
 
 ## Codex 账号预热
 
-当把一个 ChatGPT 账号加入 Codex 账号池时，opencodex 会在持久化前向 Codex Responses backend
-发送一个小型 streaming 请求来验证它。该请求使用真正的 Responses item 数组
-（`input: [{ type: "message", ... }]`），等待 `response.completed`，并默认使用 `gpt-5.4-mini`。
-如果该模型返回 HTTP 400，则会改用 `gpt-5.5` 重试；结构化的上游错误详情会被展示给用户，但不会暴露
-原始响应正文。后台重新验证是独立功能，默认关闭；只有在启用 Token Guardian、将 `chatgpt` 刷新策略设为
-`proactive`，并且 `tokenGuardian.codexWarmupEnabled` 为 true 时才会运行。
+添加或重新认证账号时，通常会在保存前发送一个小型模型请求并等待 `response.completed`。默认使用 `gpt-5.6-luna`，HTTP 400 或 HTTP 404 时改用 `gpt-5.5` 重试。公开错误仅包含固定分类，不包含原始响应正文。
 
+如果新 OAuth 凭据的已认证用量查询确认5小时、每周或每月额度耗尽，则不调用模型而直接保存账号，显示**等待验证**。重启或刷新令牌也不会使其可用。额度恢复后刷新额度：只有完整的最新用量显示有余额，才会发送一个小型验证请求；请求完成后账号才可用于路由。查询或验证失败将保留等待状态。普通状态轮询不会发送该请求。初次注册时用量未知仍需常规预热验证。
+
+`ocx account refresh openai` 和 `ocx account list openai --quota --refresh` 仅查询用量。模型验证会消耗配额，因此需要用户的仪表板会话：配额恢复后，打开 `ocx gui` 并点击 **Refresh quotas**。无界面主机也需要通过浏览器访问其仪表板；仅凭管理员令牌无法授权验证。暂停的账号可以完成验证，但不会因此恢复或被选中。模型授权错误会一直显示，直到验证或重新登录成功。
+
+后台重新验证是独立功能，默认关闭。它要求 Token Guardian、`openai` 的 `proactive` 刷新策略及 `tokenGuardian.codexWarmupEnabled`，并跳过等待注册验证的账号。
+
+### 账号停止处理请求的原因
+
+账号退出账号池选择时，原因随判定一起传递，而不是为显示重新计算，因此界面不会在路由已排除该账号时仍显示正常。`GET /api/codex-auth/accounts` 在每个账号的 `needsReauth` 旁返回 `reauthReason`：从未保存凭据为 `missing_credential`，刷新持续失败为 `refresh_failed`，用量查询本身被拒绝为 `quota_unauthorized`。
+
+主账号刷新未完成时仍返回带 `Retry-After` 的 `503`，因为重试仍可能成功。消息中现在补充说明：若持续失败，则主账号需要重新认证，而不只是再试一次。
+
+### 让降级的账号退出轮换
+
+`codexPool.excludedPlans` 列出自动账号池选择要跳过的套餐键，与每个账号上保存的套餐不区分大小写比对。默认不存在，因此现有安装的轮换完全不变。
+
+```bash
+ocx config set codexPool '{"excludedPlans":["free"]}'
+```
+
+这是选择策略，不是封禁。被排除的账号保留凭据、用量历史和线程亲和性，仍显示在账号列表中，也仍可通过 `work/gpt-5.5` 这类显式选择使用。改变的只是自动轮换不再选它，包括它已经是活跃账号或已绑定线程的情况——订阅到期后留下的正是这种状态。
+
+主 Codex 账号不受套餐排除策略影响；仅选择模式不会读取受保护的原生凭据。如果所有可用的池账号都被排除，自动选择不返回账号。明确指定账号的路由仍可使用，并继续检查暂停、认证和模型权限。账号卡片与 CLI 将被排除的路由套餐与凭据健康状态分开显示。套餐没有全序关系，因此不提供 `minimumPlan` 设置。
 ## 恢复原生 Codex
 
-opencodex 绝不会把你困住。**`ocx stop` 是完全恢复原生 Codex 的单一命令** —— 它会停止 proxy、
-停止后台服务（如已安装），并剥除所有注入的行和路由的目录条目，使普通的 `codex` 完全像 opencodex
-从未存在过一样工作：
+`ocx stop` 会停止 proxy 和已安装的后台服务，然后尝试恢复原生 Codex。OpenCodex 只移除能够确认归属的路由配置；如果无法安全恢复配置文件，会报告恢复未完成。
+
+如果当前 config 或 profile 与保存的原始内容不同，且日志缺少该文件注入状态的哈希值，自动快照恢复会保留两个文件和日志，不作修改。已经与原始内容相同的文件不会重写。对已路由配置的再次注入也会拒绝使用这种未确认的基线；原生配置可以建立新的快照。详见[恢复规则](/guides/codex-integration/#recovery-without-injection-hashes)。
 
 ```bash
 ocx stop       # stop the proxy + service, restore native Codex
@@ -342,3 +378,15 @@ ocx restore back # point plain Codex at the running proxy again
 当 opencodex 作为受管的 [background service](/reference/cli/#ocx-service) 运行时，它会设置
 `OCX_SERVICE=1`，这样由服务驱动的重启**不会**反复改写 Codex config——只有显式的
 `ocx stop` / `ocx service stop` 才会恢复原生 Codex。
+
+## 分页历史记录安全拒绝
+
+如果受影响的历史存储支持分页，提供商切换可能返回 `history_paginated_requires_native_writer`。该原因不再拒绝写入 Codex 配置、参考配置档和模型目录。`ocx sync` 与 `ocx start` 仍会写入这些文件并设置 `model_catalog_json`，因此 Codex 模型选择器会继续显示所有经 OpenCodex 路由的模型。只有这一条原因会让会话历史的重新标记停手，因为分页历史序号由 Codex 自己的写入器分配，重试也不会改变。无法读取的状态数据库、身份已变的历史文件、未能运行的预检等其他历史预检原因仍会拒绝整个切换并回滚，因为那些情况以后可能成功。在此状态下，OpenCodex 不会修改分页历史文件或线程行。现有会话保留已标记的提供商，不会被迁移；新会话仍正常经代理路由。重新标记停手时，主目录里已有的 `[model_providers.opencodex]` 表会保留而不是撤下，即便是 root-override（loopback）形式也一样，这样行上标记为 `opencodex` 的会话仍能对应到还存在的提供商 id。可迁移存储中的 legacy 记录也适用。CLI 会打印 `Codex resume history: left to Codex's native writer (history_paginated_requires_native_writer)`。`ocx restore` 和移除 Codex 配置仍会因 `history_paginated_requires_native_writer` 被拒绝。线程行仍在引用时撤掉 `[model_providers.opencodex]` 定义会使这些会话无法解析，而恢复路径没有办法留下兼容提供商表。已经分页的主目录目前无法通过产品卸载；这是已知的未完成工作，而非预期行为。
+
+返回根 URL 覆盖模式时，即使历史预检通过，OpenCodex 也会在提交配置前保留已有的 `[model_providers.opencodex]` 定义。这样，即使 Codex 在提交后或后台历史任务启动时迁移历史格式，旧的 `opencodex` 对话仍能找到其提供商。新对话继续使用所选的根提供商；显式恢复仍执行原有的独立删除检查。
+
+不要改写正在使用的分页历史文件或线程行来自行迁移这些会话。恢复前关闭相关会话，并只报告准确的错误和版本，不要公开私人历史。备份或脚本成功并不能证明显示已恢复；重新打开 Codex 后检查会话。
+
+## 取消主账号重新认证
+
+取消主账号的设备代码重新认证时，如果 DELETE 请求暂时失败、发生网络错误，或响应状态未知或尚未结束，系统会保留当前流程和取消失败提示，以便重试取消。通常状态轮询会继续，因此仍能检测到登录完成。如果流程处于 `pending` 或 `committing` 状态时，可重试的取消失败与 GET 状态查询的非 2xx HTTP 响应同时发生，无论响应到达顺序如何，系统都会保留或恢复服务器最后提供的设备代码、验证 URL 和阶段，使同一流程仍可重试取消。GET 的 HTTP 失败仍会停止轮询，但无需发送第二次登录 POST 即可重试取消。终止状态为 `failed` 的响应会释放流程并显示规范化的失败原因，只有 `succeeded` 才表示登录成功。确认状态为 `cancelled` 的响应会释放流程，以便开始新的设备代码登录。明确返回 HTTP 404 且代码为 `unknown_flow` 的响应也会释放已过期的流程 ID，以便开始新的设备代码登录，但不会显示登录成功或已确认取消。先前流程中延迟到达的 POST、GET 或 DELETE 响应不能改变新流程，也不能将新流程报告为登录成功。

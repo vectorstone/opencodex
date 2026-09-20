@@ -23,9 +23,27 @@ the bare or API-key model list. The row is matched on the field shape a real cat
 which filters malformed entries — it does not prove the id came from an upstream response, since
 the cache is a user-owned file. See [Exact Codex account selectors](/reference/configuration/routing/#exact-codex-account-selectors).
 
-`gpt-daybreak-blue-latest` follows that observation-only rule for account-qualified rows and is not
-added to the bare native allowlist. A separate, explicit `customModels` entry can expose the same
-wire id as `openai/gpt-daybreak-blue-latest` through the canonical Codex-login forward provider:
+`gpt-daybreak-blue-latest` is account-gated. opencodex checks each authenticated ChatGPT account's
+own Codex model roster before advertising or routing it. In Pool mode, the bare row exists only when
+at least one eligible Pool account reports the slug. In Direct mode, the bare row follows the main
+account used by the local catalog, and each request also checks the forwarded caller credential (or
+the stored main credential when an OpenCodex admission bearer is substituted). A
+`<selector>/gpt-daybreak-blue-latest` row exists only when that selector's mapped account reports it.
+Pool routing excludes unentitled accounts. If no roster can be confirmed, the gated row fails closed
+instead of spending a prompt on an upstream 400.
+
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` and `gpt-6-astra` are deliberately **not** gated that
+way: they are listed on every install, whatever the entitlement roster says. opencodex asks upstream
+under a client version new enough to return them, but it cannot make an answer appear — an
+unconfirmed account, a timed-out lookup or a shard that has not caught up would otherwise make the
+model disappear from the picker with no explanation. Listing them means the request is sent and you
+see the real upstream status instead. An account that does not have one of these models will get an
+upstream refusal at request time rather than an absent row, and in a multi-account Pool the request
+is no longer steered to the account that owns the model first. `disabledModels` is the lever for
+hiding any of them.
+
+A separate, explicit `customModels` entry can expose the same wire id as
+`openai/gpt-daybreak-blue-latest` through the canonical Codex-login forward provider:
 
 ```json
 {
@@ -41,10 +59,29 @@ wire id as `openai/gpt-daybreak-blue-latest` through the canonical Codex-login f
 
 Only that exact provider, endpoint, and model id receive the pinned Sol capability snapshot:
 922,000 context, 829,800 automatic compaction, the native reasoning ladder, and native Codex tool
-metadata. The request still sends `gpt-daybreak-blue-latest`; opencodex does not rewrite it to Sol,
-does not create a bare row, and does not grant account entitlement. The separately billed
+metadata. The request still sends `gpt-daybreak-blue-latest`; opencodex does not rewrite it to Sol
+or grant account entitlement. The separately billed
 `openai-apikey/daybreak-blue-latest` API row is a different route and its 1,050,000 / 922,000 limits
 are never copied into the Codex-login row.
+
+For custom Astra and Daybreak rows on that canonical `openai` Codex-forward destination,
+explicit `reasoningEfforts` are bounded by the model's pinned Codex capabilities. A custom
+`["none", "minimal", "low"]` becomes `["low"]` in the catalog; a nonempty list with no
+supported values also falls back to the native default as a single choice. An explicit `[]`
+stays empty and has no advertised default. A declared default is retained only if it belongs to
+the resulting list; otherwise the native default is used when present, then the first surviving
+choice. Stored custom configuration is unchanged, and repeated syncs do not add `max` back to a
+narrow custom list.
+
+The same catalog bound applies when the custom model id has pinned native capability metadata,
+including an arbitrary gateway such as `YYLJ/gpt-6-astra`. Desktop validates the model id, so
+`none` and `minimal` are stripped from that catalog row. Full native identity still requires the
+exact provider, destination, and capability-backed model identity; a gateway does not inherit
+Responses Lite, multi-agent, or native windows from its name.
+Codex's native Astra `ultra` choice is retained: it is a client delegation mode converted to a
+supported wire effort, distinct from the [API model's effort list](https://developers.openai.com/api/docs/models/gpt-6-astra).
+Catalog normalization does not rewrite existing thread settings. Request-time native effort
+clamps remain canonical-forward only.
 
 When the `codexAccountNamespaces` map is empty, account-qualified picker rows are off. If
 `codexAccountPickerEnabled` is omitted with a non-empty map, they are treated as enabled for
@@ -68,7 +105,7 @@ gpt-5.6-sol                         # bare Codex-login route via Pool or Direct
 <selector>/gpt-5.6-sol              # stored Codex account mapped by that selector
 openai-apikey/gpt-5.6-sol           # API key
 openai/gpt-daybreak-blue-latest     # explicit Codex-forward custom row (922,000)
-<selector>/gpt-daybreak-blue-latest # observed account-qualified native id, when available
+<selector>/gpt-daybreak-blue-latest # account-qualified native id, only when that account reports it
 openai-apikey/daybreak-blue-latest  # separate API-key route (1,050,000 / 922,000)
 ```
 
@@ -96,11 +133,68 @@ rows from the effective catalog while compatibility aliases exist, so Desktop ca
 them by ignoring `visibility`. See [Codex Desktop native-allowlist compatibility](/guides/combos/#codex-desktop-native-allowlist-compatibility)
 for the command, disable-key semantics, and safety constraints.
 
+### What this means for a disabled native model
+
+Without a native alias configured, disabling a bare native GPT slug does not remove it from the
+catalog. The row stays with `visibility: "hide"`, which `/v1/models` and the dashboard both honour
+— they stop listing the model — while Desktop, under the policy above, can keep showing it. So the
+model can still be picked in Desktop after you disabled it, and the surfaces disagree about whether
+it exists.
+
+Picking it is not rejected for being disabled. `disabledModels` controls catalog visibility, not
+admission, so the request is routed by the ordinary rules as though the model were enabled: the turn
+runs on the model you disabled, or fails on whatever path that id resolves to. Either way the
+outcome is not the one the toggle implies.
+
+The row is retained deliberately. It holds the real upstream metadata, so re-enabling the model
+restores that metadata instead of a synthesized guess. When you need the row gone outright rather
+than hidden, configure a `nativeAlias` combo: while one exists, disabled bare native rows are
+omitted from the effective catalog entirely.
+
+If Codex's `config.toml` pins a root `model` that this proxy does not expose — a disabled model
+among them — every new session starts on a model opencodex does not serve. `ocx doctor` reports
+that under **Codex default model exposure**, as a warning rather than a failure, and says when it
+could not determine the exposed set at all.
+
 ## Integration path
 
 `ocx init`, `ocx start`, and `ocx sync` wire the shared Codex config and catalog into the proxy; see
 [Codex Integration](/guides/codex-integration/) for config injection, catalog sync, shims, WebSocket
 fallback, and restore mechanics.
+
+## Native quota fallback limitation
+
+When the Codex app exhausts its native five-hour quota it can switch to a reserve
+fallback model and grey out the other rows in its picker. Reported in
+[#2813](https://github.com/lidge-jun/opencodex/issues/2813), that gating also hides routed
+opencodex rows, even though those use unrelated provider credentials and consume none of the
+ChatGPT quota.
+
+This gate is applied by the client before a request reaches the proxy, so opencodex cannot lift
+it. Routed rows are written with `visibility: "list"`, catalog filtering consults only
+`disabledModels` and each provider's `selectedModels`, and no quota value takes part in routed
+visibility.
+
+Selecting a routed model explicitly does not go through the picker. Set the model in
+`config.toml`:
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+or send it directly:
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+Both paths route correctly **once the request reaches the proxy** — that part is covered by
+tests. The Codex desktop app, however, does not send the configured model while reserve mode is
+active: it decides reserve from its own `wham/usage` poll (`luna_reserve` upsell plus an allowed
+`gpt-reserve` additional limit) and forces the model setting to `gpt-reserve` before the request
+leaves, so the `config.toml` route is overridden in the app. Use `ocx access test`, Claude Code
+through the proxy (`ocx claude`), or any direct `/v1` client until the window resets. See
+[Routed models during Codex reserve mode](/guides/codex-integration/#routed-models-during-codex-reserve-mode).
 
 ## Why routed models show up
 
@@ -119,8 +213,8 @@ including OpenAI service-tier metadata.
 
 ## Current stable model coverage
 
-The native fallback set includes `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
-`gpt-5.3-codex-spark`, and GPT-5.6 Sol/Terra/Luna. For the GPT-5.5/5.4 family, opencodex preserves
+The native fallback set includes `gpt-5.5` and GPT-5.6 Sol/Terra/Luna.
+For the GPT-5.5 family, opencodex preserves
 the installed Codex catalog's richer live entries and only synthesizes a missing entry. The bundled
 upstream snapshot is used only for GPT-5.6, where it supplies the real per-model identity and
 metadata instead of an older-template approximation.
@@ -184,6 +278,17 @@ preserved, so Luna has `max` but no `ultra`.
 On the wire, routed adapters map or clamp unsupported tiers. For older native models whose real
 ladder stops at `xhigh`, `nativeEffortClamp` maps a direct `max` or an `ultra` selection to `xhigh`
 (for example, GPT-5.5). Sol, Terra, and Luna have a real `max` rung.
+
+Catalog advertisement of the two top tiers is unconditional: `ocx sync` no longer removes `max` or
+`ultra` when the installed Codex binary is too old to offer them — Codex versions without those
+rungs are out of support, and hiding them from current clients costs more than it buys. Other
+rungs are still intersected with the observed runtime ladder, and a clamp diagnostic recorded by a
+previous binary stops applying once the binary at that path reports a different version (the
+in-place upgrade case), so `ocx status` and `ocx doctor` stop warning about a clamp the upgraded
+runtime no longer needs.
+Catalog visibility is not entitlement: advertising `max`/`ultra` does not guarantee the upstream
+account or provider accepts the tier, and for older native models whose real ladder stops at
+`xhigh` the wire clamp above still maps the selection down at request time.
 
 ## Fast tier rules
 
@@ -250,3 +355,5 @@ ocx sync
 
 opencodex rewrites `models_cache.json` with a deliberately stale cache wrapper whenever catalog
 visibility, priority, or metadata changes, so the next Codex model refresh reads the new catalog.
+
+After a catalog or model-cache write, OpenCodex invalidates its cached app-server observation so the next request checks process freshness again. A configuration sync also invalidates the observation when catalog contents are unchanged. This refresh does not restart Codex processes.

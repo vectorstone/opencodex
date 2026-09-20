@@ -10,6 +10,12 @@ import {
   startStorageCleanupScheduler,
   stopStorageCleanupScheduler,
 } from "../storage/policy-scheduler";
+import { startQuotaResetPoller, stopQuotaResetPoller } from "../quota/reset-poller";
+import {
+  startCatalogAutoRefresh,
+  stopCatalogAutoRefresh,
+  syncCatalogAutoRefreshCadence,
+} from "../codex/catalog-auto-refresh";
 import {
   cancelQueuedStorageWorkerSpawns,
   drainStorageWorkers,
@@ -59,11 +65,43 @@ function startProcessLoops(applyPolicy: PolicyApply): ProcessLoops {
     stateStoreSweeper = startStateStoreSweeper();
     setLivePolicyOwner(applyPolicy);
     startStorageCleanupScheduler();
+    // Opt-in: the tick itself is a no-op unless config.quotaResetNotify is enabled with a
+    // sink, and the interval is unref'd, so a default install pays one dormant timer.
+    startQuotaResetPoller();
+    // The configured cadence is resolved out of band: reading it here would put a static edge
+    // to the config barrel on the load-time path the quota boundary guard pins.
+    void import("../quota/reset-poller")
+      .then(poller => poller.syncQuotaResetPollerCadence())
+      .catch(() => {
+        // The next tick adopts it.
+      });
+    // Opt-in: the tick is a no-op unless catalogAutoRefresh.enabled is true, and the
+    // interval is unref'd, so a default install pays one dormant timer. The scheduler
+    // module keeps every heavy import inside its tick, so naming it statically here
+    // costs a module record and nothing else.
+    startCatalogAutoRefresh();
+    // The scheduler starts at its default cadence because resolving the operator's value
+    // reads the config barrel. Fire-and-forget: startup must not await an optional
+    // subsystem, and the next tick adopts the cadence anyway.
+    void syncCatalogAutoRefreshCadence().catch(() => {
+      // The next tick adopts it.
+    });
+    // Install the delivery sink now rather than waiting out the first poll interval, which is 15
+    // minutes by default. Without this, an enabled install would observe nothing for its first
+    // quarter hour — including the live request path, which is gated on the sink existing.
+    // Fire-and-forget: startup must not await an optional subsystem.
+    void import("../quota/reset-activation")
+      .then(activation => activation.syncQuotaResetActivation())
+      .catch(() => {
+        // The next poll tick retries.
+      });
     return { memoryWatchdog, stateStoreSweeper };
   } catch (error) {
     memoryWatchdog?.stop();
     stateStoreSweeper?.stop();
     stopStorageCleanupScheduler();
+    stopQuotaResetPoller();
+    stopCatalogAutoRefresh();
     setLivePolicyOwner(null);
     throw error;
   }
@@ -75,6 +113,8 @@ function stopProcessLoops(): void {
   loops?.memoryWatchdog.stop();
   loops?.stateStoreSweeper.stop();
   stopStorageCleanupScheduler();
+  stopQuotaResetPoller();
+  stopCatalogAutoRefresh();
   setLivePolicyOwner(null);
 }
 

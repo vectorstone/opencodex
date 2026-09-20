@@ -12,26 +12,32 @@ exécute des fonctionnalités d'assistance autour des demandes du fournisseur.
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` | Port d'écoute proxy. |
 | `hostname?` | `string` | `"127.0.0.1"` | Adresse de liaison. Les liaisons hors bouclage nécessitent `OPENCODEX_API_AUTH_TOKEN`. |
-| `proxy?` | `string` | — | URL du proxy HTTP(S) sortant ou `${ENV_VAR}`. Appliquée à `HTTP_PROXY` / `HTTPS_PROXY` uniquement lorsque ces variables ne sont pas définies ; le bouclage reste dans `NO_PROXY`. |
+| `proxy?` | `string` | — | URL du proxy HTTP(S) ou SOCKS5 sortant (`socks5://host:port`) ou `${ENV_VAR}`. Les URL HTTP s’appliquent à `HTTP_PROXY` / `HTTPS_PROXY` si elles sont vides. Les URL SOCKS5 utilisent le tunnel SOCKS5 intégré et sont aussi exposées via `ALL_PROXY` (`ocx start --socks5`); `HTTP(S)_PROXY` héritées sont effacées dans ce processus. Le bouclage reste dans `NO_PROXY`. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Active une nouvelle tentative Responses identique lorsqu’une réponse ne contient ni texte ni appel d’outil. Cette tentative peut être facturée. `OCX_EMPTY_COMPLETION_RETRY=0` la désactive sans modifier la configuration ; les combinaisons et les tours de compactage routés restent exclus. |
-| `stallTimeoutSec?` | `number` | `300` | Nombre de secondes sans données en amont avant `response.incomplete`. Minimum : 1. |
+| `stallTimeoutSec?` | `number` | `300` | Secondes sans progression utile en amont, pour Responses et le Chat natif. Minimum : 1. |
 | `connectTimeoutMs?` | `number` | `200000` | Délai maximal par tentative pour DNS/TCP/TLS et les en-têtes finaux ; il prend fin avant la génération du corps. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Délai de vidange gracieux avant l’annulation des tours actifs. |
 | `websockets?` | `boolean` | `false` | Annonce et autorise la route WebSocket Responses destinée aux clients. La valeur false maintient les clients sur HTTP/SSE ; elle ne désactive pas une optimisation WebSocket canonique admissible vers ChatGPT en amont. |
 | `corsAllowOrigins?` | `string[]` | `[]` | Origines exactes supplémentaires autorisées par CORS. Les origines de bouclage sont toujours autorisées. Les origines d'extensions de navigateur basées sur l'autorité telles que `chrome-extension://<extension-id>` sont prises en charge ; `*` n'est pas un caractère générique. Firefox et Safari régénèrent l'extension UUID (par installation / par lancement de navigateur), mettez donc à jour l'entrée lorsque l'origine change. |
-| `apiKeys?` | `OcxApiKey[]` | `[]` | Identifiants `ocx_…` générés, acceptés par l'API de gestion et l'authentification du plan de données sur les liaisons hors bouclage. Gérés depuis le tableau de bord. |
+| `apiKeys?` | `OcxApiKey[]` | `[]` | Identifiants `ocx_…` générés pour l'admission au plan de données sur les liaisons hors bouclage. Ils n'autorisent pas les API de gestion ; l'accès à la gestion utilise l'identifiant distinct décrit dans la [référence de l'API de gestion](/fr/reference/management-api/). Gérés depuis le tableau de bord. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | désactivé | Politique facultative de nettoyage des sessions archivées. Elle n'est jamais activée implicitement. |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` | Plafond en Mio pour les journaux, caches, objets binaires et charges utiles de continuation évincables qui appartiennent à l'application. Plage : 64–4096 ; il ne s'agit pas d'un plafond RSS. |
+| `metricsExport.enabled?` | `boolean` | `false` | Active les métriques de requêtes agrégées, locales au processus, sur `GET /api/metrics` authentifié. Redémarrage requis ; lorsque désactivé, le chemin renvoie 404 et aucune activité d'export n'est démarrée. |
 | `codexAutoStart?` | `boolean` | `true` | Autorise le lanceur intermédiaire Codex à exécuter `ocx ensure` avant de démarrer Codex. Avec la valeur false, cette vérification ne fait rien. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Restaure le lanceur intermédiaire installé après son remplacement par une mise à jour externe de Codex terminée. Désactivation par variable d'environnement : `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Compatibilité historique Codex App réversible. Les métadonnées originales sont sauvegardées et restaurées par `ocx stop` / `ocx restore`. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | désactivé | Redirigez les appels Codex helper/shadow reconnus vers un modèle choisi avec peu d'effort. Le préfixe source par défaut est `gpt-5.6-luna` ; les clients plus anciens via 0.144.x utilisaient `gpt-5.4-mini`, que `sourceModels` peut restaurer. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | désactivé | Redirigez les appels Codex helper/shadow reconnus vers un modèle choisi tout en conservant l'effort de raisonnement configuré pour la requête. Le préfixe source par défaut est `gpt-5.6-luna` ; les clients plus anciens via 0.144.x utilisaient `gpt-5.4-mini`, que `sourceModels` peut restaurer. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | activé lorsqu'il est utilisable | Options du service auxiliaire de recherche Web. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | activé lorsqu'il est utilisable | Options du service auxiliaire de description d'images. |
 | `images?` | `OcxImagesConfig` | sélection automatique OpenAI | Options de relais d'images autonomes pour Codex `image_gen`. |
 
 Si une ancienne version de développement a modifié les métadonnées de l'historique de reprise avant que la prise en charge de la sauvegarde n'existe, exécutez
-`ocx recover-history --legacy-openai` pour forcer la récupération du fournisseur natif.
+`ocx recover-history --legacy-openai --yes` pour forcer la récupération du fournisseur natif.
+La commande réétiquette chaque ligne `opencodex` contenant un message utilisateur, y compris l'historique légitime d'un fournisseur dédié ; consultez l'avertissement sur la portée complète dans la référence du cycle de vie avant de l'exécuter.
+
+### Délais et fin de réponse du Chat natif
+
+Le Chat natif utilise aussi `stallTimeoutSec` pendant l’attente de la sortie amont. Le texte non vide, le raisonnement, le refus, les mises à jour d’outils et les événements de fin renouvellent ce délai ; les commentaires de maintien de connexion, le rôle seul et les statistiques seules ne le renouvellent pas. L’attente d’un client lent suspend le décompte. Un blocage produit `upstream_stall_timeout` : un événement d’erreur en streaming, ou HTTP 502 sans streaming. Une annulation avant le résultat terminal renvoie une erreur d’annulation plutôt qu’une réponse partielle réussie. Le Chat sans streaming accepte les délimiteurs SSE LF et CRLF et les champs data multilignes.
 
 ## Accès à distance
 
@@ -104,7 +110,8 @@ Le port est obligatoire et doit différer du port proxy. Il n'est jamais attribu
 changerait au fil des redémarrages tandis que les serveurs d'applications déjà en cours d'exécution conservaient le `base_url` précédent.
 
 L'écouteur ne sert que `POST /v1/responses`, sa mise à niveau WebSocket, `POST /v1/responses/compact`,
-et `GET /v1/models`. Tout le reste, y compris `/api/*` et le tableau de bord, renvoie `404`.
+`POST /v1/alpha/search` (le relais de recherche web natif de Codex), `GET /v1/models` et les mises à
+niveau WebSocket vocales autonomes. Tout le reste, y compris `/api/*` et le tableau de bord, renvoie `404`.
 
 :::danger[Surface non authentifiée]
 Chaque processus de la machine peut utiliser cet écouteur. Il consomme le quota du compte et utilise les identifiants de
@@ -176,10 +183,10 @@ l'abonnement avec un avertissement lorsque la détection n'est pas concluante. V
 
 Codex utilise de petits modèles auxiliaires pour des tâches telles que les titres et les messages de commit. Activez
 `shadowCallIntercept` pour rediriger les préfixes de modèle source reconnus vers un autre modèle configuré. Le
-modèle de remplacement s'exécute avec un faible effort. Définissez `sourceModels` uniquement lorsqu'un client utilise d'autres identifiants de modèles auxiliaires.
-Codex 0.145.0+ indique l'objet de la requête dans `x-codex-turn-metadata` : les requêtes normales portant `request_kind: "turn"`
-conservent le modèle sélectionné, tandis que les requêtes de maintenance reconnues peuvent être redirigées. Les clients
-qui ne fournissent pas ces métadonnées conservent le comportement historique fondé sur le préfixe.
+modèle de remplacement conserve l'effort de raisonnement configuré pour la requête. Définissez `sourceModels` uniquement lorsqu'un client utilise d'autres identifiants de modèles auxiliaires.
+L'interception dépend du modèle : toute requête dont l'identifiant de modèle nu correspond à `sourceModels`
+peut être redirigée, y compris une requête normale portant `request_kind: "turn"`.
+`x-codex-turn-metadata` n'exempte pas une requête correspondante.
 
 ```json
 {
@@ -209,8 +216,10 @@ l'API Images d'OpenAI et la forme de réponse attendue par Codex.
 | Champ | Type | Par défaut | Signification |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | activé lorsqu'il est utilisable | Interrupteur principal. |
-| `backend?` | `"openai" \| "anthropic"` | automatique | Une valeur explicite est prioritaire ; sinon, la présence d'identifiants OAuth Anthropic stockés et utilisables sélectionne `anthropic`, puis `openai`. |
-| `model?` | `string` | dépendant du backend | `gpt-5.6-luna` pour OpenAI ou `claude-sonnet-5` pour Anthropic. L'héritage explicite `gpt-5.4-mini` migre au démarrage. |
+| `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Une valeur explicite est prioritaire ; l'absence de valeur sélectionne toujours `openai`. `anthropic` et `xai` ne s'exécutent que s'ils sont configurés explicitement ; `gemini` et `exa` restent réservés jusqu'à la livraison de leur executor. |
+| `model?` | `string` | dépendant du backend | `gpt-5.6-luna` pour OpenAI, `claude-sonnet-5` pour Anthropic ou `grok-4.6` pour xAI. L'héritage explicite `gpt-5.4-mini` migre au démarrage. |
+| `exaApiKey?` | `string` | aucun | Clé opérateur pour le backend `exa`. Écriture seule : les lectures de gestion ne renvoient jamais la valeur stockée. |
+| `xSearch?` | `object` | omis | Activation facultative de `x_search` hébergé, propre à xAI : `enabled`, tableaux mutuellement exclusifs `allowedXHandles` / `excludedXHandles` (20 au maximum), et dates ISO `fromDate` / `toDate` (`YYYY-MM-DD`). |
 | `reasoning?` | `string` | `low` | Effort secondaire. `minimal` est rejeté lors de la recherche sur le Web. |
 | `maxSearchesPerTurn?` | `number` | `3` | Recherches réelles autorisées par tour de modèle principal. |
 | `routedModelStallTimeoutMs?` | `number` | `200000` | Date limite d'inactivité du corps brut du modèle routé uniquement pour les fichiers de configuration. Entier 1–2147483647 ; chaque morceau non vide le réinitialise. |
@@ -220,7 +229,11 @@ Le moteur OpenAI nécessite une connexion à ChatGPT et un fournisseur ChatGPT `
 entrantes depuis Claude injectent l'authentification ChatGPT principale dans la requête interne. Le moteur Anthropic utilise les
 identifiants actifs stockés auprès d'un fournisseur Anthropic OAuth activé. Si le moteur Anthropic est sélectionné explicitement
 mais qu'aucun compte n'est utilisable, l'opération échoue de manière sûre au lieu de se rabattre sur un autre moteur. L'exécuteur Anthropic utilise son
-outil `web_search_20250305` natif.
+outil `web_search_20250305` natif. Le backend xAI nécessite un compte OAuth Grok stocké et utilisable, emploie
+`web_search` hébergé et ajoute `x_search` hébergé lorsque `xSearch.enabled` vaut true. Une entrée de gestion
+`xSearch` mal formée renvoie `400` ; un bloc persistant mal formé échoue de manière sûre pendant la planification.
+Les voies `gemini` et `exa` ne s'activent jamais par découverte d'identifiants ni par fallback ; l'opérateur doit
+les sélectionner explicitement. `exaApiKey` est accepté en écriture mais omis des réponses de gestion.
 
 Quatre horloges régissent la recherche : base `stallTimeoutSec`, `connectTimeoutMs`, inactivité du modèle routé et
 délai d'expiration de la recherche hébergée. Le chien de garde efficace du pont est le maximum plus 30 secondes. Le décrochage routé est
@@ -231,8 +244,8 @@ une garde d'inactivité, pas un délai de génération total.
 | Champ | Type | Par défaut | Signification |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | activé lorsqu'il est utilisable | Commutateur principal de description d'images. |
-| `backend?` | `"openai" \| "anthropic"` | automatique | Même sélection, prioritaire lorsqu'elle est explicite et tenant compte des identifiants Anthropic, que pour la recherche Web. |
-| `model?` | `string` | dépendant du backend | `gpt-5.4-mini` pour OpenAI ou `claude-sonnet-5` pour Anthropic. |
+| `backend?` | `"openai" \| "anthropic"` | automatique | La valeur explicite prévaut ; si elle est omise, un identifiant OAuth Anthropic stocké et utilisable est privilégié, sinon `openai`. |
+| `model?` | `string` | dépendant du backend | `gpt-5.6-luna` pour OpenAI ou `claude-sonnet-5` pour Anthropic. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | Nouvelles descriptions des ratés du cache admises par tour principal. `0` désactive les appels ; les valeurs non valides utilisent la valeur par défaut. |
 | `timeoutMs?` | `number` | `45000` | Délai d'expiration de la récupération par le service auxiliaire. Entier 1–2147483647. |
 
@@ -244,3 +257,13 @@ Les images `https:` distantes et les descriptions échouées ou vides ne sont pa
 
 Les services auxiliaires Anthropic OAuth réutilisent l'empreinte OAuth Claude Code existante d'opencodex. Effectuez un test d'endurance avec le
 compte et la charge de travail prévus.
+
+## Clés Remote Hub et valeurs par défaut
+
+`runtimeRole` vaut `standalone` par défaut. Un hub utilise `hub.managementPublicOrigin`, `hub.managementIngress` limité au loopback (`enabled:false` si absent) et les identités exactes de `remoteGui.allowedTailscaleUsers` (liste vide si absente). La clé client reste dans `service-api-token`, jamais dans `config.json`; `service-api-token.prev` peut exister pendant une rotation. Les usages ne sont pas répliqués.
+
+`remoteGui.allowInsecureHttp` est un ancien no-op déprécié, conservé uniquement pour que les anciens fichiers passent encore le schéma strict. Supprimez-le de la configuration : les grants de pairing ne sont acceptés que sur loopback ou via HTTPS authentifié, et `true` ne réactive pas le pairing HTTP en clair.
+
+## Diagnostic réseau des quotas Codex
+
+Le champ `quotaRefresh` de la ligne du compte Codex principal décrit la récupération du quota, pas le quota restant ni les droits d’accès au modèle. Il peut être absent lorsque les données sont en cache ou qu’aucune récupération n’a eu lieu. La requête utilise l’environnement du service proxy en cours d’exécution, pas celui du terminal interactif. Sans `proxy`, l’environnement existant est conservé ; `"auto"` lit uniquement le proxy statique Windows au démarrage. PAC/WPAD, les paramètres SOCKS seuls et les changements à chaud ne sont pas pris en compte automatiquement. Un succès avec TUN ne valide pas à lui seul le chemin du proxy HTTP. Consultez [les commandes et les états en anglais](/reference/configuration/server/#codex-quota-network-diagnostics).

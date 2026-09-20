@@ -82,20 +82,24 @@ let unresolvedKills = 0;
 let killFailures = 0;
 
 /** Rejection text when Cursor-native shell is denied by policy (issue #604). */
-export function nativeShellDisabledMessage(): string {
+export function nativeShellDisabledMessage(hint?: string): string {
+  if (hint) return hint;
   // Do not insist on "the same command" — that steers models into replaying bash/CMD
   // idioms through the Codex bridge on Windows PowerShell 5.1 and looping (#604).
   // Keep this host-shell-neutral: OpenCodex may run on a different OS than the Codex
   // client that executes the bridge (LAN/SSH remote-proxy).
+  // Silent-redirect framing (devlog 260826 gap-8): no "blocked/denied/disabled" words —
+  // models narrate those as a surface switch ("Shell이 차단되어 전환합니다") and burn turns.
   return (
-    "Route this through the Codex bridge shell tool from the current catalog (`shell_command` or `exec_command`, including the long `mcp_opencodex-responses_*` display name if listed). "
+    "Re-issue this command NOW through the catalog shell tool (`shell_command` or `exec_command`; the long `mcp_opencodex-responses_*` display name is the same tool). "
     + "Adapt the command for the Codex client host shell before calling the bridge "
     + "(Windows PowerShell 5.1: no CMD `cd /d`, no bash heredocs; `&&`/`||` are unsupported parser errors — prefer the bridge working-directory argument for directory changes, and use `if ($?) { ... }` for success-gated follow-up steps; do not treat `;` as a substitute for `&&`). "
-    + "Make at most one corrected bridge attempt after a failure, then report the error and stop — do not repeat equivalent failing commands."
+    + "Make at most one corrected bridge attempt after a failure, then report the error and stop — do not repeat equivalent failing commands. "
+    + "Do NOT narrate this redirect, do NOT comment on tool availability, and do NOT re-announce the task — just make the bridge call."
   );
 }
 
-function rejectedShellResult(command: string, cwd: string, started: number) {
+function rejectedShellResult(command: string, cwd: string, started: number, hint?: string) {
   return create(ShellResultSchema, {
     result: {
       case: "failure",
@@ -105,7 +109,7 @@ function rejectedShellResult(command: string, cwd: string, started: number) {
         exitCode: 1,
         signal: "",
         stdout: "",
-        stderr: nativeShellDisabledMessage(),
+        stderr: nativeShellDisabledMessage(hint),
         executionTime: Date.now() - started,
         aborted: true,
       }),
@@ -113,10 +117,10 @@ function rejectedShellResult(command: string, cwd: string, started: number) {
   });
 }
 
-export function rejectShellExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
+export function rejectShellExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
   if (execMsg.message.case !== "shellArgs") throw new Error("invalid shell exec");
   const args = execMsg.message.value;
-  return execBytes(execMsg, "shellResult", rejectedShellResult(args.command, resolve(args.workingDirectory || process.cwd()), Date.now()));
+  return execBytes(execMsg, "shellResult", rejectedShellResult(args.command, resolve(args.workingDirectory || process.cwd()), Date.now(), hint));
 }
 
 export function shellExec(execMsg: ExecServerMessage): Uint8Array {
@@ -154,7 +158,7 @@ export function shellExec(execMsg: ExecServerMessage): Uint8Array {
   }));
 }
 
-export function rejectShellStreamExecForPolicy(execMsg: ExecServerMessage): Uint8Array[] {
+export function rejectShellStreamExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array[] {
   if (execMsg.message.case !== "shellStreamArgs") throw new Error("invalid shell stream exec");
   const args = execMsg.message.value;
   const cwd = resolve(args.workingDirectory || process.cwd());
@@ -164,12 +168,12 @@ export function rejectShellStreamExecForPolicy(execMsg: ExecServerMessage): Uint
       event: { case: "start", value: create(ShellStreamStartSchema, { sandboxPolicy: args.requestedSandboxPolicy }) },
     })),
     execBytes(execMsg, "shellStream", create(ShellStreamSchema, {
-      event: { case: "stderr", value: create(ShellStreamStderrSchema, { data: nativeShellDisabledMessage() }) },
+      event: { case: "stderr", value: create(ShellStreamStderrSchema, { data: nativeShellDisabledMessage(hint) }) },
     })),
     execBytes(execMsg, "shellStream", create(ShellStreamSchema, {
       event: { case: "exit", value: create(ShellStreamExitSchema, { code: 1, cwd, aborted: true }) },
     })),
-    execBytes(execMsg, "shellResult", rejectedShellResult(args.command, cwd, started)),
+    execBytes(execMsg, "shellResult", rejectedShellResult(args.command, cwd, started, hint)),
     execStreamCloseBytes(execMsg),
   ];
 }
@@ -260,12 +264,12 @@ export async function shellStreamExec(execMsg: ExecServerMessage): Promise<Uint8
   return replies;
 }
 
-export function rejectBackgroundShellSpawnExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
+export function rejectBackgroundShellSpawnExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
   if (execMsg.message.case !== "backgroundShellSpawnArgs") throw new Error("invalid background shell exec");
   const args = execMsg.message.value;
   const cwd = resolve(args.workingDirectory || process.cwd());
   return execBytes(execMsg, "backgroundShellSpawnResult", create(BackgroundShellSpawnResultSchema, {
-    result: { case: "error", value: create(BackgroundShellSpawnErrorSchema, { command: args.command, workingDirectory: cwd, error: nativeShellDisabledMessage() }) },
+    result: { case: "error", value: create(BackgroundShellSpawnErrorSchema, { command: args.command, workingDirectory: cwd, error: nativeShellDisabledMessage(hint) }) },
   }));
 }
 
@@ -517,10 +521,10 @@ export function backgroundShellSpawnExec(execMsg: ExecServerMessage, sessionId: 
   }
 }
 
-export function rejectWriteShellStdinExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
+export function rejectWriteShellStdinExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
   if (execMsg.message.case !== "writeShellStdinArgs") throw new Error("invalid shell stdin exec");
   return execBytes(execMsg, "writeShellStdinResult", create(WriteShellStdinResultSchema, {
-    result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: nativeShellDisabledMessage() }) },
+    result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: nativeShellDisabledMessage(hint) }) },
   }));
 }
 

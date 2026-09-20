@@ -32,8 +32,6 @@ import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
-import { resolveCodexHomeDir } from "../../codex/home";
-import { scanStorage } from "../../storage/scanner";
 import { executeArchivedCleanup, listTrashEntries, pickWireCleanupTestHooks, previewArchivedCleanup, type CleanupMode, type RestoreErrorCode } from "../../storage/cleanup";
 import { runArchivedCleanupJob } from "../../storage/cleanup-job";
 import { getRestoreTrashTestStreamResponse, runRestoreTrashEntryJob } from "../../storage/restore-job";
@@ -49,13 +47,12 @@ import {
 } from "../../storage/policy-job";
 import {
   currentUsageLogRevision,
-  readUsageSnapshotForManagement,
   usageLogIdentityKey,
   usageLogRevisionKey,
-  type PersistedUsageEntry,
 } from "../../usage/log";
 import { getUsageDebugLogEntries } from "../../usage/debug";
-import { parseRange, parseUsageSurface, rangeWindow, summarizeUsage, type UsageRange, type UsageSummary, type UsageSurface } from "../../usage/summary";
+import { parseUsageTimeWindow, type UsageTimeWindow } from "../../usage/time-range";
+import { USAGE_RANGES, USAGE_SURFACES, parseRange, parseUsageSurface, rangeWindow, type UsageRange, type UsageSummary, type UsageSurface } from "../../usage/summary";
 import { stripCodexRuntimeProviderFields } from "../../codex/auth-context";
 import { getProviderRegistryEntry } from "../../providers/registry";
 import { getDebugLogEntries } from "../../lib/debug-log-buffer";
@@ -70,6 +67,7 @@ import {
 import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, filteredRequestLogCount, getRequestLogEntries, type RequestLogEntry } from "../request-log";
+import { decodeRequestLogCursor, selectRequestLogPoll } from "../request-log-cursor";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
 import { userCostOverlayVersion } from "../../usage/user-cost-overlays";
 import type { PersistedUsageAttempt } from "../../usage/log";
@@ -85,7 +83,7 @@ import {
   getUsageSummaryCacheEntry,
   setUsageSummaryCacheEntry,
 } from "./usage-summary-cache";
-import { cacheApiKeyUsageFromSnapshot } from "./api-key-usage";
+import { getFilteredUsageAggregate, getUsageAggregate } from "./usage-aggregate-cache";
 
 function nextLocalMidnight(now: number): number {
   const next = new Date(now);
@@ -94,7 +92,6 @@ function nextLocalMidnight(now: number): number {
 }
 
 function usageSummaryExpiresAt(
-  _entries: PersistedUsageEntry[],
   _range: UsageRange,
   _surface: UsageSurface,
   now: number,
@@ -107,40 +104,27 @@ function refreshedUsageSummary<T extends UsageSummary & { historyTruncated: bool
   return { ...summary, since, generatedAt: now };
 }
 
-/**
- * Timestamp bounds of the rows the bounded reader actually loaded.
- *
- * Deliberately computed over the whole snapshot, BEFORE `summarizeUsage` applies the range
- * and surface predicates: truncation is a property of the read, not of the query, so the
- * window that matters to a client is the one the reader could see. It is not a completeness
- * claim and must never be presented as one. `usage.jsonl` is appended when a request
- * COMPLETES while each row carries the request START time, so a long-running request can be
- * appended after shorter ones that started later — meaning the oldest loaded timestamp does
- * not bound what the dropped prefix contains (#1497).
- */
-function snapshotWindow(entries: PersistedUsageEntry[]): { start: number | null; end: number | null } {
-  let start: number | null = null;
-  let end: number | null = null;
-  for (const entry of entries) {
-    const at = entry.timestamp;
-    if (typeof at !== "number" || !Number.isFinite(at)) continue;
-    if (start === null || at < start) start = at;
-    if (end === null || at > end) end = at;
-  }
-  return { start, end };
-}
-
 export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Response | null> {
   const { req, url, config, deps, syncClaudeAgentDefsBestEffort } = ctx;
 
   if (url.pathname === "/api/logs" && req.method === "GET") {
+    const rawCursor = url.searchParams.get("cursor");
+    const cursor = rawCursor === null ? null : decodeRequestLogCursor(rawCursor);
+    if (rawCursor !== null && cursor === null) {
+      return jsonResponse({ error: { code: "invalid_cursor", message: "invalid cursor" } }, 400);
+    }
     const all = getRequestLogEntries();
     const total = filteredRequestLogCount(all, url.searchParams);
-    const logs = filterRequestLogs(all, url.searchParams);
+    // Not point-free: requestLogDto takes an options object second, and Array.map would pass the
+    // element INDEX into it. An explicit arrow keeps the default (decode rate included) and is
+    // what /api/logs wants; /api/request-history opts out at its own call sites.
+    const logs = filterRequestLogs(all, url.searchParams).map(entry => requestLogDto(entry));
+    const poll = selectRequestLogPoll(logs, url.searchParams, cursor);
     return jsonResponse({
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      generatedAt: Date.now(),
       total,
-      logs: logs.map(requestLogDto),
+      ...poll,
     });
   }
 
@@ -197,6 +181,22 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
   if (url.pathname === "/api/usage" && req.method === "GET") {
     const range = parseRange(url.searchParams.get("range"));
     const surface = parseUsageSurface(url.searchParams.get("surface"));
+    let window: UsageTimeWindow | undefined;
+    try {
+      window = parseUsageTimeWindow(url.searchParams.get("since"), url.searchParams.get("until"));
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : "invalid usage time window" }, 400);
+    }
+    // A filtered summary must never reach the cache or the warm loop below:
+    // the key is `range:surface`, so a filtered entry stored under it would be
+    // served to the next unfiltered caller, dashboard included.
+    const filter = {
+      provider: url.searchParams.get("provider"),
+      model: url.searchParams.get("model"),
+      apiKeyId: url.searchParams.get("apiKeyId"),
+    };
+    const filterRequested = window !== undefined || [filter.provider, filter.model, filter.apiKeyId]
+      .some(value => typeof value === "string" && value.trim() !== "");
     const now = Date.now();
     try {
       const cacheKey = `${range}:${surface}`;
@@ -204,65 +204,91 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
       const observed = currentUsageLogRevision();
       const identityKey = `${usageLogIdentityKey(observed)}\0${effectiveReadLimit}`;
       const observedSize = observed?.size ?? 0;
+      const observedTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       const cached = getUsageSummaryCacheEntry(cacheKey);
       if (cached
+        // Filtered responses have their own full-scan singleflight and never
+        // read or write this cache.
+        && !filterRequested
         && cached.identityKey === identityKey
         && cached.maxReadBytes === effectiveReadLimit
         && cached.overlayVersion === userCostOverlayVersion()
+        && cached.timeZone === observedTimeZone
         && now < cached.freshUntil
         && now < cached.expiresAt
         && observedSize >= cached.lastSeenSize) {
         return jsonResponse(refreshedUsageSummary(cached.summary, range, now));
       }
-      if (cached) discardUsageSummaryCacheEntry(cacheKey);
-      // Capture the overlay version BEFORE reading/computing: the cache entry
-      // must be stamped with the version the summary was priced under. Reading
-      // it again at stamp time could cache an old-price summary as current,
-      // and the next request would then accept stale pricing for the whole
-      // cache lifetime.
-      const overlayVersion = userCostOverlayVersion();
-      const snapshot = await readUsageSnapshotForManagement(effectiveReadLimit);
-      const revisionReadAt = Date.now();
-      const window = snapshotWindow(snapshot.entries);
-      const summary = {
-        ...summarizeUsage(snapshot.entries, range, now, surface),
-        historyTruncated: snapshot.truncatedPrefixBytes > 0 || snapshot.entriesTruncated,
-        truncatedPrefixBytes: snapshot.truncatedPrefixBytes,
-        entriesTruncated: snapshot.entriesTruncated,
-        entriesDropped: snapshot.entriesDropped,
-        snapshotWindowStart: window.start,
-        snapshotWindowEnd: window.end,
-      };
-      if (userCostOverlayVersion() !== overlayVersion) {
-        // The overlay changed while the summary was being computed, so this
-        // summary may mix old and new prices. Serve it uncached: the next
-        // request recomputes against the settled overlay instead of caching a
-        // mixed-price entry under either version.
-        return jsonResponse(summary);
+      if (cached && !filterRequested) discardUsageSummaryCacheEntry(cacheKey);
+      if (filterRequested) {
+        const filteredAggregate = await getFilteredUsageAggregate(filter, window);
+        const accumulator = filteredAggregate.accumulator;
+        return jsonResponse({
+          ...accumulator.summarize(range, now, surface),
+          ...(filteredAggregate.usageIncomplete ? { usageIncomplete: true as const, usageIncompleteReason: "oversized_rows" as const } : {}),
+          historyTruncated: false,
+          truncatedPrefixBytes: 0,
+          entriesTruncated: false,
+          entriesDropped: 0,
+          snapshotWindowStart: accumulator.snapshotWindow.start,
+          snapshotWindowEnd: accumulator.snapshotWindow.end,
+        });
       }
+
+      const configuredApiKeyIds = (config.apiKeys ?? []).map(key => key.id);
+      const aggregate = await getUsageAggregate({
+        now,
+        configuredApiKeyIds,
+        managementUsageMaxReadBytes: effectiveReadLimit,
+      });
+      const baseAccumulator = aggregate.accumulator;
+      const revisionReadAt = Date.now();
       const freshUntil = now + 60_000;
-      const snapshotIdentity = `${usageLogIdentityKey(snapshot.revision)}\0${effectiveReadLimit}`;
-      const revisionKey = `${usageLogRevisionKey(snapshot.revision)}\0${effectiveReadLimit}`;
-      const lastSeenSize = snapshot.revision?.size ?? 0;
-      const ranges: UsageRange[] = ["7d", "30d", "all"];
-      const surfaces: UsageSurface[] = ["all", "codex", "claude", "grok"];
+      const snapshotIdentity = `${usageLogIdentityKey(aggregate.revision)}\0${effectiveReadLimit}`;
+      const revisionKey = `${usageLogRevisionKey(aggregate.revision)}\0${effectiveReadLimit}`;
+      const lastSeenSize = aggregate.revision?.size ?? 0;
+      const baseReadMetadata = {
+        ...(aggregate.usageIncomplete ? { usageIncomplete: true as const, usageIncompleteReason: "oversized_rows" as const } : {}),
+        historyTruncated: false,
+        truncatedPrefixBytes: 0,
+        entriesTruncated: false,
+        entriesDropped: 0,
+        snapshotWindowStart: baseAccumulator.snapshotWindow.start,
+        snapshotWindowEnd: baseAccumulator.snapshotWindow.end,
+      } as const;
+      const requestedSummary = {
+        ...baseAccumulator.summarize(range, now, surface),
+        ...baseReadMetadata,
+      };
+      const currentOverlayVersion = userCostOverlayVersion();
+      const currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (currentOverlayVersion !== aggregate.overlayVersion
+        || currentTimeZone !== aggregate.timeZone) {
+        // The aggregate is internally consistent, but an input changed after
+        // its scan. Serve it uncached and let the next request rebuild.
+        return jsonResponse(requestedSummary);
+      }
+      // Derived from the canonical constants rather than re-listed: a subset
+      // literal type-checks perfectly happily, so a range added to the union
+      // and forgotten here would never be warmed and never invalidated
+      // alongside its siblings.
+      const ranges: readonly UsageRange[] = USAGE_RANGES;
+      const surfaces: readonly UsageSurface[] = USAGE_SURFACES;
       for (const nextRange of ranges) {
         for (const nextSurface of surfaces) {
-          const nextSummary = nextRange === range && nextSurface === surface ? summary : {
-            ...summarizeUsage(snapshot.entries, nextRange, now, nextSurface),
-            historyTruncated: summary.historyTruncated,
-            truncatedPrefixBytes: summary.truncatedPrefixBytes,
-            entriesTruncated: summary.entriesTruncated,
-            entriesDropped: summary.entriesDropped,
-            snapshotWindowStart: summary.snapshotWindowStart,
-            snapshotWindowEnd: summary.snapshotWindowEnd,
-          };
+          const nextSummary = nextRange === range && nextSurface === surface
+              ? requestedSummary
+              : {
+                ...baseAccumulator.summarize(nextRange, now, nextSurface),
+                ...baseReadMetadata,
+              };
           setUsageSummaryCacheEntry(`${nextRange}:${nextSurface}`, {
             revisionKey,
             identityKey: snapshotIdentity,
             maxReadBytes: effectiveReadLimit,
-            overlayVersion,
-            expiresAt: usageSummaryExpiresAt(snapshot.entries, nextRange, nextSurface, now),
+            overlayVersion: aggregate.overlayVersion,
+            timeZone: aggregate.timeZone,
+            expiresAt: usageSummaryExpiresAt(nextRange, nextSurface, now),
             freshUntil,
             lastSeenSize,
             revisionReadAt,
@@ -270,21 +296,13 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
           });
         }
       }
-      cacheApiKeyUsageFromSnapshot(
-        snapshot.entries,
-        (config.apiKeys ?? []).map(key => key.id),
-        usageLogIdentityKey(snapshot.revision),
-        snapshot.revision?.size ?? 0,
-        snapshot.truncatedPrefixBytes > 0 || snapshot.entriesTruncated,
-        effectiveReadLimit,
-        now,
-      );
-      return jsonResponse(summary);
+      return jsonResponse(requestedSummary);
     } catch {
       return jsonResponse({
         range,
         surface,
-        since: null,
+        since: window?.since ?? null,
+        ...(window ? { customWindow: true, until: window.until } : {}),
         generatedAt: now,
         summary: {
           requests: 0,
@@ -318,20 +336,6 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
         snapshotWindowStart: null,
         snapshotWindowEnd: null,
         error: "read_failed",
-      });
-    }
-  }
-
-  if (url.pathname === "/api/storage" && req.method === "GET") {
-    try {
-      return jsonResponse(scanStorage());
-    } catch {
-      return jsonResponse({
-        codexHome: resolveCodexHomeDir(),
-        generatedAt: Date.now(),
-        total: { bytes: 0, fileCount: 0 },
-        buckets: [],
-        error: "scan_failed",
       });
     }
   }
@@ -426,6 +430,7 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
         bytes: result.bytes,
         ...(result.trashDir ? { trashDir: result.trashDir } : {}),
         removedPaths: result.removedPaths,
+        ...(result.skippedReferencedPaths?.length ? { skippedReferencedPaths: result.skippedReferencedPaths } : {}),
       });
     } catch {
       return jsonResponse({

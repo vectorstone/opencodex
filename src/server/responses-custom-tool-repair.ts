@@ -1,7 +1,13 @@
 import type { TranslatorBudget } from "../lib/translator-budget";
+import { mayBecomePatchEnvelope, normalizeApplyPatchDelimiters } from "../responses/apply-patch-envelope";
+import { compileCodeModeHelperInput, resolveCodeModeHelperName } from "../responses/code-mode-helper-compat";
+import { progressiveFreeformInput } from "../responses/progressive-freeform-input";
+import { declaresCodeModeExec } from "../types/tools";
 import {
   customToolItemId,
   restoreRoutedCustomCalls,
+  routedCustomToolTargetName,
+  routedCustomToolWireName,
   unwrapRoutedCustomToolArguments,
 } from "../responses/custom-tool-compat";
 import {
@@ -10,48 +16,8 @@ import {
   type SseBlockRewrite,
 } from "./sse-payload-rewrite";
 
-/** Exact compact prefix used by our upstream rewriter; progressive matching also
- *  tolerates insignificant JSON whitespace via FREEFORM_WRAP_PREFIX_RE. */
-const FREEFORM_WRAP_PREFIX = '{"input":"';
-const FREEFORM_WRAP_PREFIX_RE = /^\s*\{\s*"input"\s*:\s*"/;
-
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-/**
- * Progressive decode of the freeform `{ "input": "…" }` wrapper.
- * Returns null when the accumulated text does not (yet) match that wrapper so
- * callers suppress deltas and rely on `response.custom_tool_call_input.done`.
- */
-function partialCustomToolInput(argumentsText: string): string | null {
-  const match = FREEFORM_WRAP_PREFIX_RE.exec(argumentsText);
-  if (!match) return null;
-  const body = argumentsText.slice(match[0]!.length);
-  let output = "";
-  for (let index = 0; index < body.length; index++) {
-    const char = body[index];
-    if (char === '"') break;
-    if (char !== "\\") {
-      output += char;
-      continue;
-    }
-    const escaped = body[index + 1];
-    if (escaped === undefined) break;
-    index += 1;
-    if (escaped === "n") output += "\n";
-    else if (escaped === "t") output += "\t";
-    else if (escaped === "r") output += "\r";
-    else if (escaped === "b") output += "\b";
-    else if (escaped === "f") output += "\f";
-    else if (escaped === "u") {
-      const hex = body.slice(index + 1, index + 5);
-      if (hex.length !== 4 || !/^[0-9a-fA-F]{4}$/.test(hex)) break;
-      output += String.fromCharCode(Number.parseInt(hex, 16));
-      index += 4;
-    } else output += escaped;
-  }
-  return output;
 }
 
 function replaceSseEventName(block: string, type: string): string {
@@ -84,8 +50,13 @@ type PendingArgumentBlock = {
 export function createRoutedCustomToolRestoreBlockRewrite(
   names: ReadonlySet<string>,
   budget?: TranslatorBudget,
+  repairNames: ReadonlySet<string> = new Set(),
+  declaredNames?: ReadonlySet<string>,
 ): SseBlockRewrite {
-  const itemNames = new Map<string, string>();
+  const itemNames = new Map<string, { name: string; aliased: boolean; namespace?: string }>();
+  // Native helper aliases and genuine bare code-mode exec calls share completion repair.
+  const customExecItemNames = new Map<string, string>();
+  const repairItemNames = new Map<string, string>();
   const ordinaryItemIds = new Set<string>();
   const openCalls = new Map<string, OpenCustomCall>();
   let pendingArguments: PendingArgumentBlock[] = [];
@@ -110,6 +81,8 @@ export function createRoutedCustomToolRestoreBlockRewrite(
     }
     pendingArguments = [];
     itemNames.clear();
+    customExecItemNames.clear();
+    repairItemNames.clear();
     ordinaryItemIds.clear();
   };
 
@@ -177,14 +150,48 @@ export function createRoutedCustomToolRestoreBlockRewrite(
     if (
       (type === "response.output_item.added" || type === "response.output_item.done")
       && isPlainObject(parsed.item)
+      && parsed.item.type === "custom_tool_call"
+      && typeof parsed.item.name === "string"
+    ) {
+      const upstreamItemId = typeof parsed.item.id === "string" ? parsed.item.id : undefined;
+      const wireName = routedCustomToolWireName(parsed.item);
+      const targetName = routedCustomToolTargetName(parsed.item, names, declaredNames);
+      const aliased = targetName !== undefined && targetName !== wireName;
+      const codeModeExec = targetName === "exec" && parsed.item.name === "exec"
+        && parsed.item.namespace === undefined && declaresCodeModeExec(declaredNames);
+      if (upstreamItemId && (aliased || codeModeExec)) {
+        customExecItemNames.set(upstreamItemId, parsed.item.name);
+        if (type === "response.output_item.added") {
+          openCalls.set(upstreamItemId, { argumentsText: "", emittedInput: "", retainedBytes: 0 });
+        }
+      }
+      const repairable = wireName !== undefined && repairNames.has(wireName);
+      if (upstreamItemId && repairable) repairItemNames.set(upstreamItemId, parsed.item.name);
+      const restored = repairable || aliased || codeModeExec
+        ? restoreRoutedCustomCalls(parsed, names, repairNames, declaredNames)
+        : { value: parsed, changed: false };
+      if (type === "response.output_item.done" && upstreamItemId) releaseCall(upstreamItemId);
+      return restored.changed
+        ? [replaceSseDataPayload(block, JSON.stringify(restored.value))]
+        : [block];
+    }
+    if (
+      (type === "response.output_item.added" || type === "response.output_item.done")
+      && isPlainObject(parsed.item)
       && parsed.item.type === "function_call"
       && typeof parsed.item.name === "string"
     ) {
       const upstreamItemId = typeof parsed.item.id === "string" ? parsed.item.id : undefined;
-      const routed = names.has(parsed.item.name);
+      const targetName = routedCustomToolTargetName(parsed.item, names, declaredNames);
+      const routed = targetName !== undefined;
+      const wireName = routedCustomToolWireName(parsed.item);
       if (upstreamItemId) {
         if (routed) {
-          itemNames.set(upstreamItemId, parsed.item.name);
+          itemNames.set(upstreamItemId, {
+            name: parsed.item.name,
+            aliased: targetName !== wireName,
+            ...(typeof parsed.item.namespace === "string" ? { namespace: parsed.item.namespace } : {}),
+          });
           ordinaryItemIds.delete(upstreamItemId);
         } else {
           ordinaryItemIds.add(upstreamItemId);
@@ -201,7 +208,7 @@ export function createRoutedCustomToolRestoreBlockRewrite(
       if (upstreamItemId && pending.length > 0 && !openCalls.has(upstreamItemId)) {
         openCalls.set(upstreamItemId, { argumentsText: "", emittedInput: "", retainedBytes: 0 });
       }
-      const restored = restoreRoutedCustomCalls(parsed, names);
+      const restored = restoreRoutedCustomCalls(parsed, names, repairNames, declaredNames);
       const restoredBlock = restored.changed
         ? replaceSseDataPayload(block, JSON.stringify(restored.value))
         : block;
@@ -213,6 +220,59 @@ export function createRoutedCustomToolRestoreBlockRewrite(
     }
 
     const upstreamItemId = typeof parsed.item_id === "string" ? parsed.item_id : undefined;
+    if (
+      type === "response.custom_tool_call_input.delta"
+      && upstreamItemId
+      && customExecItemNames.has(upstreamItemId)
+    ) {
+      const open = openCalls.get(upstreamItemId) ?? { argumentsText: "", emittedInput: "", retainedBytes: 0 };
+      const delta = typeof parsed.delta === "string" ? parsed.delta : "";
+      const deltaBytes = Buffer.byteLength(delta, "utf8");
+      if (deltaBytes > 0) budget?.chargeRetained(deltaBytes, { kind: "retained_collectors" });
+      open.argumentsText += delta;
+      open.retainedBytes += deltaBytes;
+      openCalls.set(upstreamItemId, open);
+      if (customExecItemNames.get(upstreamItemId) !== "exec"
+        || mayBecomePatchEnvelope(open.argumentsText)
+        // JSON.parse accepts whitespace, escaped keys and arbitrary property order.
+        // Any object prefix may still wrap a patch; keep it until authoritative completion.
+        || open.argumentsText.trimStart() === ""
+        || open.argumentsText.trimStart().startsWith("{")) return [];
+      // If a held prefix turns out to be ordinary JavaScript, release the entire
+      // un-emitted suffix. Native custom input remains byte-exact.
+      const inputDelta = open.argumentsText.slice(open.emittedInput.length);
+      open.emittedInput = open.argumentsText;
+      return inputDelta ? [replaceSseDataPayload(block, JSON.stringify({ ...parsed, delta: inputDelta }))] : [];
+    }
+    if (
+      type === "response.custom_tool_call_input.done"
+      && upstreamItemId
+      && customExecItemNames.has(upstreamItemId)
+    ) {
+      const source = typeof parsed.input === "string"
+        ? parsed.input
+        : openCalls.get(upstreamItemId)?.argumentsText ?? "";
+      const name = customExecItemNames.get(upstreamItemId)!;
+      const helper = name === "exec"
+        ? resolveCodeModeHelperName(undefined, name, source, undefined, declaredNames)
+        : name;
+      releaseCall(upstreamItemId);
+      return [replaceSseDataPayload(block, JSON.stringify({
+        ...parsed,
+        input: helper ? compileCodeModeHelperInput(source, helper, name) : source,
+      }))];
+    }
+    if (
+      type === "response.custom_tool_call_input.done"
+      && upstreamItemId
+      && repairItemNames.has(upstreamItemId)
+      && typeof parsed.input === "string"
+    ) {
+      const input = normalizeApplyPatchDelimiters(parsed.input);
+      if (input !== parsed.input) {
+        return [replaceSseDataPayload(block, JSON.stringify({ ...parsed, input }))];
+      }
+    }
     const argumentEvent = type === "response.function_call_arguments.delta"
       || type === "response.function_call_arguments.done";
     if (argumentEvent && (!upstreamItemId || (!itemNames.has(upstreamItemId) && !ordinaryItemIds.has(upstreamItemId)))) {
@@ -231,11 +291,35 @@ export function createRoutedCustomToolRestoreBlockRewrite(
       open.argumentsText += delta;
       open.retainedBytes += deltaBytes;
       openCalls.set(upstreamItemId, open);
-      // Still accumulating toward the compact wrapper, or an unrecognized shape:
-      // suppress progressive emission and let the done event carry input.
-      if (FREEFORM_WRAP_PREFIX.startsWith(open.argumentsText)) return [];
-      const fullInput = partialCustomToolInput(open.argumentsText);
+      // A helper alias will become JavaScript at completion, never raw patch/JSON.
+      if (itemNames.get(upstreamItemId)?.aliased) return [];
+      const itemName = itemNames.get(upstreamItemId);
+      const ownsFreeformGrammar = itemName?.namespace === undefined
+        || itemName?.namespace === "functions";
+      const fullInput = progressiveFreeformInput(
+        open.argumentsText,
+        ownsFreeformGrammar ? itemName?.name ?? "" : "",
+      );
       if (fullInput === null) return [];
+      // This routed path historically holds every unrecognized JSON object until done.
+      // The shared decoder streams ordinary raw input, so retain the stricter routed rule
+      // when no recognized wrapper transformed the accumulated object.
+      if (fullInput === open.argumentsText && open.argumentsText.trimStart().startsWith("{")) return [];
+      // Hold a buffer that could still become a complete patch envelope, for either of the two
+      // reasons completion rewrites one. Both are the same rewind this path forbids, and both
+      // mirror `src/bridge/sse.ts`.
+      //
+      // `exec`: the done event recompiles such a body into an apply_patch helper call.
+      // `apply_patch`: `normalizeApplyPatchDelimiters` rewrites a decorated
+      // `*** Begin Patch ***` envelope at completion, so the decorated markers would be
+      // published and then replaced by the normalized ones. Before the shared decoder, this
+      // path held every non-canonical shape and so never reached that case; now that ordinary
+      // raw input streams, the second reason has to be stated explicitly.
+      const mayCompile = declaresCodeModeExec(declaredNames)
+        && itemName?.namespace === undefined
+        && itemName?.name === "exec";
+      const mayNormalize = ownsFreeformGrammar && itemName?.name === "apply_patch";
+      if ((mayCompile || mayNormalize) && mayBecomePatchEnvelope(fullInput)) return [];
       if (!fullInput.startsWith(open.emittedInput) || fullInput.length === open.emittedInput.length) return [];
       const inputDelta = fullInput.slice(open.emittedInput.length);
       open.emittedInput = fullInput;
@@ -259,16 +343,24 @@ export function createRoutedCustomToolRestoreBlockRewrite(
         ? parsed.arguments
         : openCalls.get(upstreamItemId)?.argumentsText ?? "";
       const { arguments: _arguments, ...rest } = parsed;
+      const itemName = itemNames.get(upstreamItemId);
+      // Name-based alias first; otherwise a raw patch envelope submitted as the `exec` body
+      // resolves to the same apply_patch helper (devlog/_plan/260905_apply_patch_envelope_gap).
+      const helper = itemName?.aliased
+        ? itemName.name
+        : resolveCodeModeHelperName(undefined, itemName?.name ?? "", source, itemName?.namespace, declaredNames);
       const next = {
         ...rest,
         type: nextType,
         item_id: customToolItemId(upstreamItemId),
-        input: unwrapRoutedCustomToolArguments(source),
+        input: helper
+          ? compileCodeModeHelperInput(source, helper, itemName?.name ?? "")
+          : unwrapRoutedCustomToolArguments(source, itemName?.name ?? "", itemName?.namespace),
       };
       return [replaceSseDataPayload(replaceSseEventName(block, nextType), JSON.stringify(next))];
     }
 
-    const restored = restoreRoutedCustomCalls(parsed, names);
+    const restored = restoreRoutedCustomCalls(parsed, names, repairNames, declaredNames);
     const terminal = type === "response.completed" || type === "response.failed" || type === "response.incomplete";
     if (terminal) releaseAll();
     return restored.changed

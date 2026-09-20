@@ -1,3 +1,4 @@
+import { codexCompatibleUrl } from "../codex/context-compat";
 /**
  * /v1/live and /v1/realtime/calls relay (issue #371).
  *
@@ -34,6 +35,7 @@ import {
   cooldownErrorResponse,
   CodexAuthContextError,
   CodexMainProfileDrainingError,
+  CodexModelAvailabilityError,
   CodexPoolAuthenticationError,
   CodexThreadAffinityExpiredError,
 } from "../codex/auth-context";
@@ -47,6 +49,7 @@ import type { RequestLogContext } from "./request-log";
 import { codexLogAccountId } from "./responses";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
+import { codexModelAvailabilityErrorResponse } from "./responses/codex-auth-error";
 
 /** Voice call create can wait on SDP negotiation; bound a hung upstream. */
 const LIVE_UPSTREAM_TIMEOUT_MS = 120_000;
@@ -69,7 +72,17 @@ export const LIVE_SIDEBAND_API_ROOT = "https://api.openai.com/v1";
  * Client protocol headers relayed verbatim to the upstream on call-create and sideband upgrade.
  * `openai-alpha: quicksilver=v2` carries the Frameless protocol negotiation — without it the
  * ChatGPT backend validates the type-less Frameless session as v1 quicksilver and 400s
- * (openai/codex `realtime_request_headers`, core/src/realtime_conversation.rs). Auth headers
+ * (openai/codex `realtime_request_headers`, core/src/realtime_conversation.rs).
+ *
+ * `x-codex-turn-metadata` is on the same list upstream builds for the sideband upgrade and was
+ * missing here, so every realtime turn reached the model with metadata the client had attached
+ * and this proxy silently dropped. The Responses passthrough already forwards it
+ * (`src/adapters/openai-responses/passthrough.ts`); the sideband goes to the same realtime
+ * upstream the caller was addressing, so there is nothing to scope it away from. That is not
+ * true of the images sidecar, which strips it deliberately and keeps doing so.
+ *
+ * Every name here is relayed only when the caller sent it. Nothing on this list is invented,
+ * which is what keeps a caller that omits one byte-identical upstream. Auth headers
  * (`authorization`, `chatgpt-account-id`) stay proxy-owned and are never taken from this list.
  */
 export const LIVE_CLIENT_PROTOCOL_HEADERS = [
@@ -79,6 +92,7 @@ export const LIVE_CLIENT_PROTOCOL_HEADERS = [
   "thread-id",
   "originator",
   "x-oai-attestation",
+  "x-codex-turn-metadata",
 ] as const;
 
 /**
@@ -86,39 +100,29 @@ export const LIVE_CLIENT_PROTOCOL_HEADERS = [
  *
  * When `OCX_LIVE_FRAME_LOG` is set to a file path, every relayed sideband frame appends one
  * JSONL record: direction, frame kind, byte length, and whether the payload contains U+FFFD.
- * Privacy: full frame payloads are never written — only when U+FFFD is present, a short
- * excerpt around the first replacement character is included so the corruption point can be
- * attributed (upstream vs relay vs client). Disabled entirely when the env var is unset.
+ * Privacy: no frame content is written, including excerpts around replacement characters.
+ * For binary frames, U+FFFD may also be introduced by UTF-8 decoding; the flag alone does not
+ * identify the source of corruption. Disabled entirely when the env var is unset.
  */
 export const LIVE_FRAME_LOG_ENV = "OCX_LIVE_FRAME_LOG";
-const LIVE_FRAME_LOG_CONTEXT_CHARS = 24;
-
-function fffdContext(text: string): string | undefined {
-  const idx = text.indexOf("\uFFFD");
-  if (idx < 0) return undefined;
-  const start = Math.max(0, idx - LIVE_FRAME_LOG_CONTEXT_CHARS);
-  const end = Math.min(text.length, idx + LIVE_FRAME_LOG_CONTEXT_CHARS);
-  return text.slice(start, end);
-}
-
 export function logLiveSidebandFrame(dir: "c2u" | "u2c", data: unknown): void {
   const logPath = process.env[LIVE_FRAME_LOG_ENV];
   if (!logPath) return;
   try {
     let kind: "text" | "binary" = "binary";
     let bytes = 0;
-    let context: string | undefined;
+    let fffd = false;
     if (typeof data === "string") {
       kind = "text";
       bytes = Buffer.byteLength(data);
-      context = fffdContext(data);
+      fffd = data.includes("\uFFFD");
     } else if (data instanceof ArrayBuffer) {
       bytes = data.byteLength;
-      context = fffdContext(new TextDecoder().decode(new Uint8Array(data)));
+      fffd = new TextDecoder().decode(new Uint8Array(data)).includes("\uFFFD");
     } else if (ArrayBuffer.isView(data)) {
       const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       bytes = data.byteLength;
-      context = fffdContext(new TextDecoder().decode(view));
+      fffd = new TextDecoder().decode(view).includes("\uFFFD");
     } else {
       return;
     }
@@ -127,12 +131,45 @@ export function logLiveSidebandFrame(dir: "c2u" | "u2c", data: unknown): void {
       dir,
       kind,
       bytes,
-      fffd: context !== undefined,
-      ...(context !== undefined ? { context } : {}),
+      fffd,
     };
     appendFileSync(logPath, `${JSON.stringify(record)}\n`);
   } catch {
     // Frame forensics must never break the relay.
+  }
+}
+
+/**
+ * Sideband lifecycle stages, recorded in the same JSONL as the frame records.
+ *
+ * Frame forensics alone cannot separate the three realtime-voice failures reported in #4721.
+ * A join that never reached this proxy, a join whose upstream handshake was refused, and a
+ * relay that opened and then carried nothing all leave the same empty file, which is why the
+ * original report could only say "no frame log". One record per stage makes them distinct:
+ * no record at all means the client never dialed the proxy, `upstream-failed` carries the
+ * status the client was handed, and `relay-attached` with no following frame record means the
+ * transport is live and the silence is upstream of it.
+ */
+export type LiveSidebandStage = "upstream-open" | "upstream-failed" | "relay-attached" | "relay-closed";
+
+/**
+ * Append one lifecycle record. Same privacy rule as the frame records and for the same reason:
+ * no URL, no call id, no header, no frame content — only the stage and, on failure, the status
+ * and error code this proxy synthesized itself.
+ */
+export function logLiveSidebandStage(
+  stage: LiveSidebandStage,
+  detail?: { status?: number; code?: string },
+): void {
+  const logPath = process.env[LIVE_FRAME_LOG_ENV];
+  if (!logPath) return;
+  try {
+    const record: Record<string, unknown> = { ts: new Date().toISOString(), stage };
+    if (detail?.status !== undefined) record.status = detail.status;
+    if (detail?.code !== undefined) record.code = detail.code;
+    appendFileSync(logPath, JSON.stringify(record) + "\n");
+  } catch {
+    // Diagnostics must never break the relay.
   }
 }
 
@@ -146,6 +183,20 @@ function clientProtocolHeaders(reqHeaders: Headers): Record<string, string> {
 }
 
 const LIVE_CALL_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Decode one path-segment call id. A malformed percent escape (`%ZZ`) makes
+ * `decodeURIComponent` throw; that must read as "not a sideband target" (JSON 404),
+ * never escape the router as a 500.
+ */
+function decodeLiveCallId(segment: string): string | null {
+  try {
+    const callId = decodeURIComponent(segment);
+    return LIVE_CALL_ID_RE.test(callId) ? callId : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Credential-shaped query keys never forwarded upstream on a standalone realtime
@@ -238,8 +289,8 @@ function httpsToWss(httpUrl: string): string {
 export function parseLiveSidebandTarget(pathname: string, searchParams: URLSearchParams, rawQuery = ""): LiveSidebandTarget | null {
   const liveMatch = pathname.match(/^\/v1\/live\/([^/]+)\/?$/);
   if (liveMatch) {
-    const callId = decodeURIComponent(liveMatch[1]!);
-    if (!LIVE_CALL_ID_RE.test(callId)) return null;
+    const callId = decodeLiveCallId(liveMatch[1]!);
+    if (!callId) return null;
     return { style: "frameless-path", callId };
   }
   // Standalone Frameless session (no call-create): `GET /v1/live?model=`.
@@ -248,8 +299,8 @@ export function parseLiveSidebandTarget(pathname: string, searchParams: URLSearc
   }
   const callsMatch = pathname.match(/^\/v1\/realtime\/calls\/([^/]+)\/?$/);
   if (callsMatch) {
-    const callId = decodeURIComponent(callsMatch[1]!);
-    if (!LIVE_CALL_ID_RE.test(callId)) return null;
+    const callId = decodeLiveCallId(callsMatch[1]!);
+    if (!callId) return null;
     return { style: "realtime-calls-path", callId };
   }
   if (pathname === "/v1/realtime" || pathname === "/v1/realtime/") {
@@ -367,7 +418,7 @@ export function buildLiveSidebandUpstreamWsUrl(
   );
 }
 
-async function backendJsonBodyFromApiMultipart(
+export async function backendJsonBodyFromApiMultipart(
   body: ArrayBuffer,
   contentType: string,
 ): Promise<{ body: Uint8Array; contentType: string } | Response> {
@@ -420,14 +471,20 @@ export async function readBodyCapped(
   stream: ReadableStream<Uint8Array> | null,
   maxBytes: number,
   tooLargeMessage: (total: number) => string,
+  signal?: AbortSignal,
 ): Promise<ArrayBuffer | Response> {
   if (!stream) return new ArrayBuffer(0);
   const reader = stream.getReader();
+  const abortRead = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", abortRead, { once: true });
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
+    if (signal?.aborted) abortRead();
+    signal?.throwIfAborted();
     for (;;) {
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       if (!value || value.byteLength === 0) continue;
       total += value.byteLength;
@@ -446,6 +503,7 @@ export async function readBodyCapped(
     await reader.cancel(err).catch(() => {});
     throw err;
   } finally {
+    signal?.removeEventListener("abort", abortRead);
     try {
       // Always release: `reader.cancel()` does NOT drop the lock, and holding it would leave
       // the stream permanently locked for any later consumer (audit R-WP5-2).
@@ -554,6 +612,8 @@ export async function resolveLiveRelay(
           "authentication_error",
           "Selected Codex account needs reauthentication",
         );
+      } else if (err instanceof CodexModelAvailabilityError) {
+        forwardAuthError = codexModelAvailabilityErrorResponse(err);
       } else if (err instanceof CodexPoolAuthenticationError) {
         forwardAuthError = formatErrorResponse(401, "authentication_error", err.message);
       } else {
@@ -632,7 +692,7 @@ export async function handleLive(
     // Frameless API-shape call-create posts to `{base}/live` without the AVAS
     // query (openai/codex RealtimeCallClient, realtime_call.rs); only the
     // realtime/calls inbound shape keeps the legacy keyed AVAS endpoint.
-    url = new URL(req.url).pathname === "/v1/live"
+    url = codexCompatibleUrl(req.url).pathname === "/v1/live"
       ? forwardLiveUrl(relay.providerBaseUrl, /* usesBackendShape */ false)
       : keyedLiveUrl(relay.providerBaseUrl);
   }

@@ -79,13 +79,78 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET /api/grok` | Прочитать статус управляемой конфигурации Grok и кандидатные модели | 400 status read failure |
 | `PUT /api/grok/selection` | Сохранить список исключённых моделей Grok | 400 invalid or oversized selection |
 | `POST /api/grok/apply` | Применить сохранённую конфигурацию Grok через managed sync | 409 `grok_apply_busy`; 400/500 apply failure |
+| `GET /api/grok/reset-coupons?accountId=...` | Прочитать оставшиеся токены сброса биллинга Grok и окна их действия для активного или указанного аккаунта xAI | 400 отсутствует аккаунт; 401 без аутентификации; 502 ошибка upstream gRPC-Web |
+| `POST /api/grok/reset-coupons/consume` | Обменять подходящий купон сброса. Тело `{ accountId?, tokenId?, operationId? }`. Необязательный `operationId` (UUIDv4) делает обмен идемпотентным: повтор того же идентификатора воспроизводит сохраненный результат без повторного обмена. | 400 некорректные JSON/UUID; 401 без аутентификации; 409 `identity_mismatch`; 502 ошибка upstream; 503 емкость реестра |
 | `GET, PUT /api/claude-desktop` | Прочитать или сохранить routed/native-профиль Claude Desktop | 400 invalid or unavailable assignment |
 | `POST /api/claude-desktop/apply` | Записать сохранённый профиль в managed config Claude Desktop | 400/500 write failure |
 | `GET /api/claude-desktop/status` | Проверить согласованность saved-vs-applied profile и здоровье Desktop | 400 status read failure |
 | `GET, PUT /api/claude-code` | Прочитать или обновить настройки gateway, auth-mode, model-map, context, agent и sidecar для Claude Code | 400 invalid field or shape |
 
+Дашборд управляет обоими путями купонов из **Providers > xAI Grok > Accounts**: каждая
+строка вошедшего аккаунта несёт значок-билет с числом оставшихся купонов, а значок
+открывает диалог, который показывает окна действия и обменивает купон, ближайший
+к истечению срока. Диалог отправляет сгенерированный клиентом `operationId` и после
+таймаута прекращает отправку вместо повторной попытки, потому что обмен, запись
+журнала которого ещё открыта, выполнился бы снова. `ocx account grok-reset-coupons`
+остаётся эквивалентом в терминале.
+
 О принципах model roster и поведении encrypted worker-task см.
 [Поверхность подагентов](/guides/sub-agent-surface/).
+
+### Журнал отката клиентских интеграций
+
+| Метод и путь | Назначение | Важные ошибки |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | Получить операции отката, при необходимости только для одного клиента. Каждая запись содержит вычисленный сервером флаг `deletable`. | 400 неверный клиент |
+| `DELETE /api/client-integrations/journal?opId=...` | Исключить старую операцию отката и по возможности удалить её снимок. В успешном ответе `snapshotRemoved: false` означает, что очистка сохранена для повторной попытки обслуживания. | 400 нет `opId`; 404 операция отсутствует или уже исключена; 409 последняя операция клиента |
+
+## Предварительный просмотр изменения интеграции
+
+Предпросмотр показывает, что сделало бы изменение, не делая его. Эти маршруты ничего не пишут:
+ни снимка, ни записи о владении, ни строки журнала, ни блокировки, ни обслуживания, ни
+восстановления.
+
+| Метод и путь | Назначение | Основные ошибки |
+| --- | --- | --- |
+| `POST /api/client-integrations/preview` | Спланировать `apply`, `overwrite` или `disable` для одного клиента; тело `{ "clientId": "...", "operation": "..." }` | 400 неверный клиент или операция; 400 `invalid_aside_profile_path`; 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/restore/preview` | Спланировать отмену; тело `{ "opId": "...", "confirmDrift": false }` | 404 операция не найдена; 400 `invalid_aside_profile_path`; 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/aside/profiles/{profileId}/preview` | Спланировать изменение одного профиля Aside; для `restore` нужен `opId` | 400 неверное тело или профиль не указан; 404 профиль или операция не найдены; 409 `integration_preview_unavailable` |
+
+План содержит `version`, `clientId`, `operation`, `state`, `foreignEdit`, список `changes` из пар
+`kind` и `path`, непрозрачный `fingerprint`, `canApply` и `willChange`; `refusalReason` и
+`profileId` необязательны. Пути — это управляемые пути схемы либо фиксированные метки
+`$snapshot`, `$ownership` и `$journal`; позиция, определяемая во время работы, показывается как
+`*`. Ни значения конфигурации, ни расположение файлов, ни имя выбранного элемента не возвращаются.
+
+`canApply` истинно при `willChange` ложном означает, что операция завершится успешно и ничего не
+изменит в управляемом клиентском документе, например повторное применение уже применённого.
+
+Изменение профиля Aside в этом случае всё же кое-что сохраняет: подтверждение записывает настройку
+синхронизации профиля до того, как будет затронут хоть один клиентский документ. Поэтому отключение
+профиля, управляемый блок которого уже отсутствует, сохраняет настройку и оставляет документ и его
+историю нетронутыми.
+
+`integration_preview_unavailable` означает, что сейчас нет пригодного списка моделей: только что
+запущенный прокси — один такой случай, список, отброшенный из-за изменения конфигурации или кэша
+провайдеров, — другой. Чтение `GET /api/client-integrations` формирует его, когда обнаружение
+прошло успешно и конфигурацию удалось определить; это обычное решение, а не гарантия.
+
+## Подтверждение просмотренного изменения
+
+Маршруты изменения принимают `operation` и `planFingerprint` рядом с обычным телом. Отправляйте
+оба или ни одного: запрос только с одним отклоняется, как и запрос, `operation` которого не
+совпадает с запрошенным изменением. Привязка Aside относится к одному профилю, поскольку один
+отпечаток не может описать несколько независимо меняющихся файлов.
+
+Перед записью сервер планирует заново и возвращает `409 integration_preview_stale` с заново
+вычисленным `plan`, когда подтверждение больше не описывает происходящее. Примите решение
+заново по новому плану; запрос не повторяется автоматически.
+
+Отпечаток — это оптимистичная проверка, а не разрешение. Возможность изменения по-прежнему
+определяют аутентификация управляющего API и правила владения.
+
+Удаление добавляет отметку вместо перезаписи журнала. Сервер защищает последнюю операцию каждого
+клиента, чтобы сохранить текущую точку отмены.
 
 ### Combos
 
@@ -126,6 +191,7 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET /api/debug/injection-logs` | Прочитать ограниченные guidance-injection debug-записи | — |
 | `GET /api/claude/inbound-debug` | Прочитать состояние и записи Claude inbound debug | — |
 | `GET /api/usage` | Сводка usage по диапазону и client surface | При сбое чтения storage вернёт summary с `error: "read_failed"` |
+| `GET /api/metrics` | Вернуть локальные для процесса текстовые метрики Prometheus: логические запросы, физические отправки, виды восстановления, длительность и TTFT. Метки ограничены закрытыми наборами protocol, result и recovery class; идентификаторы запросов и учётных данных не экспортируются. | 404, если `metricsExport.enabled` не был true при запуске; требуется обычная management-аутентификация, data-plane credentials доступа не дают |
 | `GET /api/storage` | Просканировать использование storage Codex по bucket'ам | При ошибке scan вернёт payload с `error: "scan_failed"` |
 | `POST /api/storage/cleanup/preview` | Предпросмотр cleanup archived-session и возврат binding digest | 400 `invalid_json` or `invalid_percent` |
 | `POST /api/storage/cleanup` | Поместить preview'нутый архивный набор в quarantine или удалить его навсегда | 400 invalid input; 409 stale/busy/referenced state; 500 filesystem/database failure |
@@ -135,6 +201,14 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET, PUT /api/storage/cleanup-policy` | Прочитать или обновить расписанную cleanup-policy и job-state | 400 invalid policy |
 | `POST /api/storage/cleanup-policy/run` | Запустить manual cleanup-policy run | 409 `already_running`; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | Тестовый policy-stream hook | 404 `not_found`, когда недоступен |
+
+Если строка превышает существующий лимит размера парсера, `GET /api/usage` и `GET /api/keys` сохраняют агрегаты читаемых строк и добавляют в ответ `usageIncomplete: true` и `usageIncompleteReason: "oversized_rows"`. Диагностика сохраняется в кеше и при инкрементальных добавлениях, в том числе для пустых результатов и отсутствующих совпадений; при перестроении она вычисляется заново. Идентификаторы провайдеров, моделей и API-ключей не сокращаются. Отсутствие флага не доказывает корректность всех строк. Это отдельный сигнал от `historyTruncated`, `entriesTruncated` и покрытия измерений токенов.
+
+Строки в `models`, `providers` и `days[].models` также содержат `cacheHitRate` — долю входных
+токенов, полученных из кэша промптов провайдера и ограниченную диапазоном `[0, 1]`. Значение равно
+`null`, а не `0`, если провайдер не передал телеметрию кэша или в строке нет входных токенов: отсутствие
+данных о кэше и фактическая доля попаданий 0 % — разные сведения, и диаграмма, отображающая их
+одинаково, вводит в заблуждение.
 
 :::caution
 Endpoint'ы storage cleanup могут перемещать или навсегда удалять архивные данные сессий. Всегда
@@ -150,10 +224,16 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | `GET /api/models` | Вернуть model-row'ы для дашборда и CLI | `catalog_busy`, когда сборка перегружена |
 | `GET /api/client-config?client=...` | Собрать read-only client config для любой поддерживаемой файловой интеграции | 400 unsupported client; 503 catalog unavailable |
 | `PUT /api/disabled-models` | Полностью заменить общий список disabled-models | 400 invalid JSON |
-| `PUT /api/model-visibility` | Атомарно изменить видимость на уровне провайдера или модели | 400 invalid provider, scope, target or body |
+| `PUT /api/model-visibility` | Атомарно изменить видимость на уровне провайдера или модели | 400 invalid provider, scope, target or body; 409 `initial_model_selection_pending` (Обновите список моделей и повторите попытку.) |
 | `GET, POST /api/custom-models` | Показать список custom-моделей или добавить одну | 400 invalid fields; 404 provider missing; 409 duplicate model |
 | `PUT, DELETE /api/custom-models/{id}` | Изменить или удалить одну custom-модель | 400 invalid id/fields; 404 not found; 409 duplicate model |
-| `GET, PUT /api/selected-models` | Прочитать allowlist'ы и availability провайдеров либо заменить один allowlist | 400 missing provider/body; 404 unknown provider |
+| `GET, PUT /api/selected-models` | Прочитать allowlist'ы и availability провайдеров либо заменить один allowlist | 400 missing provider/body; 404 unknown provider; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | Прочитать пресеты или выбрать режим preset/all/custom | 400 неверный режим или неподдерживаемый пресет; 404 неизвестный провайдер; PUT 409 `initial_model_selection_pending` |
+
+Ручная модель заменяет строку панели Models с тем же провайдером и идентификатором модели. Для OpenAI ручная строка сохраняет `openai/<model>` и поддерживает управление видимостью. При её удалении восстанавливается нативная строка без уточнения аккаунта. Нативные строки с указанием аккаунта остаются отдельными. Нативные маршруты и права аккаунта не меняются. Ненативная цель видимости OpenAI должна соответствовать настроенной ручной модели.
+
+
+Пока достоверный исходный список моделей не получен, корректные PUT-запросы к `/api/selected-models` и `/api/model-presets` возвращают HTTP 409 с кодом `initial_model_selection_pending`. Обновите список моделей, например через `GET /api/models`, и повторите запрос после успешного получения списка.
 
 ### OAuth-аккаунты, ключи провайдеров и ключи data plane
 
@@ -168,7 +248,8 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | `POST /api/oauth/logout` | Удалить сохранённый credential выбранного провайдера | 400 unknown provider; `oauth_mutation_busy` |
 | `GET, DELETE /api/oauth/accounts` | Показать список masked-аккаунтов или удалить один аккаунт | 400 invalid provider/id; 404 account missing; `oauth_mutation_busy` |
 | `PUT /api/oauth/accounts/active` | Выбрать активный OAuth-аккаунт | 400 invalid provider/account; `oauth_mutation_busy` |
-| `GET, PUT, PATCH /api/oauth/accounts/pool` | Прочитать или обновить policy Anthropic OAuth pool | 400 non-Anthropic provider or invalid policy |
+| `GET, PUT, PATCH /api/pool/settings` | Прочитать или обновить policy пула любого вида (codex, anthropic, generic); все три отвечают одинаковыми ключами, а поля, которые вид действительно применяет, перечислены в `supported` | 400 неизвестный provider, поле, которое вид не поддерживает, или недопустимое значение |
+| `GET, PUT, PATCH /api/oauth/accounts/pool` | Прежняя policy пула для Anthropic и обычных OAuth-провайдеров; заменена на `/api/pool/settings` и сохранена для существующих клиентов | 400 codex или api-key provider, либо недопустимая policy |
 | `POST /api/oauth/accounts/clear-cooldown` | Очистить runtime cooldown одного OAuth-аккаунта | 400 invalid provider/account |
 | `PUT /api/oauth/accounts/alias` | Задать или очистить alias OAuth-аккаунта | 400 invalid provider/account/alias |
 | `GET, POST, DELETE /api/providers/keys` | Показать список masked provider-key'ов, добавить/активировать один или удалить один | 400 invalid input; 404 provider/key missing |
@@ -191,6 +272,18 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | `GET /api/provider-quotas` | Прочитать отчёты по provider quota; `refresh=1` форсирует refresh | — |
 | `GET, PUT /api/provider-context-caps` | Прочитать или обновить context cap глобально, для всех провайдеров или для одного провайдера | 400 invalid request; 404 unknown provider |
 | `GET /api/provider-presets` | Вернуть GUI-presets провайдеров, выведенные из runtime registry | — |
+
+Ответ API лимитов контекста содержит `caps` (активные лимиты) и `values` (последние выбранные
+значения, сохраняемые после отключения). Включение лимита провайдера без `value` восстанавливает
+его выбор, а при первом включении использует глобальное значение `contextCapValue`.
+Это относится и к OpenAI: переключатель не выбирает специальный режим 922k. Активный лимит
+ограничивает каждое нативное окно; модели с поддержкой длинного контекста могут расширять окно
+только до собственного поддерживаемого предела.
+`{ "value": 600000, "setAll": true }` меняет глобальное значение и только активные лимиты.
+Провайдеры с отключённым лимитом сохраняют свой выбор для последующего включения.
+`{ "setAll": true }` без `value` включает лимиты всех настроенных провайдеров с текущим глобальным
+значением и заменяет сохранённый выбор. Отключение сохраняет выбор даже после перезагрузки,
+но не применяет его как ограничение.
 
 `provider_has_dependent_combos` — это safety-барьер: сначала удалите или отредактируйте
 зависящие combo, и лишь потом удаляйте их провайдера.
@@ -215,7 +308,7 @@ Management-аутентификация доказывает доступ к п�
 | --- | --- | --- |
 | `GET /api/system/memory` | Вернуть скалярные метрики процесса, heap, stream, response-state, watchdog и active-turn | — |
 | `POST /api/system/restart` | Начать restart процесса с учётом drain, не снимая client injection | Возвращает 202; повторные вызовы сообщают о текущем drain |
-| `POST /api/stop` | Остановить службу, восстановить native Codex, убрать managed Grok injection и выполнить drain прокси | 409 service ownership conflict |
+| `POST /api/stop` | Остановить службу, восстановить native Codex, убрать managed Grok injection и выполнить drain прокси | 409 service ownership conflict; 409 `respawnable_service`, когда обёртка планировщика заданий Windows может перезапустить прокси, а вызывающая сторона — не `ocx stop` (ничего не изменяется); 409, когда установленный менеджер отказывается останавливаться; 409 `service_state_unknown`, когда состояние планировщика заданий не удаётся прочитать (ничего не изменяется; исправьте запрос и повторите) |
 
 ### Делегирование аутентификации Codex
 
@@ -241,7 +334,7 @@ picker изменилась. `catalogRefreshPending: true` в успешном �
 | `PUT /api/codex-auth/failover` | Задать порог failover аккаунтов | 400 invalid threshold |
 | `GET /api/codex-auth/quota` | Прочитать кэшированное состояние квоты по аккаунтам | — |
 | `GET /api/codex-auth/reset-credits` | Проверить право аккаунта на reset credit | 400 missing account id; upstream status passthrough; 500 lookup failure |
-| `POST /api/codex-auth/reset-credits/consume` | Израсходовать доступный reset credit | 400 missing account id; upstream status passthrough; 503 `server_busy`; 500 consume failure |
+| `POST /api/codex-auth/reset-credits/consume` | Израсходовать доступный reset credit. Необязательный `operationId` (UUIDv4) делает списание идемпотентным: тот же id воспроизводит один сохранённый результат вместо расходования второго кредита. | 400 missing account id или некорректный `operationId`; 409 `identity_mismatch`, если id принадлежит другому аккаунту; upstream status passthrough; 503 `server_busy`, `capacity` или `unavailable`; 500 consume failure |
 | `POST /api/codex-auth/login` | Запустить login или reauthentication для Codex | 400 invalid request; conflict/busy login states |
 | `POST /api/codex-auth/login/code` | Отправить manual code для login-flow Codex | 400 invalid flow/code |
 | `POST /api/codex-auth/login/cancel` | Отменить login-flow Codex | — |
@@ -271,3 +364,7 @@ fail closed, пока аккаунт отсутствует, а при повт�
 соответствующие команды `ocx`: они обращаются к тому же живому API и возвращают ненулевой код,
 если прокси недоступен или операция завершилась неудачей. Прямой HTTP полезнее всего там, где
 интеграции нужен точный контракт endpoint'ов, описанный выше.
+
+## Удалённые сессии и ротация ключей данных
+
+`POST /api/keys/rotate {id}` начинает десятиминутный overlap и один раз возвращает новый секрет. `POST /api/keys/rotate/commit {id,rotationId}` подтверждает, `DELETE /api/keys/rotate {id,rotationId}` отменяет. Требуется management auth; ключ данных не подходит. `POST /api/session/logout` требует текущую `gui-session`, совпадающий Origin и CSRF. Admin token получает 403 и не может создать consent session.

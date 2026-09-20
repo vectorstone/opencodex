@@ -23,6 +23,8 @@ import {
 
 const MODEL_DISCOVERY_MAX_FILTER_VALUES = 256;
 const MODEL_DISCOVERY_MAX_FILTER_STRING_LENGTH = 1_024;
+const TRAILING_SLASHES = /\/+$/;
+const TRAILING_MODELS = /\/models$/;
 
 export interface ResolvedProviderModelDiscovery {
   spec?: ProviderModelDiscoverySpec;
@@ -49,6 +51,20 @@ export type ProviderModelItemsResult =
 export type ModelEnvelopeRowsResult =
   | { ok: true; rows: unknown[] }
   | { ok: false; reason: "invalid_shape" | "too_many_models" };
+
+/**
+ * Build the default OpenAI-compatible model-discovery URL from a configured baseUrl.
+ *
+ * `baseUrl` is required on both `OcxProviderConfig` and the persisted-config schema, so a row
+ * without one is not a state configuration loading can produce. It is deliberately not tolerated
+ * here: the old template-literal join silently produced `"undefined/models"`, which is not a usable
+ * fallback either — it only ever survived because a static row returns before the URL is parsed.
+ */
+export function providerModelsUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(TRAILING_SLASHES, "");
+  const withoutEndpoint = trimmed.replace(TRAILING_MODELS, "");
+  return `${withoutEndpoint}/models`;
+}
 
 function positiveIntegerAtMost(value: number | undefined, hardLimit: number): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return hardLimit;
@@ -113,6 +129,14 @@ export function providerModelDiscoverySpecError(spec: ProviderModelDiscoverySpec
   if (queryEntries.some(([key, value]) => !key.trim() || key.length > 128 || typeof value !== "string" || value.length > 512)) {
     return "discovery query keys/values exceed their bounds";
   }
+  for (const [field, value] of [
+    ["envelopeKey", spec.envelopeKey],
+    ["idField", spec.idField],
+  ] as const) {
+    if (value !== undefined && (
+      typeof value !== "string" || !value || value !== value.trim() || value.length > 128
+    )) return `${field} must be a nonblank field name up to 128 characters`;
+  }
   for (const [field, value, hardLimit] of [
     ["maxResponseBytes", spec.maxResponseBytes, MODEL_DISCOVERY_MAX_RESPONSE_BYTES],
     ["maxModels", spec.maxModels, MODEL_DISCOVERY_MAX_MODELS],
@@ -156,6 +180,82 @@ export function resolveProviderModelDiscovery(
 function appendDiscoveryQuery(url: URL, query: Readonly<Record<string, string>> | undefined): URL {
   for (const [key, value] of Object.entries(query ?? {})) url.searchParams.set(key, value);
   return url;
+}
+
+/**
+ * Whether a model-discovery request URL is a registry-owned fixed discovery
+ * URL — the canonical-URL proof for the transparent fake-IP (Clash/Surge/
+ * Mihomo TUN) exception in provider-outbound.
+ *
+ * The proof is on the FINAL URL, not the provider name: an OAuth/forward name
+ * matches any baseUrl by design (`providerMatchesRegistryTransport` returns
+ * true regardless of destination), while the bearer is pinned to the registry
+ * destination independently in `buildModelsRequest`. Comparing the fetched URL
+ * against registry spec URLs keeps a renamed custom row fetching an
+ * attacker-controlled URL from gaining the exception.
+ *
+ * Both spec shapes are covered: an absolute `url` spec matches its own URL
+ * (plus the spec's fixed query), and a `path` spec matches the URL it resolves
+ * to against the registry's own baseUrl (plus the spec's fixed query) — so the
+ * `commandcode` key preset's `path: "models"` proves the same
+ * `https://api.commandcode.ai/provider/v1/models` string the `command-code`
+ * OAuth `url` spec proves, and the `nebius` `path: "models"` plus
+ * `query: { verbose: "true" }` proves
+ * `https://api.tokenfactory.nebius.com/v1/models?verbose=true`.
+ *
+ * Registry-owned fixed query parameters are canonical only on EXACT match:
+ * a missing, changed, or additional parameter is not canonical, so `?token=`
+ * smuggling on the right origin+path stays rejected. Fragments are never
+ * canonical.
+ */
+export function isRegistryModelDiscoveryUrl(providerName: string, url: string): boolean {
+  const entry = getProviderRegistryEntry(providerName);
+  const spec = entry?.modelDiscovery;
+  if (!spec) return false;
+  let candidate: URL;
+  try {
+    candidate = new URL(url);
+  } catch {
+    return false;
+  }
+  if (candidate.protocol !== "https:") return false;
+  if (candidate.username || candidate.password) return false;
+  if (candidate.hash) return false;
+  const sameUrl = (canonical: string): boolean => {
+    let expected: URL;
+    try {
+      expected = new URL(canonical);
+    } catch {
+      return false;
+    }
+    return candidate.origin === expected.origin
+      && candidate.pathname.replace(/\/+$/, "") === expected.pathname.replace(/\/+$/, "")
+      && candidate.search === expected.search;
+  };
+  // One shared construction with `resolveProviderModelDiscoveryUrl` below: the
+  // absolute `url` form carries the spec's fixed query (if any), and the `path`
+  // form resolves against the REGISTRY's own baseUrl (never a configured one)
+  // before appending the spec's fixed query. The candidate's own query must
+  // equal the registry-owned query exactly — no subset/superset matching.
+  if ("url" in spec && spec.url) {
+    try {
+      return sameUrl(appendDiscoveryQuery(new URL(spec.url), spec.query).toString());
+    } catch {
+      return false;
+    }
+  }
+  if ("path" in spec && spec.path) {
+    try {
+      const base = new URL(entry.baseUrl.endsWith("/") ? entry.baseUrl : `${entry.baseUrl}/`);
+      const resolved = spec.path.startsWith("/")
+        ? new URL(spec.path, base.origin)
+        : new URL(spec.path, base);
+      return sameUrl(appendDiscoveryQuery(resolved, spec.query).toString());
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 /** Apply a registry-owned URL/path/query policy to the adapter's normal discovery endpoint. */
@@ -330,7 +430,7 @@ export function extractModelEnvelopeRows(
   return { ok: true, rows };
 }
 
-/** Validate, bound, deduplicate, and declaratively filter OpenAI `{data:[...]}` or top-level arrays (Together `#617`). */
+/** Validate, bound, deduplicate, and filter the declared envelope or a top-level array (Together `#617`). */
 /**
  * Metadata a sibling `models[]` array may contribute to an ALREADY-ADMITTED
  * `data[]` row (#1797).
@@ -409,24 +509,26 @@ export function extractProviderModelItems(
   let data: unknown[];
   let siblings: SiblingIndex | null = null;
   if (Array.isArray(value)) {
-    // Together-style top-level /models arrays. Catalog discovery must not treat a stray
-    // `models` key on openai-chat responses as valid — only `data` envelopes or top-level arrays.
+    // Together-style top-level /models arrays. The default contract must not treat a stray
+    // `models` key on openai-chat responses as valid; only a provider spec may opt into it.
     if (value.length > limit) return { ok: false, reason: "too_many_models" };
     data = value;
   } else {
-    const envelope = extractModelEnvelopeRows(value, discovery.maxModels, ["data"]);
+    const envelopeKey = discovery.spec?.envelopeKey ?? "data";
+    const envelope = extractModelEnvelopeRows(value, discovery.maxModels, [envelopeKey]);
     if (!envelope.ok) return envelope;
     data = envelope.rows;
-    siblings = buildSiblingIndex(value, limit);
+    siblings = envelopeKey === "data" ? buildSiblingIndex(value, limit) : null;
   }
 
   const items: ProviderModelsApiItem[] = [];
   const seen = new Set<string>();
+  const idField = discovery.spec?.idField ?? "id";
   for (const raw of data) {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
       return { ok: false, reason: "invalid_shape" };
     }
-    const id = (raw as { id?: unknown }).id;
+    const id = (raw as Record<string, unknown>)[idField];
     if (!isValidModelDiscoveryModelId(id)) return { ok: false, reason: "invalid_shape" };
     const prefix = discovery.spec?.stripIdPrefix;
     let finalId = id;
@@ -434,7 +536,9 @@ export function extractProviderModelItems(
       finalId = finalId.slice(prefix.length);
       if (!isValidModelDiscoveryModelId(finalId)) continue;
     }
-    const item = finalId === id ? raw as ProviderModelsApiItem : { ...(raw as ProviderModelsApiItem), id: finalId };
+    const item = finalId === id && idField === "id"
+      ? raw as ProviderModelsApiItem
+      : { ...(raw as Record<string, unknown>), id: finalId };
     // Admission is decided on the ORIGINAL `data[]` row, before any sibling
     // enrichment. Merging first let a `models[]` entry supply the very field a
     // provider filter requires — reproduced against the real Chutes policy,

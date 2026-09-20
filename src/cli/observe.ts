@@ -10,14 +10,24 @@ import {
   takeOption,
   type RuntimeApiDeps,
 } from "./runtime-api";
+import { formatUsageReport } from "./usage-report";
+import { USAGE_RANGES, USAGE_SURFACES, type UsageSummary } from "../usage/summary";
+import { parseUsageTimeWindow, type UsageTimeWindow } from "../usage/time-range";
+import { redactSecretString } from "../lib/redact";
+import { readClientConnectionState, sameClientConnectionOwner } from "../client/state";
+import { readServiceApiTokenState } from "../lib/service-secrets";
+import { fetchHubUsage } from "../client/hub-client";
+import type { HubUsageReport } from "../remote/hub-usage";
 
 const USAGE = `Usage:
   ocx observe logs [--provider <name>] [--model <id>] [--status <code>]
-      [--limit <n>] [--follow] [--json|--jsonl]
+      [--conversation <id>] [--account <label>] [--limit <n>] [--follow] [--json|--jsonl]
   ocx logs explain <request-id> [--json]
   ocx logs rebuild-index
   ocx logs index-status
-  ocx observe usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]
+  ocx observe usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>]
+      [--since <epoch-ms|ISO-datetime>] [--until <epoch-ms|ISO-datetime>]
+      [--provider <name>] [--model <id>] [--json]
   ocx observe storage [codex-logs [status|protect|unprotect|repair|compact] [--mode <compat|quiet>]] [--json]
   ocx observe memory [--json]
   ocx observe debug [--json]
@@ -47,7 +57,19 @@ function formatLog(row: LogEntry): string {
   const route = [row.provider, row.model].filter(Boolean).join("/");
   const status = row.status ?? row.statusCode ?? "?";
   const duration = row.durationMs !== undefined ? `${String(row.durationMs)}ms` : "";
-  return [time, String(status), route, duration].filter(Boolean).join("  ");
+  // The conversation id is shown because a conversation FILTER whose output never names the
+  // conversation is hard to trust: an empty result and a wrong-id result look identical (#2704).
+  const conversation = typeof row.conversationId === "string" && row.conversationId.length > 0
+    ? `conv=${row.conversationId}`
+    : "";
+  // The account label is printed for the same reason, and for one more: it is the answer to
+  // "which of my accounts served this?" (#4057). It is only ever the stable non-PII label the
+  // proxy already persists (`main`, `p<hex6>`, `o<hex6>`) — never an email, a key, or an
+  // upstream account id. Rows from a single-account provider carry no label and print none.
+  const account = typeof row.accountLogLabel === "string" && row.accountLogLabel.length > 0
+    ? `acct=${row.accountLogLabel}`
+    : "";
+  return [time, String(status), route, duration, account, conversation].filter(Boolean).join("  ");
 }
 
 async function logs(argv: string[], deps: RuntimeApiDeps): Promise<void> {
@@ -58,13 +80,21 @@ async function logs(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const provider = takeOption(args, "--provider");
   const model = takeOption(args, "--model");
   const status = takeOption(args, "--status");
+  // Both spellings, because the server accepts both (`request-log.ts:1032`) and an operator
+  // should not have to remember which one this surface wanted.
+  const conversationId = takeOption(args, "--conversation") ?? takeOption(args, "--conversationId");
+  // Server-side, so `--limit` caps the rows that MATCHED rather than the rows scanned; a
+  // client-side filter after a 200-row cap would silently hide older matches.
+  const account = takeOption(args, "--account");
   const limit = takeIntegerOption(args, "--limit", { min: 1 }) ?? 200;
   rejectArgs(args, USAGE);
   if (wantsJson && wantsJsonl) throw new CliUsageError("--json and --jsonl cannot be combined", USAGE);
-  if (follow && wantsJson) throw new CliUsageError("--follow uses --jsonl, not --json", USAGE);
+  if (follow && wantsJson) {
+    throw new CliUsageError("--follow cannot be combined with --json; use --jsonl for streaming JSONL", USAGE);
+  }
   let seen = new Set<string>();
   do {
-    const data = await runtimeRequest(`/api/logs${query({ provider, model, status, limit })}`, {}, deps);
+    const data = await runtimeRequest(`/api/logs${query({ provider, model, status, conversationId, account, limit })}`, {}, deps);
     const rows = logRows(data);
     if (!follow && wantsJson) printData(data, true);
     else {
@@ -131,11 +161,58 @@ async function usage(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const wantsJson = takeFlag(args, "--json");
   const range = takeOption(args, "--range") ?? "30d";
   const surface = takeOption(args, "--surface") ?? "all";
-  if (!["7d", "30d", "all"].includes(range)) throw new CliUsageError("--range must be 7d, 30d, or all", USAGE);
-  if (!["all", "codex", "claude", "grok"].includes(surface)) throw new CliUsageError("--surface must be all, codex, claude, or grok", USAGE);
-  rejectArgs(args, USAGE);
-  const result = await runtimeRequest(`/api/usage${query({ range, surface })}`, {}, deps);
-  printData(result, wantsJson, summaryLines(result));
+  const provider = takeOption(args, "--provider");
+  const model = takeOption(args, "--model");
+  const since = takeOption(args, "--since");
+  const until = takeOption(args, "--until");
+  let window: UsageTimeWindow | undefined;
+  try {
+    window = parseUsageTimeWindow(since, until);
+  } catch (error) {
+    throw new CliUsageError(error instanceof Error ? error.message : "invalid usage time window", USAGE);
+  }
+  // `1d` is accepted here as well as server-side so the CLI does not reject an
+  // alias the API would have understood.
+  const ranges = [...USAGE_RANGES, "1d"];
+  if (!ranges.includes(range)) throw new CliUsageError(`--range must be one of ${USAGE_RANGES.join(", ")} (1d aliases today)`, USAGE);
+  if (!USAGE_SURFACES.includes(surface as (typeof USAGE_SURFACES)[number])) {
+    throw new CliUsageError(`--surface must be one of ${USAGE_SURFACES.join(", ")}`, USAGE);
+  }
+  rejectArgs(args.map(redactSecretString), USAGE);
+  const suffix = query({ range, surface, provider, model, since: window?.since, until: window?.until });
+  const connection = readClientConnectionState();
+  let result: UsageSummary | HubUsageReport;
+  if (connection.kind === "invalid" || connection.kind === "mismatched") {
+    throw new Error(`Client usage unavailable: ${connection.reason}`);
+  }
+  if (connection.kind === "connected") {
+    const token = readServiceApiTokenState();
+    if (token.kind !== "present" || token.fingerprint !== connection.value.tokenFingerprint) {
+      throw new Error("Client usage unavailable: the enrolled data key is missing or changed; repair the client connection");
+    }
+    result = await fetchHubUsage(connection.value.serverUrl, token.token, new URLSearchParams(suffix), {
+      fetchImpl: deps.fetchImpl, timeoutMs: 60_000,
+    });
+    const current = readClientConnectionState();
+    const currentToken = readServiceApiTokenState();
+    if (current.kind !== "connected" || !sameClientConnectionOwner(current.value, connection.value)
+      || current.value.tokenFingerprint !== token.fingerprint
+      || currentToken.kind !== "present" || currentToken.fingerprint !== token.fingerprint) {
+      throw new Error("Client connection changed while reading usage; retry for the current connection");
+    }
+  } else {
+    result = await runtimeRequest<UsageSummary>(`/api/usage${suffix}`, {}, deps);
+  }
+  // Older daemons ignore custom bounds and return successful preset reports.
+  if (window && (result?.customWindow !== true || result.since !== window.since || result.until !== window.until)) {
+    throw new Error("The server did not confirm the requested custom usage window. Upgrade and restart the proxy, then retry.");
+  }
+  // Built only when it will be printed: JavaScript evaluates arguments before
+  // the call, so passing formatUsageReport(...) inline would run the human
+  // renderer during --json and let its assumptions affect a path that is meant
+  // to bypass it entirely.
+  if (wantsJson) printData(result, true);
+  else printData(result, false, formatUsageReport(result as Parameters<typeof formatUsageReport>[0]));
 }
 
 async function simple(path: string, argv: string[], deps: RuntimeApiDeps): Promise<void> {

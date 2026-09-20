@@ -90,13 +90,15 @@ Inspectez les requêtes de proxy, l’utilisation, le stockage, la mémoire et l
 | Alias ​​| Ressource équivalente |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json\|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d\|30d\|all>] [--surface <all\|codex\|claude\|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today\|1d\|7d\|30d\|all>] [--surface <all\|codex\|claude\|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
 ```bash
 ocx observe usage --range 30d --json
 ```
+
+Si certains enregistrements ne peuvent pas être inclus, la sortie lisible affiche un avertissement, même sans ligne lisible. Les totaux affichés ne reflètent que les enregistrements lisibles. Si un filtre ne trouve aucune correspondance lisible, la sortie affiche l'avertissement et des indications au lieu des lignes de totaux ; les enregistrements ignorés peuvent contenir des correspondances. `--json` préserve le diagnostic `usageIncomplete` et sa raison.
 
 ### `ocx debug <provider|usage|injection|claude> <on|off|status|reset|logs [-f]>`
 
@@ -156,7 +158,7 @@ restent soutenus. Utilisez `ocx claude config <status|set> ...` pour les réglag
 
 ### `ocx opencode [opencode args...]`
 
-Vérifiez que le proxy est actif, puis lancez opencode avec un bloc `provider.opencodex` généré dans la couche d’exécution intégrée d’OpenCode (`OPENCODE_CONFIG_CONTENT`). La configuration intégrée existante est préservée et seul `provider.opencodex` est remplacé pour ce lancement. Les fichiers `opencode.json` globaux ou propres au projet peuvent être lus afin de signaler une substitution existante, mais les fichiers sur disque ne sont jamais modifiés. Les modèles routés apparaissent sous la forme `opencodex/<provider>/<model>`. Un lancement ultérieur de `opencode` sans intermédiaire se comporte exactement comme auparavant.
+Vérifiez que le proxy est actif, puis lancez opencode avec les blocs `provider.opencodex` et `providers.opencodex` générés dans la couche d’exécution intégrée d’OpenCode (`OPENCODE_CONFIG_CONTENT`). La configuration intégrée existante est préservée et seules ces deux clés sont remplacées pour ce lancement. Les fichiers `opencode.json` globaux ou propres au projet peuvent être lus afin de signaler une substitution existante, mais les fichiers sur disque ne sont jamais modifiés. Les modèles routés apparaissent sous la forme `opencodex/<provider>/<model>`. Un lancement ultérieur de `opencode` sans intermédiaire se comporte exactement comme auparavant.
 
 ### `ocx grok <status|exclude|include|set|clear|apply> ...`
 
@@ -164,7 +166,7 @@ Gérez et appliquez la clôture du modèle Grok Build.
 
 ## Exportation de la configuration client
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo>`
 
 Imprimez une configuration client connectée au proxy en cours d'exécution. La commande sérialise le
 bloc fournisseur `opencodex` — URL de base, liste de modèles et référence d’identifiant du client
@@ -175,7 +177,7 @@ les modèles Codex peuvent actuellement voir.
 
 | Option | Actions |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | Requis. Sélectionne le dialecte de configuration client. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo>` | Requis. Sélectionne le dialecte de configuration client. |
 | `--json` | Imprimez le document généré en tant que JSON sur la sortie standard pour les scripts. Il s'agit de JSON même lorsque le format natif du client sélectionné est YAML, TOML ou JSON5. |
 | `--out <path>` | Écrivez le format de configuration natif du client dans `<path>`. Refuse de remplacer un fichier existant. |
 | `--force` | Autoriser `--out` à remplacer un fichier existant. |
@@ -195,13 +197,29 @@ propres valeurs par défaut à ces lignes.
 | Client | Destination canonique | Télécharger le nom du fichier | Var.environnement |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json` (`XDG_CONFIG_HOME` gagne une fois défini) | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | none — le bloc porte le littéral `opencodex-loopback` |
+| `pi` | `~/.pi/agent/models.json` (`PI_CODING_AGENT_DIR` l'emporte une fois défini ; une valeur relative est refusée) | `pi-models.json` | none — le bloc porte le littéral `opencodex-loopback` |
 | `omp` | `~/.omp/agent/models.yml` (`OMP_PROFILE` l'emporte sur `PI_PROFILE`, même lorsqu'il est vide ; les profils nommés utilisent le nom du répertoire `PI_CONFIG_DIR` relatif à la maison et ignorent `PI_CODING_AGENT_DIR`, tandis que le profil par défaut laisse `PI_CODING_AGENT_DIR` gagner) | `omp-models.yaml` | aucun — espace réservé de bouclage |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | aucun — espace réservé de bouclage |
-| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
+| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | valeur de substitution non secrète pour la boucle locale |
 | `dsh` | `$DSH_HOME/settings.yaml` (`~/.dsh/settings.yaml` par défaut) | `settings.yaml` | none — espace réservé pour le porteur de bouclage non secret |
+| `mcode` | `~/.minimax/config.yaml` (`MINIMAX_DATA_DIR`, puis l'ancien `MAVIS_DATA_DIR`, l'emportent une fois définis ; une valeur relative est refusée) | `mcode-config.yaml` | aucun — espace réservé de bouclage |
+| `zcode` | `~/.zcode/v2/config.json` (`ZCODE_DATA_DIR` l'emporte une fois défini ; une valeur relative est refusée) | `config.json` | aucun — espace réservé de bouclage |
+| `prime` | `~/.prime/agent/models.json` (`PRIME_AGENT_CODING_AGENT_DIR` l'emporte une fois défini ; une valeur relative est refusée) | `prime-models.json` | aucun — espace réservé de bouclage |
+| `aside` | `~/.aside/u/<account>/models.json` pour le compte que le fichier `accounts.json` d'Aside désigne comme courant ; un manifeste illisible est refusé plutôt que de retomber sur un compte | `aside-models.json` | aucun — espace réservé de bouclage |
+| `raycast` | `~/.config/raycast/ai/providers.yaml`, sur macOS comme sur Windows (Raycast n'honore pas `XDG_CONFIG_HOME`) | `raycast-providers.yaml` | aucun — bouclage uniquement, aucune entrée `api_keys` n'est écrite |
+| `omo` | `~/.omo/agent/models.json` (`OMO_CODING_AGENT_DIR`, puis `SENPI_CODING_AGENT_DIR`, puis `PI_CODING_AGENT_DIR` l'emportent dans cet ordre une fois définis ; une valeur relative est refusée) | `omo-models.json` | aucun — espace réservé de bouclage |
+
+L'exportation Raycast est un document `providers.yaml` autonome contenant un seul élément `id: opencodex`
+dans la séquence `providers` : `name: OpenCodex`, l'URL de base `/v1` du proxy et chaque modèle routé avec
+ses `abilities` (`tools` et `system_message` toujours pris en charge, `vision` d'après les modalités d'entrée
+du catalogue, `reasoning_effort` lorsque le modèle dispose d'une échelle d'effort, `temperature` désactivé
+pour les modèles de raisonnement). Les fournisseurs personnalisés sont une fonctionnalité Raycast Pro, et
+Raycast surveille le fichier : une modification enregistrée prend effet sans redémarrage. Le format est
+documenté sur [manual.raycast.com/ai/custom-providers](https://manual.raycast.com/ai/custom-providers).
+Aucune entrée `api_keys` n'est écrite ; cette exportation est donc limitée au bouclage et une liaison hors
+bouclage est refusée.
 
 L'exportation DSH gérée nécessite DSH 0.1.0-rc.6 ou plus récent et ne possède que
 `llm-pi-ai.providers.opencodex`. DSH recharge à chaud ce fournisseur ; le modèle par défaut de l'utilisateur et
@@ -227,22 +245,45 @@ le proxy se lie au-delà du bouclage ; voir
 [Accès à distance](/fr/reference/configuration/server/#accès-à-distance) pour savoir comment les clés d'admission sont délivrées. Clés pour
 les fournisseurs en amont eux-mêmes sont une chose entièrement distincte, configurée par
 [Fournisseurs](/fr/guides/providers/).
-Gajae est l'exception : `OPENCODEX_GAJAE_API_KEY` remplit ses informations d'identification de fournisseur à partir du
-environnement, mais son schéma ne peut pas envoyer l'en-tête d'admission à distance, donc le Gajae généré
-l'intégration reste uniquement en boucle.
+L’intégration gjc générée utilise une valeur de remplacement locale non secrète, sans variable d’environnement. Elle reste limitée au loopback et ne configure pas les identifiants d’accès distant.
 
 La même charge utile est servie par `GET /api/client-config` et rendue sur l'onglet API du tableau de bord, donc
 le CLI, l’API, et le GUI utilisent les mêmes octets.
 
 ## Exécution et configuration
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 Gérez les paramètres d'exécution sans tête, le démarrage, la synchronisation, les diagnostics et les mises à jour.
+
+`ocx system codex-restart --yes` redémarre les serveurs d'application Codex et quitte puis relance entièrement l'application Codex Desktop, via le même module que `ocx sync --restart-codex`. Lorsque le proxy lui-même s'exécute dans l'application Codex, la commande refuse avec un message actionnable au lieu de promettre un transfert qu'elle ne peut pas mener à bien.
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update` met à jour OpenCodex lui-même. Utilisez cette commande distincte et en lecture seule pour Codex CLI :
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` n’interroge aucun registre de paquets et inspecte, dans des limites strictes, les éléments de provenance du candidat d’installation configuré, notamment l’emplacement expurgé de l’exécutable et les preuves de propriété. Le contexte de confiance du lanceur publié authentifie uniquement cet instantané du candidat, et non l’exécution réussie de Codex. Comme cette commande ponctuelle n’exécute jamais Codex, les candidats issus de l’environnement ou de l’état persistant restent purement informatifs (`managed: false`, normalement `selection_unattested`) et `selectionAttested` reste `false`. La sortie JSON contient `candidateAvailable`, `candidateVersion`, `candidateSource` et `selectionAttested: false`. Une exécution directe via Bun ou depuis les sources ne fournit pas la preuve du lanceur, ignore les candidats issus de l’environnement ou de l’état persistant et peut signaler `candidate_unavailable` sur les systèmes POSIX. Sous Windows, cette première étape n’effectue aucune E/S de système de fichiers sur les chemins du candidat ou de configuration. Seul un candidat d’environnement absolu capturé par le lanceur de confiance peut recevoir une étiquette lexicale de bundle d’application ou de gestionnaire de versions ; tous les autres candidats Windows échouent de manière fermée. Comme cette étape ne consulte jamais l’état persistant, une exécution Windows pour laquelle aucun candidat d’environnement n’a été capturé signale `windows_inspection_deferred` plutôt que `candidate_unavailable` : la commande ne peut pas observer si une CLI Codex est installée, elle signale donc le report de l’inspection au lieu d’affirmer qu’aucun candidat n’existe. La commande n’exécute ni Codex ni aucun gestionnaire de paquets, ne répare aucun shim, n’écrit ni dans la configuration ni dans le cache, n’arrête aucun processus et n’installe rien. Les candidats intégrés à une application, issus d’un gestionnaire de versions reconnu, autonomes mais non vérifiés, ou associés à un état de shim ambigu sont signalés comme non gérés ou inconnus et ne sont jamais classés comme gérés.
+
+Sous Windows, une commande simple capturée comme `CODEX_CLI_PATH=codex`, un chemin distant ou un chemin de périphérique produit plutôt `candidate_path_unavailable`. Le candidat a été capturé, mais son chemin ne convient pas à cette inspection.
+
+#### Observation explicite d’une installation Windows x64
+
+```text
+ocx system codex-cli-update attest [--json]
+ocx system codex-cli-update attest --candidate <absolute-path> --npm-prefix <absolute-path> --npm-cli <absolute-path> --node <absolute-path> [--json]
+```
+
+`attest` observe en lecture seule une installation npm Windows x64 sélectionnée ou explicitement désignée. Sans options, la commande observe le candidat sélectionné identifié par l’instantané du lanceur de confiance (le `CODEX_CLI_PATH` configuré ou le premier `codex` du PATH capturé), un wrapper opencodex étant résolu vers sa sauvegarde npm renommée `codex.opencodex-real.cmd`. Fournir les quatre chemins absolus remplace la découverte ; celle-ci ne propose que des chemins et l’observation par handles conservés reste l’autorité. `--candidate` désigne le `<prefix>/codex.cmd` npm standard ou `<prefix>/node_modules/@openai/codex/bin/codex.js`. `--npm-cli` doit se terminer par `node_modules/npm/bin/npm-cli.js` et `--node` désigne un `node.exe` explicite. Les applications groupées, les emplacements reconnus de gestionnaires de versions, les shims appartenant à opencodex sans sauvegarde npm et les wrappers personnalisés sont refusés.
+
+Des handles natifs maintiennent les répertoires parents et les fichiers pendant les lectures bornées. Les plateformes non prises en charge, points de réanalyse/junctions, écritures concurrentes, chemins dangereux et fichiers trop volumineux sont refusés. Le rapport fixe ne contient aucun chemin : `status` vaut `observed` ou `refused`, avec `installationIdentityObserved`. `selectionAttested`, `managed` et `applyAllowed` restent `false`. Vérifiez `status` : un refus rapporté peut produire un code de sortie 0.
+
+L’identité ou le condensat décrit les fichiers au moment de l’observation, sans autorisation durable de mise à jour. Cela ne prouve ni le runtime sélectionné, ni l’installateur passé, ni la configuration npm effective, ni l’authenticité des outils. Le Node fourni est seulement observé, pas identifié comme celui que choisirait le lanceur. Aucune cible n’est exécutée ; aucune requête au registre, installation, écriture de configuration ou commande de processus n’a lieu. Le `check` Windows existant ne réalise toujours aucune E/S de fichiers candidats ou de configuration.
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

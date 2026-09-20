@@ -1,6 +1,6 @@
 ---
 title: Adaptörler
-description: Yedi sağlayıcı adaptörü — her birinin neyi hedeflediği, istekleri nasıl oluşturduğu ve kendine özgü yanları.
+description: Sağlayıcı adaptörleri — her birinin neyi hedeflediği, istekleri nasıl oluşturduğu ve kendine özgü yanları.
 ---
 
 Bir **adaptör**, opencodex'in dahili istek/yanıt modeli ile bir sağlayıcının hat
@@ -30,8 +30,7 @@ olayları Responses SSE'ye dönüştürür.
 
 **Hedefler:** OpenAI **Chat Completions** (`POST {baseUrl}/chat/completions`;
 `baseUrl` üzerindeki sondaki `/chat/completions` veya `/` önce kaldırılır) ve
-her uyumlu sağlayıcı — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (yerel
-ve bulut) ve daha fazlası.
+her uyumlu sağlayıcı — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (yerel) ve daha fazlası.
 **Kimlik Doğrulama:** `key` (Bearer).
 
 - Dahili mesajları OpenAI rollerine dönüştürür; araçları `{type:"function",
@@ -49,13 +48,52 @@ ve bulut) ve daha fazlası.
   `provider.noReasoningModels` içindeki kimlikler için bunu **tamamen atlar**.
 - `delta.content` (metin), `delta.reasoning_content` (düşünme) ve
   `delta.tool_calls[]` akışını sağlar; `usage` toplar.
-- ClinePass, canlı olarak doğrulanmış `reasoning: { enabled: true, effort: "low"
-  }` (veya akıl yürütme devre dışı bırakıldığında `{ enabled: false }`) ağ
+- ClinePass, canlı olarak doğrulanmış `reasoning: { enabled: true, effort }` (veya akıl yürütme devre dışı bırakıldığında `{ enabled: false }`) ağ
   geçidi formatını kullanır; genel API belgeleri şu anda bu istek şeklini
-  belirtmemektedir. Adaptör diğer çaba isteklerini doğrulanmış `low` katmanına
-  sabitler, `delta.reasoning_content` veya `delta.reasoning`'den gelen akıl
+  belirtmemektedir. Adaptör istenen `low`, `medium`, `high`, `xhigh` ve `max` katmanlarını
+  korur, `delta.reasoning_content` veya `delta.reasoning`'den gelen akıl
   yürütme farklarını kabul eder, `stream_options.include_usage` ile akışlı
   kullanım ister ve akışsız yanıt zarflarından kullanımı okur.
+
+## `ollama-native`
+
+**Hedefler:** OpenAI uyumlu yüzey yerine Ollama'nın kendi **Chat API'si** (`POST /api/chat`).
+Yerleşik `ollama-cloud` sağlayıcısı kayıt defteri tarafından bu adaptöre seçilir; ayrıca ayrı adlı
+özel veya kendi kendine barındırılan bir Ollama sağlayıcısında `adapter: "ollama-native"` ile
+yapılandırılabilir.
+**Kimlik Doğrulama:** bulut/özel hedefler için `key` (Bearer). Loopback veya `authMode: "local"`
+hedeflerine kimlik bilgisi gönderilmez.
+
+- **Kayıt defteri seçimi belirleyicidir.** Yerleşik `ollama-cloud` satırı, `/v1/models` canlı
+  keşfi için `https://ollama.com/v1` temel URL'sini korurken çıkarım
+  `POST https://ollama.com/api/chat` üzerine normalleştirilir. Sağlayıcı satırındaki yapılandırılmış
+  `adapter` değeri atılır. Sıradan yerleşik yerel Ollama `openai-chat` üzerinde kalır; yerel veya
+  self-hosted bir hedef için `ollama-native` seçmek açık bir sağlayıcı yapılandırma kararıdır ve
+  ana bilgisayara göre belirlenir, böylece Ollama olmayan bir hedef hiçbir zaman sessizce
+  yeniden yazılmaz.
+- **Model meta verileri:** `/v1/models` model başına meta veri taşımaz; bu yüzden kanonik Ollama
+  Cloud için sağlayıcı, keşfedilen her kimliği *sınırlı* bir `POST /api/show` ile zenginleştirir
+  (yanıt başına 256 KiB, istek başına 8 sn, eşzamanlılık 4, 48 istek, tüm aşama için 12 sn süre) ve
+  gerçek bağlam penceresi ile vision yeteneğini doldurur. show isteği aynı kaynaktadır ve asla bir
+  yönlendirmeyi izlemez; hata yalnızca o modeli düşürür, keşfi asla bozmaz.
+- **Akış:** Ollama'nın yerel NDJSON'u. Metin ve `message.thinking` delta'ları geldikçe iletilir;
+  bir tur yalnızca `done: true` terminal kaydında tamamlanır ve tamponlanmış `done: false` ya da
+  eksik terminal, kısmi metni ve araç çağrılarını tamamen bastırır.
+- **Reasoning:** Ollama'nın yerel `think` alanına (`low`/`medium`/`high`/`max` ve booleans)
+  eşlenir, modelin duyurulan merdivenine kırpılır ve üst katmanda yapılandırılan `__omit__`
+  sentinel semantiğine uyar.
+- **Görseller:** model vision destekliyorsa mesajın `images` dizisinde yerel olarak gönderilir;
+  video yanlış gönderilmek yerine reddedilir ve uzak görsel URL'leri alınmaz.
+- **Araçlar:** Ollama'nın yerel biçiminde bildirilir; akış halindeki araç çağrıları `arguments`
+  alanı nesne olan bütün çağrı kayıtlarıdır ve araç sonucu yeniden oynatma, çağrı kimliği ve araç
+  adına göre sıkı şekilde eşleştirilir. `tool_choice: "none"` ve `auto` normal çalışır;
+  **`required` veya tam adlandırılmış seçim fail closed** olur, çünkü Ollama'nın `/api/chat`
+  arabiriminde bunu dayatacak bir `tool_choice` alanı yoktur.
+- **Yapılandırılmış çıktı kanonik Ollama Cloud'da reddedilir.** Ollama şu anda yapılandırılmış
+  çıktıyı Cloud'da desteklemediğini belgeliyor ve Cloud `format` alanını zorunlu kılmıyor; bu
+  yüzden OpenCodex, şema tanımlı bir isteğe karşılık serbest metin döndürmek yerine isteği kapatarak
+  başarısız kılar. Yerel ve özel `ollama-native` uç noktaları Ollama'nın yerel `format` eşlemesini
+  korur (`json_object` → `"json"`, `json_schema` → şema nesnesinin kendisi).
 
 ## `openai-responses`
 
@@ -210,6 +248,11 @@ sidecar'ı etkinken serbest bırakılan yorum terminal olayından önce yine de 
 yalnızca modelin sentetik bir arama talep edip etmediğine karar vermek için
 gereken olaylar arabelleğe alınmış olarak kalır.
 
+Yalnızca kullanıcının verebileceği bir karar, bilgi ya da açıklama olmadan devam
+edilemiyorsa, sözleşme bu soruyu tamamlama aracıyla gönderip durmayı söyler. Böyle
+bir tur da yorum ya da istemci araç çağrısı değil, turu bitiren `final_answer`
+olarak ulaşır.
+
 Kiro tamamlama aracını çağırmadan durursa adaptör bir devam işlemi yapar.
 Yalnızca akıl yürütme yeniden denemeleri boş bir asistan mesajı üretmek yerine
 orijinal geçerli kullanıcı/araç sonucu turunu korur; görünür ilerleme boş
@@ -225,15 +268,12 @@ tam olarak tekrarlasa bile, çünkü aşama doğruluğu kozmetik tekilleştirmed
 
 ### Akıl yürütme çabası
 
-`gpt-5.6-sol` ve `claude-opus-5` doğrulanmış yerel çaba desteğine sahiptir ve
-her model ailesi istek alanını farklı şekilde adlandırır. Seçilen `low`,
-`medium`, `high`, `xhigh` veya `max` değeri `gpt-5.6-sol` için
-`additionalModelRequestFields.reasoning.effort` olarak ve `claude-opus-5` için
-`additionalModelRequestFields.output_config.effort` olarak gönderilir. Diğer
-Kiro modelleri şu anda öykünülmüş akıl yürütme kullanır: opencodex yerel çaba
-alanları doğrulanmadığı için seçilen seviyeyi kullanıcı içeriğinde sınırlı
-düşünme talimatlarına dönüştürür. Bu modellerde bildirilen bir çaba denetimini
-yukarı akış yerel akıl yürütme desteğinin kanıtı olarak yorumlamayın.
+GPT-5.6 ailesi `additionalModelRequestFields.reasoning.effort`, `claude-opus-5` ise
+`additionalModelRequestFields.output_config.effort` alanını kullanır. `gpt-5.6-luna` ve
+`gpt-5.6-terra` için yalnızca doğrulanmış `low`, `medium`, `high` ve `max` seviyeleri yerel alandan
+gönderilir. Bu iki modelin yerel `xhigh` seviyesi doğrulanmadığı için mevcut sınırlı düşünme
+talimatlarıyla öykünme korunur. `gpt-5.6-sol` ve `claude-opus-5` için mevcut yerel `low`, `medium`,
+`high`, `xhigh` ve `max` davranışı değişmez. Diğer Kiro modelleri öykünme kullanır; çaba seçeneği yerel desteğin kanıtı değildir.
 
 ## `cursor`
 
@@ -265,6 +305,17 @@ başlığından Cursor OAuth/erişim belirteci.
   `unsafeAllowNativeLocalExec: true` yalnızca `nativeLocalExec` ayarlanmadığında
   eşdeğer kalır.
 
+## `devin`
+
+**Hedef:** Cognition'ın `exa.api_server_pb.ApiServerService/GetChatMessage` uç noktası; `server.codeium.com` üzerinde Connect akışı.
+**Kimlik doğrulama:** `provider.apiKey` veya iletilen authorization başlığındaki Devin/Cognition API anahtarı. Giriş önce kurulu Devin CLI'nin zaten tuttuğu kimlik bilgisini içe aktarmayı dener: `devin auth login`, CLI'nin kendi PKCE oturumunu tamamlar ve `devin-session-token`'ı kendi `credentials.toml` dosyasına yazar; bu, `SeatManagementService.RegisterUser`'ın tarayıcı girişi için ürettiği kimlikle aynıdır. Kullanılabilir bir CLI kimliği yoksa giriş, tarayıcıda Auth0 oturumuna geri döner ve yapıştırılan belirteci `RegisterUser` ile uzun ömürlü bir anahtara dönüştürür. `devin-cli` yalnızca kullanımdan kaldırılmış bir takma ad olarak kalır: `ocx login devin-cli` hâlâ `devin`'e yönlendirilir ve eski id ile kaydedilmiş bir yapılandırma başlangıçta yeniden yazılır.
+
+- Olağan fetch/parse yolu yerine `runTurn` kullanır. İstekler ve sunucu olayları `devin/cloud-direct/wire.ts` içindeki elle yazılmış protobuf çerçevelemesiyle işlenir.
+- Modeller hesaba göre `GetCascadeModelConfigs` ile keşfedilir; pakette olmayanlar istek anında hata vermek yerine listeden düşer.
+- Cognition araç açıklamaları için uzunluk sınırı ve birebir ifade engeli uygular. Bağdaştırıcı bilinen ifadeleri yeniden yazar, uzun açıklamaları kırpar.
+- Anahtarlar yenilenmez. Süresi dolduğunda veya iptal edildiğinde `ocx login devin` komutunu yeniden çalıştırın.
+- CLI içe aktarma yolu kullanıldığında yerel olan yalnızca kimlik bilgisidir; tur her iki yolda da Cognition'a gider. Önceki bir sürüm, `devin-cli` kimliği altında turu yerel bir `devin acp` alt sürecine karşı Agent Client Protocol oturumu olarak çalıştıran ikinci bir bağdaştırıcıyla geliyordu. Kaldırıldı: o bağdaştırıcıyı hâlâ adlandıran kayıtlı bir yapılandırma, `"devin-acp"` gibi özel adlı bir satır da dahil olmak üzere başlangıçta `devin`'e yeniden yazılır.
+
 ## `azure-openai` (takma ad: `azure`)
 
 **Hedefler:** **Azure OpenAI**. `openai-responses`'ı sarar (bu nedenle
@@ -285,5 +336,4 @@ Vizyon duyarlı adaptörler tarafından kullanılan paylaşılan yardımcılar:
 - `contentPartsToText(content)` — salt metin araç mesajları için içerik
   parçalarını metne düzleştirir (açıklanmayan bir görsel kısa bir `[image]`
   işaretçisi haline gelir, asla belirteç patlatan bir base64 bloğu olmaz).
-
 

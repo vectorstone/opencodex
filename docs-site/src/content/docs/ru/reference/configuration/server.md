@@ -12,27 +12,34 @@ description: Listener, удалённый доступ, admission key, тайм�
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` | Порт, который слушает прокси. |
 | `hostname?` | `string` | `"127.0.0.1"` | Адрес bind'а. Не-loopback bind требует `OPENCODEX_API_AUTH_TOKEN`. |
-| `proxy?` | `string` | — | URL исходящего HTTP(S)-прокси или `${ENV_VAR}`. Применяется к `HTTP_PROXY` / `HTTPS_PROXY` только когда эти переменные не заданы; loopback всегда остаётся в `NO_PROXY`. |
-| `emptyCompletionRetry?` | `boolean` | `false` | Явно включает один идентичный повтор Responses, если completion не содержит ни текста, ни tool call. Повтор может тарифицироваться. `OCX_EMPTY_COMPLETION_RETRY=0` отключает его без изменения config; combo и routed-compaction turn исключены. |
-| `stallTimeoutSec?` | `number` | `300` | Секунды без upstream-данных до `response.incomplete`. Минимум 1. |
+| `proxy?` | `string` | — | URL исходящего HTTP(S) или SOCKS5-прокси (`socks5://host:port`) или `${ENV_VAR}`. HTTP URL пишутся в `HTTP_PROXY` / `HTTPS_PROXY`, если те не заданы. SOCKS5 используют встроенный SOCKS5-туннель и также пишутся в `ALL_PROXY` (`ocx start --socks5`); унаследованные `HTTP(S)_PROXY` сбрасываются в этом процессе. Loopback всегда остаётся в `NO_PROXY`. |
+| `emptyCompletionRetry?` | `boolean` | `false` | Явно включает один идентичный повтор Responses, если в turn нет ни текста, ни tool call, включая случай, когда stream завершается до terminal event. Повтор может тарифицироваться. `OCX_EMPTY_COMPLETION_RETRY=0` отключает его без изменения config; combo и routed-compaction turn исключены. |
+| `dropCodexSafetyBuffering?` | `boolean` | `false` | Удаляет подсказки Codex safety-buffering из passthrough-ответов Codex Responses: заголовки `x-codex-safety-buffering-enabled` / `x-codex-safety-buffering-faster-model`, SSE-события `response.metadata` типа `safety_buffering` и поле `safety_buffering` в других SSE-событиях. Codex TUI отображает их как предложение повторить запрос с более быстрой моделью, действие по умолчанию в котором переключает сессию на более слабую модель. Остальные заголовки `x-codex-*` и содержимое других SSE-событий передаются без изменений, кроме удаления этого поля. По умолчанию выключено. |
+| `stallTimeoutSec?` | `number` | `300` | Секунды без полезного прогресса upstream для Responses и нативного Chat. Минимум 1. |
 | `connectTimeoutMs?` | `number` | `200000` | Дедлайн одной попытки DNS/TCP/TLS/final-header; он завершается до генерации тела ответа. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Дедлайн graceful-drain до принудительного прерывания активных turn'ов. |
 | `websockets?` | `boolean` | `false` | Объявляет и разрешает клиентский WebSocket-путь Responses. При false клиенты используют HTTP/SSE; это не отключает подходящую upstream WS-оптимизацию canonical ChatGPT. |
 | `corsAllowOrigins?` | `string[]` | `[]` | Дополнительные точные origin, разрешённые CORS. Loopback-origin разрешены всегда. Поддерживаются authority-based origin браузерных расширений, например `chrome-extension://<extension-id>`; `*` не является маской. Firefox и Safari пересоздают UUID расширения (при каждой установке/запуске браузера), поэтому обновляйте запись при смене origin. |
-| `apiKeys?` | `OcxApiKey[]` | `[]` | Сгенерированные credentials `ocx_…`, принимаемые для management и data-plane auth на не-loopback bind'ах. Управляются через дашборд. |
+| `apiKeys?` | `OcxApiKey[]` | `[]` | Сгенерированные credentials `ocx_…` для data-plane admission на не-loopback bind'ах. Они не авторизуют management API; доступ к management использует отдельный credential, описанный в [management reference](/ru/reference/management-api/). Управляются через дашборд. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | disabled | Opt-in policy очистки архивированных сессий. Никогда не включается неявно. |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` | Лимит в MiB для eviction-friendly app-owned log'ов, cache'ей, blob'ов и continuation payload'ов. Это не RSS-cap. Диапазон 64–4096. |
+| `metricsExport.enabled?` | `boolean` | `false` | Включает локальные для процесса агрегированные метрики запросов на аутентифицированном `GET /api/metrics`. Требуется перезапуск; в выключенном состоянии маршрут возвращает 404 и экспортёр не запускает никакой активности. |
 | `codexAutoStart?` | `boolean` | `true` | Разрешает shim'у Codex запускать `ocx ensure` перед стартом Codex. При false `ensure` становится no-op. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Восстанавливает установленный shim после завершённого внешнего обновления Codex, которое заменило его. Для отключения через окружение: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Обратимый режим совместимости истории Codex App. Исходные metadata резервируются и восстанавливаются через `ocx stop` / `ocx restore`. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | Перенаправляет распознанные helper/shadow-call'ы Codex на выбранную модель с low effort. Source-prefix по умолчанию: `gpt-5.6-luna`; клиенты до 0.144.x включительно использовали `gpt-5.4-mini`, который можно восстановить через `sourceModels`. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | Перенаправляет распознанные helper/shadow-call'ы Codex на выбранную модель с сохранением настроенного для запроса reasoning effort. Source-prefix по умолчанию: `gpt-5.6-luna`; клиенты до 0.144.x включительно использовали `gpt-5.4-mini`, который можно восстановить через `sourceModels`. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | on when usable | Настройки sidecar'а web-search. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | on when usable | Настройки sidecar'а описания изображений. |
 | `images?` | `OcxImagesConfig` | automatic OpenAI selection | Настройки standalone Images relay для Codex `image_gen`. |
 
 Если более старая development-сборка изменила metadata resume-history до появления резервного
-backup'а, выполните `ocx recover-history --legacy-openai`, чтобы принудительно вернуть
+backup'а, выполните `ocx recover-history --legacy-openai --yes`, чтобы принудительно вернуть
 native-provider history.
+Команда переименовывает все строки `opencodex` с пользовательским сообщением, включая корректную историю выделенного провайдера; перед запуском прочитайте предупреждение о полном охвате в справочнике lifecycle.
+
+### Тайм-ауты и завершение нативного Chat
+
+Нативный Chat также использует `stallTimeoutSec` при ожидании вывода upstream. Непустой текст, рассуждения, отказ, обновления инструментов и события завершения обновляют время ожидания; комментарии keepalive, только роль и только статистика использования его не обновляют. Ожидание чтения медленным клиентом приостанавливает отсчёт. При зависании возникает `upstream_stall_timeout`: событие ошибки для потокового клиента или HTTP 502 без потоковой передачи. Отмена до конечного результата возвращает ошибку отмены вместо успешного частичного ответа. Непотоковый Chat поддерживает SSE с LF, CRLF и многострочными полями data.
 
 ## Удалённый доступ
 
@@ -131,7 +138,7 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 
 Codex использует маленькие helper-model'и для задач вроде заголовков и commit message. Включите
 `shadowCallIntercept`, чтобы перенаправлять распознанные `sourceModels` на другую настроенную
-модель. Замещающая модель работает с low effort. `sourceModels` задавайте только если клиент
+модель. Замещающая модель сохраняет настроенный для запроса reasoning effort. `sourceModels` задавайте только если клиент
 использует другие helper-id.
 
 ```json
@@ -162,8 +169,10 @@ Codex использует маленькие helper-model'и для задач 
 | Поле | Тип | По умолчанию | Значение |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | on when usable | Главный переключатель. |
-| `backend?` | `"openai" \| "anthropic"` | auto | Явный выбор выигрывает; иначе usable stored Anthropic OAuth выбирает `anthropic`, затем `openai`. |
-| `model?` | `string` | backend-dependent | `gpt-5.6-luna` для OpenAI или `claude-sonnet-5` для Anthropic. Старый явный `gpt-5.4-mini` мигрирует при старте. |
+| `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Явный выбор выигрывает; отсутствие значения всегда означает `openai`. `anthropic` и `xai` запускаются только при явной настройке; `gemini` и `exa` зарезервированы до появления executor. |
+| `model?` | `string` | backend-dependent | `gpt-5.6-luna` для OpenAI, `claude-sonnet-5` для Anthropic или `grok-4.6` для xAI. Старый явный `gpt-5.4-mini` мигрирует при старте. |
+| `exaApiKey?` | `string` | отсутствует | Ключ оператора для backend `exa`. Только для записи: management-read никогда не возвращает сохранённое значение. |
+| `xSearch?` | `object` | отсутствует | Опциональный hosted `x_search` только для xAI: `enabled`, взаимоисключающие массивы `allowedXHandles` / `excludedXHandles` (не более 20) и ISO-даты `fromDate` / `toDate` (`YYYY-MM-DD`). |
 | `reasoning?` | `string` | `low` | Effort sidecar'а. Значение `minimal` с web search отклоняется. |
 | `maxSearchesPerTurn?` | `number` | `3` | Число реальных поисков, разрешённых за один turn основной модели. |
 | `routedModelStallTimeoutMs?` | `number` | `200000` | Config-file-only дедлайн бездействия raw-body у routed-model. Целое 1–2147483647; каждый непустой chunk сбрасывает таймер. |
@@ -173,7 +182,12 @@ Backend OpenAI требует логина в ChatGPT и включённого 
 с входом от Claude внедряет auth основного ChatGPT во внутренний запрос. Anthropic-backend
 использует активный stored credential из включённого Anthropic OAuth-провайдера. Явно выбранный
 Anthropic-backend без рабочего аккаунта закрывается с ошибкой и не откатывается на другой backend.
-Исполнитель Anthropic использует нативный tool `web_search_20250305`.
+Исполнитель Anthropic использует нативный tool `web_search_20250305`. Backend xAI требует рабочего
+сохранённого аккаунта Grok OAuth, использует hosted `web_search` и добавляет hosted `x_search`, когда
+`xSearch.enabled` равно true. Некорректный management-input `xSearch` возвращает `400`, а некорректный
+сохранённый блок закрывается с ошибкой при планировании. Линии `gemini` и `exa` никогда не активируются
+через обнаружение credentials или fallback; оператор должен выбрать их явно. `exaApiKey` принимается
+при записи, но не включается в management-response.
 
 Поиск ограничивают четыре clock'а: базовый `stallTimeoutSec`, `connectTimeoutMs`, inactivity для
 routed-model и hosted-search timeout. Эффективный watchdog моста равен максимуму этих значений плюс
@@ -184,8 +198,8 @@ routed-model и hosted-search timeout. Эффективный watchdog мост�
 | Поле | Тип | По умолчанию | Значение |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | on when usable | Главный переключатель описания изображений. |
-| `backend?` | `"openai" \| "anthropic"` | auto | Та же логика выбора explicit-first/Anthropic-credential-aware, что и у web search. |
-| `model?` | `string` | backend-dependent | `gpt-5.4-mini` для OpenAI или `claude-sonnet-5` для Anthropic. |
+| `backend?` | `"openai" \| "anthropic"` | auto | Явное значение имеет приоритет; если оно не задано, предпочтение отдаётся пригодным сохранённым учётным данным Anthropic OAuth, иначе используется `openai`. |
+| `model?` | `string` | backend-dependent | `gpt-5.6-luna` для OpenAI или `claude-sonnet-5` для Anthropic. |
 | `reasoning?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"low"` | Уровень рассуждений OpenAI Responses. Anthropic его игнорирует. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | Максимум новых промахов description-cache за один main turn. `0` отключает вызовы; некорректные значения возвращают дефолт. |
 | `timeoutMs?` | `number` | `45000` | Таймаут запроса sidecar'а. Целое число 1–2147483647. |
@@ -201,3 +215,15 @@ context; в ключи OpenAI дополнительно входит reasoning 
 
 Sidecar'ы Anthropic OAuth повторно используют уже существующий OAuth fingerprint Claude Code от
 opencodex. Перед использованием прогоните soak-test на нужном аккаунте и ожидаемой нагрузке.
+
+## Ключи Remote Hub и значения по умолчанию
+
+`runtimeRole` по умолчанию равен `standalone`. Hub использует `hub.managementPublicOrigin`, loopback-only `hub.managementIngress` (`enabled:false`, если отсутствует) и точные `remoteGui.allowedTailscaleUsers` (пустой список, если отсутствует). Ключ клиента хранится в `service-api-token`, не в `config.json`; во время ротации может появиться `service-api-token.prev`. Статистика не зеркалируется.
+
+`remoteGui.allowInsecureHttp` — устаревший no-op, оставленный только для загрузки старых файлов со строгой схемой. Удалите его из конфигурации: pairing grants принимаются лишь через loopback или аутентифицированный HTTPS, а значение `true` не включает pairing по открытому HTTP.
+
+## Сетевая диагностика квоты Codex
+
+Поле `quotaRefresh` в строке основного аккаунта Codex описывает получение квоты, а не её остаток или право доступа к модели. Оно может отсутствовать при чтении кэша или если запрос не выполнялся. Используется окружение работающего прокси-сервиса, а не текущего терминала. Если `proxy` не задан, существующее окружение сохраняется; `"auto"` читает только статические настройки прокси Windows при запуске. PAC/WPAD, настройки только SOCKS и изменения во время работы автоматически не учитываются. Успех через TUN сам по себе не подтверждает исправность пути HTTP-прокси. См. [команды и состояния на английском](/reference/configuration/server/#codex-quota-network-diagnostics).
+
+`dropCodexSafetyBuffering`: не меняет проверки безопасности провайдера или отказы. Native WebSocket `codex.response.metadata.headers` и `/responses/compact` не входят в область фильтра.

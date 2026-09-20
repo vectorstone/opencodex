@@ -30,6 +30,11 @@ export interface OcxReasoningReplayIdentity {
  * the holder, so late tool-call cache writes see the active physical identity.
  */
 export interface OcxReasoningReplayScopeRef {
+  /**
+   * Conversation namespace for replay state. Historically this was always the Codex parent-thread
+   * id; headerless Responses callers use a raw sanitized thread/Cursor/session fallback, never the
+   * hashed request-log conversation id.
+   */
   readonly clientThreadId: string;
   current?: Readonly<OcxReasoningReplayIdentity>;
 }
@@ -63,8 +68,25 @@ export interface OcxParsedRequest {
   _cursorConversationId?: string;
   /** Stable upstream client thread identity, used only to derive provider-scoped continuation ids. */
   _clientThreadId?: string;
-  /** Provider/account/model-bound namespace for process-local raw-reasoning replay. */
+  /**
+   * This request's OWN Codex thread id (`thread-id`), as opposed to `_clientThreadId`, which
+   * carries `x-codex-parent-thread-id` and is therefore shared by every parallel child of one
+   * parent. Only a surface that must distinguish siblings should read it.
+   */
+  _codexOwnThreadId?: string;
+  /** True when promptCacheKey identifies a shared cache cohort rather than one conversation. */
+  _promptCacheKeyIsSharedCohort?: boolean;
+  /** Cursor-only thread owner; may be an opaque process-local Desktop session/thread identity. */
+  _cursorClientThreadId?: string;
+  /** Conversation/provider/account/model-bound namespace for reasoning replay state. */
   _reasoningReplayScope?: OcxReasoningReplayScopeRef;
+  /**
+   * Set by bindRouteReasoningReplayScope after a proven serving-identity change, or by
+   * prepareOpaqueBlobRecovery after an authoritative rejection; consumers strip replayed blobs.
+   */
+  _stripReasoningEncryptedContent?: boolean;
+  /** Final-route opt-in: emit v2 collaboration message arguments as plaintext on ChatGPT. */
+  _plaintextV2AgentMessages?: boolean;
   /**
    * Optional authenticated tenant/operator namespace for Cursor thread→conversation derivation.
    * When absent (single-operator local proxy), derivation stays local-scoped.
@@ -76,13 +98,17 @@ export interface OcxParsedRequest {
    */
   _cursorIsolateConversation?: boolean;
   /** Account-scoped, non-secret Kiro request metadata selected with the OAuth access token. */
-  _kiroAuthContext?: Pick<KiroOAuthMetadata, "profileArn" | "apiRegion" | "ssoRegion">;
+  _kiroAuthContext?: Pick<KiroOAuthMetadata, "profileArn" | "apiRegion" | "ssoRegion" | "authType">;
   /** Provider-private continuation metadata resolved from the Responses previous_response_id chain. */
   _providerContinuation?: OcxProviderContinuationState;
+  /** Persisted continuation considered only after the final physical route is known. */
+  _providerContinuationCandidate?: OcxProviderContinuationState;
+  /** Exact process-local route owner attached to newly persisted provider state. */
+  _providerContinuationOwner?: OcxProviderContinuationOwner;
   /**
    * The hosted `{type:"web_search", ...}` tool config, stashed when Codex enables web search. Routed
    * (non-OpenAI) providers can't run it server-side, so the proxy re-exposes it as a function tool and
-   * executes searches via the gpt-5.4-mini sidecar (see src/web-search). Absent when not requested.
+   * executes searches via the gpt-5.6-luna sidecar (see src/web-search). Absent when not requested.
    */
   _webSearch?: Record<string, unknown>;
   /** Hosted image_generation tool config stashed for the image bridge sidecar (see src/images). */
@@ -100,6 +126,8 @@ export interface OcxParsedRequest {
    * (see src/responses/compaction.ts).
    */
   _compactionRequest?: boolean;
+  /** Manual compaction moved to another provider: summarize portably even on a canonical ChatGPT target. */
+  _portableCompaction?: boolean;
   /**
    * True when the current request newly introduced a stored compaction summary/marker. Historical
    * markers restored by previous_response_id expansion were already acknowledged and do not reset
@@ -134,9 +162,11 @@ export interface OcxAssistantMessage {
   model?: string;
   timestamp: number;
   /**
-   * Kiro `reasoningContent.redactedContent` for THIS assistant turn — an opaque encrypted blob
-   * Kiro replays to preserve model reasoning across turns. Provider-specific and unrenderable, so
-   * it rides the message rather than a content part: any other adapter simply ignores it.
+   * Kiro's encrypted reasoning blob for THIS assistant turn — the opaque value from the turn's
+   * `reasoningContentEvent` (`signature` for the GPT-5.6 family, `redactedContent` for the base64
+   * shape), tagged with the wire field it must be replayed on (see kiro/reasoning.ts). Kiro
+   * replays it to preserve model reasoning across turns. Provider-specific and unrenderable, so it
+   * rides the message rather than a content part: any other adapter simply ignores it.
    */
   kiroRedactedReasoning?: string;
 }
@@ -174,8 +204,14 @@ export interface OcxImageContent {
   detail?: string;
 }
 
-/** A user/developer message content part: text or an image (vision). */
-export type OcxContentPart = OcxTextContent | OcxImageContent;
+export interface OcxVideoContent {
+  type: "video";
+  /** A base64 `data:` URL from an OpenAI-compatible `video_url` part. */
+  videoUrl: string;
+}
+
+/** A user/developer message content part: text or native media. */
+export type OcxContentPart = OcxTextContent | OcxImageContent | OcxVideoContent;
 
 export interface OcxThinkingContent {
   type: "thinking";
@@ -251,31 +287,49 @@ export interface OcxRequestOptions {
 
 export type OcxMessagePhase = "commentary" | "final_answer";
 
+/** Non-secret, process-local owner fence for provider-private continuation state. */
+export interface OcxProviderContinuationOwner {
+  [field: string]: string | number;
+  version: 1;
+  providerName: string;
+  providerDestinationIdentity: string;
+  adapterName: string;
+  modelId: string;
+  credentialIdentity: string;
+}
+
 /**
  * Provider-private state that must follow a locally expanded `previous_response_id` chain.
  * Kept out of public Responses output and persisted only in the bounded local continuation cache.
  */
 export interface OcxProviderContinuationState {
+  /** Proxy-authored owner metadata; stripped before provider adapters receive the state. */
+  __ocxOwner?: OcxProviderContinuationOwner;
   cursor?: {
+    [field: string]: unknown;
     conversationId?: string;
     checkpointUsable?: boolean;
+    /** Opaque process-local Cursor ConversationStateStructure snapshot ref. Never raw protobuf. */
+    checkpointRef?: string;
   };
   kiro?: {
+    [field: string]: unknown;
     conversationId?: string;
   };
   [provider: string]: Record<string, unknown> | undefined;
 }
 
 export type AdapterEvent =
-  | { type: "heartbeat" }
+  | { type: "heartbeat"; replayUnsafe?: true }
   | { type: "text_delta"; text: string; phase?: OcxMessagePhase }
   | { type: "thinking_delta"; thinking: string }
   // Anthropic extended-thinking round-trip: signature_delta for the current thinking block, and
   // opaque redacted_thinking blocks. Both must be replayed verbatim or tool-use turns 400.
   | { type: "thinking_signature"; signature: string }
   | { type: "redacted_thinking"; data: string }
-  // Kiro reasoning round-trip: the encrypted `redactedContent` blob for the CURRENT assistant turn.
-  // Never rendered — it only rides the reasoning item's envelope so the next request can replay it.
+  // Kiro reasoning round-trip: the encrypted reasoning blob for the CURRENT assistant turn, tagged
+  // with the wire field it arrived on. Never rendered — it only rides the reasoning item's envelope
+  // so the next request can replay it verbatim.
   | { type: "kiro_redacted_reasoning"; data: string }
   | { type: "reasoning_raw_delta"; text: string }
   | { type: "tool_call_start"; id: string; name: string; providerMetadata?: OcxProviderOpaqueToolCallMetadata }
@@ -294,6 +348,8 @@ export type AdapterEvent =
   | {
       type: "done";
       usage?: OcxUsage;
+      /** Native opaque compaction ciphertext returned by a Responses backend. */
+      compactionEncryptedContent?: string;
       stopReason?: string;
       endTurn?: boolean;
       providerState?: OcxProviderContinuationState;
@@ -355,4 +411,12 @@ export interface OcxUsage {
   cacheCreationInputTokens?: number;
   reasoningOutputTokens?: number;
   estimated?: boolean;
+  /**
+   * The raw upstream usage object for Responses-shaped upstreams (openai/codex#41980 parity):
+   * codex-rs preserves the complete `response.usage` object through its own pipeline, so fields
+   * the proxy does not model (subscription metadata, future counters) must survive the bridged /
+   * rebuilt `response.completed` too. Accounting paths read only the canonical fields above; the
+   * wire rebuild merges this object's unknown keys back under the normalized values.
+   */
+  rawUsage?: Record<string, unknown>;
 }

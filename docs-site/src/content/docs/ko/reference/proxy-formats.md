@@ -19,6 +19,10 @@ Responses 표현이 이 연결의 중심입니다. 네이티브 호환 경로는
 [Configuration](/reference/configuration/)에서 리스너와 admission 키를 설정하십시오. 하나의 공개 모델 id가
 여러 대상 중 하나를 골라야 할 때는 [Combos](/guides/combos/)를 사용하십시오.
 
+## 업스트림 리다이렉트
+
+자격 증명을 포함하는 모델·이미지·동영상·검색 요청은 동일 출처를 포함한 HTTP 리다이렉트를 자동으로 따라가지 않습니다. 리다이렉트하는 별칭 대신 최종 업스트림 API URL을 설정하세요. 서버는 리다이렉트 대상으로 자격 증명이나 요청 본문을 다시 보내지 않습니다. 각 응답 처리 경로의 기존 오류·전달 동작은 유지되며, native Responses와 compact 경로는 원래 3xx와 `Location`을 클라이언트에 반환할 수 있습니다. 클라이언트의 리다이렉트 동작은 이 서버 전송 정책과 별개입니다.
+
 ## 엔드포인트 개요
 
 | 클라이언트 표면 | 엔드포인트 | 성공한 비스트리밍 결과 | 성공한 스트리밍 또는 소켓 결과 |
@@ -27,7 +31,7 @@ Responses 표현이 이 연결의 중심입니다. 네이티브 호환 경로는
 | OpenAI Chat Completions | `POST /v1/chat/completions` | `chat.completion` JSON | `[DONE]`으로 끝나는 `chat.completion.chunk` SSE |
 | Anthropic Messages | `POST /v1/messages` | Anthropic `message` JSON | Anthropic Messages SSE |
 | Anthropic token count | `POST /v1/messages/count_tokens` | `{ "input_tokens": number }` | 해당 없음 |
-| 모델 탐색 | `GET /v1/models` | 세 가지 카탈로그 계약 중 하나 | 해당 없음 |
+| 모델 탐색 | `GET /v1/models` | 카탈로그 또는 명시적 Desktop 스냅샷 | 해당 없음 |
 | Voice and Realtime | `POST /v1/live`, `POST /v1/realtime/calls` | 릴레이된 call-creation 응답 | 별도의 sideband WebSocket이 양방향 프레임을 릴레이함 |
 | Responses compaction | `POST /v1/responses/compact` | 대체 히스토리 JSON | 해당 없음 |
 
@@ -65,6 +69,10 @@ deltas, 그리고 정확히 하나의 종료 `response.completed`, `response.fai
 
 클라이언트로 전달되는 Responses SSE 프레임은 SSE 블록 구분자 앞의 원시 바이트 기준으로 프레임당 4 MiB로 제한됩니다. HTTP에서는 구분자 없이 이 한도를 초과한 업스트림 프레임을 합성 `response.failed` 이벤트와 이어지는 `data: [DONE]`으로 fail closed 처리합니다. Responses WebSocket 브리지에서는 같은 조건에서 502 `websocket_protocol_error`를 보내고 업스트림 reader를 취소합니다. 완전한 Responses 종료 프레임이 이미 수신된 경우에는 그 종료가 우선하며, 이후의 과도한 크기 또는 잘못된 바이트는 완료된 턴을 전송 오류로 바꾸지 않고 버립니다.
 
+:::note
+네이티브 passthrough에서는 Responses 종료 이벤트가 우선합니다. 너무 이른 `data: [DONE]`은 해당 이벤트가 도착할 때까지 보류됩니다. 일반 네이티브 경로가 파싱된 종료 이벤트 없이 정상 HTTP 200 EOF에 도달하면, 프록시는 `incomplete_details.reason: "adapter_eof"`가 있는 `response.incomplete` 하나와 `data: [DONE]` 하나를 보냅니다. 구분자 없는 종료 JSON이 문법적으로 유효하면 정확히 한 번 받아들이고, 잘못되었거나 잘린 JSON은 incomplete로 남습니다. 모델별 종료 복구를 사용하도록 설정된 공급자에서는 프레임이 없는 종료 유사 suffix와 EOF의 너무 이른 `data: [DONE]`을, 승격할 수 있는 완전한 lifecycle 후보가 없을 때 `missing_terminal_event`로 fail closed 처리하며, 완전한 후보가 있으면 `response.completed`로 승격합니다. 신뢰도가 높은 `cyber_policy` 종료 형식은 의미론적 로깅 및 집계에서 `error.code: "cyber_policy"`가 있는 `response.failed`(status 400)로 정규화되지만, 이미 시작된 스트리밍 HTTP 응답은 200을 유지합니다. 이 커밋된 요청 경계에서는 재시도하거나 재전송하지 않습니다.
+:::
+
 canonical ChatGPT forward streaming은 stable Bun 1.4.0 이상에서 Codex 업스트림 WebSocket을
 투명하게 사용할 수 있습니다. 번들 Bun 1.3.14, prerelease, 또는 검증 불가능한 런타임 identity는
 HTTP/SSE를 사용합니다. 업스트림 WS adapter는 같은 downstream SSE 계약을 유지하며, 원시 JSON
@@ -87,6 +95,19 @@ queue overflow 시 downstream에는 terminal `response.failed` 이벤트와 `[DO
 사용 가능한 경우 `input_tokens_details`에는 `cache_write_tokens`도 포함될 수 있습니다. 항상 존재하는 상세 객체는
 엄격한 Responses 클라이언트를 위한 호환성 보장입니다. 0은 "보고되지 않음"을 뜻할 수 있으며, 반드시
 "제공자가 그런 작업을 하지 않았다"는 의미는 아닙니다.
+
+### 응답과 요청 로그 연결
+
+허용된 모든 HTTP Responses 응답에는 프록시가 생성한 `ocx-<32 hex>` 형식의 ID를 담은
+`x-opencodex-request-id` 헤더가 있습니다. 이 값은 응답을 요청 로그 및 사용량 보고의 해당 행과 연결하는 키입니다.
+
+프록시는 이 값을 항상 직접 생성하고 호출자가 제공하거나 업스트림이 반환한 ID를 덮어쓰므로, 이 프록시에서
+고유하며 상관관계 키로 신뢰할 수 있습니다. 이 헤더는 `Access-Control-Expose-Headers`에 명시되어 있어 브라우저
+JavaScript가 교차 출처에서도 읽을 수 있습니다. 사용자 지정 `x-` 헤더는 실제 전송 데이터에 있더라도 그렇지 않으면
+`response.headers.get()`에서 보이지 않습니다.
+
+인증 또는 출처 허용 단계에서 거부된 Responses 요청은 이 래퍼에 도달하지 않으며 ID가 없습니다. 따라서 헤더가
+없다는 것은 요청이 로그에 기록되기 전에 거부되었다는 뜻입니다.
 
 ### 같은 경로에서의 WebSocket 업그레이드
 
@@ -157,6 +178,11 @@ SSE 객체, choice delta, `finish_reason`이 있는 종료 choice, `data: [DONE]
 이 엔드포인트는 Claude Code와 호환 클라이언트가 사용하는 Anthropic Messages 방언을 말합니다. 대부분의 요청은
 Responses로 변환되어 일반적으로 라우팅된 뒤, Anthropic JSON 또는 Anthropic SSE로 다시 변환됩니다.
 
+변환되는 Messages 요청의 reasoning 재전송은 요청 전체의 번역 예산을 공유합니다. 이 예산에는
+인코딩·디코딩 과정에서 생기는 복사본도 포함됩니다. 한도를 초과하면 `translation_buffer_limit`과
+HTTP 413을 반환하며, 한도에 맞추려고 서명이나 불투명 reasoning 데이터를 자르지 않습니다.
+네이티브 Anthropic passthrough에는 별도의 본문 크기 제한이 적용됩니다.
+
 네이티브 Anthropic passthrough는 다음이 모두 참일 때만 적용됩니다.
 
 - Claude Code 설정에서 native passthrough가 비활성화되어 있지 않습니다.
@@ -180,10 +206,17 @@ Responses로 변환되어 일반적으로 라우팅된 뒤, Anthropic JSON 또�
 { "input_tokens": 123 }
 ```
 
+해석되지 않은 날짜형 Desktop ID는 탐색 결과에서 빠진 실제 네이티브 모델일 수도 있습니다.
+정보가 부족해 ID를 해석할 수 없으면 Messages와 count-tokens는 고정된 `desktop_model_mapping_unavailable` 오류와
+HTTP 503을 반환합니다. 모델이 잘못됐다는 판정은 아닙니다. 미등록 레거시 해시 별칭은 계속
+HTTP 400을 반환합니다. 두 경우 모두 날짜 제거나 다른 경로로의 폴백은 하지 않습니다.
+알려진 ID, 등록된 매핑, 정확한 `modelMap` 일치와 인식된 실제 네이티브 ID의 처리는 유지됩니다.
+모델 탐색을 갱신하거나 연결된 허브 프로필을 다시 적용한 뒤 시도하세요. 재시도만으로
+해결된다는 보장은 없습니다.
+
 ## `GET /v1/models`
 
-같은 경로가 서로 호환되지 않는 카탈로그 envelope를 기대하는 세 가지 클라이언트를 모두 처리합니다.
-`client_version`이 함께 있지 않으면 Anthropic 형식이 우선합니다.
+`format=desktop-config`를 지정하지 않으면 다음 기본 카탈로그 계약을 사용합니다.
 
 | 계약 | 트리거 | 최상위 형식 | 모델 id 동작 |
 | --- | --- | --- | --- |
@@ -191,7 +224,34 @@ Responses로 변환되어 일반적으로 라우팅된 뒤, Anthropic JSON 또�
 | Codex 카탈로그 | `client_version` 쿼리 파라미터 | `{ "models": [...] }` | 네이티브 및 라우팅 항목은 더 풍부한 Codex 카탈로그 필드, 표시 여부, effort, WebSocket, 다중 에이전트 메타데이터를 담음 |
 | 일반 OpenAI list | 어느 트리거도 아님 | `{ "object": "list", "data": [...] }` | 보이는 네이티브 id는 그대로이며, 라우팅 id는 alias 또는 `provider/model` |
 
+### Desktop 설정 스냅샷
+
+`GET /v1/models?ids=desktop&format=desktop-config`는 user-agent와 관계없이 Desktop
+스냅샷을 선택합니다. 응답은 `{ "version": 1, "models": [...] }`이며
+`Cache-Control: no-store`를 포함합니다. 연결된 클라이언트는 `Accept: application/json`,
+`anthropic-version: 2023-06-01`과 기존 데이터 자격 증명을 보냅니다. 관리자 토큰이나 프로필
+업로드는 필요하지 않습니다. 항목은 Codex 카탈로그 행이 아니라 허브가 발급한 Desktop 설정용 모델입니다.
+
+이 형식에 `ids=cli` 또는 `client_version`을 함께 보내면 HTTP 400을 반환합니다. 형식 선택자가
+없으면 위의 기본 응답 계약을 유지합니다. Claude가 꺼져 있으면
+`{ "version": 1, "models": [] }`를 반환하며, 연결된 Desktop apply는 사용 불가로 처리하고
+대체 프로필을 쓰지 않습니다. 버전 1 대신 일반 카탈로그를 반환하는 구형 허브는 지원하지 않으며,
+클라이언트가 로컬에서 만든 ID로 대신 적용하지 않습니다.
+
+스냅샷은 읽기 전용 모델 목록이며 키 회전이나 프로필 업로드 API가 아닙니다. 연결된 Desktop의
+키 이전·복구·연결 해제는 기존 클라이언트 수명주기에서 처리합니다. 회전은 모델 항목과 선택을
+유지하며 CLI의 `rotation`은 `committed`와 `rolled_back`을 구분합니다. 연결 해제는 관리 설정을
+복원하거나 확인된 구형 프로필을 표준 모드로 전환하고, 사용자 필드와 이후의 유효한 선택을
+보존합니다. 충돌이나 미완료 복구를 완료로 표시하지 않습니다. 디스크 변경을 읽으려면 Desktop을
+재시작해야 하며, 연결 해제는 허브 키를 자동 폐기하지 않습니다.
+[Claude Desktop 안내](/ko/guides/claude-code/)를 참고하세요. thinking 재전송과 프롬프트 캐시는
+별도 [#3719](https://github.com/lidge-jun/opencodex/issues/3719)에서 다룹니다.
+
 ## `POST /v1/live`와 Realtime sideband
+
+아래 계정 연결 설명은 기존 Codex 클라이언트 기준입니다. 외부 API 키로 쓰는 받아쓰기와 GPT-Live는 [영문 음성 API 명세](/reference/proxy-formats/#streaming-dictation)를 따릅니다.
+
+Connections > API keys에는 받아쓰기와 실시간 음성 블록이 있습니다. 데이터 키는 입력란에만 잠시 유지됩니다. 받아쓰기는 선택한 파일을 전송하고, 음성 연결 확인은 마이크 없이 세션 응답을 기다립니다. 설정 표시는 실제 연결 성공을 뜻하지 않습니다.
 
 `POST /v1/live`는 ChatGPT/Codex App Frameless call-creation 표면을 받습니다.
 `POST /v1/realtime/calls`는 OpenAI Realtime call-creation 표면을 받습니다. opencodex는 적절한 OpenAI 계열
@@ -206,6 +266,18 @@ call creation 이후 클라이언트는 다음의 지원되는 모든 inbound �
 
 프록시는 업스트림 join URL을 정규화한 뒤, 양방향 텍스트 및 바이너리 프레임을 투명하게 릴레이합니다. 업스트림
 인증은 프록시가 소유한 상태로 유지되며, 클라이언트 프로토콜 헤더는 보존됩니다.
+
+call creation과 sideband join은 같은 OpenAI 계정으로 이루어져야 하며, 그렇지 않으면 업스트림이 join을
+거부합니다(`404`). 두 요청 모두 Codex의 `session-id`와 `thread-id` 헤더를 실어 보냅니다. Pool 모드는
+계정 선택을 그 쌍에 묶어 두므로(프로세스 로컬) 프록시에 도착한 join은 통화를 만든 계정을 그대로 쓰고,
+Direct 모드는 두 요청 모두 호출자의 현재 bearer를 전달합니다. 릴레이되는 클라이언트 헤더는 정확히
+`openai-alpha`, `x-session-id`, `session-id`, `thread-id`, `originator`, `x-oai-attestation`,
+`x-codex-turn-metadata`(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, 각 헤더는
+호출자가 보낸 경우에만 전달되고 프록시가 만들어 내지 않습니다. `Authorization`과 ChatGPT 계정 id는
+ChatGPT 경로에서 프록시가 소유합니다(Pool은 저장된 계정으로 교체, Direct는 검증된 호출자 bearer를 전달).
+API 키 프로바이더는 자체 bearer를 씁니다. Codex가 join을 프록시로 보내는 것은
+`experimental_realtime_ws_base_url`이 프록시를 가리킬 때뿐이며, `ocx start`가 이 키를
+`openai_base_url` 옆에 주입합니다([Codex 연동](/ko/guides/codex-integration/) 참고).
 
 ## `POST /v1/responses/compact`
 
@@ -236,16 +308,20 @@ loopback 전용 bind에서는 data-plane admission에 설정된 key가 필요하
 
 | 표면 | Dedicated | Bearer | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP and WebSocket | 필요함 | proxy admission에서는 거부됨 | 거부됨 |
-| `/v1/responses/compact` | 필요함 | proxy admission에서는 거부됨 | 거부됨 |
-| `/v1/chat/completions` | 필요함 | proxy admission에서는 거부됨 | 거부됨 |
+| `/v1/responses` HTTP and WebSocket | 허용됨 | 허용됨 | 거부됨 |
+| `/v1/responses/compact` | 허용됨 | 허용됨 | 거부됨 |
+| `/v1/chat/completions` | 허용됨 | 허용됨 | 거부됨 |
 | `/v1/messages`와 `/v1/messages/count_tokens` | 허용됨 | 허용됨 | 허용됨 |
 | `/v1/models` | 허용됨 | 허용됨 | 허용됨 |
 | `/v1/live`, `/v1/realtime/calls`, 및 sideband joins | 허용됨 | 허용됨 | 허용됨 |
 
-Responses 계열과 Chat 요청은 `Authorization`을 provider 또는 Codex Direct passthrough용으로 예약하므로, remote
-proxy key는 전용 헤더를 사용해야 합니다. Messages와 Realtime 표면은 더 넓은 클라이언트 호환성이 필요하므로
-세 가지 형식을 모두 허용합니다.
+Responses 계열과 Chat 요청은 전용 헤더 또는 Bearer 필드의 프록시 키를 허용합니다. 네이티브 경로에서는 선택한 저장 Codex 자격 증명이 admission bearer를 대체하고, 다른 경로에서는 해당 bearer를 제거합니다. 프록시 키를 upstream 자격 증명으로 사용하지 않습니다. 별도의 provider bearer도 전달하려면 프록시 키는 전용 헤더에 넣으십시오.
+
+키가 없고 OAuth를 쓰지 않는 Cursor 경로는 별도의 호출자 bearer를 사용할 수 있지만, 프록시 secret이나 자동으로 보충한 ChatGPT main 인증은 사용할 수 없습니다. Combo/policy 선택과 실제 shadow/thread-spawn 경로 변경은 호출자의 원본 자격 증명을 새 대상으로 넘기지 않습니다. 정규 OpenAI 라우팅은 JWT에 ChatGPT 계정 claim이 포함되어 있고 명시적 계정 헤더가 있으면 그 claim과 일치하는 경우에만, 내부 경로 변경 후 프록시 키가 아닌 호출자의 단일 bearer를 복원할 수 있습니다. 선택적 OpenAI sidecar에 호출자 인증을 전달하려면 단일 JWT와 이에 일치하는 명시적 `chatgpt-account-id`가 필요합니다. Opaque bearer는 명시적 계정 헤더가 있어도 경로 변경을 거쳐 복원되지 않습니다. 그 외의 최종 대상에는 자체 설정·OAuth·저장 자격 증명이 필요하며, 없으면 로컬에서 실패합니다. thread-spawn 표지만 있고 경로가 바뀌지 않으면 자격 증명을 제거하지 않습니다.
+
+설정된 키가 없고 OAuth를 쓰지 않는 Cursor Chat 요청의 선택적 저장 main 인증 보강은 실제 OpenAI 보조 호출이 계획되고 canonical Direct 대상이 있을 때까지 미룹니다. 무관한 Cursor 요청은 이 과정에서 native main을 점유하지 않아 프로필 전환을 지연시키지 않습니다. 보조 호출 인증은 시작·전환 소유권 차단을 따르며 Cursor bearer와 분리됩니다. Pool 및 계정을 지정한 보조 호출은 기존 계정 선택을 유지합니다.
+
+Claude replay는 해당 turn이 소유권을 확보한 main 인증만 메모리 snapshot으로 유지하며, 최종 대상이 정규 ChatGPT 경로일 때만 복원합니다.
 
 :::caution
 data-plane key는 management credential이 아닙니다. management API는 별도의 admin secret을 사용합니다.
@@ -261,7 +337,7 @@ data-plane key는 management credential이 아닙니다. management API는 별�
 | 401 | `authentication_error` | 필요한 프록시 admission credential이 없거나 유효하지 않습니다 |
 | 403 | `origin_rejected` | Responses/OpenAI data-plane 요청 또는 WebSocket 업그레이드가 허용되지 않은 origin에서 들어왔습니다 |
 | 503 | `combo_unavailable` | 선택한 combo의 모든 대상이 사용할 수 없거나, cooldown 중이거나, 비활성화되어 있거나, 다른 이유로 부적합합니다 |
-| 400 | `unreadable_encrypted_agent_task` | 암호화된 v2 worker task를 소비할 수 있는 적격 네이티브 ChatGPT 대상이 없습니다 |
+| 400 | `unreadable_encrypted_agent_task` | 암호화된 v2 worker task를 처리할 수 있는 정규 ChatGPT 대상이나 명시적으로 신뢰한 Responses 대상이 없습니다 |
 | 426 | `upgrade_required` | Responses WebSocket transport가 비활성화되어 있거나 업그레이드에 실패했습니다. HTTP를 사용하십시오 |
 
 Anthropic-origin 실패는 Anthropic의 error envelope로 렌더링됩니다. 따라서 해당 방언에서 origin 거부는

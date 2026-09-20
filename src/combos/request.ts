@@ -1,4 +1,5 @@
-import type { OcxComboDefaultEffort, OcxComboTarget, OcxConfig } from "../types";
+import type { OcxComboDefaultEffort, OcxComboDefaultEffortMode, OcxComboReasoningEffortMode, OcxComboTarget, OcxConfig } from "../types";
+import { isCodexReasoningEffort, resolveEffortAtOrBelow } from "../reasoning-effort";
 import { resolveComboId } from "./types";
 
 const warnedUnsupportedDefaults = new Set<string>();
@@ -58,21 +59,44 @@ export function concreteComboRequestBody(
   target: Pick<OcxComboTarget, "provider" | "model">,
   defaultEffort: OcxComboDefaultEffort | null,
   targetReasoningEfforts: readonly string[] | undefined,
+  reasoningEffortMode: OcxComboReasoningEffortMode = "strict",
+  defaultEffortMode: OcxComboDefaultEffortMode = "fallback",
 ): Record<string, unknown> {
   const clone = structuredClone(body) as Record<string, unknown>;
   clone.model = `${target.provider}/${target.model}`;
-  if (!defaultEffort) return clone;
+  if (defaultEffortMode === "force" && (!defaultEffort || !isCodexReasoningEffort(defaultEffort))) {
+    throw new Error("force combo default effort requires a valid defaultEffort");
+  }
+  if (targetReasoningEfforts?.length === 0
+    || (reasoningEffortMode === "adaptive" && targetReasoningEfforts === undefined)) {
+    stripUnsupportedReasoningControls(clone);
+  }
+  if (!defaultEffort || !isCodexReasoningEffort(defaultEffort)) return clone;
   const reasoning = clone.reasoning;
-  const needsDefault = reasoning === undefined || (
-    reasoning
-    && typeof reasoning === "object"
-    && !Array.isArray(reasoning)
-    && !Object.prototype.hasOwnProperty.call(reasoning, "effort")
-  );
-  if (!needsDefault) return clone;
+  const reasoningRecord = reasoning && typeof reasoning === "object" && !Array.isArray(reasoning)
+    ? reasoning as Record<string, unknown>
+    : undefined;
+  const hasEffort = reasoningRecord !== undefined
+    && Object.prototype.hasOwnProperty.call(reasoningRecord, "effort");
+  const callerEffort = reasoningRecord?.effort;
+  const validCallerEffort = typeof callerEffort === "string" && isCodexReasoningEffort(callerEffort);
+  const needsDefault = reasoning === undefined || (reasoningRecord !== undefined && !hasEffort);
+  const shouldForce = defaultEffortMode === "force" && validCallerEffort;
+  if (!needsDefault && !shouldForce) return clone;
   // Picker availability treats an unknown ladder as a wildcard, but runtime
   // injection stays fail-closed until this concrete target advertises support.
-  if (!targetReasoningEfforts?.includes(defaultEffort)) {
+  //
+  // Support is not literal membership. The catalog advertises the combo's default
+  // through effectiveComboDefault, which keeps the highest supported rung at or
+  // below the request rather than dropping it. Testing membership here meant a
+  // combo configured for `max` against a target topping out at `high` sent no
+  // effort at all, so the provider default applied and the turn ran at `none`
+  // while the catalog still advertised `max` (#3108). Resolve the same way the
+  // catalog did.
+  const resolvedEffort = targetReasoningEfforts === undefined
+    ? undefined
+    : resolveEffortAtOrBelow(defaultEffort, targetReasoningEfforts);
+  if (!resolvedEffort) {
     const key = `${target.provider}/${target.model}:${defaultEffort}`;
     if (!warnedUnsupportedDefaults.has(key)) {
       warnedUnsupportedDefaults.add(key);
@@ -86,9 +110,22 @@ export function concreteComboRequestBody(
     return clone;
   }
   if (reasoning === undefined) {
-    clone.reasoning = { effort: defaultEffort };
+    clone.reasoning = { effort: resolvedEffort };
   } else {
-    clone.reasoning = { ...(reasoning as Record<string, unknown>), effort: defaultEffort };
+    clone.reasoning = { ...(reasoning as Record<string, unknown>), effort: resolvedEffort };
   }
   return clone;
+}
+
+function stripUnsupportedReasoningControls(body: Record<string, unknown>): void {
+  const reasoning = body.reasoning;
+  if (reasoning && typeof reasoning === "object" && !Array.isArray(reasoning)) {
+    const next = { ...(reasoning as Record<string, unknown>) };
+    delete next.effort;
+    if (Object.keys(next).length > 0) body.reasoning = next;
+    else delete body.reasoning;
+  }
+  delete body.reasoning_effort;
+  delete body.thinking_budget;
+  delete body.thinking;
 }

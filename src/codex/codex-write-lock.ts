@@ -66,7 +66,7 @@ export type CodexWriteLockRefusalReason =
 
 export type CodexWriteLockResult<T> =
   | { status: "acquired"; value: T; waitedMs: number; lockId: string }
-  | { status: "skipped"; reason: "desired_disabled" | "desired_enabled"; waitedMs: number }
+  | { status: "skipped"; reason: CodexWriteLockSkipReason; waitedMs: number }
   | { status: "busy"; reason: "deadline" | "cancelled"; retryable: true; waitedMs: number; lockId: string }
   | {
       status: "refused";
@@ -93,6 +93,8 @@ export interface CodexWriteLockOptions {
   admitted: CodexWriteWitness;
   /** Authoritative synchronous re-read while N and C are both held. */
   readAdmissionUnderLock(): CodexWriteWitness;
+  /** Positively authorized migration of an already-routed pre-substrate home. */
+  adoption?: { readonly direction: "apply" | "remove" };
 }
 
 /**
@@ -125,9 +127,18 @@ export interface CodexWriteCommitContext {
   readonly coordinator: CodexCoordinatorTransaction;
 }
 
+/**
+ * Why an under-lock policy re-read refused the write.
+ *
+ * `hub-gated` is not the user's switch: a hub declines to rewrite its own local clients, and
+ * reporting that as "integration is OFF" sent operators hunting for a toggle they never set
+ * (#4236).
+ */
+export type CodexWriteLockSkipReason = "desired_disabled" | "desired_enabled" | "hub-gated";
+
 /** A synchronous under-lock policy re-read proved the requested apply stale. */
 export class CodexWriteLockSkipped extends Error {
-  constructor(readonly reason: "desired_disabled" | "desired_enabled") {
+  constructor(readonly reason: CodexWriteLockSkipReason) {
     super(reason);
     this.name = "CodexWriteLockSkipped";
   }
@@ -304,7 +315,7 @@ export async function withCodexWriteLock<T>(
 
     let transaction: ReturnType<typeof openCodexCoordinatorTransaction> | undefined;
     try {
-      transaction = openCodexCoordinatorTransaction(databasePath);
+      transaction = openCodexCoordinatorTransaction(databasePath, options.adoption);
     } catch (error) {
       // Only contention retries. A malformed database, an unsafe path, or an
       // identity failure will fail identically forever; telling a caller to retry

@@ -1,4 +1,5 @@
 import { loadConfig } from "../config";
+import { hasPassiveAccountQuota } from "../providers/quota";
 import { closeSync, openSync, readSync } from "node:fs";
 import {
   MAX_ACCOUNT_PRIORITY,
@@ -40,6 +41,11 @@ const EXTENDED_USAGE = `Usage:
   ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]
   ocx account alias <provider> <id|main> <display-name|-> [--json]
   ocx account priority <provider> <id|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
+  ocx account pause <provider> <id|main> [--json]
+  ocx account resume <provider> <id|main> [--json]
+  ocx account pause-exhausted <provider> [--json]
+  ocx account strategy <provider> [<quota|round-robin|fill-first|reset-first>] [--json]
+  ocx account sticky <provider> [<1-100>] [--json]
   ocx account remove <provider> <id|main> --yes [--json]
   ocx account clear-cooldown <provider> <id|main> [--json]
   ocx account add-key <provider> [--label <label>] [--json]
@@ -232,8 +238,8 @@ function configAndType(deps: AccountDeps, name: string) {
 }
 
 function familyFailure(result: FamilyRows, fallback: string): number | null {
-  if (result.networkDown) return proxyUnreachable();
-  if (result.errorJson) return apiError(result.errorJson, fallback);
+  if (result.networkDown) return proxyUnreachable(result.transportError);
+  if (result.errorJson) return apiError(result.errorJson, fallback, result.status);
   return null;
 }
 
@@ -249,18 +255,16 @@ function resetIso(value: number | undefined): string | null {
 
 function refreshLine(row: FamilyRows["rows"][number]): string {
   const parts = [row.id === MAIN_ID ? "main" : row.id, row.email, row.plan];
-  const quota = row.quota;
-  if (!quota || (quota.weeklyPercent === undefined && quota.monthlyPercent === undefined)) {
-    parts.push("quota: unknown");
-  } else {
-    if (quota.weeklyPercent !== undefined) parts.push(`weekly ${quota.weeklyPercent}%`);
-    const weeklyReset = resetIso(quota.weeklyResetAt);
-    if (weeklyReset) parts.push(`resets ${weeklyReset}`);
-    if (quota.monthlyPercent !== undefined) parts.push(`monthly ${quota.monthlyPercent}%`);
-    const monthlyReset = resetIso(quota.monthlyResetAt);
-    if (monthlyReset) parts.push(`resets ${monthlyReset}`);
-  }
+  if (row.paused) parts.push("paused");
+  // Was a second quota dialect: it gated the whole block on weekly/monthly, so an account
+  // reporting only a 5h window printed `quota: unknown` while `quotaParts` five lines below
+  // rendered the same data correctly for the provider path (#2703). Two halves of one file
+  // disagreeing about how to read one DTO is the defect; delegating removes it rather than
+  // teaching the second dialect a third window.
+  const quotaText = row.quota ? quotaParts(row.quota).join(" ") : "";
+  parts.push(quotaText.length > 0 ? quotaText : "quota: unknown");
   if (row.needsReauth) parts.push("needs-reauth");
+  if (row.validationPending) parts.push("validation-pending (routing disabled; open 'ocx gui' and click Refresh quotas after recovery)");
   return parts.filter(Boolean).join(" ");
 }
 
@@ -279,7 +283,7 @@ function quotaParts(quota: ProviderQuotaDto): string[] {
   return parts;
 }
 
-function providerQuotaLine(name: string, report: ProviderQuotaReportDto): string {
+export function providerQuotaLine(name: string, report: ProviderQuotaReportDto): string {
   return [name, ...quotaParts(report.quota)].join(" ");
 }
 
@@ -325,13 +329,18 @@ export async function cmdRefresh(args: string[], deps: AccountDeps): Promise<num
   if (!baseUrl) return proxyUnreachable();
   if (classified.type !== "codex") {
     const result = await fetchProviderQuotaReport(deps, baseUrl, name);
-    if (result.status === 0) return proxyUnreachable();
-    if (result.status !== 200) return apiError(result.errorJson ?? {}, `failed to refresh ${name}`);
+    if (result.status === 0) return proxyUnreachable(result.transportError);
+    if (result.status !== 200) return apiError(result.errorJson ?? {}, `failed to refresh ${name}`, result.status);
     if (wantsJson) console.log(JSON.stringify({ provider: name, report: result.report }, null, 2));
-    else console.log(result.report ? providerQuotaLine(name, result.report) : `no quota report available for ${name}`);
+    else if (result.report) console.log(providerQuotaLine(name, result.report));
+    // A passive provider has no probe to run, so "no report available" reads as a
+    // failure of something that was never attempted. Say what is actually true.
+    else if (hasPassiveAccountQuota(name)) {
+      console.log(`${name} reports usage only during a streaming response; there is nothing to refresh. Run a request through this provider to update it, then see \`ocx account list ${name}\`.`);
+    } else console.log(`no quota report available for ${name}`);
     return 0;
   }
-  const result = await fetchCodexRows(deps, baseUrl, true);
+  const result = await fetchCodexRows(deps, baseUrl, true, true, { refreshAction: true });
   const failed = familyFailure(result, `failed to refresh ${name}`);
   if (failed !== null) return failed;
   if (wantsJson) console.log(JSON.stringify({ accounts: result.rows }, null, 2));
@@ -345,9 +354,12 @@ export async function cmdAutoSwitch(args: string[], deps: AccountDeps): Promise<
   const action = args.shift();
   if (!name || !action) return usage();
   const classified = configAndType(deps, name);
-  if ("error" in classified || classified.type !== "codex") {
-    return usage("Error: auto-switch only applies to the openai Codex account pool");
+  // Anthropic keeps its threshold on its own pool contract; generic OAuth providers (#695)
+  // and the Codex pool are accepted here.
+  if ("error" in classified || classified.type === "api-key" || name === "anthropic") {
+    return usage("Error: auto-switch only applies to the openai Codex account pool or a generic OAuth provider pool");
   }
+  const genericPool = classified.type === "oauth";
   let threshold: number | undefined;
   if (action === "on" && args.length === 0) threshold = 80;
   else if (action === "off" && args.length === 0) threshold = 0;
@@ -356,19 +368,55 @@ export async function cmdAutoSwitch(args: string[], deps: AccountDeps): Promise<
   if (threshold !== undefined && (!Number.isInteger(threshold) || threshold < 0 || threshold > 100)) {
     return usage("Error: threshold must be an integer 0-100");
   }
+  let settings: Record<string, unknown> = {};
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
   if (action === "status") {
-    const response = await apiJson(deps, baseUrl, "GET", "/api/codex-auth/active");
-    if (response.status === 0) return proxyUnreachable();
-    if (response.status !== 200 || typeof response.json.autoSwitchThreshold !== "number") {
-      return apiError(response.json, "failed to read auto-switch status");
+    const response = await apiJson(
+      deps, baseUrl, "GET",
+      genericPool ? `/api/oauth/accounts/pool?provider=${encodeURIComponent(name)}` : "/api/codex-auth/active",
+    );
+    if (response.status === 0) return proxyUnreachable(response.transportError);
+    if (response.status !== 200 || (!genericPool && typeof response.json.autoSwitchThreshold !== "number")) {
+      return apiError(response.json, "failed to read auto-switch status", response.status);
     }
-    threshold = response.json.autoSwitchThreshold;
+    settings = genericPool && (!response.json || typeof response.json !== "object" || Array.isArray(response.json))
+      ? {} : response.json;
+    threshold = typeof settings.autoSwitchThreshold === "number" ? settings.autoSwitchThreshold : 0;
   } else {
-    const response = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/auto-switch", { threshold });
-    if (response.status === 0) return proxyUnreachable();
-    if (response.status !== 200) return apiError(response.json, "failed to update auto-switch");
+    const response = genericPool
+      ? await apiJson(deps, baseUrl, "PUT", "/api/oauth/accounts/pool", { provider: name, autoSwitchThreshold: threshold })
+      : await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/auto-switch", { threshold });
+    if (response.status === 0) return proxyUnreachable(response.transportError);
+    if (response.status !== 200) return apiError(response.json, "failed to update auto-switch", response.status);
+    settings = genericPool && (!response.json || typeof response.json !== "object" || Array.isArray(response.json))
+      ? {} : response.json;
+  }
+  if (genericPool) {
+    // Generic thresholds are stored independently of the enabled override. The
+    // latter may inherit global preference and never disables reactive rotation.
+    const stored = settings.autoSwitchThreshold;
+    const storedThreshold = typeof stored === "number" && Number.isInteger(stored) && stored >= 0 && stored <= 100
+      ? stored : null;
+    const poolEnabled = typeof settings.enabled === "boolean" ? settings.enabled : null;
+    // Three states, not two. `true` is stored-but-not-applied, `false` is applied by the
+    // shared kernel, and absent is a server that does not speak this field at all. Collapsing
+    // false into absent would render the live feature as an unknown capability.
+    const inert = typeof settings.inert === "boolean" ? settings.inert : null;
+    // A positive stored threshold only steers selection once the pool consumes it, which is
+    // exactly what `inert: false` reports. Zero remains the explicit disabled value.
+    const enabled = inert === false && storedThreshold !== null && storedThreshold > 0;
+    if (wantsJson) {
+      console.log(JSON.stringify({ provider: name, autoSwitchThreshold: storedThreshold, enabled, poolEnabled, inert }, null, 2));
+    } else {
+      const value = storedThreshold === null ? "unset" : `${storedThreshold}%`;
+      const state = inert === false ? (enabled ? "on" : "off") : inert === true ? "inactive" : "unavailable";
+      const why = inert === false
+        ? (enabled ? "applied by this pool" : storedThreshold === 0 ? "usage-based switching disabled" : "no threshold stored")
+        : inert === true ? "not applied by this pool" : "threshold support is unknown";
+      console.log(`auto-switch: ${state} (stored threshold ${value}; ${why})`);
+    }
+    return 0;
   }
   const enabled = threshold! > 0;
   if (wantsJson) console.log(JSON.stringify({ provider: name, autoSwitchThreshold: threshold, enabled }, null, 2));
@@ -459,8 +507,8 @@ export async function cmdAddKey(args: string[], deps: AccountDeps): Promise<numb
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
   const response = await apiJson(deps, baseUrl, "POST", "/api/providers/keys", { name, key, ...(label ? { label } : {}) });
-  if (response.status === 0) return proxyUnreachable();
-  if (response.status !== 201) return apiError(response.json, `failed to add a key for ${name}`);
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 201) return apiError(response.json, `failed to add a key for ${name}`, response.status);
   const id = typeof response.json.id === "string" ? response.json.id : null;
   // Redact the key inside the label BEFORE serialization — a key containing
   // JSON-escaped characters (" or \) would otherwise survive the whole-output
@@ -536,7 +584,7 @@ export async function cmdImport(args: string[], deps: AccountDeps): Promise<numb
     clearTimeout(timer);
   }
   if (response.status === 0) {
-    if (!timedOut) return proxyUnreachable();
+    if (!timedOut) return proxyUnreachable(response.transportError);
     console.error(`Error: import_timeout after ${importTimeoutMs}ms`);
     return 1;
   }
@@ -589,8 +637,8 @@ export async function cmdClearCooldown(args: string[], deps: AccountDeps): Promi
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
   const response = await apiJson(deps, baseUrl, "POST", "/api/codex-auth/accounts/clear-cooldown", { id });
-  if (response.status === 0) return proxyUnreachable();
-  if (response.status !== 200) return apiError(response.json, `failed to clear cooldown for ${requestedId}`);
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 200) return apiError(response.json, `failed to clear cooldown for ${requestedId}`, response.status);
   const cleared = response.json?.cleared === true;
   if (wantsJson) console.log(JSON.stringify({ ok: true, provider: name, id, cleared }, null, 2));
   else if (cleared) console.log(`${name}: cooldown lifted for ${requestedId}`);
@@ -680,8 +728,8 @@ export async function cmdPriority(args: string[], deps: AccountDeps): Promise<nu
   }
 
   const response = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/accounts/priority", { id, priority });
-  if (response.status === 0) return proxyUnreachable();
-  if (response.status !== 200) return apiError(response.json, `failed to set selection order for ${requestedId}`);
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 200) return apiError(response.json, `failed to set selection order for ${requestedId}`, response.status);
   const applied = typeof response.json.priority === "number" ? response.json.priority : (priority ?? 0);
   if (wantsJson) {
     console.log(JSON.stringify(
@@ -701,6 +749,243 @@ export async function cmdPriority(args: string[], deps: AccountDeps): Promise<nu
   // this line that is a silent side effect of a command that looks purely declarative.
   console.error('Also releases any manual "use this account now" pin, on any account.');
   return 0;
+}
+
+/**
+ * `ocx account pause|resume <provider> <id>` (#2702).
+ *
+ * The server routes have always existed; only the CLI caller was missing, so pausing an
+ * account was dashboard-only. The issue reports these as POST; the code is PUT
+ * (`auth-api.ts:1494`), and the route is shared by both directions with a `paused` boolean
+ * rather than being two endpoints.
+ */
+export async function cmdPause(args: string[], deps: AccountDeps, paused: boolean): Promise<number> {
+  const wantsJson = flag(args, "--json");
+  const name = args.shift();
+  const requestedId = args.shift();
+  const verb = paused ? "pause" : "resume";
+  if (!name || !requestedId || args.length) return usage();
+  const classified = configAndType(deps, name);
+  if ("error" in classified) return usage(`Error: ${classified.error}`);
+  if (classified.type !== "codex") {
+    return usage(`Error: ${verb} applies to the openai Codex account pool`);
+  }
+  const id = requestedId === "main" ? MAIN_ID : requestedId;
+
+  const baseUrl = await resolveBaseUrl(deps);
+  if (!baseUrl) return proxyUnreachable();
+
+  const response = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/accounts/pause", { id, paused });
+  // Transport sentinel first: status 0 means the proxy never answered, and comparing it to
+  // 200 would report an unreachable proxy as a management error.
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 200) return apiError(response.json, `failed to ${verb} ${requestedId}`, response.status);
+
+  if (wantsJson) {
+    console.log(JSON.stringify({ ok: true, provider: name, id, paused }, null, 2));
+  } else {
+    console.log(`${name}: ${requestedId} ${paused ? "paused" : "resumed"}`);
+  }
+  if (paused) {
+    // Both are server-side effects of this route (auth-api.ts:1508-1510), not consequences
+    // the operator would infer from the word "pause".
+    console.error("Threads bound to this account are unbound, and a fallback account is selected if this one was active.");
+  }
+  return 0;
+}
+
+/**
+ * `ocx account pause-exhausted [--off]` (#2702).
+ *
+ * Pauses every account whose quota is spent. The route refreshes quota for each account, so
+ * it can partially fail; the response distinguishes "checked none and some failed" from
+ * "checked some", and that distinction is reported rather than flattened into ok/not-ok.
+ */
+export async function cmdPauseExhausted(args: string[], deps: AccountDeps): Promise<number> {
+  const wantsJson = flag(args, "--json");
+  const name = args.shift();
+  if (!name || args.length) return usage();
+  const classified = configAndType(deps, name);
+  if ("error" in classified) return usage(`Error: ${classified.error}`);
+  if (classified.type !== "codex") {
+    return usage("Error: pause-exhausted applies to the openai Codex account pool");
+  }
+
+  const baseUrl = await resolveBaseUrl(deps);
+  if (!baseUrl) return proxyUnreachable();
+
+  const response = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/accounts/pause-exhausted", {});
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 200) return apiError(response.json, "failed to pause exhausted accounts", response.status);
+
+  const pausedIds = Array.isArray(response.json.pausedAccountIds)
+    ? (response.json.pausedAccountIds as unknown[]).filter((value): value is string => typeof value === "string")
+    : [];
+  const checked = typeof response.json.checkedAccountCount === "number" ? response.json.checkedAccountCount : null;
+  const failed = typeof response.json.failedAccountCount === "number" ? response.json.failedAccountCount : null;
+
+  const complete = failed === null || failed === 0;
+  const ok = complete;
+  if (failed !== null && failed > 0) {
+    console.error(`Quota refresh failed for ${failed} account(s); those were not evaluated.`);
+  }
+  if (wantsJson) {
+    console.log(JSON.stringify({
+      ok,
+      complete,
+      provider: name,
+      pausedAccountIds: pausedIds,
+      checkedAccountCount: checked,
+      failedAccountCount: failed,
+    }, null, 2));
+    return ok ? 0 : 1;
+  }
+  console.log(pausedIds.length > 0
+    ? `${name}: paused ${pausedIds.length} exhausted account(s): ${pausedIds.join(", ")}`
+    : `${name}: no exhausted accounts to pause`);
+  return ok ? 0 : 1;
+}
+
+/**
+ * One transport, because there is now one contract.
+ *
+ * This used to be a table of the differences between the Codex and Anthropic pools -- different
+ * read path, different write path, different response keys, and a `provider` field mandatory on
+ * one body and forbidden on the other. That table existed only because the two contracts
+ * disagreed; `/api/pool/settings` answers with the same keys for every kind, so the table
+ * collapses to a single shape and the asymmetry it encoded is gone rather than relocated.
+ *
+ * The legacy paths still work and still have their own goldens. Nothing here reads them.
+ */
+interface PoolTransport {
+  readPath: string;
+  writePath: string;
+  /** Response key carrying the applied strategy. */
+  strategyKey: string;
+  /** Response key carrying the applied sticky limit. */
+  stickyKey: string;
+  writeBody: (field: "strategy" | "stickyLimit", value: unknown) => Record<string, unknown>;
+}
+
+function unifiedPoolTransport(provider: string): PoolTransport {
+  return {
+    readPath: `/api/pool/settings?provider=${encodeURIComponent(provider)}`,
+    writePath: "/api/pool/settings",
+    strategyKey: "strategy",
+    stickyKey: "stickyLimit",
+    writeBody: (field, value) => ({ provider, [field]: value }),
+  };
+}
+
+/**
+ * Codex and Anthropic keep their own pool transports; every other OAuth provider speaks the
+ * generic pool-settings contract on the same `/api/oauth/accounts/pool` route (#695).
+ * API-key providers have no pool and are refused here without a round-trip.
+ */
+function poolTransportFor(
+  classified: { type: "codex" | "oauth" | "api-key" },
+  name: string,
+): PoolTransport | string {
+  if (classified.type === "codex" || classified.type === "oauth") return unifiedPoolTransport(name);
+  return `pool settings apply to OAuth account pools, not the API-key provider "${name}"`;
+}
+
+/**
+ * `ocx account strategy <provider> [<name>]` and `ocx account sticky <provider> [<n>]` (#2702).
+ *
+ * One implementation rather than two near-duplicates, because strategy and sticky are two
+ * fields of one setting on every pool that has them.
+ *
+* Values are NOT re-validated here. The server owns both contracts -- three strategy names,
+* a 1-100 sticky bound -- and a duplicated bound is a second thing to keep in sync. Its 400
+* is actionable now that the CLI prints `reason`.
+*/
+async function poolSetting(
+  args: string[],
+  deps: AccountDeps,
+  field: "strategy" | "stickyLimit",
+): Promise<number> {
+  const wantsJson = flag(args, "--json");
+  const name = args.shift();
+  const requested = args.shift();
+  const label = field === "strategy" ? "pool strategy" : "sticky limit";
+  if (!name || args.length) return usage();
+  const classified = configAndType(deps, name);
+  if ("error" in classified) return usage(`Error: ${classified.error}`);
+  const transport = poolTransportFor(classified, name);
+  if (typeof transport === "string") return usage(`Error: ${transport}`);
+
+  const baseUrl = await resolveBaseUrl(deps);
+  if (!baseUrl) return proxyUnreachable();
+
+  // No value means show. A read must not rewrite what it is reporting.
+  if (requested === undefined) {
+    const response = await apiJson(deps, baseUrl, "GET", transport.readPath);
+    if (response.status === 0) return proxyUnreachable(response.transportError);
+    if (response.status !== 200) return apiError(response.json, `failed to read ${label}`, response.status);
+    const strategy = response.json[transport.strategyKey];
+    const sticky = response.json[transport.stickyKey];
+    const autoSwitchThreshold = typeof response.json.autoSwitchThreshold === "number"
+      ? response.json.autoSwitchThreshold
+      : undefined;
+    if (wantsJson) {
+      // Pool-neutral key names: the two routes spell the same two settings differently, and a
+      // `--json` consumer should not have to branch on which pool answered.
+      const payload: Record<string, unknown> = { ok: true, provider: name, strategy, stickyLimit: sticky };
+      if (autoSwitchThreshold !== undefined) {
+        payload.autoSwitchThreshold = autoSwitchThreshold;
+      }
+      console.log(JSON.stringify(payload, null, 2));
+    } else {
+      if (field === "strategy" && autoSwitchThreshold !== undefined) {
+        const thresholdSummary = strategy === "round-robin"
+          ? "threshold not used"
+          : autoSwitchThreshold > 0
+          ? (strategy === "fill-first"
+              ? `drain at ${autoSwitchThreshold}%`
+              : strategy === "reset-first"
+              ? `nearest reset below ${autoSwitchThreshold}%`
+              : `switch at ${autoSwitchThreshold}%`)
+          : "proactive switching off";
+        console.log(`${name}: ${label} is ${String(strategy)} (${thresholdSummary})`);
+      } else {
+        console.log(`${name}: ${label} is ${String(field === "strategy" ? strategy : sticky)}`);
+      }
+    }
+    return 0;
+  }
+
+  // Sent as a number when it parses as one so the server sees the type it validates;
+  // a non-numeric string still goes through and earns the server's own 400.
+  const value = field === "strategy"
+    ? requested
+    : (Number.isNaN(Number(requested)) ? requested : Number(requested));
+  const response = await apiJson(deps, baseUrl, "PUT", transport.writePath, transport.writeBody(field, value));
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 200) return apiError(response.json, `failed to set ${label}`, response.status);
+
+  if (wantsJson) {
+    console.log(JSON.stringify({
+      ok: true,
+      provider: name,
+      strategy: response.json[transport.strategyKey],
+      stickyLimit: response.json[transport.stickyKey],
+    }, null, 2));
+  } else {
+    // Echo the APPLIED value from the response, not the requested one: the server normalizes,
+    // and printing the request would hide a normalization the operator should see.
+    const applied = field === "strategy" ? response.json[transport.strategyKey] : response.json[transport.stickyKey];
+    console.log(`${name}: ${label} is now ${String(applied)}`);
+  }
+  return 0;
+}
+
+export function cmdStrategy(args: string[], deps: AccountDeps): Promise<number> {
+  return poolSetting(args, deps, "strategy");
+}
+
+export function cmdSticky(args: string[], deps: AccountDeps): Promise<number> {
+  return poolSetting(args, deps, "stickyLimit");
 }
 
 export async function cmdAlias(args: string[], deps: AccountDeps): Promise<number> {
@@ -728,8 +1013,8 @@ export async function cmdAlias(args: string[], deps: AccountDeps): Promise<numbe
       ? { provider: name, accountId: id, alias }
       : { name, id, alias };
   const response = await apiJson(deps, baseUrl, "PUT", path, body);
-  if (response.status === 0) return proxyUnreachable();
-  if (response.status !== 200) return apiError(response.json, `failed to rename ${requestedId}`);
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 200) return apiError(response.json, `failed to rename ${requestedId}`, response.status);
   const result = { ok: true, provider: name, id, alias: alias || null };
   if (wantsJson) console.log(JSON.stringify(result, null, 2));
   else console.log(alias ? `${name}: ${requestedId} is now “${alias}”` : `${name}: cleared alias for ${requestedId}`);

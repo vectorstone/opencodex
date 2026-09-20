@@ -1,43 +1,21 @@
 import { createHash } from "node:crypto";
-import type { OcxConfig, OcxContentPart, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxTextContent } from "../types";
-import { modelInList } from "../types";
-import { modelRecordValue } from "../reasoning-effort";
-import type { VisionReasoningEffort } from "../reasoning-effort";
-import { describeImage, type DescribeOutcome, type VisionSettings } from "./describe";
+import type { OcxContentPart, OcxMessage, OcxParsedRequest, OcxTextContent } from "../types";
+import { describeImage, type DescribeOutcome } from "./describe";
 import { describeImageAnthropic } from "./anthropic-describe";
-import { normalizeVisionReasoningForModel } from "./reasoning";
+import { describeImageRouted } from "./routed-describe";
 import type { CodexAuthContext } from "../codex/auth-context";
-import { getAccountSet } from "../oauth/store";
-import type { ResolvedOpenAiForwardSidecar } from "../providers/openai-sidecar";
 import type { SidecarOutcomeRecorder } from "../web-search/executor";
 import { enforceAppOwnedMemoryBudget } from "../lib/app-owned-memory";
 import type { TranslatorBudget } from "../lib/translator-budget";
-import {
-  DEFAULT_VISION_TIMEOUT_MS,
-  MAX_VISION_TIMEOUT_MS,
-  MIN_VISION_TIMEOUT_MS,
-} from "./timeout-bounds";
+import type { VisionPlan } from "./plan";
+import { carriesImages, descriptionEncoder, syncRawBodyImageDescriptions } from "./image-rewrite";
 
 export { describeImage } from "./describe";
-
-/**
- * True when the model is explicitly known to be text-only — either listed in
- * `noVisionModels` or declared with `modelInputModalities` that exclude "image".
- * Returns false for unknown models (no evidence either way) so they fall through
- * to native image passthrough, which is the safe default for an unclassified model.
- */
-export function isModelTextOnly(
-  provider: OcxProviderConfig,
-  modelId: string,
-): boolean {
-  if (modelInList(provider.noVisionModels, modelId)) return true;
-  const modalities = modelRecordValue(provider.modelInputModalities, modelId);
-  if (Array.isArray(modalities) && modalities.length > 0 && !modalities.includes("image")) return true;
-  return false;
-}
+export { isModelVisionSidecarConsumer as isModelTextOnly } from "./eligibility";
 export { describeImageAnthropic, parseAnthropicVisionSSE } from "./anthropic-describe";
 export {
   BASELINE_VISION_MODELS,
+  isModelVisionSidecarConsumer,
   isVisionEligibleModel,
   isVisionSidecarConsumer,
   modelAcceptsImageInput,
@@ -45,19 +23,26 @@ export {
   visionEligibleModelOptions,
 } from "./eligibility";
 export type { VisionCandidateModel, VisionModelOption, VisionSidecarBackend } from "./eligibility";
+export { DEFAULT_VISION_TIMEOUT_MS, MAX_VISION_TIMEOUT_MS, MIN_VISION_TIMEOUT_MS } from "./timeout-bounds";
 export {
-  DEFAULT_VISION_TIMEOUT_MS,
-  MAX_VISION_TIMEOUT_MS,
-  MIN_VISION_TIMEOUT_MS,
-};
+  DEFAULT_MAX_DESCRIPTIONS_PER_TURN,
+  resolveMaxDescriptionsPerTurn,
+  isValidVisionTimeoutMs,
+  resolveVisionTimeoutMs,
+  findAnthropicVisionProvider,
+  resolveVisionBackend,
+  resolveOpenAiVisionModel,
+  resolveEffectiveVisionModel,
+  shouldResolveOpenAiVisionSidecar,
+  planVisionSidecar,
+  requiresVisionPreprocessing,
+} from "./plan";
+export type { AnthropicVisionProvider, VisionPlan } from "./plan";
+export { stripImagesInPlace } from "./image-rewrite";
 
-const DEFAULT_VISION_MODEL = "gpt-5.4-mini";
-const DEFAULT_ANTHROPIC_VISION_MODEL = "claude-sonnet-5";
-const DEFAULT_REASONING: VisionReasoningEffort = "low";
-export const DEFAULT_MAX_DESCRIPTIONS_PER_TURN = 8;
+
 const DESCRIPTION_CACHE_MAX_ENTRIES = 256;
 export const VISION_DESCRIPTION_CACHE_MAX_BYTES = 1024 * 1024;
-const descriptionEncoder = new TextEncoder();
 /** Max images described in parallel — keeps first-token latency bounded without flooding the backend. */
 const VISION_CONCURRENCY = 3;
 /** Per-image description hard cap (chars) so multi-image turns can't blow the main model's context. */
@@ -172,25 +157,6 @@ export function evictOldestVisionDescriptionForBudget(): number {
   return descriptionCache.evictOldest?.() ?? 0;
 }
 
-/** Runtime config is permissive: zero is intentional; malformed values fall back to the bounded default. */
-export function resolveMaxDescriptionsPerTurn(value: unknown): number {
-  if (value === 0) return 0;
-  return typeof value === "number" && Number.isInteger(value) && value > 0
-    ? value
-    : DEFAULT_MAX_DESCRIPTIONS_PER_TURN;
-}
-
-export function isValidVisionTimeoutMs(value: unknown): value is number {
-  return typeof value === "number"
-    && Number.isInteger(value)
-    && value >= MIN_VISION_TIMEOUT_MS
-    && value <= MAX_VISION_TIMEOUT_MS;
-}
-
-/** Runtime config is permissive: malformed or out-of-range values fall back to the default. */
-export function resolveVisionTimeoutMs(value: unknown): number {
-  return isValidVisionTimeoutMs(value) ? value : DEFAULT_VISION_TIMEOUT_MS;
-}
 
 /** Run `worker` over `items` with bounded concurrency, preserving input order in the result array. */
 async function runBounded<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
@@ -210,123 +176,7 @@ function clamp(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}\n…[description truncated]`;
 }
 
-export interface AnthropicVisionProvider {
-  providerName: string;
-  provider: OcxProviderConfig;
-}
 
-/** First enabled Anthropic OAuth provider whose active stored account is not marked for reauth. */
-export function findAnthropicVisionProvider(config: OcxConfig): AnthropicVisionProvider | undefined {
-  for (const [providerName, provider] of Object.entries(config.providers)) {
-    if (provider.disabled === true || provider.adapter !== "anthropic" || provider.authMode !== "oauth") continue;
-    const accountSet = getAccountSet(providerName);
-    const active = accountSet?.accounts.find(account => account.id === accountSet.activeAccountId);
-    if (active && active.needsReauth !== true) return { providerName, provider };
-  }
-  return undefined;
-}
-
-export function resolveVisionBackend(
-  explicit: "openai" | "anthropic" | undefined,
-  anthropicSidecar: AnthropicVisionProvider | undefined,
-): "openai" | "anthropic" {
-  if (explicit === "openai" || explicit === "anthropic") return explicit;
-  return anthropicSidecar ? "anthropic" : "openai";
-}
-
-/** Native model used by the OpenAI vision helper, including its bounded default. */
-export function resolveOpenAiVisionModel(config: Pick<OcxConfig, "visionSidecar">): string {
-  return config.visionSidecar?.model || DEFAULT_VISION_MODEL;
-}
-
-/** Effective describer model for the backend `planVisionSidecar` selected. */
-export function resolveEffectiveVisionModel(
-  config: Pick<OcxConfig, "visionSidecar">,
-  backend: "openai" | "anthropic",
-): string {
-  return backend === "anthropic"
-    ? config.visionSidecar?.model || DEFAULT_ANTHROPIC_VISION_MODEL
-    : resolveOpenAiVisionModel(config);
-}
-
-/** A user/developer/toolResult message can carry images (toolResult: e.g. Codex view_image output). */
-function carriesImages(role: string): boolean {
-  return role === "user" || role === "developer" || role === "toolResult";
-}
-
-function messagesHaveImage(parsed: OcxParsedRequest): boolean {
-  return parsed.context.messages.some(m =>
-    carriesImages(m.role) && Array.isArray(m.content) && (m.content as OcxContentPart[]).some(p => p.type === "image"));
-}
-
-export function shouldResolveOpenAiVisionSidecar(
-  config: OcxConfig,
-  provider: OcxProviderConfig,
- modelId: string,
- parsed: OcxParsedRequest,
-): boolean {
-  if (!isModelTextOnly(provider, modelId) || !messagesHaveImage(parsed)) return false;
-  const cfg = config.visionSidecar ?? {};
-  if (cfg.enabled === false) return false;
-  return resolveVisionBackend(cfg.backend, findAnthropicVisionProvider(config)) === "openai";
-}
-
-export interface VisionPlan {
-  backend: "openai" | "anthropic";
-  forwardSidecar?: ResolvedOpenAiForwardSidecar;
-  anthropicSidecar?: AnthropicVisionProvider;
-  settings: VisionSettings;
-  maxDescriptionsPerTurn: number;
-}
-
-/**
- * Decide whether the vision sidecar should pre-describe images for this request, returning the plan
- * if so. Active when: the routed model is in `provider.noVisionModels`, the request actually carries
- * an image, the sidecar isn't disabled, and the selected backend has usable auth. Returns undefined
- * otherwise (the caller strips images before sending to a text-only model).
- */
-export function planVisionSidecar(
-  config: OcxConfig,
-  provider: OcxProviderConfig,
-  modelId: string,
-  parsed: OcxParsedRequest,
-  openAiSidecar?: ResolvedOpenAiForwardSidecar,
-): VisionPlan | undefined {
-  if (!isModelTextOnly(provider, modelId)) return undefined;
-  if (!messagesHaveImage(parsed)) return undefined;
-  const cfg = config.visionSidecar ?? {};
-  if (cfg.enabled === false) return undefined;
-  const anthropicSidecar = findAnthropicVisionProvider(config);
-  const backend = resolveVisionBackend(cfg.backend, anthropicSidecar);
-  const model = resolveEffectiveVisionModel(config, backend);
-  const maxDescriptionsPerTurn = resolveMaxDescriptionsPerTurn(cfg.maxDescriptionsPerTurn);
-
-  if (backend === "anthropic") {
-    if (!anthropicSidecar) return undefined;
-    return {
-      backend,
-      anthropicSidecar,
-      settings: {
-        model,
-        reasoning: normalizeVisionReasoningForModel(model, cfg.reasoning) ?? DEFAULT_REASONING,
-        timeoutMs: resolveVisionTimeoutMs(cfg.timeoutMs),
-      },
-      maxDescriptionsPerTurn,
-    };
-  }
-
-  if (!openAiSidecar) return undefined;
-  return {
-    backend,
-    forwardSidecar: openAiSidecar,
-    settings: {
-      model,
-      reasoning: normalizeVisionReasoningForModel(model, cfg.reasoning) ?? DEFAULT_REASONING,
-        timeoutMs: resolveVisionTimeoutMs(cfg.timeoutMs),
-    },
-    maxDescriptionsPerTurn,
-  };
-}
 
 interface ImageJob {
   imageUrl: string;
@@ -344,71 +194,6 @@ function renderDescription(out: { text: string; error?: string }): OcxTextConten
   };
 }
 
-const IMAGE_OMITTED_TEXT = "[image omitted: this model is text-only and the vision sidecar is unavailable (no ChatGPT login)]";
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * Keep the native Responses passthrough body aligned with image replacements made in the parsed
- * message graph. The passthrough adapter serializes `_rawBody`, while translated adapters serialize
- * `context.messages`; updating only the latter would send the original pixels to a text-only
- * Responses upstream even after the vision sidecar produced a caption.
- *
- * Rewrites only image-bearing user/developer messages and tool outputs. All other native Responses
- * items (reasoning, calls, ids, compaction, and provider-specific metadata) remain byte-structurally
- * untouched.
- */
-function syncRawBodyImageDescriptions(parsed: OcxParsedRequest, descriptions: readonly string[]): void {
-  const rawBody = parsed._rawBody;
-  if (!isPlainRecord(rawBody) || !Array.isArray(rawBody.input)) return;
-
-  let nextDescription = 0;
-  const rewriteImages = (value: unknown, nonEmptyImageUrlsOnly: boolean): unknown => {
-    if (Array.isArray(value)) {
-      let changed = false;
-      const rewritten = value.map(entry => {
-        const next = rewriteImages(entry, nonEmptyImageUrlsOnly);
-        if (next !== entry) changed = true;
-        return next;
-      });
-      return changed ? rewritten : value;
-    }
-    if (!isPlainRecord(value)) return value;
-    if (value.type === "input_image" && typeof value.image_url === "string") {
-      if (nonEmptyImageUrlsOnly && value.image_url.length === 0) {
-        return { type: "input_text", text: IMAGE_OMITTED_TEXT };
-      }
-      const description = descriptions[nextDescription++];
-      return { type: "input_text", text: description ?? IMAGE_OMITTED_TEXT };
-    }
-    return value;
-  };
-
-  let changed = false;
-  const input = rawBody.input.map(item => {
-    if (!isPlainRecord(item)) return item;
-    const type = typeof item.type === "string" ? item.type : (typeof item.role === "string" ? "message" : "");
-    const role = typeof item.role === "string" ? item.role : "";
-    const isMessageContent = (
-      (type === "message" && (role === "user" || role === "developer"))
-      || type === "agent_message"
-    );
-    const field = isMessageContent
-      ? "content"
-      : (type === "function_call_output" || type === "custom_tool_call_output")
-        ? "output"
-        : undefined;
-    if (!field) return item;
-    const rewritten = rewriteImages(item[field], isMessageContent);
-    if (rewritten === item[field]) return item;
-    changed = true;
-    return { ...item, [field]: rewritten };
-  });
-
-  if (changed) rawBody.input = input;
-}
 
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
@@ -448,6 +233,18 @@ async function executeDescription(
   abortSignal?: AbortSignal,
   recordSidecarOutcome?: SidecarOutcomeRecorder,
 ): Promise<DescribeOutcome> {
+  if (plan.backend === "routed") {
+    if (!plan.routedModel || !plan.routedConfig) return { text: "", error: "routed vision sidecar is unavailable" };
+    return describeImageRouted(
+      job.imageUrl,
+      job.detail,
+      job.contextText,
+      plan.routedModel,
+      plan.routedConfig,
+      plan.settings,
+      abortSignal,
+    );
+  }
   if (plan.backend === "anthropic") {
     const sidecar = plan.anthropicSidecar;
     if (!sidecar) return { text: "", error: "anthropic vision sidecar is unavailable" };
@@ -581,34 +378,4 @@ export async function describeImagesInPlace(
     msg.content = newParts;
   }
   syncRawBodyImageDescriptions(parsed, descriptions);
-}
-
-/**
- * Fail-closed image strip for sidecar-covered models when NO sidecar plan exists (no forward
- * provider / missing forwarded auth / sidecar disabled): the upstream is text-only, so forwarding
- * raw images would 400 or silently confuse it. Replace each image with an explicit marker so the
- * model (and the user, via its reply) knows the image was dropped rather than ignored.
- */
-export function stripImagesInPlace(parsed: OcxParsedRequest, translatorBudget?: TranslatorBudget): boolean {
-  let stripped = false;
-  const descriptions: string[] = [];
-  for (const msg of parsed.context.messages) {
-    if (!carriesImages(msg.role) || !Array.isArray(msg.content)) continue;
-    const parts = msg.content as OcxContentPart[];
-    if (!parts.some(p => p.type === "image")) continue;
-    msg.content = parts.map(p => {
-      if (p.type !== "image") return p;
-      const replacement = { type: "text", text: IMAGE_OMITTED_TEXT } as OcxContentPart;
-      descriptions.push((replacement as OcxTextContent).text);
-      const reservation = translatorBudget?.reserveTransient(
-        descriptionEncoder.encode((replacement as OcxTextContent).text).byteLength,
-        { kind: "request_copies" },
-      );
-      reservation?.commitRetained();
-      return replacement;
-    });
-    stripped = true;
-  }
-  syncRawBodyImageDescriptions(parsed, descriptions);
-  return stripped;
 }

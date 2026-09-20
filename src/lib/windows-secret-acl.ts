@@ -30,9 +30,16 @@
  */
 
 import { existsSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import { env, platform } from "node:process";
+import {
+  SUBPROCESS_KILL_GRACE_MS,
+  waitForSubprocessExit,
+  type SubprocessDeadlineScheduler,
+} from "./bounded-subprocess";
 import { resolveTrustedWindowsIcaclsExe } from "./windows-elevation";
 import {
+  cachedCurrentWindowsIdentity,
   resolveCurrentWindowsPrincipal,
   resolveCurrentWindowsPrincipalAsync,
   setSyntheticWindowsPrincipalForTests,
@@ -46,17 +53,32 @@ const hardenedPaths = new Map<string, HardenedIdentity>();
  * that attempt was consumed. Ordinary callers never consume it.
  */
 const timedOutPaths = new Map<string, boolean>();
+/** Compatibility slack before the outer belt releases a caller whose killed child has not reaped. */
+const ASYNC_ICACLS_BELT_MARGIN_MS = 250;
+const pendingAsyncIcaclsReaps = new Map<string, Set<Promise<void>>>();
+
+const scheduleAsyncIcaclsBelt: SubprocessDeadlineScheduler = (callback, milliseconds) => {
+  const timer = setTimeout(callback, milliseconds);
+  return () => clearTimeout(timer);
+};
+let asyncIcaclsBeltScheduler: SubprocessDeadlineScheduler = scheduleAsyncIcaclsBelt;
 
 /**
- * The memo value: `object:freshness` for a file a harden was actually attributed
- * to.
+ * The memo value: the `object` plus `freshness` of a file a harden was actually
+ * attributed to.
  *
  * There is deliberately no null member. An observation that cannot be read is
  * not stored at all — the entry is deleted — because a "recorded as unverifiable"
  * value was dead code the moment attribution became a before/after comparison,
  * and a branch nothing can reach is a branch no test can defend.
+ *
+ * It is the observation itself rather than a joined string so that the two
+ * questions stay separately askable after storage. `reattributeHardenedSecretPath`
+ * has to compare the object while deliberately ignoring the freshness, and
+ * recovering one half out of `dev:ino:ctimeNs` by counting colons would make that
+ * comparison depend on a format nothing declares.
  */
-type HardenedIdentity = string;
+type HardenedIdentity = PathObservation;
 
 /**
  * What a stat can tell us about WHICH OBJECT is at a path.
@@ -126,8 +148,8 @@ function observe(targetPath: string): PathObservation | null {
   }
 }
 
-function memoValue(seen: PathObservation): HardenedIdentity {
-  return `${seen.object}:${seen.freshness}`;
+function sameObservation(a: PathObservation, b: PathObservation): boolean {
+  return a.object === b.object && a.freshness === b.freshness;
 }
 
 /**
@@ -153,7 +175,7 @@ function memoSatisfied(cache: Map<string, HardenedIdentity>, targetPath: string)
   // without any ACL work. That needs exact-identity ABA to bite — outside the
   // proof bound this unit claims — but "the consequence is out of scope" is not a
   // reason to keep an entry we have just proven does not describe what is there.
-  if (current === null || memoValue(current) !== remembered) {
+  if (current === null || !sameObservation(current, remembered)) {
     cache.delete(targetPath);
     return false;
   }
@@ -201,7 +223,7 @@ function recordHarden(
     cache.delete(targetPath);
     return false;
   }
-  cache.set(targetPath, memoValue(after));
+  cache.set(targetPath, after);
   return true;
 }
 
@@ -215,6 +237,11 @@ export interface HardenResult {
 
 export interface HardenOptions {
   required: boolean;
+  /**
+   * Explicit total budget for this harden call. Shutdown recovery uses a reduced
+   * caller-owned slice instead of opening the normal 30-second window.
+   */
+  deadlineMs?: number;
   /**
    * Optional timeout-memo key distinct from `targetPath` (issue #612).
    * Atomic writers mint a fresh `.tmp` path per write; keying the timeout cache by the
@@ -256,7 +283,11 @@ const HARDEN_DEADLINE_MIN_MS = 1_000;
 const HARDEN_DEADLINE_MAX_MS = 60_000;
 
 /** Resolve the total harden budget once per call (env mutation cannot change it midway). */
-function resolveHardenDeadlineMs(): number {
+function resolveHardenDeadlineMs(overrideMs?: number): number {
+  if (overrideMs !== undefined) {
+    if (!Number.isSafeInteger(overrideMs) || overrideMs <= 0) return 1;
+    return Math.min(HARDEN_DEADLINE_MAX_MS, overrideMs);
+  }
   const raw = env["OPENCODEX_ACL_TIMEOUT_MS"]?.trim();
   if (!raw) return HARDEN_DEADLINE_DEFAULT_MS;
   const parsed = Number(raw);
@@ -327,33 +358,97 @@ function defaultIcaclsRunner(args: string[], timeoutMs: number): IcaclsResult {
 
 /**
  * Async icacls runner (#612): yields the event loop while waiting for the child.
- * Timeout provenance is recorded by our timer (async Subprocess has no exitedDueToTimeout);
- * we still await process exit before classifying so settlement is confirmed.
+ * Async Subprocess has no exitedDueToTimeout, so the shared settlement helper
+ * classifies the deadline and keeps waiting for a killed child to actually exit.
  */
 async function defaultAsyncIcaclsRunner(args: string[], timeoutMs: number): Promise<IcaclsResult> {
   const proc = trySpawnIcacls(args);
   if (!proc) return spawnFailedResult();
-  let timedOutByUs = false;
-  const timer = setTimeout(() => {
-    timedOutByUs = true;
-    try { proc.kill(); } catch { /* already exited */ }
-  }, Math.max(1, timeoutMs));
-  let exitCode: number | null = null;
-  try {
-    exitCode = await proc.exited;
-  } finally {
-    clearTimeout(timer);
-  }
-  const stdout = proc.stdout
+  const { exitCode, timedOut } = await waitForSubprocessExit(proc, timeoutMs);
+  const stdout = !timedOut && proc.stdout
     ? await new Response(proc.stdout).text().catch(() => "")
     : "";
-  const timedOut = timedOutByUs;
   return {
     success: !timedOut && exitCode === 0,
     exitCode: timedOut ? null : exitCode,
     timedOut,
     stdout,
   };
+}
+
+function awaitAsyncIcaclsRunner(args: string[], timeoutMs: number): Promise<IcaclsResult> {
+  return new Promise(resolve => {
+    let settled = false;
+    let cancelBelt: (() => void) | undefined;
+    const finish = (result: IcaclsResult): void => {
+      if (settled) return;
+      settled = true;
+      cancelBelt?.();
+      resolve(result);
+    };
+    const runner = asyncIcaclsRunner(args, timeoutMs).then(
+      result => { finish(result); },
+      () => { finish(spawnFailedResult()); },
+    );
+    // The belt has to outlast the runner it is guarding, or it is not a belt -- it is the
+    // deadline. The runner may now legitimately outlive it while a killed child is reaped. The
+    // caller is still released, but the target is registered so removal can wait for the distinct
+    // handle-release question instead of treating flight settlement as proof that the child died.
+    cancelBelt = asyncIcaclsBeltScheduler(
+      () => {
+        const targetPath = args[0];
+        if (targetPath) registerPendingAsyncIcaclsReap(targetPath, runner);
+        finish({ success: false, exitCode: null, timedOut: true, stdout: "" });
+      },
+      Math.max(1, timeoutMs) + SUBPROCESS_KILL_GRACE_MS + ASYNC_ICACLS_BELT_MARGIN_MS,
+    );
+  });
+}
+
+function registerPendingAsyncIcaclsReap(targetPath: string, reap: Promise<void>): void {
+  let pending = pendingAsyncIcaclsReaps.get(targetPath);
+  if (!pending) {
+    pending = new Set();
+    pendingAsyncIcaclsReaps.set(targetPath, pending);
+  }
+  pending.add(reap);
+  void reap.finally(() => {
+    pending!.delete(reap);
+    if (pending!.size === 0) pendingAsyncIcaclsReaps.delete(targetPath);
+  });
+}
+
+function pathIsAtOrBelow(targetPath: string, rootPath: string): boolean {
+  const relativePath = relative(resolve(rootPath), resolve(targetPath));
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+/** True while an async icacls runner still owns this exact path after its caller's belt fired. */
+export function windowsSecretAclReapPendingForPath(targetPath: string): boolean {
+  return (pendingAsyncIcaclsReaps.get(targetPath)?.size ?? 0) > 0;
+}
+
+/** Non-blocking removal guard for callers that must refuse rather than wait for a stuck child. */
+export function windowsSecretAclReapPendingAtOrBelow(rootPath: string): boolean {
+  return [...pendingAsyncIcaclsReaps.keys()]
+    .some(targetPath => pathIsAtOrBelow(targetPath, rootPath));
+}
+
+/**
+ * Removal barrier for a file or tree that may still be held by a timed-out icacls child.
+ *
+ * This wait is deliberately separate from ordinary startup and shutdown: a genuinely stuck child
+ * must not defeat the caller-facing belt. Code that chooses to remove the target has the stricter
+ * contract and must not proceed until every registered runner at or below it has actually reaped.
+ */
+export async function flushWindowsSecretAclReapsBeforeRemoval(rootPath: string): Promise<void> {
+  while (true) {
+    const pending = [...pendingAsyncIcaclsReaps]
+      .filter(([targetPath]) => pathIsAtOrBelow(targetPath, rootPath))
+      .flatMap(([, reaps]) => [...reaps]);
+    if (pending.length === 0) return;
+    await Promise.all(pending);
+  }
 }
 
 let icaclsRunner: IcaclsRunner = defaultIcaclsRunner;
@@ -369,6 +464,13 @@ export function setIcaclsRunnerForTests(runner: IcaclsRunner | null): void {
 /** Test seam: replace the async icacls runner. Pass null to restore the default. */
 export function setAsyncIcaclsRunnerForTests(runner: AsyncIcaclsRunner | null): void {
   asyncIcaclsRunner = runner ?? defaultAsyncIcaclsRunner;
+}
+
+/** Test seam: fire the outer caller-facing belt without sleeping. */
+export function setAsyncIcaclsBeltSchedulerForTests(
+  scheduler: SubprocessDeadlineScheduler | null,
+): void {
+  asyncIcaclsBeltScheduler = scheduler ?? scheduleAsyncIcaclsBelt;
 }
 
 /**
@@ -403,6 +505,58 @@ export function resetHardenedStateForTests(): void {
 /** Forget a successful harden only after this exact ephemeral path is gone. */
 export function forgetHardenedSecretPath(targetPath: string): void {
   hardenedPaths.delete(targetPath);
+}
+
+/**
+ * Re-attribute an existing file memo to the SAME object after the caller wrote
+ * content to it through a descriptor whose identity it verified.
+ *
+ * This exists because `freshness` is `ctimeNs`, and on Windows libuv reports
+ * `st_ctim` from the NTFS ChangeTime, which moves when file DATA is written. An
+ * atomic writer therefore invalidated its own memo between the harden that
+ * protects the empty temp and the harden before the rename, and paid a second
+ * full `/grant:r` + `/inheritance:r` + `/remove:g` sequence to reapply the ACL
+ * that was already on the file. Every secret write on Windows paid it twice.
+ *
+ * Only the freshness moves, and only for an unchanged object: a different object
+ * retires the entry instead. A caller must have proven, immediately beforehand,
+ * that `targetPath` resolves to the object its own descriptor refers to.
+ *
+ * The cost of this is worth stating exactly, because `PathObservation` documents
+ * that freshness also moves when PERMISSIONS change, and this call cannot tell
+ * the two apart. So a DACL change landing between the harden and this call is
+ * absorbed instead of forcing a re-harden. That window is the caller's own
+ * content write; every permission change after this call still moves ctime
+ * again and still misses the memo, so the detection this memo provides is
+ * relocated, not removed.
+ *
+ * What makes the absorbed window acceptable is who can be in it. Once the harden
+ * has run, the DACL is an explicit owner-only ACE with inheritance removed, so
+ * no other principal can open the file for `WRITE_DAC` at all. The one principal
+ * who can still rewrite that DACL is one holding a handle opened BEFORE the
+ * harden, and Windows keeps the access granted to an open handle: that principal
+ * can equally rewrite the DACL after any later harden, and after the rename, on
+ * the same object. A second mutation pass never bounded that capability — it
+ * stripped an ACE the holder could immediately re-add — so declining to repeat
+ * it removes no guarantee anyone had.
+ *
+ * Refusal is cheap and safe in either direction: an unmoved memo simply means the
+ * caller's next harden runs in full.
+ *
+ * Returns whether the memo now describes what is at the path.
+ */
+export function reattributeHardenedSecretPath(targetPath: string): boolean {
+  const remembered = hardenedPaths.get(targetPath);
+  if (remembered === undefined) return false;
+  const current = observe(targetPath);
+  // Unreadable, or a different object: this is exactly the case the memo must
+  // not cover. Retire it so the next harden is a real one.
+  if (current === null || current.object !== remembered.object) {
+    hardenedPaths.delete(targetPath);
+    return false;
+  }
+  hardenedPaths.set(targetPath, current);
+  return true;
 }
 
 /**
@@ -500,6 +654,74 @@ function grantAce(user: string, directory: boolean): string {
   return directory ? `${user}:(OI)(CI)(F)` : `${user}:(F)`;
 }
 
+function existingAclIsCompliant(
+  targetPath: string,
+  directory: boolean,
+  stdout: string,
+  ownerName: string,
+): boolean {
+  const lines = stdout.replaceAll("\r", "").split("\n");
+  const first = lines.shift();
+  if (!first || first.slice(0, targetPath.length).toLowerCase() !== targetPath.toLowerCase()) {
+    return false;
+  }
+  const separator = first[targetPath.length];
+  if (separator !== undefined && !/\s/.test(separator)) return false;
+
+  const aceLines: string[] = [];
+  const firstAce = first.slice(targetPath.length).trim();
+  if (firstAce) aceLines.push(firstAce);
+  for (const line of lines) {
+    if (!line.trim()) break;
+    // Localized summary text is not indented like a continuation ACE.
+    if (!/^\s/.test(line)) break;
+    aceLines.push(line.trim());
+  }
+  if (aceLines.length !== 1) return false;
+
+  const match = /^([^:]+):((?:\([A-Z]+\))+)$/.exec(aceLines[0]!);
+  if (!match || match[1]!.trim().toLowerCase() !== ownerName.toLowerCase()) return false;
+  const rights = [...match[2]!.matchAll(/\(([A-Z]+)\)/g)].map(part => part[1]);
+  const expected = directory ? ["OI", "CI", "F"] : ["F"];
+  return rights.length === expected.length && rights.every((right, index) => right === expected[index]);
+}
+
+function shouldVerifyExistingAcl(): boolean {
+  return env["OPENCODEX_ACL_VERIFY_EXISTING"] === "1";
+}
+
+function existingAclAlreadyCompliant(targetPath: string, directory: boolean, deadline: number): boolean {
+  if (!shouldVerifyExistingAcl()) return false;
+  const identity = cachedCurrentWindowsIdentity();
+  if (!identity) return false;
+  try {
+    const remaining = deadline - nowFn();
+    if (remaining <= 0) return false;
+    const result = icaclsRunner([targetPath], remaining);
+    return result.success && existingAclIsCompliant(targetPath, directory, result.stdout, identity.name);
+  } catch {
+    return false;
+  }
+}
+
+async function existingAclAlreadyCompliantAsync(
+  targetPath: string,
+  directory: boolean,
+  deadline: number,
+): Promise<boolean> {
+  if (!shouldVerifyExistingAcl()) return false;
+  const identity = cachedCurrentWindowsIdentity();
+  if (!identity) return false;
+  try {
+    const remaining = deadline - nowFn();
+    if (remaining <= 0) return false;
+    const result = await awaitAsyncIcaclsRunner([targetPath], remaining);
+    return result.success && existingAclIsCompliant(targetPath, directory, result.stdout, identity.name);
+  } catch {
+    return false;
+  }
+}
+
 function runIcacls(targetPath: string, directory: boolean, deadline: number): void {
   const principal = currentWindowsPrincipal(deadline);
 
@@ -554,7 +776,7 @@ async function runIcaclsAsync(targetPath: string, directory: boolean, deadline: 
     if (remaining <= 0) {
       throw icaclsError(step, { success: false, exitCode: null, timedOut: true, stdout: "" });
     }
-    return asyncIcaclsRunner(args, remaining);
+    return awaitAsyncIcaclsRunner(args, remaining);
   };
   const runOrThrow = async (step: string, args: string[]): Promise<void> => {
     const result = await run(step, args);
@@ -629,18 +851,22 @@ function sanitizedAclError(diagnostics: string, cause: unknown): NodeJS.ErrnoExc
   return error;
 }
 
-function previousTimeoutError(retryConsumed: boolean): NodeJS.ErrnoException {
+type TimeoutMemoRefusalError = NodeJS.ErrnoException & {
+  aclFailureOrigin: "timeout_memo_refusal";
+};
+
+function previousTimeoutError(retryConsumed: boolean): TimeoutMemoRefusalError {
   if (retryConsumed) {
     const error = new Error(
       "ACL hardening skipped — the previous timeout recovery was already consumed",
     ) as NodeJS.ErrnoException;
     error.code = "EACLRETRYEXHAUSTED";
-    return error;
+    return Object.assign(error, { aclFailureOrigin: "timeout_memo_refusal" as const });
   }
-  return sanitizedAclError(
+  return Object.assign(sanitizedAclError(
     "ACL hardening skipped — previous attempt timed out",
     Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }),
-  );
+  ), { aclFailureOrigin: "timeout_memo_refusal" as const });
 }
 
 /** Consume, but never reset, the single explicit recovery attempt for this key. */
@@ -687,7 +913,7 @@ async function describeAclStateAfterTimeoutAsync(targetPath: string, deadline: n
     for (const sid of BROAD_SIDS) {
       const remaining = deadline - nowFn();
       if (remaining <= 0) return "ACL state unverified (budget exhausted)";
-      const found = await asyncIcaclsRunner([targetPath, "/findsid", sid], remaining);
+      const found = await awaitAsyncIcaclsRunner([targetPath, "/findsid", sid], remaining);
       if (!found.success) return "ACL state unverified (probe failed)";
       if (found.stdout.includes(targetPath)) return "broad ACL grants still present";
     }
@@ -724,6 +950,8 @@ function hardenEntry(
   if (!existsSync(targetPath)) { cache.delete(targetPath); return { ok: true }; }
   if (effectivePlatform() !== "win32") return { ok: true };
   if (memoSatisfied(cache, targetPath)) return { ok: true };
+  const deadline = nowFn() + resolveHardenDeadlineMs(opts.deadlineMs);
+  if (existingAclAlreadyCompliant(targetPath, directory, deadline)) return { ok: true };
   const memoKey = timeoutMemoKey(targetPath, opts);
   const timeoutMemoError = timeoutMemoErrorIfBlocked(memoKey, opts);
   if (timeoutMemoError) {
@@ -731,7 +959,6 @@ function hardenEntry(
     return { ok: false, diagnostics: timeoutMemoError.message };
   }
 
-  const deadline = nowFn() + resolveHardenDeadlineMs();
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0 && deadline - nowFn() <= 0) break; // retry only while budget remains
@@ -776,6 +1003,8 @@ async function hardenEntryAsync(
   if (!existsSync(targetPath)) { cache.delete(targetPath); return { ok: true }; }
   if (effectivePlatform() !== "win32") return { ok: true };
   if (memoSatisfied(cache, targetPath)) return { ok: true };
+  const deadline = nowFn() + resolveHardenDeadlineMs(opts.deadlineMs);
+  if (await existingAclAlreadyCompliantAsync(targetPath, directory, deadline)) return { ok: true };
   const memoKey = timeoutMemoKey(targetPath, opts);
   const timeoutMemoError = timeoutMemoErrorIfBlocked(memoKey, opts);
   if (timeoutMemoError) {
@@ -783,7 +1012,6 @@ async function hardenEntryAsync(
     return { ok: false, diagnostics: timeoutMemoError.message };
   }
 
-  const deadline = nowFn() + resolveHardenDeadlineMs();
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0 && deadline - nowFn() <= 0) break;

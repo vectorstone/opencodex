@@ -64,12 +64,69 @@ Authorization: Bearer <admin-token>
 | `GET /api/grok` | Grok 管理対象設定のステータスと候補モデルを読む | 400 ステータス読み取り失敗 |
 | `PUT /api/grok/selection` |除外された Grok モデルを永続化します。 400 個の無効な選択またはサイズが大きすぎる選択 |
 | `POST /api/grok/apply` |管理された同期を通じて永続的な Grok 設定を適用する | 409 `grok_apply_busy`; 400/500 適用失敗 |
+| `GET /api/grok/reset-coupons?accountId=...` | アクティブまたは指定された xAI アカウントの残り Grok 請求リセット トークンと有効期限ウィンドウを読む | 400 アカウントがありません; 401 未認証; 502 上流 gRPC-Web エラー |
+| `POST /api/grok/reset-coupons/consume` | 対象となるリセット クーポンを換金します。本文は `{ accountId?, tokenId?, operationId? }`。任意の `operationId`（UUIDv4）により換金は冪等になります: 同じ ID を繰り返すと、二重換金せずに永続化された結果を再生します。 | 400 無効な JSON/UUID; 401 未認証; 409 `identity_mismatch`; 502 上流エラー; 503 台帳容量 |
 | `GET, PUT /api/claude-desktop` | Claude Desktop のルーティング/ネイティブ プロファイルを読み取るか永続化する | 400 無効または使用できない割り当て |
 | `POST /api/claude-desktop/apply` |保存したプロファイルを Claude Desktop の管理対象設定に書き込みます。 400/500 書き込み失敗 |
 | `GET /api/claude-desktop/status` |保存済みプロファイルと適用済みプロファイルおよびデスクトップの健全性を検査する | 400 ステータス読み取り失敗 |
 | `GET, PUT /api/claude-code` |クロード コードのゲートウェイ、認証モード、モデル マップ、コンテキスト、エージェント、サイドカー設定の読み取りまたは更新 | 400 無効なフィールドまたは図形 |
 
+ダッシュボードは **Providers > xAI Grok > Accounts** から両方のクーポン パスを操作します。サインイン済みの各アカウント行には残りのクーポン数を示すチケット バッジがあり、バッジは有効期限ウィンドウを一覧し、期限が最も近いクーポンを換金するダイアログを開きます。ダイアログはクライアントが発行した `operationId` を送り、再試行せずタイムアウト後に送信を止めます。ジャーナル記録がまだ開いている換金は再実行されてしまうためです。`ocx account grok-reset-coupons` はターミナル側の同等コマンドです。
+
 モデルロスターと暗号化されたワーカータスクの動作の背後にある概念については、「[サブエージェントサーフェス](/guides/sub-agent-surface/)」を参照してください。
+
+### クライアント統合のロールバックジャーナル
+
+| メソッドとパス | 目的 | 主なエラー |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | ロールバック操作を一覧表示します。任意でクライアントを指定でき、各行にはサーバー計算の `deletable` が含まれます。 | 400 無効なクライアント |
+| `DELETE /api/client-integrations/journal?opId=...` | 古いロールバック操作を廃止し、可能ならスナップショットも削除します。成功時の `snapshotRemoved` が `false` の場合、保守処理で再試行されます。 | 400 `opId` なし、404 存在しないか廃止済み、409 そのクライアントの最新操作 |
+
+## 統合変更のプレビュー
+
+プレビューは変更を適用せずに内容だけを示します。スナップショットも所有権記録もジャーナルも
+ロックも復旧も、いっさい書き込みません。
+
+| メソッドとパス | 目的 | 主なエラー |
+| --- | --- | --- |
+| `POST /api/client-integrations/preview` | クライアント 1 つの `apply`、`overwrite`、`disable` を計画します。本文は `{ "clientId": "...", "operation": "..." }` | 400 不正なクライアントまたは操作、400 `invalid_aside_profile_path`、409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/restore/preview` | 取り消しを計画します。本文は `{ "opId": "...", "confirmDrift": false }` | 404 該当操作なし、400 `invalid_aside_profile_path`、409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/aside/profiles/{profileId}/preview` | Aside プロファイル 1 つの変更を計画します。`restore` には `opId` が必要です | 400 不正な本文またはプロファイル未指定、404 該当プロファイルまたは操作なし、409 `integration_preview_unavailable` |
+
+計画には `version`、`clientId`、`operation`、`state`、`foreignEdit`、`kind` と `path` の組からなる
+`changes`、不透明な `fingerprint`、`canApply`、`willChange` が含まれ、`refusalReason` と
+`profileId` は任意です。パスは管理対象スキーマのパスか、`$snapshot`、`$ownership`、`$journal`
+の固定表記で、実行時に決まる位置は `*` になります。設定値やファイルの場所、選ばれた項目の
+名前は返しません。
+
+`canApply` が真で `willChange` が偽なら、操作は成功しますが管理対象のクライアント文書は何も
+変わりません。すでに適用済みのものを適用した場合などです。
+
+Aside プロファイルの変更はこの場合でも一つだけ保存します。確認を送ると、クライアント文書に触れる
+前にそのプロファイルの同期設定が記録されるため、管理ブロックがすでにないプロファイルを無効にすると
+設定だけが保存され、文書とその履歴はそのまま残ります。
+
+`integration_preview_unavailable` は今使えるモデル一覧がないという意味です。プロキシを起動した
+直後もそうですし、設定やプロバイダーキャッシュが変わって以前の一覧を破棄した場合もそうです。
+`GET /api/client-integrations` を読むと、取得に成功し設定を特定できたときに用意されるので、
+通常はこれで解決しますが、必ず用意されるとはかぎりません。
+
+## プレビューした変更の確定
+
+変更要求の本文に `operation` と `planFingerprint` を一緒に送ります。両方送るか両方省くかの
+どちらかで、片方だけ、または要求と異なる操作を書いた場合は拒否します。Aside はプロファイル
+1 つにしか結び付けられません。1 つのフィンガープリントで複数ファイルの変更は説明できないから
+です。
+
+サーバーは書き込む前に計画し直し、確認した内容がもう当てはまらなければ新しい計画を添えて
+`409 integration_preview_stale` を返します。自動で再試行はしないので、新しい計画を見て判断し
+直してください。
+
+フィンガープリントは楽観的な確認であって権限ではありません。変更してよいかどうかは管理 API の
+認証と所有権の規則が決めます。
+
+削除時はジャーナルを書き換えず、トゥームストーンを追記します。現在の取り消し地点を
+残すため、各クライアントの最新操作はサーバー側で保護されます。
 
 ### コンボ
 
@@ -110,6 +167,7 @@ Authorization: Bearer <admin-token>
 | `GET /api/debug/injection-logs` |制限付きガイダンス挿入デバッグ エントリを読み取る | — |
 | `GET /api/claude/inbound-debug` | Claude インバウンドのデバッグ状態とエントリを読む | — |
 | `GET /api/usage` |範囲とクライアント サーフェスごとの使用状況を要約する |ストレージを読み取れない場合は、`error: "read_failed"` 概要を返します。
+| `GET /api/metrics` | 論理リクエスト、物理送信、復旧種別、所要時間、TTFT のプロセスローカル Prometheus テキストメトリクスを返します。ラベルはプロトコル、結果、復旧クラスの閉じた集合のみで、リクエストや認証情報の識別子は出力しません。 | 起動時に `metricsExport.enabled` が true でなければ 404。通常の管理認証が必要で、データプレーン認証情報ではアクセスできません。 |
 | `GET /api/storage` |バケットごとの Codex ストレージ使用量をスキャン |スキャン失敗時に `error: "scan_failed"` ペイロードを返します。
 | `POST /api/storage/cleanup/preview` |アーカイブされたセッションのクリーンアップをプレビューし、バインディング ダイジェストを返します。 400 `invalid_json` または `invalid_percent` |
 | `POST /api/storage/cleanup` |プレビューされたアーカイブ セットを隔離または完全に削除します。 400 無効な入力。 409 古い/ビジー/参照状態。 500 ファイルシステム/データベース障害 |
@@ -119,6 +177,10 @@ Authorization: Bearer <admin-token>
 | `GET, PUT /api/storage/cleanup-policy` |スケジュールされたクリーンアップ ポリシーとジョブの状態を読み取りまたは更新します。 400 無効なポリシー |
 | `POST /api/storage/cleanup-policy/run` |手動クリーンアップ ポリシーの実行を開始します。 409 `already_running`; 500`cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` |テスト専用ポリシー ストリーム フック | 404 `not_found` 利用できない場合 |
+
+行が既存のパーサーのサイズ上限を超えた場合、`GET /api/usage` と `GET /api/keys` は読み取れる行の集計を維持し、応答全体に `usageIncomplete: true` と `usageIncompleteReason: "oversized_rows"` を追加します。この診断はキャッシュや増分追記後も維持され、結果が空または一致なしでも返されます。再構築時には再計算されます。プロバイダー、モデル、API キーの識別子は短縮しません。フラグがないことは全行が有効だった証明にはなりません。`historyTruncated`、`entriesTruncated`、トークン測定カバレッジとは別の情報です。
+
+`models`、`providers`、および `days[].models` の各行にも `cacheHitRate` が含まれます。これは、プロバイダーのプロンプト キャッシュから供給された入力トークンの割合で、`[0, 1]` の範囲に制限されます。プロバイダーがキャッシュ テレメトリを報告しなかった場合、または行に入力トークンがない場合は、`0` ではなく `null` になります。「キャッシュ データなし」と「実際のヒット率 0%」は異なる事実であり、それらを同じように描画するチャートは誤解を招くためです。
 
 :::caution
 ストレージ クリーンアップ エンドポイントは、アーカイブされたセッション データを移動または完全に削除できます。必ず最初にプレビューして、返されたダイジェストを送信してください。回復が必要な場合は隔離を優先します。
@@ -132,10 +194,16 @@ Authorization: Bearer <admin-token>
 | `GET /api/models` |ダッシュボード/CLI モデルの行を返す |収集が飽和したときの `catalog_busy` |
 | `GET /api/client-config?client=...` |サポートされているファイル連携の読み取り専用クライアント設定を作成する | 400 クライアントがサポートされていません。 503 カタログは利用できません |
 | `PUT /api/disabled-models` |共有の無効モデル リストを置き換える | 400 無効な JSON |
-| `PUT /api/model-visibility` |プロバイダーレベルまたはモデルレベルの可視性をアトミックに変更 | 400 プロバイダー、スコープ、ターゲット、または本文が無効です。
+| `PUT /api/model-visibility` |プロバイダーレベルまたはモデルレベルの可視性をアトミックに変更 | 400 プロバイダー、スコープ、ターゲット、または本文が無効です。; 409 `initial_model_selection_pending` (モデル一覧を更新してから再試行してください。) |
 | `GET, POST /api/custom-models` |カスタム モデルをリストするか追加する | 400 個の無効なフィールド。 404 プロバイダーがありません。 409 複製モデル |
 | `PUT, DELETE /api/custom-models/{id}` | 1 つのカスタム モデルを編集または削除する | 400 個の無効な ID/フィールド。 404 が見つかりません。 409 複製モデル |
-| `GET, PUT /api/selected-models` |プロバイダーのホワイトリストと可用性を読み取るか、1 つのホワイトリストを置き換えます。 400 のプロバイダー/本体が欠落しています。 404 不明なプロバイダ |
+| `GET, PUT /api/selected-models` | プロバイダーの許可リストと可用性を読む、または許可リストを置き換える | 400 プロバイダー/本文の不足; 404 不明なプロバイダー; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | プリセット情報を読む、または preset/all/custom モードを選ぶ | 400 不正なモードまたは未提供のプリセット; 404 不明なプロバイダー; PUT 409 `initial_model_selection_pending` |
+
+手動モデルは、Models ダッシュボードで provider と model ID が一致する行を置き換えます。OpenAI の手動行は `openai/<model>` を維持し、表示状態を変更できます。削除すると、アカウント修飾子のないネイティブ行が復元されます。アカウント修飾付きのネイティブ行は別に保持されます。ネイティブルートやアカウントの権限は変更しません。OpenAI の非ネイティブ表示対象は、設定済みの手動モデルと一致する必要があります。
+
+
+信頼できる初回モデル一覧が確定するまで、有効な `PUT /api/selected-models` と `PUT /api/model-presets` も HTTP 409 とコード `initial_model_selection_pending` を返します。`GET /api/models` などでモデル一覧を更新し、取得に成功してから再試行してください。
 
 ### OAuth アカウント、プロバイダー キー、およびデータプレーン キー
 
@@ -173,6 +241,16 @@ Authorization: Bearer <admin-token>
 | `GET, PUT /api/provider-context-caps` |グローバル、全プロバイダー、または 1 つのプロバイダーのコンテキスト キャップを読み取りまたは更新します。 400 無効なリクエスト。 404 不明なプロバイダ |
 | `GET /api/provider-presets` |ランタイム レジストリから派生した GUI プロバイダー プリセットを返します。 — |
 
+コンテキスト上限のレスポンスには `caps`（有効な上限）と `values`（無効化後も保持される最後の選択値）が
+含まれます。`value` を指定せずにプロバイダーの上限を有効にすると選択値を復元し、初回はグローバルの
+`contextCapValue` を使います。OpenAI でも同様で、スイッチが特別な 922k モードを選ぶことはありません。
+有効な上限はすべてのネイティブウィンドウに適用されます。長いコンテキストに対応したモデルは、
+そのモデルが対応する上限まで拡張できます。
+`{ "value": 600000, "setAll": true }` はグローバル値と有効な上限だけを更新します。
+上限が無効なプロバイダーは選択値を保持し、後で有効にすると復元します。
+`value` なしの `{ "setAll": true }` は、設定済みの全プロバイダーの上限を現在のグローバル値で有効にし、
+保存された選択値も置き換えます。無効化しても選択値は再読み込み後まで保持されますが、制限としては適用されません。
+
 `provider_has_dependent_combos` は安全バリアです。プロバイダーを削除する前に、依存するコンボを削除または編集してください。
 
 ### サイドバーと同意に基づくアクション
@@ -193,7 +271,7 @@ Authorization: Bearer <admin-token>
 | --- | --- | --- |
 | `GET /api/system/memory` |スカラー プロセス、ヒープ、ストリーム、応答状態、ウォッチドッグ、およびアクティブ ターン メトリックを返します。 — |
 | `POST /api/system/restart` |クライアント インジェクションを削除せずに、ドレイン対応プロセスの再起動を開始します。 202 を返します。繰り返しの呼び出しにより、既存の排水が報告されます。
-| `POST /api/stop` |サービスを停止し、ネイティブ Codex を復元し、マネージド Grok インジェクションを削除し、プロキシをドレインします。 409 サービス所有権の競合 |
+| `POST /api/stop` | サービスを停止し、ネイティブ Codex を復元し、マネージド Grok インジェクションを削除し、プロキシをドレインします | 409 サービス所有権の競合、409 `respawnable_service`（Windows タスク スケジューラのラッパーがプロキシを再起動しうる状態で、呼び出し元が `ocx stop` でない場合。何も変更されません）、409 インストール済みマネージャが停止を拒否した場合、409 `service_state_unknown`（タスク スケジューラの状態を読み取れない場合。何も変更されません。クエリを修復して再試行してください） |
 
 ### Codex認証の委任
 
@@ -217,7 +295,7 @@ Authorization: Bearer <admin-token>
 | `PUT /api/codex-auth/failover` |アカウントのフェイルオーバーしきい値を設定する | 400 無効なしきい値 |
 | `GET /api/codex-auth/quota` |キャッシュされたクォータ状態をアカウントごとに読み取る | — |
 | `GET /api/codex-auth/reset-credits` |アカウントのリセット クレジット資格を検査する | 400 アカウント ID がありません。アップストリームステータスパススルー。 500 検索失敗 |
-| `POST /api/codex-auth/reset-credits/consume` |対象となるリセット クレジットを消費する | 400 アカウント ID がありません。アップストリームステータスパススルー。 503 `server_busy`; 500 消費失敗 |
+| `POST /api/codex-auth/reset-credits/consume` |対象となるリセット クレジットを消費する。任意の `operationId`（UUIDv4）を指定すると消費が冪等になります。同じ id は 2 つ目のクレジットを消費せず、保存済みの結果を 1 回再生します。 | 400 アカウント ID がありません、または `operationId` が不正です。id が別のアカウントに属する場合は 409 `identity_mismatch`。アップストリームステータスパススルー。 503 `server_busy`、`capacity`、`unavailable`; 500 消費失敗 |
 | `POST /api/codex-auth/login` | Codex のログインまたは再認証を開始する | 400 無効なリクエスト。競合/ビジー ログイン状態 |
 | `POST /api/codex-auth/login/code` | Codex ログイン フローの手動コードを送信する | 400 無効なフロー/コード |
 | `POST /api/codex-auth/login/cancel` | Codex ログイン フローをキャンセルする | — |
@@ -238,3 +316,7 @@ account の selector binding は残るため、欠落中の exact route は fail
 ## クライアントの選択
 
 通常の管理では、[ウェブダッシュボード](/guides/web-dashboard/) が最も安全なガイド付きワークフローを提供します。ヘッドレス ホストとオートメーションの場合は、対応する `ocx` コマンドを使用します。これらのコマンドは、これと同じライブ API を呼び出し、プロキシに到達できない場合、または操作が失敗した場合にゼロ以外の結果を返します。ダイレクト HTTP は、上記の正確なエンドポイント コントラクトを必要とする統合に最も役立ちます。
+
+## リモートセッションとデータキー更新
+
+`POST /api/keys/rotate {id}` は10分間の移行を開始し、新しい秘密値を一度だけ返します。`POST /api/keys/rotate/commit {id,rotationId}` で確定し、`DELETE /api/keys/rotate {id,rotationId}` で中止します。管理認証が必須で、データキーからは呼べません。`POST /api/session/logout` には現在の `gui-session`、一致する Origin、CSRF が必要です。管理トークンは 403 となり、同意セッションを作成できません。

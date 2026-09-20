@@ -74,6 +74,22 @@ Aliases change the public name clients request; they do not change the combo's s
 concrete provider/model selectors behind it.
 :::
 
+## Compaction after switching combos
+
+When a client compacts using a bare model name after switching combos, opencodex can recall the
+combo that most recently completed successfully on that conversation lane. The model must match
+the completed response, and the combo and its target must still exist in the current configuration.
+The request then follows normal combo selection and failover.
+
+Explicit provider/combo selectors and configured combo aliases take precedence over this recall.
+Failed, incomplete, or cancelled responses do not replace the last successful selection. Recall is
+process-local and bounded to 256 conversations for 30 minutes, and to 1 KiB per remembered model
+name and 64 KiB in total; expired entries are also cleaned up in the background. A response whose
+model name is too large to retain leaves the previous selection untouched rather than clearing it.
+Recall does not store account credentials.
+Without usable conversation identity or valid remembered state, normal compaction routing applies.
+A restart clears the remembered state.
+
 ## Codex Desktop native-allowlist compatibility
 
 Some Codex Desktop releases apply a remote native-only `available_models` allowlist after the
@@ -170,6 +186,27 @@ Weights are relative, not percentages. Weights `2,1` and `200,100` express the s
 small values that communicate intent.
 :::
 
+### Random: weighted draw per request
+
+`random` draws one eligible target per request, with odds proportional to `weight`. Every request
+is an independent draw, so traffic spreads across targets without the deterministic pattern or
+stickiness of round-robin. `stickyLimit` does not affect this strategy.
+
+### Least-used: favor the target with fewest successes
+
+`least-used` routes each request to the eligible target with the fewest successful requests
+recorded by this opencodex process. Counts start at zero on restart, and ties keep configuration
+order. Weights and `stickyLimit` do not affect this strategy.
+
+### Reset-window: follow the soonest quota reset
+
+`reset-window` routes each request to the eligible target whose cached provider quota snapshot
+shows the soonest upcoming window reset (five-hour, weekly, monthly, or custom). This spends the
+provider that refreshes first. Targets without fresh quota data, and ties, keep configuration
+order. Weights and `stickyLimit` do not affect this strategy.
+
+This ranking and provider exclusion before dispatch require fresh model-inference limits that apply to the current single API key as a whole. OAuth/current-account summaries, caller-forward routes, multiple keys, and snapshots with changed credentials or destinations are display-only for this early decision. The same applies when `Authorization`, `x-api-key`, or `x-goog-api-key` headers override credentials; search-only and MCP-only windows are excluded. If no eligible target has an applicable reset, configuration order wins. Account selection and retries still enforce their normal limits.
+
 ## What happens when a target fails
 
 Combo failures are divided into **hop** failures and **terminal** failures.
@@ -177,39 +214,97 @@ Combo failures are divided into **hop** failures and **terminal** failures.
 | Result | Behavior |
 | --- | --- |
 | HTTP 401, 403, 404, 408, 429, or any 5xx | Cool the target and hop to the next eligible target. |
+| HTTP 410 with an explicit model end-of-life, retired, deprecated, sunset, decommissioned, or no-longer-available signal | Cool that target and hop. Unrelated 410 responses remain terminal. |
 | Classified authentication, subscription, quota, rate-limit, overload, or upstream-server error | Cool the target and hop, even when the status alone is not sufficient. |
-| Client cancellation (499), `origin_rejected`, cyber-policy refusal, context overflow, or invalid request | Stop and return the error; another target would not make the request valid. |
+| Client cancellation (499), `origin_rejected`, cyber-policy refusal, context overflow, or other invalid request | Stop and return the error; another target would not make the request valid. |
+| Structured HTTP 400 rejecting optional `user`, an unsupported reasoning effort, or model-scoped image input | Hop before output commitment without cooling; see request-local target compatibility below. |
 | Any other unclassified error | Stop and return the error. |
 
-A hopped target enters cooldown for 60 seconds by default. If the upstream response includes a
-valid `Retry-After` value, opencodex uses it instead. Numeric seconds and HTTP-date values are
-accepted, and every cooldown is capped at 10 minutes.
+When `cooldownMs` is unset, a hopped target uses an upstream fallback: 5 seconds for request-rate
+429s with upstream code `1302` or `1305`, and 60 seconds otherwise. When it is set, `cooldownMs`
+applies whenever no usable upstream `Retry-After` or Codex reset signal exists, including those
+request-rate 429s. Numeric `Retry-After` seconds and HTTP-date values are accepted, and every
+cooldown is capped at 10 minutes. The precedence is, from strongest to weakest, explicit
+`Retry-After` → Codex reset headers (`x-codex-primary-reset-at`, `x-codex-secondary-reset-at`, or
+`x-codex-tertiary-reset-at`) → the combo's `cooldownMs` (when set) → the 5-second request-rate
+fallback for upstream rate-limit codes `1302`/`1305` → the 60-second default. A valid immediate
+`Retry-After: 0` remains an immediate upstream directive rather than being replaced by a configured
+cooldown.
 
-The current request never retries the same attempted target. Later requests skip it until its
-cooldown expires. If no eligible target remains, the proxy returns HTTP 503 with
-`error.code = "combo_unavailable"`.
+The current request never retries the same attempted target. Later requests skip a cooled target until its
+cooldown expires; request-local compatibility rejections do not cool the target. A `Retry-After` HTTP-date that is already in the past is also preserved as an
+immediate upstream directive, just like `Retry-After: 0`. Set `waitForCooldownMs` to allow a later
+request to wait for the earliest eligible target cooldown, up to that cap on each selection attempt,
+and then make one fresh selection. A request may therefore wait up to `hops × waitForCooldownMs`
+across multiple failover hops. The default is `0`, which fails closed immediately with HTTP 503 when
+every eligible target is cooling; that `combo_unavailable` 503 carries a `Retry-After` header equal
+to the earliest remaining cooldown, rounded up to whole seconds with a minimum of 1. Waits are not jittered, so
+synchronized wake-ups are possible. An aborted request cancels this wait and returns the normal
+`client_cancelled` response; it does not dispatch a backup target after cancellation. A combo target
+cooldown is process-local per-combo state and is separate from the account-level Codex quota cooldown
+used by native account routing.
 
 :::note
 Failover is intentionally bounded. It helps with target-specific availability, authentication,
 quota, and overload failures; it does not hide caller errors or policy refusals.
 :::
 
+For streaming requests, the upstream HTTP status is not the final decision. OpenCodex buffers a
+bounded pre-output prefix of the selected child's Responses SSE. If the stream reports a retryable
+`response.failed` terminal before any text, reasoning, tool call, or other output event, the child
+is recorded as failed and the combo may try its next eligible target. Once any output event begins,
+the target is committed: a later stream failure is returned to the client and is never replayed on
+another provider, which prevents duplicate text and tool execution. If the pre-output buffer reaches
+its safety cap without a terminal or output boundary, OpenCodex also commits the current target
+instead of growing memory without a bound.
+
+## Request-local target compatibility
+
+When routing Claude Code to the canonical ChatGPT Codex backend, OpenCodex removes the unsupported top-level `user` metadata field without changing the session/cache key, input messages, tool schemas, or safety identifiers. Public Responses API and noncanonical forward gateways keep that field.
+
+A combo can also advance after an intact HTTP 400 `invalid_request_error` that specifically rejects `user`, reports `unsupported_value` for `reasoning.effort`/`reasoning_effort`, or reports `param: input` with an exact model-scoped `does not support image inputs` rejection. This is a mismatch for that request, not evidence that the target is unhealthy, so it records no cooldown. This compatibility recovery does not silently change `none` into a different effort or broaden this exception to arbitrary invalid requests. Policy refusals, cancellation and already-committed output remain non-replayable. A single-target request still returns an unresolved upstream rejection.
+
 ## Default reasoning effort
 
-`defaultEffort` supplies `reasoning.effort` only when all of these are true:
+`defaultEffort` supplies a configured effort when the selected target has a known, nonempty supported ladder. With the default `defaultEffortMode: "fallback"`, an explicit caller effort keeps precedence. `defaultEffortMode: "force"` overrides a valid caller effort with the configured default; it requires a valid, non-null `defaultEffort` and can increase cost and latency. Force mode is an explicit operator choice through combo configuration or management.
 
-1. the combo has a non-null default;
-2. the caller did not set an effort; and
-3. the selected target's catalog advertises that exact effort.
+The target's advertised ladder remains authoritative. An exact supported value is retained; otherwise the highest supported rung at or below it is selected, or the lowest supported rung when none is lower. Unknown or empty ladders never cause default injection. Force mode does not repair malformed caller effort into a valid expensive request. Other reasoning fields, including `reasoning.summary`, are preserved.
 
-If the request has no `reasoning` object, opencodex creates one. If `reasoning` exists without an
-`effort` property, it preserves the other fields and adds the default. A caller-provided effort is
-never overwritten.
+`reasoningEffortMode` remains independent of `defaultEffortMode`: explicit empty ladders remove unsupported effort/thinking controls, and adaptive unknown ladders do so as well, as described below. Strict unknown ladders preserve the caller's request without forcing a default. Supported defaults are `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; omit `defaultEffort` or set it to `null` to disable default injection in fallback mode.
 
-When target capability is unknown or does not include the configured effort, opencodex omits the
-default and leaves the target's own behavior unchanged. Supported values are `low`, `medium`,
-`high`, `xhigh`, `max`, and `ultra`; omit the field or set it to `null` to leave effort entirely to
-the caller and target.
+### Mixed-capability groups (`reasoningEffortMode`)
+
+The effort levels a combo advertises are the intersection of what its targets advertise. A target
+that explicitly advertises **no** effort control takes part in that intersection, so a single
+no-effort backup empties the effort picker for the whole combo — including for the targets that do
+support tuning.
+
+Set `reasoningEffortMode: "adaptive"` to exclude those empty ladders from the published
+intersection instead. The picker then shows the levels the remaining targets share, and the
+no-effort target stays eligible for routing. Targets whose ladder is simply *unknown* are treated
+as wildcards in both modes.
+
+```json
+{
+  "combos": {
+    "mixed": {
+      "targets": [
+        { "provider": "openai-apikey", "model": "gpt-5.6-luna" },
+        { "provider": "local", "model": "no-effort-model" }
+      ],
+      "reasoningEffortMode": "adaptive"
+    }
+  }
+}
+```
+
+The default is `"strict"`, which keeps the original picker behavior. This setting does not change
+target order or failover policy. At dispatch, an explicitly empty target ladder has its unsupported
+effort/thinking controls removed in either mode while preserving supported non-effort reasoning fields
+such as `reasoning.summary`; `"adaptive"` applies the same normalization to an unknown target
+capability, while known non-empty targets keep their existing per-target effort resolution.
+In the dashboard it is the **Adaptive reasoning ladder** switch in a
+combo's Capabilities section.
 
 ## Image / multimodal capability
 
@@ -258,6 +353,10 @@ task workflow.
 Open the local dashboard and choose **Models → Combos**. The workspace creates, edits, renames, and removes
 combos, and its target picker excludes disabled models and nested combos.
 
+Each target also shows a live quota badge: **Available**, **Out of quota**, or **Quota unknown**. The editor blocks Save and Create for quota only when every usable target has a current server-confirmed exhausted inference limit for its configured credential. Display-only account, model, search and MCP quota, or missing or expired routing evidence, does not cause this block. The block expires at the applicable reset or freshness boundary and is rechecked when the page becomes active or visible; Refresh reloads both Combo data and quota. The dashboard
+editor does not yet expose `cooldownMs` or `waitForCooldownMs`; use the configuration file or management
+API until the follow-up UI work lands.
+
 ### CLI
 
 The primary commands are:
@@ -280,7 +379,12 @@ model alias and a non-empty display name. `create` and `update` are aliases for 
 Headless clients use `GET`, `PUT`, and `DELETE` on `/api/combos`. `GET` lists normalized combo
 definitions, `PUT` creates or replaces one (and can rename one), and `DELETE` takes the id query
 parameter. Authentication and request/response details are in the
-[Management API reference](/reference/management-api/).
+[Management API reference](/reference/management-api/). When a `PUT` body omits `cooldownMs`
+or `waitForCooldownMs`, the API preserves the value already stored for that combo; send an explicit
+value to change it. An explicit `cooldownMs` (even `60000`) is persisted as-is because it overrides
+the request-rate fallback. A stored `cooldownMs` can only be removed by editing the configuration file;
+`waitForCooldownMs` resets to its default when a `PUT` explicitly sends `0`, because the sparse
+serializer omits that default. Omission preserves both values and the dashboard does not expose them yet.
 
 For the complete persisted configuration, see [Configuration](/reference/configuration/).
 
@@ -308,10 +412,14 @@ Combos are stored in the top-level `combos` object, keyed by combo id:
 | Field | Required | Default | Rules |
 | --- | --- | --- | --- |
 | `targets` | Yes | — | Non-empty ordered array of configured `{ provider, model, weight? }` targets. Duplicate provider/model pairs are rejected. |
-| `targets[].weight` | No | `1` | Integer from 1 to 10,000. Used by round-robin; ignored by failover. |
-| `strategy` | No | `"failover"` | `"failover"` or `"round-robin"`. |
-| `stickyLimit` | No | `1` | Integer from 1 to 100 successful requests per round-robin selection. |
-| `defaultEffort` | No | `null` | `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; applied only when the caller omits effort and the target advertises support. |
+| `targets[].weight` | No | `1` | Integer from 1 to 10,000. Used by round-robin and random; ignored by failover, least-used, and reset-window. |
+| `strategy` | No | `"failover"` | `"failover"`, `"round-robin"`, `"random"`, `"least-used"`, or `"reset-window"`. |
+| `stickyLimit` | No | `1` | Integer from 1 to 100 successful requests per round-robin selection. Applies only to round-robin. |
+| `cooldownMs` | No | unset → upstream fallback (5 s for request-rate 429 codes `1302`/`1305`, otherwise 60 s) | Integer from 1 to 600000. When set, applies as the per-target cooldown whenever no usable upstream `Retry-After` or Codex reset signal exists, including request-rate 429s; when unset, uses the upstream fallback. |
+| `waitForCooldownMs` | No | `0` | Integer from 0 to 600000. Maximum time to wait for the earliest eligible cooling target before returning `combo_unavailable`; abort cancels the wait. |
+| `defaultEffort` | No | `null` | `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; resolved against each target's advertised ladder. |
+| `defaultEffortMode` | No | `"fallback"` | `"fallback"` preserves explicit caller effort. `"force"` overrides valid caller effort, requires a valid non-null default, and can increase cost and latency. |
+| `reasoningEffortMode` | No | `"strict"` | `"strict"` intersects every known target ladder, so one target advertising no effort control empties the combo's picker. `"adaptive"` excludes those empty ladders from the published intersection. At dispatch, explicit empty or adaptive unknown ladders remove unsupported effort/thinking controls while preserving supported non-effort reasoning fields such as `reasoning.summary`; known non-empty targets keep existing effort resolution. |
 | `imageInput` | No | `"auto"` | `"auto"` or `"disabled"`. `"auto"` publishes image support only when every target supports images; `"disabled"` forces text-only (drops image from published modalities and rejects image-bearing requests before dispatch). |
 | `alias` | No | none | Optional trimmed public model id; use the alias rules above. An empty value is stored as no alias. |
 | `nativeAlias` | No | `false` | Explicitly permit a currently supported bare native `alias` to take routing and catalog precedence. Never inferred from the alias. |
@@ -329,8 +437,11 @@ running opencodex instance that receives model requests.
 
 Every target is currently ineligible: for example, its provider is disabled, it is cooling down,
 it has already been attempted for this request, or an encrypted v2 task excludes it. Check target
-provider state and recent upstream errors. For cooldowns, wait for the 60-second default or the
-upstream `Retry-After` period (never more than 10 minutes), then retry.
+provider state and recent upstream errors. For cooldowns, follow an observed `Retry-After` value first;
+Codex reset headers also take precedence over `cooldownMs`.
+If neither upstream signal is usable, the configured `cooldownMs` applies, or the upstream fallback applies
+when it is unset (5 seconds for request-rate codes `1302`/`1305`, otherwise 60 seconds); every cooldown is
+capped at 10 minutes.
 
 ### Why was my alias rejected?
 

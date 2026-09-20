@@ -40,7 +40,7 @@ const OPENCODE_ENVELOPE_BASE = {
         npm: "@ai-sdk/openai-compatible",
         name: "OpenCodex",
         options: { baseURL: "http://127.0.0.1:10100/v1", apiKey: "{env:OPENCODEX_OPENCODE_API_KEY}" },
-        models: { "gpt-5.4": { name: "gpt-5.4 (native)" } },
+        models: { "gpt-5.5": { name: "gpt-5.5 (native)" } },
       },
     },
   },
@@ -57,7 +57,7 @@ const PI_ENVELOPE_BASE = {
   format: "json",
   mediaType: "application/json",
   // Pi keys its models as an ARRAY — the shape swap is what proves a real refetch.
-  config: { providers: { opencodex: { models: [{ id: "gpt-5.4" }, { id: "claude-sonnet-4-6" }] } } },
+  config: { providers: { opencodex: { models: [{ id: "gpt-5.5" }, { id: "claude-sonnet-4-6" }] } } },
 };
 
 /**
@@ -170,11 +170,13 @@ function rowButton(container: HTMLElement, name: string, label: string): HTMLBut
     .find(el => el.textContent?.trim() === label)!;
 }
 
-test("the API download surface includes DSH and MiniMax Code as clients", () => {
-  expect(CLIENTS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode"]);
+test("the API download surface includes DSH, MiniMax Code, Aside, Raycast and omo as clients", () => {
+  expect(CLIENTS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside", "raycast", "omo", "cline"]);
   expect(CLIENT_LABEL_KEYS.dsh).toBe("api.clientConfig.clientDsh");
   expect(CLIENT_LABEL_KEYS.mcode).toBe("api.clientConfig.clientMcode");
   expect(CLIENT_LABEL_KEYS.zcode).toBe("api.clientConfig.clientZcode");
+  expect(CLIENT_LABEL_KEYS.aside).toBe("api.clientConfig.clientAside");
+  expect(CLIENT_LABEL_KEYS.omo).toBe("api.clientConfig.clientOmo");
 });
 
 test("each row fetches its own client and its dialog renders that client's exact bytes", async () => {
@@ -215,6 +217,27 @@ test("the config bytes are not rendered at rest", async () => {
   await act(async () => { rowButton(container, "OpenCode", "Details").click(); });
   expect(container.querySelector(".awi-clientconfig-json")).not.toBeNull();
 
+  await act(async () => { root.unmount(); });
+});
+
+test("Cline details explain the two-file bundle instead of a single-file merge", async () => {
+  const config = { settings: { version: 1, providers: {} }, catalog: { version: 1, providers: {} } };
+  const envelope = {
+    ...OPENCODE_ENVELOPE,
+    client: "cline", filename: "cline-config-bundle.json",
+    destination: "/home/dev/.cline/data/settings/providers.json", apiKeyEnv: "",
+    exportHint: "Cline CLI bundle", config, text: JSON.stringify(config),
+  };
+  stubRoute(client => Response.json(client === "cline" ? envelope : OPENCODE_ENVELOPE));
+  const { root, container } = await mountPanel({ hasKeys: false });
+  await act(async () => { rowButton(container, "Cline CLI", "Details").click(); });
+  const dialog = container.querySelector("dialog")!;
+  expect(dialog.textContent).toContain("two-file bundle");
+  expect(dialog.textContent).toContain("Stop Cline");
+  expect(dialog.textContent).not.toContain("Merge this into the destination file.");
+  expect(dialog.textContent).not.toContain("Set the key before launching");
+  expect(dialog.querySelector(".awi-clientconfig-nokey")).toBeNull();
+  expect(JSON.parse(dialog.querySelector("pre")!.textContent!)).toEqual(config);
   await act(async () => { root.unmount(); });
 });
 
@@ -273,24 +296,48 @@ test("dialog closes on Escape and returns focus to its trigger", async () => {
 });
 
 test("each client row shows its own brand mark, never a borrowed one", async () => {
-  // OpenCode and Pi ship real assets; the clients added later have none yet and
-  // fall back to a monogram tile. The rule this guards is that no client ever
-  // borrows another product's logo — not that every client has an asset.
+  // Every client now ships a real first-party asset, two of them traced from the
+  // vendor's own raster. The rule this guards is that no client ever borrows
+  // another product's logo; uniqueness is the teeth, because a borrowed logo
+  // would show up twice. Completeness of the map is guarded separately in
+  // client-marks-assets.test.ts, and the monogram branch stays for the next
+  // client that arrives without an asset.
+  //
+  // A mark reaches the DOM one of two ways. A plated brand SVG is an <img>; a
+  // single-ink silhouette is a masked span so the theme supplies its color. Both
+  // are collected here, because asserting only <img> would let a masked mark go
+  // missing, or two of them collide, without failing.
   stubRoute(client => Response.json(client === "pi" ? PI_ENVELOPE : OPENCODE_ENVELOPE));
   const { root, container } = await mountPanel();
 
-  expect(row(container, "OpenCode").querySelector("img")?.getAttribute("src"))
-    .toBe("/provider-icons/opencode.svg");
+  // OpenCode is monochrome, so its mark is masked rather than an <img>.
+  const opencodeMark = row(container, "OpenCode").querySelector<HTMLElement>(".client-mark--mask");
+  expect(opencodeMark).not.toBeNull();
+  expect(opencodeMark!.style.maskImage || opencodeMark!.style.webkitMaskImage)
+    .toContain("/provider-icons/opencode.svg");
   expect(row(container, "Pi").querySelector("img")?.getAttribute("src"))
     .toBe("/provider-icons/pi.svg");
-  // Every rendered mark belongs to the client whose row it sits in.
-  const sources = [...container.querySelectorAll("img")]
-    .map(img => img.getAttribute("src"))
-    .filter((src): src is string => src !== null);
+  // Every rendered mark belongs to the client whose row it sits in, counting both
+  // rendering paths.
+  const imgSources = [...container.querySelectorAll("img")]
+    .map(img => img.getAttribute("src"));
+  const maskSources = [...container.querySelectorAll<HTMLElement>(".client-mark--mask")]
+    .map(node => {
+      const raw = node.style.maskImage || node.style.webkitMaskImage;
+      return raw.replace(/^url\(["']?/, "").replace(/["']?\)$/, "");
+    });
+  const sources = [...imgSources, ...maskSources]
+    .filter((src): src is string => src !== null && src !== "");
+  expect(sources.length).toBeGreaterThan(1);
   expect(new Set(sources).size).toBe(sources.length);
   // Marks are decoration: the row already names its client in text.
   for (const img of container.querySelectorAll("img")) {
     expect(img.getAttribute("alt")).toBe("");
+  }
+  // A masked mark is a bare span, so it must not announce itself either; the
+  // slot around it already carries aria-hidden.
+  for (const node of container.querySelectorAll(".client-mark--mask")) {
+    expect(node.textContent).toBe("");
   }
 
   await act(async () => { root.unmount(); });
@@ -456,7 +503,7 @@ test("one client's failure isolates to its row, with no partial JSON and the bas
   await act(async () => { root.unmount(); });
 });
 
-test("degraded line appears only when models ship without context limits", async () => {
+test("degraded line appears only when models ship without complete supported limits", async () => {
   // Retargeted into the dialog; the line must stay reachable, not stay put.
   stubRoute(client => Response.json(client === "pi" ? PI_ENVELOPE : OPENCODE_ENVELOPE));
   const { root, container } = await mountPanel();
@@ -467,7 +514,7 @@ test("degraded line appears only when models ship without context limits", async
 
   await act(async () => { rowButton(container, "Pi", "Details").click(); });
   expect(container.querySelector(".awi-clientconfig-degraded")?.textContent)
-    .toBe("1 of 2 model(s) ship without a context limit; the client applies its own defaults.");
+    .toBe("1 of 2 model(s) ship without complete supported limit metadata; the client applies its own defaults.");
 
   await act(async () => { root.unmount(); });
 });
@@ -484,6 +531,32 @@ test("no-key state is informational and leaves copy and download enabled", async
   await act(async () => { rowButton(container, "OpenCode", "Details").click(); });
   expect(container.querySelector(".awi-clientconfig-nokey")?.textContent)
     .toContain("OPENCODEX_OPENCODE_API_KEY has no key behind it yet");
+
+  await act(async () => { root.unmount(); });
+});
+
+test("keyless Gajae details do not ask users to generate an admission key", async () => {
+  const config = { providers: { opencodex: { apiKey: "opencodex-loopback", models: [] } } };
+  const envelope = {
+    ...OPENCODE_ENVELOPE,
+    client: "gajae",
+    apiKeyEnv: "",
+    exportHint: "No environment variable is required for the loopback-only Gajae integration.",
+    config,
+    text: JSON.stringify(config),
+  };
+  stubRoute(client => Response.json(client === "gajae" ? envelope : OPENCODE_ENVELOPE));
+  const { root, container } = await mountPanel({ hasKeys: false });
+
+  await act(async () => { rowButton(container, "gjc", "Details").click(); });
+  const dialog = container.querySelector("dialog")!;
+  expect(dialog.querySelector(".awi-clientconfig-nokey")).toBeNull();
+  expect(dialog.textContent).toContain(envelope.exportHint);
+  expect(dialog.textContent).not.toContain("Set the key before launching");
+  expect(dialog.textContent).not.toContain("environment variable named in the config");
+  expect(JSON.parse(dialog.querySelector("pre")!.textContent!)).toEqual(config);
+  expect(button(dialog, "Copy config").disabled).toBe(false);
+  expect(button(dialog, "Download").disabled).toBe(false);
 
   await act(async () => { root.unmount(); });
 });

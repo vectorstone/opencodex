@@ -13,6 +13,15 @@ const PROVIDER_ICON_ALIASES: Record<string, string> = {
   commandcode: "commandcode-color.svg",
   cursor: "cursor-color.svg",
   deepseek: "deepseek-color.svg",
+  /*
+   * One mark for the merged Devin provider. `devin` is Cognition's cloud; the
+   * former `devin-cli` row was folded into it (CLI-credential import is now
+   * devin's first login step), and `devin-cli` survives only as a deprecated
+   * alias that startup migration rewrites before the GUI ever sees it.
+   * Windsurf still publishes its own `W` app icon, but showing it next to a
+   * row labelled Cognition would name the retired brand.
+   */
+  devin: "devin.svg",
   firepass: "firepass-color.svg",
   fireworks: "fireworks-color.svg",
   github: "github-copilot-color.svg",
@@ -27,7 +36,11 @@ const PROVIDER_ICON_ALIASES: Record<string, string> = {
   "kimi-code": "kimi-color.svg",
   kiro: "kiro-color.svg",
   "lm-studio": "lm-studio-color.svg",
+  "meta-model": "meta.svg",
+  "meta-muse": "meta.svg",
   mistral: "mistral-color.svg",
+  minimax: "minimax.svg",
+  "minimax-cn": "minimax.svg",
   moonshot: "moonshot-color.svg",
   nvidia: "nvidia-color.svg",
   ollama: "ollama-color.svg",
@@ -38,16 +51,65 @@ const PROVIDER_ICON_ALIASES: Record<string, string> = {
   "opencode-go": "opencode.svg",
   "opencode-zen": "opencode.svg",
   openrouter: "openrouter-color.svg",
+  opper: "opper.svg",
   qianfan: "qianfan-color.svg",
+  /*
+   * Qoder Global and Qoder CN are one brand on two operators (BRIGHT ZENITH
+   * PRIVATE LIMITED and 通义云启（杭州）信息技术有限公司), the meta-model/meta-muse
+   * shape. codebuddy / codebuddy-cn deliberately have no alias: see the
+   * provider-icons README for the terms clause that forbids the Tencent mark.
+   */
+  qoder: "qoder.svg",
+  "qoder-cn": "qoder.svg",
   alibaba: "alibaba-color.svg",
   "alibaba-token-plan": "alibaba-color.svg",
   "alibaba-token-plan-intl": "alibaba-color.svg",
+  baseten: "baseten.svg",
+  bizrouter: "bizrouter.svg",
+  cerebras: "cerebras.svg",
+  crusoe: "crusoe.svg",
+  deepinfra: "deepinfra.svg",
+  digitalocean: "digitalocean.svg",
+  featherless: "featherless.svg",
+  hyperbolic: "hyperbolic.svg",
+  kilo: "kilo.svg",
+  nanogpt: "nanogpt.svg",
+  nebius: "nebius.svg",
+  neuralwatt: "neuralwatt.svg",
+  nous: "nous.svg",
+  novita: "novita.svg",
+  orcarouter: "orcarouter.svg",
+  "orcarouter-oauth": "orcarouter.svg",
+  packycode: "packycode.svg",
+  parallel: "parallel.svg",
+  sambanova: "sambanova.svg",
+  scaleway: "scaleway.svg",
+  siliconflow: "siliconflow.svg",
+  synthetic: "synthetic.svg",
+  together: "together.svg",
+  umans: "umans.svg",
+  venice: "venice.svg",
+  vultr: "vultr.svg",
+  litellm: "litellm.svg",
+  zenmux: "zenmux.svg",
+  /*
+   * Z.AI and Zhipu's BigModel are the same company on two brands. `zai` is the
+   * international GLM Coding Plan and the mark comes from z.ai; the two
+   * `zhipu-bigmodel*` ids are the mainland console, which publishes only a
+   * horizontal wordmark, so they borrow it rather than render a lockup squeezed
+   * into a 19px box.
+   */
+  zai: "zai.svg",
+  "zhipu-bigmodel": "zai.svg",
+  "zhipu-bigmodel-coding": "zai.svg",
   "qwen-cloud": "qwen-portal-color.svg",
   "vercel-ai-gateway": "vercel-ai-gateway-color.svg",
   vllm: "vllm-color.svg",
   xai: "grok.svg",
   "mimo-free": "xiaomi-color.svg",
+  mimo: "xiaomi-color.svg",
   xiaomi: "xiaomi-color.svg",
+  "xiaomi-mimo": "xiaomi-color.svg",
 };
 
 /**
@@ -73,15 +135,27 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   xiaomi: "Xiaomi",
   cursor: "Cursor",
   deepseek: "DeepSeek",
+  // "Devin", not the registry's "Cognition (Devin/Windsurf)". This label sits in
+  // a narrow provider rail beside one-word names like Cursor and Kimi, and the
+  // long form is the registry's disambiguation for an add-provider list, not a
+  // name to read at a glance. No "devin-cli" entry: it is a deprecated alias
+  // that startup migration rewrites to "devin" before the GUI reads config.
+  devin: "Devin",
   github: "GitHub",
   "github-copilot": "GitHub Copilot",
   "gitlab-duo": "GitLab Duo",
   openrouter: "OpenRouter",
+  opper: "Opper",
   "opencode-go": "OpenCode Go",
   "opencode-free": "OpenCode Free",
   "opencode-zen": "OpenCode Zen",
+  orcarouter: "OrcaRouter - API",
+  "orcarouter-oauth": "OrcaRouter - Auth",
+  packycode: "PackyCode",
   mistral: "Mistral",
   groq: "Groq",
+  "meta-model": "Meta Model API",
+  "meta-muse": "Muse Code",
   alibaba: "Alibaba Coding Plan",
   "alibaba-token-plan": "Alibaba Token Plan",
   "alibaba-token-plan-intl": "Alibaba Token Plan (Intl)",
@@ -95,6 +169,10 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   "qwen-cloud": "Qwen Cloud",
   siliconflow: "SiliconFlow",
   "tencent-coding-plan": "Tencent Cloud Coding Plan",
+  codebuddy: "CodeBuddy",
+  "codebuddy-cn": "CodeBuddy CN",
+  qoder: "Qoder",
+  "qoder-cn": "Qoder CN",
   "vercel-ai-gateway": "Vercel AI Gateway",
   vllm: "vLLM",
   litellm: "LiteLLM",
@@ -103,6 +181,8 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
 const PROVIDER_DISPLAY_NAME_KEYS: Record<string, TKey> = {
   "command-code": "provider.name.commandCodeAuth",
   commandcode: "provider.name.commandCodeApi",
+  orcarouter: "provider.name.orcaRouterApi",
+  "orcarouter-oauth": "provider.name.orcaRouterAuth",
   volcengine: "provider.name.volcengine",
   "volcengine-coding-plan": "provider.name.volcengineCodingPlan",
   "volcengine-agent-plan": "provider.name.volcengineAgentPlan",
@@ -128,6 +208,110 @@ export function providerIconSrc(provider: string, _hints?: ProviderIconHints): s
   void _hints;
   const icon = providerIconAlias(provider);
   return icon ? `/provider-icons/${icon}` : undefined;
+}
+
+/**
+ * Marks whose artwork is one neutral ink, so the ink has to come from the theme.
+ *
+ * Keyed by asset path, deliberately, and for the same reason `MASKED_MARKS` is on
+ * the client side: an asset reachable from two surfaces cannot be masked on one
+ * and drawn plain on the other without looking like a bug.
+ *
+ * Membership is a measurement, not a guess. Each of these renders a single fill
+ * that is either near-black or near-white, which means it disappears against one
+ * of the two tile surfaces (`--raised` resolves to #f4f4f4 light, #303030 dark).
+ * `zenmux` is #000, `synthetic` is #ffffff, `neuralwatt` is #081a17.
+ *
+ * A mark that carries real colour never belongs here. Masking discards every ink
+ * in the file and repaints the silhouette, so applying it to a palette is
+ * destructive in a way that still looks deliberate on screen.
+ */
+const MASKED_PROVIDER_ICONS: ReadonlySet<string> = new Set([
+  "cerebras.svg",
+  "deepinfra.svg",
+  "neuralwatt.svg",
+  "nous.svg",
+  "novita.svg",
+  "packycode.svg",
+  "opper.svg",
+  "siliconflow.svg",
+  "synthetic.svg",
+  "zenmux.svg",
+
+  /*
+   * Marks that predate this pass and were invisible on one tile the whole time.
+   *
+   * `opencode.svg` (#211e1e) and `kimi-color.svg` (#1a1a1a) are the same two files
+   * the client surface already masks -- the Integrations page fixed them and the
+   * provider rail kept drawing them plain, because the two surfaces had no shared
+   * decision. `grok.svg` is the same story one PR later. `ollama-color.svg`
+   * (#141414) and `vercel-ai-gateway-color.svg` (#000000) were never caught by
+   * either pass; the luminance guard found all five at once.
+   */
+  "grok.svg",
+  "kimi-color.svg",
+  "ollama-color.svg",
+  "opencode.svg",
+  "vercel-ai-gateway-color.svg",
+]);
+
+/**
+ * Marks that carry colour but whose dominant ink is near-black.
+ *
+ * These cannot be masked -- that would flatten a real palette -- and they cannot
+ * be left alone either: measured against the dark tile they land between 1.04:1
+ * and 1.59:1, which is invisible. `zai` is 1.04, `bizrouter` 1.08, `baseten` 1.59.
+ *
+ * The fix belongs to the tile rather than the file. A vendor's artwork is drawn
+ * unchanged on a constant light plate, which is what a favicon assumes anyway:
+ * every one of these was designed to sit on a page, not on a #303030 chip.
+ *
+ * `digitalocean.svg` looks like it belongs here and must not: its file carries
+ * its own `@media (prefers-color-scheme: dark)` rule that repaints the glyph
+ * #F4F5F5. A constant plate defeats that -- the file goes light-on-light and
+ * measures 1.01:1 -- so the one mark that solves this problem itself is left
+ * alone to do it. Check for an embedded media query before plating anything.
+ */
+const PLATED_PROVIDER_ICONS: ReadonlySet<string> = new Set([
+  "baseten.svg",
+  "kilo.svg",
+  "sambanova.svg",
+  "venice.svg",
+  "zai.svg",
+]);
+
+/**
+ * The same problem pointing the other way: colour artwork whose dominant ink is
+ * near-WHITE, drawn for a dark header and invisible on the light tile.
+ *
+ * Measured dominant luminance: `parallel` 1.00, `bizrouter` 0.98, `nebius` 0.87,
+ * `featherless` 0.87, `umans` 0.84, `hyperbolic` 0.84 -- all of which land near
+ * 1.0:1 against #f4f4f4. A light plate would make them worse, so they get a dark
+ * one, which is the surface their own designers assumed.
+ *
+ * Two plates rather than one theme-following plate on purpose: a plate that
+ * followed the theme would put light-ink art back on a light tile in light mode,
+ * which is the exact failure being fixed.
+ */
+const DARK_PLATED_PROVIDER_ICONS: ReadonlySet<string> = new Set([
+  "bizrouter.svg",
+  "featherless.svg",
+  "hyperbolic.svg",
+  "nebius.svg",
+  "parallel.svg",
+  "umans.svg",
+]);
+
+/** How a provider mark must be painted so it survives both themes. */
+export type ProviderIconPaint = "mask" | "plate" | "dark-plate" | "image";
+
+export function providerIconPaint(src: string | undefined): ProviderIconPaint {
+  if (!src) return "image";
+  const file = src.split("/").pop() ?? "";
+  if (MASKED_PROVIDER_ICONS.has(file)) return "mask";
+  if (PLATED_PROVIDER_ICONS.has(file)) return "plate";
+  if (DARK_PLATED_PROVIDER_ICONS.has(file)) return "dark-plate";
+  return "image";
 }
 
 /** Display label with proper brand casing when known; otherwise original name. */

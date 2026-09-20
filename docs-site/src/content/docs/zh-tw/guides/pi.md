@@ -23,19 +23,24 @@ ocx export --client pi
       "baseUrl": "http://127.0.0.1:10100/v1",
       "api": "openai-completions",
       "apiKey": "$OPENCODEX_API_KEY",
+      "compat": {
+        "sendSessionAffinityHeaders": true
+      },
       "models": [
         {
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
-          "contextWindow": 200000,
-          "maxTokens": 32000
+          "contextWindow": 1000000,
+          "maxTokens": 128000
         }
       ]
     }
   }
 }
 ```
+
+產生的 Pi 供應商設定會啟用 `compat.sendSessionAffinityHeaders`。合併或手動編輯供應商時請保留此設定：Pi 提供穩定的工作階段識別碼，OpenCodex 據此為標準 OpenCode Go 目標產生工作階段親和識別碼。當 `cacheRetention` 為 `none` 時，Pi 可能不傳送識別碼。
 
 模型 id 是代理的規範選擇器，因此路由模型顯示為 `provider/model`（`anthropic/claude-opus-5`），而原生 OpenAI slug 保持無前綴（`gpt-5.6-sol`）。`name` 後綴 — `(anthropic)`、`(native)`、`(routed)` — 正是讓來自不同上游的兩個同名模型在 Pi 的 picker 中可區分的關鍵。
 
@@ -81,9 +86,9 @@ export OPENCODEX_API_KEY=<your key>
 
 ## 模型後設資料
 
-`contextWindow` 與 `maxTokens` 僅在目錄回報權威上下文窗口時發出。若未回報，該模型的兩個欄位都會省略，Pi 會套用自身預設值；`ocx export` 會印出有多少列屬於該情況。
+`contextWindow` 與 `maxTokens` 是兩個獨立的權威能力欄位。只有對應值已知時才會輸出；缺少的值由 Pi 使用自己的預設設定。`ocx export` 會回報有多少模型缺少用戶端支援的完整限制組合。
 
-`maxTokens` 是滿足 schema 的 `32000` 預算，並限制在不超過上下文窗口，使得小上下文模型永遠不會被給予超過上下文的輸出量。它並非對任何特定模型真實最大值的聲明。
+`maxTokens` 來自精確的 provider 中繼資料或 custom model 的明確設定；當上下文視窗也已知時會向下限制到該視窗。OpenCodex 不再填入舊的 `32000` 佔位值。
 
 有兩個欄位刻意省略。`cost` 需要全部四個價格欄位，而 opencodex 對路由模型沒有價格資料 — 發出零值會斷言每個模型都是免費的。`reasoning` 在 Pi 中是 boolean，而目錄帶有 effort 階梯，將兩者互相映射會是猜測。
 

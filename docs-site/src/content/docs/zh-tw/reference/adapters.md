@@ -1,6 +1,6 @@
 ---
 title: 轉接器
-description: 七個 provider adapter 的目標、請求建置方式與各自特性。
+description: provider adapter 的目標、請求建置方式與各自特性。
 ---
 
 **adapter** 負責在 opencodex 的內部請求/回應模型與某個 provider 的 wire 格式之間轉換。每個
@@ -25,7 +25,7 @@ interface ProviderAdapter {
 ## `openai-chat`
 
 **目標：** OpenAI **Chat Completions**（`POST {baseUrl}/chat/completions`）以及所有相容 provider，
-包括 xAI、Kimi、DeepSeek、GLM、Groq、OpenRouter、Ollama（本機與雲端）等。
+包括 xAI、Kimi、DeepSeek、GLM、Groq、OpenRouter、Ollama（本機）等。
 **認證：** `key`（Bearer）。
 
 - 把內部訊息轉換成 OpenAI role；工具對映為 `{type:"function", function:{…}}` 和
@@ -36,6 +36,43 @@ interface ProviderAdapter {
   省略**該引數。
 - 流式輸出 `delta.content`（文字）、`delta.reasoning_content`（thinking）和
   `delta.tool_calls[]`，並收集 `usage`。
+- ClinePass 使用經即時驗證的 gateway 格式 `reasoning: { enabled: true, effort }`（關閉 reasoning
+  時為 `{ enabled: false }`）；其公開 API 文件目前未說明這個請求形狀。adapter 會保留請求的 `low`、
+  `medium`、`high`、`xhigh`、`max` 層級，接受來自 `delta.reasoning_content` 或 `delta.reasoning`
+  的 reasoning delta，以 `stream_options.include_usage` 請求串流 usage，並從非串流回應 envelope
+  讀取 usage。
+
+## `ollama-native`
+
+**目標：** Ollama 自身的 **Chat API**（`POST /api/chat`），而非其 OpenAI 相容介面。內建的
+`ollama-cloud` 提供者由 registry 選擇到此 adapter；也可以在另外命名的自訂 / 自架 Ollama
+提供者上設定 `adapter: "ollama-native"`。
+**驗證：** cloud / 自訂端點使用 `key`（Bearer）；loopback 或 `authMode: "local"` 端點不會
+收到任何憑證。
+
+- **registry 選擇具有決定性。** 內建 `ollama-cloud` 列保留 `https://ollama.com/v1` 作為
+  `/v1/models` 動態探索的基礎 URL，同時推論會正規化到 `POST https://ollama.com/api/chat`。
+  對該提供者列，設定中的 `adapter` 會被丟棄。一般內建本機 Ollama 仍在 `openai-chat`；為本機
+  或自架端點選擇 `ollama-native` 是明確的提供者設定決定，並依主機判別，因此非 Ollama 目的
+  地不會被默默改寫。
+- **模型中繼資料：** `/v1/models` 不攜帶任何模型級中繼資料，因此在正典 Ollama Cloud 上，
+  提供者會透過 *有界限的* `POST /api/show`（每回應 256 KiB、每請求 8 秒、並行 4、48 個請求、
+  整階段 12 秒期限）補上每個被探索 id 的真實 context window 與 vision 能力。show 請求同源
+  且絕不跟隨重新導向；失敗只會降級該模型，不會讓探索本身失敗。
+- **串流：** Ollama 原生 NDJSON。文字與 `message.thinking` delta 隨到隨轉發；回合僅在
+  `done: true` 終止記錄上完成，緩衝的 `done: false` 或缺少終端會完全抑制部分文字與工具呼叫。
+- **Reasoning：** 對映到 Ollama 原生 `think` 欄位（`low`/`medium`/`high`/`max`，外加布林值），
+  依模型宣告的層級夾限，並遵守上游設定的 `__omit__` sentinel 語義。
+- **圖像：** 在模型具備 vision 能力時，原樣放進訊息的 `images` 陣列送出；video 會被拒絕而非
+  誤送，遠端圖像 URL 不會被擷取。
+- **工具：** 以 Ollama 原生形狀宣告；串流 tool call 是 `arguments` 為物件的整呼叫記錄，
+  tool result 重播按 call id 與工具名嚴格配對。`tool_choice: "none"` 與 `auto` 正常運作；
+  **`required` 或精確名稱選擇會 fail closed**，因為 Ollama 的 `/api/chat` 沒有可用來強制它的
+  `tool_choice` 欄位。
+- **正典 Ollama Cloud 上拒絕結構化輸出。** Ollama 目前在文件中說明其 Cloud 不支援結構化輸出，
+  且 Cloud 不會強制 `format` 欄位，因此 OpenCodex 會讓該請求顯式失敗，而不是在 schema 指定的
+  請求上回傳不受約束的散文。本機 / 自訂 `ollama-native` 端點保留 Ollama 原生的 `format` 映射
+  （`json_object` → `"json"`，`json_schema` → schema 物件本身）。
 
 ## `openai-responses`
 
@@ -103,12 +140,17 @@ Kiro 的 assistant 文字本身沒有可靠的回合結束標記，但終止的 
 重複抑制嚴格限定為空白歸一化後的完全一致：改寫過的狀態更新可能改變本回合的結果（從"仍在進行"變成"已完成"），
 丟掉那句話比顯示一次表面重複更糟糕。
 
+當缺少只有使用者能提供的決定、資訊或說明而無法繼續時，契約要求把該問題透過完成工具送出並停止；
+這樣的回合同樣以結束回合的 `final_answer` 抵達，而不是 commentary 或用戶端工具呼叫。
+
 ### Reasoning effort
 
-`gpt-5.6-sol` 和 `claude-opus-5` 支援原生 effort，且請求欄位名不同。`low` / `medium` / `high` /
-`xhigh` / `max` 分別透過 `additionalModelRequestFields.reasoning.effort` 和
-`output_config.effort` 傳送。
-
+GPT-5.6 系列使用 `additionalModelRequestFields.reasoning.effort`，`claude-opus-5` 使用
+`additionalModelRequestFields.output_config.effort`。`gpt-5.6-luna` 和 `gpt-5.6-terra`
+只透過原生欄位傳送已驗證的 `low`、`medium`、`high` 和 `max`。
+這兩個模型的原生 `xhigh` 尚未驗證，因此仍使用原有的有界 thinking 指令模擬。
+`gpt-5.6-sol` 和 `claude-opus-5` 保留現有原生檔位（`low`、`medium`、`high`、`xhigh`、`max`）。
+其他 Kiro 模型使用模擬推理；提供 effort 選項不代表原生支援。
 
 ## `cursor`
 
@@ -122,8 +164,20 @@ Kiro 的 assistant 文字本身沒有可靠的回合結束標記，但終止的 
 - 經 content-addressed blob 重放對話狀態，把 server tool call 對映回 Codex，用 protobuf
   `GetUsableModels` RPC 發現即時 Cursor 模型，並且只在 run request 尚未 commit 到 wire 前重試。
 - Cursor 原生本機 filesystem/shell/network 執行預設被拒絕。顯式 `mcpServers` 與
-  `desktopExecutor` 整合分別需要 opt-in；`unsafeAllowNativeLocalExec` 會啟用更廣泛的內建
-  executor，並繞過 Codex 審批和 sandbox 語義。
+  `desktopExecutor` 整合分別需要 opt-in；`nativeLocalExec: "on"` 會啟用更廣泛的內建
+  executor，並繞過 Codex 審批和 sandbox 語義；舊的 `unsafeAllowNativeLocalExec: true` 僅在
+  `nativeLocalExec` 未設定時等效。
+
+## `devin`
+
+**目標：** Cognition 的 `exa.api_server_pb.ApiServerService/GetChatMessage`（`server.codeium.com`，Connect 串流）。
+**認證：** 來自 `provider.apiKey` 或轉送 authorization 標頭的 Devin/Cognition API 金鑰。登入會先嘗試匯入已安裝 Devin CLI 已持有的憑證：`devin auth login` 會完成 CLI 自身的 PKCE 登入並把 `devin-session-token` 寫入它自己的 `credentials.toml`，這與 `SeatManagementService.RegisterUser` 為瀏覽器登入簽發的憑證相同。沒有可用的 CLI 憑證時，登入回退到 Auth0 瀏覽器頁面，再透過 `RegisterUser` 把貼上的權杖換成長期金鑰。`devin-cli` 僅作為已棄用的別名保留：`ocx login devin-cli` 仍會路由到 `devin`，以舊 id 儲存的設定會在啟動時被重寫。
+
+- 使用 `runTurn` 而非一般的 fetch/parse 路徑。請求與伺服器事件由 `devin/cloud-direct/wire.ts` 手寫的 protobuf 分幀處理。
+- 以 `GetCascadeModelConfigs` 依帳號取得模型；方案未涵蓋的模型在清單階段就被濾除。
+- Cognition 對工具說明設有長度上限與完全比對的封鎖清單。轉接器會改寫已知語句並截斷過長說明。
+- 金鑰不會更新。失效後請重新執行 `ocx login devin`。
+- 即使走 CLI 匯入路徑，本機的也只有憑證，請求本身無論哪條路徑都發往 Cognition。早期版本曾在 `devin-cli` id 下提供第二個轉接器，把請求作為對本機 `devin acp` 子行程的 Agent Client Protocol 工作階段來執行，現已移除。仍引用該轉接器的已儲存設定會在啟動時重寫為 `devin`，包括 `"devin-acp"` 這類自訂名稱的列。
 
 ## `azure-openai`（別名：`azure`）
 

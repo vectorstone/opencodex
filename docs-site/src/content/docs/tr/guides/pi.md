@@ -31,19 +31,24 @@ export line, and how many models carry authoritative context limits.
       "baseUrl": "http://127.0.0.1:10100/v1",
       "api": "openai-completions",
       "apiKey": "$OPENCODEX_API_KEY",
+      "compat": {
+        "sendSessionAffinityHeaders": true
+      },
       "models": [
         {
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
-          "contextWindow": 200000,
-          "maxTokens": 32000
+          "contextWindow": 1000000,
+          "maxTokens": 128000
         }
       ]
     }
   }
 }
 ```
+
+Oluşturulan Pi sağlayıcılarında `compat.sendSessionAffinityHeaders` etkinleştirilir. Sağlayıcıyı birleştirirken veya elle düzenlerken bu ayarı koruyun: Pi sabit bir oturum kimliği gönderir ve OpenCodex bu kimlikten kanonik OpenCode Go hedefi için oturum yakınlığı üretir. `cacheRetention` değeri `none` olduğunda Pi kimliği göndermeyebilir.
 
 Model ids are the proxy's canonical selectors, so routed models appear as
 `provider/model`
@@ -118,11 +123,10 @@ window. When it does not, both fields are omitted for that model and Pi applies
 its own defaults;
 `ocx export` prints how many rows fell into that case.
 
-`maxTokens` is a schema-satisfying budget of `32000`, clamped down to the
-context window so a
-small-context model is never given more output than context. It is not a claim
-about any specific
-model's true maximum.
+`contextWindow` ve `maxTokens` birbirinden bağımsız, doğrulanmış yeteneklerdir. Her alan yalnızca
+değeri biliniyorsa yazılır; eksik değer için Pi kendi varsayılanını kullanır. `maxTokens`, kesin
+provider metadata'sından veya açık bir custom model değerinden gelir ve context biliniyorsa ona
+göre sınırlandırılır. Eski `32000` placeholder artık kullanılmaz.
 
 Two fields are deliberately absent. `cost` requires all four price fields and
 opencodex has no
@@ -150,5 +154,3 @@ A running opencodex proxy (`ocx start`) and Pi installed. `ocx export` reads the
 live catalog
 through the proxy's management API, so a config can never be emitted with an
 empty model list.
-
-

@@ -17,6 +17,10 @@
 
 export const OCX_COMPACTION_PREFIX = "ocx1:";
 
+export const OCX_NATIVE_REPLAY_RECOVERY_NOTE =
+  "Threads compacted through a routed provider can contain OpenCodeX-owned ocx1 state. "
+  + "Before resuming one through native Codex, run `ocx recover-history --ocx-compaction <thread-id> --yes`.";
+
 /** Mirrors codex-rs core/templates/compact/prompt.md (the local-compaction instruction). */
 export const COMPACT_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
@@ -32,6 +36,24 @@ Be concise, structured, and focused on helping the next LLM seamlessly continue 
 export const SUMMARY_PREFIX = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 
 export const OPAQUE_COMPACTION_NOTE = "[earlier conversation was compacted; the summary is stored in a format this model cannot read]";
+
+/**
+ * Item types in the compact wire family. Each carries an `encrypted_content` blob the client
+ * replays verbatim on every later turn, and the minting backend verifies it is unmodified.
+ *
+ * Keep this the only enumeration: a copy that listed just `compaction` let the response-side
+ * field backfill synthesize ids into the other two, which the client then replayed as "modified
+ * from the compact response".
+ */
+const COMPACTION_ITEM_TYPES: ReadonlySet<string> = new Set([
+  "compaction",
+  "compaction_summary",
+  "context_compaction",
+]);
+
+export function isCompactionItemType(type: unknown): boolean {
+  return typeof type === "string" && COMPACTION_ITEM_TYPES.has(type);
+}
 
 export function encodeCompactionSummary(summary: string): string {
   return OCX_COMPACTION_PREFIX + Buffer.from(summary, "utf-8").toString("base64");

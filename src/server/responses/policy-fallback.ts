@@ -1,11 +1,13 @@
 import { comboFailureDecision } from "../../combos/failover";
 import { readBoundedResponseBody } from "../../lib/bounded-body";
-import { readJsonRequestBody } from "../request-decompress";
 import { finishRequestAttempt, type RequestLogContext } from "../request-log";
+import { linkRequestSessionLane } from "../request-log-conversation";
 import type { OcxConfig } from "../../types";
 import type { RouteCandidateTrace, RouteDecisionTraceV1 } from "../../routing/trace";
 import { handleResponses as handleResponsesCore } from "./core";
 import { requestPacingOverloadResponse } from "./pacing-overload";
+import { captureExplicitOpenAiCallerAuth } from "../../providers/openai-sidecar";
+import { captureCallerDirectAuth } from "../../providers/caller-authorization";
 
 type CoreHandler = typeof handleResponsesCore;
 type CoreOptions = Parameters<CoreHandler>[3];
@@ -47,15 +49,24 @@ function requestWithCandidate(
   candidate: Pick<RouteCandidateTrace, "provider" | "model">,
 ): Request {
   const headers = new Headers(req.headers);
+  // The next candidate owns a different physical credential domain. Typed
+  // admission and any claimed Claude snapshot stay in caller-owned CoreOptions.
+  headers.delete("authorization");
+  headers.delete("chatgpt-account-id");
   headers.delete("content-encoding");
   headers.delete("content-length");
   headers.set("content-type", "application/json");
-  return new Request(req.url, {
+  const retryRequest = new Request(req.url, {
     method: req.method,
     headers,
     body: JSON.stringify({ ...rawBody, model: `${candidate.provider}/${candidate.model}` }),
     signal: req.signal,
   });
+  // A sessionless request keeps the lane it was already allocated. Without this the second
+  // candidate reaches OpenCode Go under a different x-opencode-session than the first attempt,
+  // which is the same conversation split the header exists to prevent.
+  linkRequestSessionLane(req, retryRequest);
+  return retryRequest;
 }
 
 function errorCodeFromText(text: string): string | undefined {
@@ -116,24 +127,32 @@ export async function handleResponsesWithPolicyFallback(
 ): Promise<Response> {
   const runCore = deps.runCore ?? handleResponsesCore;
   let requestBodyReadNotified = false;
-  const coreOptions: CoreOptions = options.onRequestBodyRead
-    ? {
-      ...options,
+  let storedPool401ReplayDispatched = false;
+  let rawBody: Record<string, unknown> | null = null;
+  const coreOptions: CoreOptions = {
+    ...options,
+    openAiSidecarAuth: options.openAiSidecarAuth === undefined
+      ? captureExplicitOpenAiCallerAuth(req.headers, config) : options.openAiSidecarAuth,
+    nativeCallerAuth: options.nativeCallerAuth === undefined
+      ? captureExplicitOpenAiCallerAuth(req.headers, config) : options.nativeCallerAuth,
+    callerDirectAuth: options.callerDirectAuth === undefined
+      ? captureCallerDirectAuth(req.headers, config) : options.callerDirectAuth,
+    ...(options.onRequestBodyRead ? {
       onRequestBodyRead: () => {
         if (requestBodyReadNotified) return;
         requestBodyReadNotified = true;
         options.onRequestBodyRead?.();
       },
-    }
-    : options;
-  let rawBody: Record<string, unknown> | null = null;
-  try {
-    const parsed = await readJsonRequestBody(req.clone());
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) rawBody = parsed as Record<string, unknown>;
-  } catch {
-    // Core owns the client-facing parse/decompression error.
-  }
-
+    } : {}),
+    onRequestBodyParsed: body => {
+      options.onRequestBodyParsed?.(body);
+      if (body && typeof body === "object" && !Array.isArray(body)) rawBody = body as Record<string, unknown>;
+    },
+    onStoredPool401ReplayDispatched: () => {
+      storedPool401ReplayDispatched = true;
+      options.onStoredPool401ReplayDispatched?.();
+    },
+  };
   let response: Response;
   try {
     response = await runCore(req, config, logCtx, coreOptions);
@@ -150,7 +169,7 @@ export async function handleResponsesWithPolicyFallback(
     candidateKey({ provider: initialTrace.selected.provider, model: initialTrace.selected.model }),
   ]);
 
-  while (await shouldHopPolicyCandidate(response, req.signal)) {
+  while (!storedPool401ReplayDispatched && await shouldHopPolicyCandidate(response, req.signal)) {
     if (req.signal.aborted) return response;
     const next = rankPolicyFallbackCandidates(initialTrace, tried)[0];
     if (!next) return response;

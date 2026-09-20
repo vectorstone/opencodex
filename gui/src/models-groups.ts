@@ -8,6 +8,18 @@ export type ProviderDiscoverySummary =
       httpStatus?: never;
     };
 
+export type ProviderEntitlementSummary =
+  | { status: "unavailable" }
+  | { status: "fresh" }
+  | { status: "unconfirmed-empty" }
+  | { status: "failed"; reason: "http-error"; httpStatus: number }
+  | {
+      status: "failed";
+      reason: "network-error" | "timeout" | "unparseable";
+      httpStatus?: never;
+    }
+  | { status: "expired-refresh-in-flight" };
+
 export interface ConfiguredProviderSummary {
   name: string;
   authMode?: string;
@@ -17,6 +29,7 @@ export interface ConfiguredProviderSummary {
   contextWindow?: number;
   modelContextWindows?: Record<string, number>;
   discovery?: ProviderDiscoverySummary;
+  entitlement?: ProviderEntitlementSummary;
 }
 
 export interface ProviderModelGroup<Row> {
@@ -37,6 +50,7 @@ export interface ProviderModelGroup<Row> {
   contextWindow?: number;
   modelContextWindows?: Record<string, number>;
   discovery?: ProviderDiscoverySummary;
+  entitlement?: ProviderEntitlementSummary;
 }
 
 export function buildProviderModelGroups<Row extends { provider: string; native?: boolean }>(
@@ -67,12 +81,14 @@ export function buildProviderModelGroups<Row extends { provider: string; native?
         provider,
         rows: providerRows,
         native: providerRows.length > 0 && providerRows.every(row => row.native === true),
-        nativeProviderGroup: providerRows.some(row => row.native === true),
+        nativeProviderGroup: providerRows.some(row => row.native === true)
+          || (provider === "openai" && configured?.authMode === "forward"),
         liveModels: configured?.liveModels !== false,
         configuredModels: configured?.models ?? [],
         contextWindow: configured?.contextWindow,
         modelContextWindows: configured?.modelContextWindows,
         discovery: configured?.discovery,
+        entitlement: configured?.entitlement,
       };
     })
     .sort((a, b) => {

@@ -22,7 +22,9 @@
 @import "./styles-usage-workspace.css";
 @import "./styles-claudecode-workspace.css";
 @import "./styles-apikeys-workspace.css";
+@import "./styles-codex-set.css";
 @import "./styles-compatibility-matrix.css";
+@import "./styles-remote-workspace.css";
 
 :root {
   /* default: follow the OS; [data-theme] below pins color-scheme so light-dark() obeys it */
@@ -253,15 +255,32 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   -webkit-backdrop-filter: var(--glass-blur);
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 6px 8px 14px; }
+/* The brand is a <button> (go home), and this stylesheet has no global button reset —
+   every control resets itself locally, the way .nav-item does. Without this the UA
+   defaults land: a grey buttonface plate, a 2px border that breaks the measured 320px
+   topbar row budget, a non-inheriting font, buttontext instead of --text on .name,
+   center text-align that shows up once .name ellipsizes, and -webkit-appearance:button
+   overriding the first two in WebKit. Layout stays with .brand; this rule only undoes
+   what the element type added. */
+.brand-home {
+  appearance: none; -webkit-appearance: none;
+  background: none; border: none;
+  font: inherit; color: inherit; text-align: left;
+  cursor: pointer;
+}
 /* logo is a white-on-transparent silhouette → recolor via mask with the theme text color so it
    stays visible in BOTH light and dark (a plain <img> was invisible white-on-white in light). */
 .brand-logo { width: 26px; height: 26px; flex-shrink: 0; background: var(--text);
   -webkit-mask: url(/logo.png) center / contain no-repeat; mask: url(/logo.png) center / contain no-repeat; }
-.brand .name { font-weight: var(--weight-semibold); font-size: var(--text-subtitle); letter-spacing: 0; line-height: 26px; }
+.brand .name { flex-shrink: 0; font-weight: var(--weight-semibold); font-size: var(--text-subtitle); letter-spacing: 0; line-height: 26px; }
 .brand .ver {
   font-family: var(--font-code); font-size: var(--text-micro); color: var(--muted); line-height: var(--leading-tight);
   background: var(--raised); border: 1px solid var(--border); padding: 2px 6px; border-radius: var(--radius-pill);
   align-self: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* [Decision Log]
@@ -328,9 +347,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 
 /* GitHub row: the label keeps the full-width link affordance, the two circular
    satellites (star, update) sit at the trailing edge without shrinking the label's
-   hover target. The update orb only exists when an update is available, so the row
+   hover target. That edge is the sidebar's 10px content inset, not the rail wall, so
+   the orbs stack under the lang chevron and the proxy orbs instead of hanging 10px
+   further out than both. The update orb only exists when an update is available, so the row
    is one or two circles wide — never a placeholder. */
-.sidebar-github-row { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.sidebar-github-row { display: flex; align-items: center; gap: 4px; min-width: 0; padding-right: 10px; }
 .sidebar-github-link { flex: 1 1 auto; min-width: 0; }
 .sidebar-github-actions { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 .sidebar-orb {
@@ -388,8 +409,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
    row with a quiet label. The stop control used to be a full-width button; pairing it
    with restart as icons keeps the foot from growing a fifth stacked row and puts the
    destructive action next to the recovery action it is most often confused with. */
-.sidebar-action-row { display: flex; align-items: center; gap: 4px; min-width: 0; padding: 8px 10px; }
-.sidebar-action-label { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: var(--text-control); }
+.sidebar-action-row { display: flex; align-items: center; gap: 4px; min-width: 0; padding-right: 10px; }
+/* Left padding matches .sidebar-link, plus the 16px icon + 9px gap gutter the
+   iconless label has to clear to sit in the same text column as its neighbours.
+   Owning the block padding here (rather than on the row) keeps the row the same
+   height as the other three, which the 28px orbs would otherwise inflate. */
+.sidebar-action-label { flex: 1 1 auto; min-width: 0; padding: 8px 10px 8px calc(10px + 16px + 9px); color: var(--muted); font-size: var(--text-control); }
 .sidebar-action-orbs { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 .sidebar-orb--danger { color: var(--red); }
 .sidebar-orb--danger:hover:not(:disabled) { background: var(--red-soft); color: var(--red); border-color: var(--red); }
@@ -442,6 +467,46 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   padding-inline: 36px;
 }
 .main-inner.main-inner--combos > .page-sub { margin-bottom: 10px; }
+
+/* Keep the Models tab strip border aligned with its tab buttons in the full-bleed layout. */
+.main-inner.main-inner--combos > .page-tabs {
+  margin-inline: 36px;
+  padding-inline: 0;
+}
+
+/*
+  Full-bleed is for the combos WORKSPACE grid only. Its loading and error fallbacks render
+  no `.combos-workspace-shell` (Combos.tsx returns a bare skeleton or an error notice), yet
+  `main-inner--combos` is applied on tab selection alone — so with no workspace to fill, the
+  lone subtitle/notice/retry stretched edge to edge (padding:0, max-width:none, flex column)
+  while every sibling Models tab stayed boxed. That is the "콤보만 영역이 이상해짐" report.
+
+  When no workspace shell is present, drop the full-bleed and box the page like the other
+  tabs: reset the container, its chrome inset, and the fill panel back to normal flow.
+*/
+/*
+  Each rule below is a SINGLE selector on purpose. Vite's Rolldown CSS minifier corrupts a
+  comma-separated selector list whose selectors carry `:not(:has(...))` — it emits a stray
+  `)` before the block and the browser then drops the whole rule. A single `:not(:has())`
+  selector minifies correctly, so the chrome inset is handled without a list: the container
+  drops its own horizontal padding and the page chrome keeps the 36px inline padding it
+  already gets above (`.main-inner--combos > .page-head` etc.), which the panel matches.
+*/
+.main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 32px 0 64px;
+  min-height: 0;
+  height: auto;
+  overflow: visible;
+  display: block;
+}
+.main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) > .models-tab-panel--fill:not([hidden]) {
+  flex: 0 1 auto;
+  height: auto;
+  display: block;
+  padding-inline: 36px;
+}
 
 /* ---- page header ---- */
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 6px; }
@@ -756,6 +821,16 @@ a.btn, a.btn:hover { text-decoration: none; }
 }
 /* Refresh icon spins while a sync is in flight (the `.spin` keyframes already exist). */
 .spin-icon { animation: spin 0.9s linear infinite; }
+/* The width cap needs two classes to beat `.notice { max-width: var(--prose-measure) }`,
+   which every toast also carries and which is declared LATER in this file. At equal
+   specificity source order won, so the toast resolved to 70ch (542px) rather than its
+   design width — visible as a toast wider than intended at desktop sizes. */
+.action-toast.notice {
+  /* Both halves of the original cap have to be restated here, not just the design width:
+     dropping the viewport term let the toast run to the screen edge at narrow widths
+     (measured left=0 at 430px, losing the 24px inset the right side keeps). */
+  max-width: min(480px, calc(100vw - 48px));
+}
 /* Toast dismiss affordance: quiet ghost button inside the notice row. */
 .action-toast-dismiss {
   flex: none;
@@ -1090,7 +1165,14 @@ select.input { appearance: none; }
 .select-dropdown {
   position: absolute; top: calc(100% + 4px); left: 0; z-index: var(--z-popover);
   min-width: 100%; max-height: 280px; overflow-y: auto;
-  background: color-mix(in oklab, canvas 84%, transparent);
+  /*
+    Opaque fill, not glass. A portaled menu opens over rows beneath its trigger
+    (Subagents → Settings: Preferred model covers the Tell Codex switch). A
+    translucent canvas mix let those controls show through and look like they
+    floated above every layer. Keep backdrop-filter for edge refraction only —
+    the fill itself must hide what sits behind the panel.
+  */
+  background: var(--surface);
   backdrop-filter: blur(20px) saturate(1.4);
   -webkit-backdrop-filter: blur(20px) saturate(1.4);
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -1152,7 +1234,47 @@ select.input { appearance: none; }
   -webkit-appearance: none;
 }
 .switch.on { background: var(--toggle-on-bg); border-color: var(--toggle-on-bg); }
+.switch.mixed { background: var(--amber-soft); border-color: var(--amber); }
 .switch:disabled { opacity: 0.6; cursor: default; }
+/* A labeled switch is ONE atomic flex item, which is what the bare 34px button was
+   before the label existed. Without flex: 0 0 auto the knob and its text become
+   separate shrinkable items in .models-provider-actions and the text collapses to a
+   min-content column.
+
+   The label lives INSIDE the button so the visible words are clickable, which means
+   the button can no longer be the 34x20 pill: that geometry moves to the ::before
+   track and the button becomes a transparent, borderless row wrapping track + text. */
+.switch.switch-labeled {
+  width: auto;
+  height: auto;
+  border: 0;
+  background: none;
+  border-radius: var(--radius-sm);
+  padding: 0;
+  gap: var(--space-1);
+  flex: 0 0 auto;
+  line-height: normal;
+}
+.switch.switch-labeled::before {
+  content: "";
+  width: 34px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--raised);
+  flex-shrink: 0;
+  box-sizing: border-box;
+  transition: background var(--motion-normal), border-color var(--motion-normal);
+}
+.switch.switch-labeled.on::before { background: var(--toggle-on-bg); border-color: var(--toggle-on-bg); }
+.switch.switch-labeled.mixed::before { background: var(--amber-soft); border-color: var(--amber); }
+/* The knob is absolutely positioned over the ::before track rather than laid out in
+   the button's flow, because the flow now also carries the label text. */
+.switch.switch-labeled { position: relative; }
+.switch.switch-labeled .knob { position: absolute; left: 3px; }
+.switch.switch-labeled.on .knob { transform: translateX(14px); }
+.switch.switch-labeled.mixed .knob { transform: translateX(7px); }
+.switch-labeled-text { white-space: nowrap; }
 .switch .knob {
   width: 14px;
   height: 14px;
@@ -1172,6 +1294,7 @@ select.input { appearance: none; }
   background: var(--toggle-dot-color);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12);
 }
+.switch.mixed .knob { transform: translateX(7px); }
 
 /* ---- misc ---- */
 .muted { color: var(--muted); }
@@ -1186,7 +1309,17 @@ select.input { appearance: none; }
 .empty svg { width: 30px; height: 30px; color: var(--faint); margin-bottom: 12px; }
 .empty .title { color: var(--text); font-weight: var(--weight-semibold); margin-bottom: 6px; }
 
-.notice { font-size: var(--text-control); line-height: var(--leading-body); padding: 9px 12px; border-radius: var(--radius-sm); margin-bottom: 14px; display: flex; align-items: center; gap: 8px; max-width: var(--prose-measure); }
+/*
+ `:not([hidden])`, not a bare `display: flex` — same cascade trap the combos panels hit.
+
+ The admin-token dialog mounts its error notice up front and hides it with the `hidden`
+ attribute until a token is actually rejected. `[hidden] { display: none }` is a
+ USER-AGENT rule, so an author `display: flex` here beat it and painted an empty red
+ bordered box the moment the dialog opened (#3483). Specificity never got a vote; origin
+ decided it. Scoping the display to `:not([hidden])` lets the UA rule win again.
+*/
+.notice:not([hidden]) { display: flex; }
+.notice { font-size: var(--text-control); line-height: var(--leading-body); padding: 9px 12px; border-radius: var(--radius-sm); margin-bottom: 14px; align-items: center; gap: 8px; max-width: var(--prose-measure); }
 .notice svg { width: 15px; height: 15px; flex-shrink: 0; }
 
 /* Portaled status toast — out of document flow so Providers (etc.) do not reflow. */
@@ -1284,12 +1417,14 @@ select.input { appearance: none; }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .sidebar { background: var(--rail); }
   .lang-toggle .select-dropdown { background: var(--rail); }
+  .select-dropdown { background: var(--surface); }
   .modal-card { background: var(--surface); }
 }
 @media (prefers-reduced-transparency: reduce) {
   body::before { display: none; }
   .sidebar { background: var(--rail); backdrop-filter: none; -webkit-backdrop-filter: none; }
   .lang-toggle .select-dropdown { background: var(--rail); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .select-dropdown { background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
   .modal-card { background: var(--surface); backdrop-filter: none; -webkit-backdrop-filter: none; }
   .modal-overlay { backdrop-filter: none; -webkit-backdrop-filter: none; }
 }
@@ -1498,6 +1633,13 @@ dialog.modal-overlay::backdrop {
 .codex-request-user-input-controls > .toggle { margin-left: auto; }
 .codex-request-user-input-feedback { flex: 1 0 100%; margin-top: -8px; color: var(--muted); font-size: var(--text-label); line-height: var(--leading-body); text-align: right; }
 .codex-request-user-input-feedback.is-error { color: var(--red); }
+/* Ultra Fast opt-in: same card-row idiom as the picker and request-user-input switches. */
+.codex-ultrafast-card { gap: 16px; flex-wrap: wrap; }
+.codex-ultrafast-copy { flex: 1 1 auto; min-width: 0; }
+.codex-ultrafast-copy .card-sub { padding: 2px 0 0; }
+.codex-ultrafast-controls { display: flex; align-items: flex-end; gap: 12px; flex: 0 0 auto; margin-left: auto; }
+.codex-ultrafast-feedback { flex: 1 0 100%; margin-top: -8px; color: var(--muted); font-size: var(--text-label); line-height: var(--leading-body); text-align: right; }
+.codex-ultrafast-feedback.is-error { color: var(--red); }
 .codex-account-picker-card { gap: 16px; flex-wrap: wrap; margin-top: 16px; }
 .codex-auth-advanced { margin-top: 8px; }
 .codex-auth-advanced__toggle {
@@ -1656,13 +1798,37 @@ dialog.modal-overlay::backdrop {
   z-index: 1;
 }
 
-.codex-auth-page-head { align-items: flex-start; }
+/* Let feedback wrap below the standalone page title when a translated message is
+   wider than the available row. Account actions use their own wrapping row below. */
+.codex-auth-page-head { align-items: flex-start; flex-wrap: wrap; row-gap: 8px; }
 .codex-auth-page-head__actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 10px;
   min-width: 0;
 }
+/* Once the cluster owns its own line the title no longer competes for width, so it
+   takes the full row rather than wrapping "Codex Auth" onto two lines. */
+.codex-auth-page-head > .page-title { flex: 1 1 auto; }
+/* The pause/refresh pair after it moved out of the page head. Right-aligned so it still
+   reads as chrome for the account list below rather than a heading of its own, and it
+   wraps because both labels grow substantially in several locales. */
+.codex-auth-actions-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.codex-quota-activation { gap: var(--space-4); flex-wrap: wrap; }
+.codex-quota-activation__copy { flex: 1 1 240px; min-width: 0; word-break: keep-all; }
+.codex-quota-activation__controls { display: flex; align-items: center; gap: var(--space-3); min-height: 44px; }
+.codex-quota-activation .is-error { color: var(--red); }
+.codex-quota-activation .toggle[aria-pressed="mixed"] .toggle-knob { transform: translateX(8px); }
 /* Account actions (pause / copy doctor / pause-exhausted): clearer hover than plain
    btn-ghost on card surface — same raised-hover + faint border as icon/list cues. */
 .codex-auth-action-btn:hover:not(:disabled) {
@@ -1721,7 +1887,8 @@ dialog.modal-overlay::backdrop {
 .account-pool-strategy-card > strong { display: block; margin: 0; }
 .account-pool-strategy-card > .card-sub,
 .account-pool-strategy-controls > .card-sub,
-.account-pool-strategy-controls .field .card-sub {
+.account-pool-strategy-controls .field .card-sub,
+.anthropic-pool-card__field .card-sub {
   /* Already inside the padded card — don't double-indent like account-card subs. */
   margin: 0;
   padding: 0;
@@ -1744,6 +1911,31 @@ dialog.modal-overlay::backdrop {
   white-space: nowrap;
   min-width: 0;
 }
+
+/*
+ * Claude account-pool card — the same inset `.account-pool-strategy-card` above already
+ * fixes, on the card that still had it. `.card` has no padding, so each child brings its
+ * own 16px: `.card-row`, `.card-sub` and `.setting-row` do, the warning box and the
+ * threshold field do not, so those two rendered flush against the card border.
+ *
+ * The warning takes margin, not padding: it is a bordered box, so its own padding insets
+ * the text and leaves the border itself on the card edge. The field takes padding — the
+ * `.input` inside is full-width, so the field owns the inset for the whole group.
+ */
+.anthropic-pool-card { margin-top: 12px; }
+.anthropic-pool-card__notice {
+  margin: 10px 16px 0;
+  padding: 10px 16px;
+  border: 1px solid var(--border, #c9a227);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--warn, #c9a227) 12%, transparent);
+}
+.anthropic-pool-card__field {
+  display: block;
+  margin-top: 12px;
+  padding: 0 16px;
+}
+.anthropic-pool-card__field--quota-window { padding-bottom: var(--space-4); }
 .api-active-keys-skeleton {
   min-height: 96px;
   border: 1px solid var(--border-soft);
@@ -1760,12 +1952,13 @@ dialog.modal-overlay::backdrop {
   background: light-dark(#fffbeb, color-mix(in oklab, var(--amber) 20%, var(--surface)));
   color: light-dark(#92400e, #fef3c7);
   border: 1px solid color-mix(in srgb, var(--amber) 32%, transparent);
-  display: flex;
   align-items: center;
   gap: 6px;
   margin-bottom: 12px;
   max-width: var(--prose-measure);
 }
+/* Same UA-vs-author `[hidden]` rule as `.notice` above: `.notice-warn` is used on its own. */
+.notice-warn:not([hidden]) { display: flex; }
 .notice-warn svg { width: 14px; height: 14px; flex-shrink: 0; color: var(--amber); }
 
 .startup-runtime-notice__text,
@@ -1779,13 +1972,18 @@ dialog.modal-overlay::backdrop {
 .codex-pool-strategy-card .card-sub { padding: 0; }
 /* Inline selection-order row on an account card: label and trigger share one line, and the
    trigger is scaled down to the card's hint text so it reads as part of the card, not a form. */
+/* Per-account ⋯: a labelled disclosure in the action row (no menu role). Its body sits on its
+   own line under the actions so the revealed controls keep DOM tab order. */
+.codex-account-more { display: inline-flex; flex-wrap: wrap; align-items: center; }
+.codex-account-more > summary { list-style: none; cursor: pointer; min-width: 28px; justify-content: center; }
+.codex-account-more > summary::-webkit-details-marker { display: none; }
+.codex-account-more-body { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex-basis: 100%; padding-top: 6px; }
 .codex-account-identity { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 16px 6px; min-width: 0; }
 .codex-account-identity-copy { font-size: var(--text-label); line-height: var(--leading-body); color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
 .codex-account-priority { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0; min-width: 0; flex: 0 0 auto; }
 .codex-account-priority-label { font-size: var(--text-label); color: var(--muted); font-weight: var(--weight-medium); white-space: nowrap; }
 .codex-account-priority .select-trigger { max-width: 100%; padding: 4px 9px; font-size: var(--text-label); }
 
-.startup-page-sub { margin-bottom: 0; }
 .startup-page-head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .startup-runtime-notice-slot {
   margin-bottom: 12px;
@@ -1803,8 +2001,10 @@ dialog.modal-overlay::backdrop {
   box-sizing: border-box;
 }
 /* Message above, command+copy below. */
-.notice.notice-warn.startup-runtime-notice {
+.notice.notice-warn.startup-runtime-notice:not([hidden]) {
   display: flex;
+}
+.notice.notice-warn.startup-runtime-notice {
   flex-direction: column;
   align-items: stretch;
   gap: 8px;
@@ -1837,8 +2037,12 @@ dialog.modal-overlay::backdrop {
 .startup-hero-icon svg { width: 21px; height: 21px; }
 .startup-hero-copy h3 { margin: 10px 0 4px; font-size: var(--text-title); }
 .startup-hero-copy p { margin: 0; color: var(--muted); line-height: var(--leading-body); max-width: var(--prose-measure); }
-.startup-state-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
-.startup-state-grid .value { font-size: var(--text-subtitle); }
+.startup-state-line { margin: 8px 0 0; font-size: var(--text-control); }
+.startup-recovery-details > summary { cursor: pointer; list-style: none; display: inline-flex; align-items: center; gap: 6px; }
+.startup-recovery-details > summary::-webkit-details-marker { display: none; }
+.startup-recovery-details > summary::before { content: ""; width: 0; height: 0; border-left: 5px solid var(--muted); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform var(--motion-fast); }
+.startup-recovery-details[open] > summary::before { transform: rotate(90deg); }
+.startup-recovery-details[open] > summary { margin-bottom: 8px; }
 .startup-details, .startup-actions { margin-bottom: 16px; }
 .startup-actions .panel-head > svg { width: 18px; height: 18px; flex: 0 0 auto; }
 .startup-detail-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid var(--border-soft); }
@@ -1856,7 +2060,6 @@ dialog.modal-overlay::backdrop {
 .startup-command-row code { color: var(--muted); font-size: var(--text-label); overflow-wrap: anywhere; }
 .startup-action-notice { margin: 14px 0 0; }
 @media (max-width: 700px) {
-  .startup-state-grid { grid-template-columns: 1fr; }
   .startup-command-row { align-items: flex-start; }
   .startup-detail-row { align-items: flex-start; }
   .startup-detail-row > .startup-detail-actions { flex-direction: column; align-items: flex-end; }
@@ -1886,15 +2089,36 @@ dialog.modal-overlay::backdrop {
 table.logs-table {
   width: 100%;
   min-width: 1100px;
+  table-layout: fixed;
 }
+.logs-table col.logs-col-time { width: 12%; }
+.logs-table col.logs-col-tokens { width: 9%; }
+.logs-table col.logs-col-rate { width: 7%; }
+.logs-table col.logs-col-cost { width: 8%; }
+.logs-table col.logs-col-model { width: 15%; }
+.logs-table col.logs-col-effort { width: 9%; }
+.logs-table col.logs-col-provider { width: 13%; }
+.logs-table col.logs-col-status { width: 8%; }
+.logs-table col.logs-col-request { width: 11%; }
+.logs-table col.logs-col-duration { width: 8%; }
 .log-col-rate { min-width: 7ch; white-space: nowrap; }
 .log-col-cost { min-width: 10ch; white-space: nowrap; }
+/* table-layout: fixed sizes the columns but does not clip them: a cell whose content is wider
+   than its <col> paints straight over the neighbour (seen as "US$0.1401claude-fable-5-1" and a
+   "reasoning_effort=high" caption sitting under the provider name). Clip at the cell so an
+   overlong value truncates inside its own column instead. */
+.logs-table tbody td { overflow: hidden; }
+.log-reasoning-cell { overflow-wrap: anywhere; }
 .log-status-cell { display: inline-flex; flex-direction: column; align-items: flex-start; gap: var(--space-0-5); min-width: 7ch; line-height: var(--leading-tight); }
 .log-detail-btn {
   background: none; border: none; padding: 0; cursor: pointer;
   color: var(--accent-hover); font: inherit; font-size: var(--text-caption); text-decoration: underline;
-  white-space: nowrap;
+  /* Wraps rather than clips: with the cell now clipping overflow, a nowrap label such as
+     zh-TW's 檢視詳細資料 would lose its tail in the 8% status column. */
+  white-space: normal;
+  text-align: left;
 }
+.log-detail-btn:focus-visible { outline-offset: -2px; }
 
 /* Logs page layout rhythm — keep spacing in CSS so virtualized rows don't flood inline px. */
 .logs-auto-refresh {
@@ -1911,6 +2135,13 @@ table.logs-table {
   gap: var(--space-2);
   margin-bottom: var(--space-3);
 }
+.logs-filter-status { display: inline-flex; align-items: center; gap: var(--space-2); margin-left: auto; }
+.logs-toolbar-secondary { margin-top: calc(var(--space-1) * -1); }
+.logs-filter-container { min-width: 0; }
+.logs-filter-container .logs-filter-field { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+.logs-filter-container .logs-filter-field .input { min-width: 0; max-width: 100%; }
+.logs-filter-container .logs-filter-status { flex-wrap: wrap; max-width: 100%; }
+.logs-filter-container .logs-segmented { max-width: 100%; flex-wrap: wrap; }
 
 .logs-segmented {
   display: inline-flex;
@@ -1944,7 +2175,14 @@ table.logs-table {
 
 .logs-table-wrap {
   overflow-y: auto;
-  max-height: calc(100vh - 260px);
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
+  /* `dvh`, not `vh`: static `vh` resolves against the LARGE viewport, so on mobile the
+     cap is computed for a viewport taller than the one the user can see and the last rows
+     sit under the browser chrome. The rest of the shell already moved to `100dvh`
+     (see .app, .sidebar, .main-inner--combos, and the mobile drawer), so this was the
+     outlier rather than the convention. */
+  max-height: calc(100dvh - 260px);
 }
 
 .logs-table thead {
@@ -2042,6 +2280,35 @@ table.logs-table {
 .prov-title { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; flex-wrap: wrap; min-width: 0; }
 .provider-icon { width: 31px; height: 31px; border-radius: var(--radius-xs); flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; background: var(--raised); border: 1px solid var(--border-soft); color: var(--text); }
 .provider-icon img { width: 19px; height: 19px; object-fit: contain; display: block; }
+
+/* A single-ink mark painted with the surrounding text colour, so it follows the
+   theme instead of vanishing into one of the two tiles. The tile already sets
+   `color: var(--text)`, so this needs no property of its own. */
+.provider-icon-mask {
+  width: 19px;
+  height: 19px;
+  display: block;
+  background: currentColor;
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+}
+.provider-icon-sm .provider-icon-mask { width: 15px; height: 15px; }
+
+/* Artwork that carries real colour but is dominantly near-black: measured between
+   1.04:1 and 1.59:1 against the dark tile, which is invisible. Masking would
+   flatten the palette, so the vendor's own colours are kept and given the light
+   plate every favicon already assumes it will sit on. */
+.provider-icon--plate { background: #f4f4f4; border-color: rgba(0, 0, 0, 0.12); }
+
+/* The mirror case: artwork drawn in near-white for a dark header, which is
+   invisible on the light tile at roughly 1.0:1. It gets the dark surface its own
+   designers assumed. A theme-following plate would not work -- it would put
+   light-ink art back on a light tile in light mode. */
+.provider-icon--plate-dark { background: #1c1c1c; border-color: rgba(255, 255, 255, 0.14); }
 .prov-meta { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; }
 .prov-meta > span { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .provider-quota { padding-left: 58px; }
@@ -2129,6 +2396,18 @@ button.prov-account-row.active { cursor: default; }
     -webkit-backdrop-filter: var(--glass-blur);
   }
   .mobile-topbar .brand { flex: 1 1 auto; min-width: 0; padding: 4px; }
+  /* A flex item only shrinks past its content when it carries `min-width: 0` itself.
+     The brand had it; its children did not, so `.name` held its intrinsic width and
+     `.ver` was pushed under the action orbs. Giving `.name` the shrink is necessary
+     but not sufficient: at 320px the row budget is 44 (menu) + 26 (logo) + 56 (badge)
+     + 94 (actions) + gaps, which leaves the product name about 38px — "op…". The
+     badge is the thing to drop instead. It is duplicated in the drawer brand, and a
+     truncated product name is worse than a version the user can still read one tap
+     away. */
+  .mobile-topbar .brand .name {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .mobile-topbar .brand .ver { flex-shrink: 1; }
   .mobile-topbar .stop-toggle { width: auto; min-width: 44px; min-height: 44px; justify-content: center; padding: 8px; }
   /* Both orbs keep the 44x44 touch target the single stop button had; a bare 28px
      .sidebar-orb would be a regression on the surface where it matters most. */
@@ -2160,6 +2439,28 @@ button.prov-account-row.active { cursor: default; }
   .main-inner.main-inner--combos > .page-head,
   .main-inner.main-inner--combos > .page-tabs,
   .main-inner.main-inner--combos > .page-sub { padding-inline: 18px; }
+  .main-inner.main-inner--combos > .page-tabs {
+    margin-inline: 18px;
+    padding-inline: 0;
+  }
+  .main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) > .models-tab-panel--fill:not([hidden]) {
+    padding-inline: 0;
+  }
+  .main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) {
+    padding: 22px 18px 48px;
+  }
+  .main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) > .page-head {
+    padding-inline: 0;
+  }
+  .main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) > .page-tabs {
+    padding-inline: 0;
+  }
+  .main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) > .page-sub {
+    padding-inline: 0;
+  }
+  .main-inner.main-inner--combos:not(:has(.combos-workspace-shell)) > .page-tabs {
+    margin-inline: 0;
+  }
   /* settings rows: copy takes the full width, controls drop underneath */
   .setting-row { flex-wrap: wrap; }
   .setting-row .setting-copy { flex: 1 1 100% !important; }
@@ -2189,6 +2490,45 @@ button.prov-account-row.active { cursor: default; }
 /* Top-align with Storage: centering against the taller filter chips dropped the "Usage" title. */
 .usage-head { flex-wrap: wrap; align-items: flex-start; }
 .usage-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+/* Custom range: a disclosure, not a second filter row. It reuses the chip language of the
+   segmented presets above it so the page reads as one control area, and the panel is
+   `width: max-content` because a four-control form stretched to 1200px is what made the old
+   flex-end row look like a stray band across the page. */
+.usage-range { display: grid; justify-items: start; gap: 8px; margin: 10px 0 4px; }
+.usage-range-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; max-width: 100%; }
+.usage-range-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: var(--control-sm); padding: 4px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+  background: var(--surface); color: var(--muted);
+  font: inherit; font-size: var(--text-label); font-weight: var(--weight-medium);
+  white-space: nowrap; cursor: pointer;
+  transition: color var(--motion-fast), background var(--motion-fast), border-color var(--motion-fast);
+}
+.usage-range-toggle:hover { background: var(--raised); color: var(--text); }
+.usage-range-toggle[aria-expanded="true"] { color: var(--text); }
+.usage-range-toggle.is-active { border-color: var(--accent); color: var(--text); }
+.usage-range-chevron { flex: 0 0 auto; transition: transform var(--motion-fast); }
+.usage-range-toggle[aria-expanded="true"] .usage-range-chevron { transform: rotate(90deg); }
+.usage-range-applied { margin: 0; min-width: 0; }
+.usage-range-panel {
+  display: grid; gap: 10px; width: max-content; max-width: 100%;
+  padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+/* `align-items: end` is the fix for the old row: a label+input stack is twice the height of a
+   `btn-sm`, so centering left Apply and Clear floating beside the middle of the fields.
+   Every track is `auto` on purpose. A fixed 200px cap does not survive contact with a
+   `datetime-local` control: its intrinsic minimum is about 206px in Chrome at this font size,
+   and it grows again for locales whose date format is longer than `mm/dd/yyyy`. The fields
+   then overflow their tracks and eat the gap, which is the exact rhythm defect this block
+   exists to fix. */
+.usage-range-fields { display: grid; grid-template-columns: repeat(4, auto); justify-content: start; align-items: end; gap: 8px; }
+.usage-range-field { display: grid; gap: 4px; min-width: 0; }
+.usage-range-field .field-label { margin: 0; }
+.usage-range-fields .input { height: var(--control-md); padding-block: 0; }
+.usage-range-action { min-height: var(--control-md); }
+.usage-range-panel > p { margin: 0; }
 .usage-segmented { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 2px; gap: 2px; background: var(--surface); }
 .usage-segmented-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: none; background: transparent; color: var(--muted); padding: 4px 12px; border-radius: var(--radius-pill); cursor: pointer; font: inherit; white-space: nowrap; }
 .usage-segmented-btn.active { background: var(--raised); color: var(--text); font-weight: var(--weight-semibold); }
@@ -2210,9 +2550,21 @@ button.prov-account-row.active { cursor: default; }
 
 @media (max-width: 640px) {
   .usage-source-btn .usage-source-label-collapsible { display: none; }
+  /* Two 200px columns plus both actions stop fitting a phone content width; the panel takes
+     the full row and every control keeps the same height it has on desktop. */
+  .usage-range-panel { width: 100%; }
+  .usage-range-fields { grid-template-columns: minmax(0, 1fr); }
+  .usage-range-action { width: 100%; }
 }
 
 @media (max-width: 360px) {
+  /* The topbar row budget at this width is 44 (menu) + 26 (logo) + 56 (badge) +
+     94 (actions) plus gaps, which leaves the product name about 38px — it rendered
+     as "op…". The badge is the thing to drop: the same brand node is mounted again
+     in the drawer head, so the version stays one tap away, and the live value is
+     also on the dashboard Version stat. Folded into the existing tiny-phone
+     breakpoint rather than inventing a 400px one for an unmeasured 375-399 band. */
+  .mobile-topbar .brand .ver { display: none; }
   .usage-filters { width: 100%; flex-direction: column; align-items: stretch; }
   .usage-segmented { width: 100%; }
   .usage-segmented-btn { flex: 1 1 0; }
@@ -2240,7 +2592,7 @@ button.prov-account-row.active { cursor: default; }
 .heatmap-cell-4 { background: var(--green); }
 .heatmap-legend { display: inline-flex; align-items: center; gap: 4px; font-size: var(--text-label); align-self: flex-end; position: sticky; right: 0; }
 .heatmap-legend .heatmap-cell { width: 10px; height: 10px; }
-.heatmap-tip { position: fixed; z-index: 10; transform: translate(-50%, -100%) translateY(-8px); pointer-events: none;
+.heatmap-tip { position: fixed; z-index: var(--z-popover); pointer-events: none;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px 10px;
   box-shadow: var(--shadow-sm); white-space: nowrap; font-size: var(--text-label); }
 .heatmap-tip-date { font-weight: var(--weight-semibold); color: var(--text); margin-bottom: 2px; }
@@ -2251,7 +2603,7 @@ button.prov-account-row.active { cursor: default; }
 
 /* 7d view: per-day request bar chart (replaces the year heatmap on the 7d toggle). */
 .daybars { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; align-items: end; height: 180px; padding-top: 8px; }
-.daybar { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+.daybar { appearance: none; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
 .daybar-track { width: 100%; max-width: 48px; flex: 1; display: flex; align-items: flex-end; background: var(--border); border-radius: var(--radius-xs); overflow: hidden; }
 /* Full-height stack scaled on Y — avoids layout thrash from animating height. */
 .daybar-stack {
@@ -2270,9 +2622,9 @@ button.prov-account-row.active { cursor: default; }
 .daybar-count { font-size: var(--text-label); font-weight: var(--weight-semibold); color: var(--text); }
 .daybar-label { font-size: var(--text-caption); white-space: nowrap; }
 .daybar:hover .daybar-track { outline: 1px solid var(--border); }
-.daybar-tip { position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); z-index: 5;
+.daybar-tip { position: fixed; z-index: var(--z-popover);
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px;
-  min-width: 160px; box-shadow: var(--shadow-sm); pointer-events: none; }
+  min-width: min(160px, calc(100vw - 16px)); box-shadow: var(--shadow-sm); pointer-events: none; }
 .daybar-tip-date { font-size: var(--text-label); font-weight: var(--weight-semibold); color: var(--text); margin-bottom: 6px; white-space: nowrap; }
 .daybar-tip-row { display: flex; align-items: center; gap: 8px; font-size: var(--text-label); line-height: var(--leading-relaxed); }
 .daybar-tip-swatch { width: 10px; height: 10px; border-radius: var(--radius-2xs); flex-shrink: 0; }
@@ -2313,6 +2665,53 @@ button.prov-account-row.active { cursor: default; }
 
 /* ---- model row hover tooltip ---- */
 .model-row-wrap { position: relative; }
+.models-model-identity {
+  display: inline-flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+.models-model-friendly {
+  max-width: min(42vw, 420px);
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.models-display-name-trigger { flex-shrink: 0; }
+.model-display-name-dialog { max-width: 460px; }
+.model-display-name-identity,
+.model-display-name-current {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 16px;
+}
+.model-display-name-identity code {
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+.model-display-name-current {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+.model-display-name-current > .text-label { grid-column: 1 / -1; }
+.model-display-name-current strong { min-width: 0; overflow-wrap: anywhere; }
+.model-display-name-dialog > .input { margin-bottom: 6px; }
+.model-display-name-dialog > .small { text-wrap: balance; }
+.model-display-name-error {
+  margin-top: 8px;
+  color: var(--red);
+  font-size: var(--text-label);
+  line-height: var(--leading-body);
+}
+@media (max-width: 560px) {
+  .models-model-friendly { max-width: 58vw; }
+  .model-display-name-current { grid-template-columns: 1fr; }
+  .model-display-name-current > .text-label { grid-column: auto; }
+  .model-display-name-dialog .modal-actions { align-items: stretch; flex-direction: column; }
+  .model-display-name-dialog .modal-actions .btn { width: 100%; }
+}
 .model-tip {
   z-index: 10;
   background: var(--surface);

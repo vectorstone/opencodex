@@ -13,18 +13,26 @@ Assistant de configuration interactif (`setup` est un alias de `init`). Il deman
 
 ## Cycle de vie du proxy
 
-### `ocx start [--port <port>]`
+### `ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]`
 
-Démarre le serveur proxy, de préférence sur le port `10100`. Si ce port est occupé, opencodex en choisit un autre qui est disponible et l’enregistre. La commande écrit l’état du PID et du port d’exécution, et refuse de démarrer une deuxième instance active. Au démarrage, elle synchronise dans le catalogue Codex les modèles de chaque fournisseur. À l’arrêt, elle rétablit le fonctionnement natif de Codex, sauf si le proxy a été lancé comme service géré (`OCX_SERVICE=1`).
+Démarre le serveur proxy, de préférence sur le port `10100`. La commande écrit l’état du PID et du port d’exécution, et refuse de démarrer une deuxième instance active. Lorsque le port préféré est occupé, `start` interroge le processus qui l’occupe puis s’arrête dans tous les cas : elle refuse de démarrer si un processus opencodex y répond et signale sinon que le processus est inconnu. Elle ne déplace jamais l’écouteur vers un autre port d’elle-même, car cela laisserait le premier proxy en cours d’exécution et redirigerait Codex vers le second. Un autre `--port` explicite est également refusé avec le même `OPENCODEX_HOME`, car les modes d’observation et de plafond écrivent tous deux dans le même journal de dépenses. Utilisez un `OPENCODEX_HOME` distinct pour une instance sœur indépendante ; `port: 0` ne sépare que l’attribution du port, pas l’état. Au démarrage, elle synchronise dans le catalogue Codex les modèles de chaque fournisseur. À l’arrêt, elle rétablit le fonctionnement natif de Codex, sauf si le proxy a été lancé comme service géré (`OCX_SERVICE=1`).
+
+`--socks5` (par défaut `127.0.0.1:10808`) enregistre l’URL SOCKS5 dans `config.proxy` et achemine
+les requêtes HTTP(S) sortantes dans un véritable tunnel SOCKS5. `--socks5-off` supprime uniquement
+le proxy SOCKS5 enregistré et ne supprime pas un proxy HTTP. La valeur reste après `ocx update`,
+car elle est stockée dans la configuration. L’URL peut contenir un nom d’utilisateur et un mot de
+passe, mais les journaux de démarrage les masquent.
 
 ```bash
 ocx start
 ocx start --port 8080
+ocx start --port 10100 --socks5
+ocx start --socks5-off
 ```
 
 ### `ocx stop`
 
-Arrête le proxy actif à partir de son PID, supprime le fichier de PID et rétablit le fonctionnement natif de Codex. Si un service d’arrière-plan géré est installé, `ocx stop` l’arrête d’abord afin qu’il ne puisse pas relancer le proxy. La même opération est disponible avec le bouton **Stop** du tableau de bord Web (`POST /api/stop`).
+Arrête le proxy actif à partir de son PID, supprime le fichier de PID et rétablit le fonctionnement natif de Codex. Si un service d’arrière-plan géré est installé, `ocx stop` l’arrête d’abord afin qu’il ne puisse pas relancer le proxy. Le bouton **Stop** du tableau de bord Web exécute la même opération (`POST /api/stop`) sur tous les backends, sauf le Planificateur de tâches Windows : le wrapper peut y relancer le proxy après la fin de la tâche, donc le tableau de bord refuse avec `respawnable_service`, ne modifie rien et vous demande d'exécuter `ocx stop`.
 
 ### `ocx restart`
 
@@ -40,6 +48,11 @@ Vérifie de manière idempotente qu’un proxy d’arrière-plan est actif, puis
 
 Rétablit le fonctionnement natif de Codex **sans arrêter** le proxy : les lignes de configuration injectées et les entrées routées du catalogue sont supprimées, de sorte qu’une invocation simple de `codex` utilise de nouveau Codex directement. `eject` est un alias de `restore`.
 
+Le catalogue restauré exclut les modèles natifs retirés, dont `gpt-5.3-codex-spark`,
+que leurs identifiants soient nus ou qualifiés par un compte de confiance. Cette règle
+s’applique avec ou sans sauvegarde ; la sauvegarde originale et les anciens choix de modèles
+enregistrés par l’utilisateur sont conservés.
+
 Ajoutez `back` à l’une ou l’autre forme pour rediriger une invocation simple de `codex` vers un proxy déjà actif, sans modifier le cycle de vie du proxy :
 
 ```bash
@@ -47,9 +60,15 @@ ocx restore back
 ocx eject back
 ```
 
-### `ocx recover-history --legacy-openai`
+### `ocx recover-history --legacy-openai --yes`
 
 Récupération explicite destinée aux anciennes versions de développement qui remappaient l’historique de Codex App avant l’ajout des sauvegardes réversibles. Fermez d’abord Codex si sa base de données d’historique est verrouillée.
+
+Il s'agit d'un réétiquetage large et destructif : chaque fil contenant un message utilisateur et actuellement marqué `opencodex` passe à `openai`, `exec` est normalisé en `cli` et l'indicateur d'événement est activé. L'historique légitime d'un fournisseur dédié est également concerné. Sauvegardez l'état et n'exécutez la commande que si vous souhaitez cette portée complète.
+
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+Réparez l'historique d'une tâche compactée par un fournisseur routé avant de la reprendre avec Codex natif. La commande sélectionne exactement une tâche par UUID, enregistre d'abord une sauvegarde privée octet par octet, puis convertit uniquement l'état de compaction `ocx1:` propre à OpenCodeX en résumé ordinaire relisible par Codex natif. Le contenu chiffré natif et les autres tâches restent inchangés. Fermez la tâche sélectionnée avant d'exécuter la commande ; toute modification simultanée du rollout interrompt la récupération sans remplacer le fichier.
 
 ### `ocx uninstall` · `ocx remove`
 
@@ -120,7 +139,7 @@ Vérifie l’identité du proxy actif. La sortie destinée aux utilisateurs indi
 
 ### `ocx ready [--json] [--wait [--timeout <seconds>]]`
 
-Vérifie l’état de préparation après synchronisation au moyen du point de terminaison non authentifié `GET /readyz`. Il renvoie `200` lorsque le service est prêt, ou `503` avec `Retry-After: 1` pour les états `pending` et terminal `failed`. Son identité HTTP expurgée est `{service, version, uptime, pid, port, status}`. Les anciens proxys dépourvus de `/readyz` échouent de manière sûre avec l’état `unreachable` ; `/healthz` mesure la disponibilité du processus, et non son état de préparation.
+Vérifie l’état de préparation après synchronisation au moyen du point de terminaison non authentifié `GET /readyz`. Il renvoie `200` lorsque le service est prêt, ou `503` avec `Retry-After: 1` pour les états `pending` et terminal `failed`. Son identité HTTP expurgée est `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}`. `protocol` est la version courante du protocole distant du hub, `minimumClientProtocol` la plus ancienne version cliente compatible et `managementUrl` l’origine canonique de gestion visible par le navigateur. Les anciens proxys dépourvus de `/readyz` échouent de manière sûre avec l’état `unreachable` ; `/healthz` mesure la disponibilité du processus, et non son état de préparation.
 
 Par défaut, la commande effectue une seule sonde. Avec `--wait`, elle interroge le service jusqu’à ce qu’il soit prêt ou jusqu’à l’expiration du délai, mais s’arrête immédiatement si elle observe l’état terminal `failed`. Le délai par défaut est de 45 secondes. `--timeout <seconds>` exige `--wait` et accepte un entier positif compris entre 1 et 300. La sortie JSON de la CLI est `{ready, status, pid, port}`, où `status` vaut `ready`, `pending`, `failed` ou `unreachable`. Les codes de sortie sont 0 si le service est prêt ; 1 s’il n’est pas prêt, reste en attente, échoue, dépasse le délai ou est inaccessible ; et 64 si les arguments sont invalides.
 
@@ -132,29 +151,61 @@ La section **OAuth reliability** indique si le stockage des identifiants est acc
 
 ## Synchronisation du catalogue
 
-### `ocx sync [--restart-codex]`
+### `ocx sync [--restart-codex] [--restart-app-server-only]`
 
 Récupère la liste active des modèles de chaque fournisseur configuré et réinjecte le catalogue fusionné dans Codex. Exécutez cette commande après l’ajout d’un fournisseur ou pour actualiser les modèles disponibles.
 
 Avant la découverte des fournisseurs ou le remplacement du catalogue et du cache, `ocx sync` vérifie que la configuration Codex gérée peut recevoir l’injection. Si cette validation refuse la configuration, la commande renvoie un code non nul, affiche la cause précise sur stderr et laisse le catalogue ainsi que le cache existants inchangés. `ocx restore back` effectue la même vérification préalable sans écriture avant de réactiver le routage.
 
-Si des processus Codex `app-server` de longue durée sont encore actifs, `ocx sync` avertit qu’ils peuvent continuer à servir l’ancienne liste de modèles conservée en mémoire, même après la mise à jour de `opencodex-catalog.json` / `models_cache.json`. Ajoutez `--restart-codex` pour envoyer `SIGTERM` uniquement aux processus `codex … app-server` et `codex-code-mode-host` correspondants qui appartiennent à l’utilisateur actuel ; les tours actifs peuvent être interrompus. La recherche générale `pkill -f codex` est volontairement évitée.
+Si des processus Codex `app-server` de longue durée sont encore actifs, `ocx sync` avertit qu’ils peuvent continuer à servir l’ancienne liste de modèles conservée en mémoire, même après la mise à jour de `opencodex-catalog.json` / `models_cache.json`. Ajoutez `--restart-codex` pour redémarrer les processus `codex … app-server` et `codex-code-mode-host` correspondants **et** quitter puis relancer entièrement l’application Codex Desktop, sous macOS, Linux et Windows, afin que le sélecteur de modèles relise le catalogue. Les conversations en cours se terminent. La recherche générale `pkill -f codex` est volontairement évitée.
 
-### `ocx sync-cache [--restart-codex]`
+`--restart-desktop-app` est un alias déprécié de `--restart-codex`. Il fonctionne encore, affiche un avis de dépréciation, et n’est pas limité à Windows.
 
-Invalide le cache local du sélecteur de modèles de Codex afin qu’il soit reconstruit à partir du catalogue opencodex actif. Le même avertissement concernant un `app-server` obsolète et le même comportement facultatif `--restart-codex` que pour `ocx sync` s’appliquent.
+`--restart-app-server-only` rétablit le comportement étroit d’avant : `SIGTERM` uniquement aux processus app-server et code-mode-host correspondants appartenant à l’utilisateur actuel, l’application Desktop restant ouverte. Les tours actifs peuvent encore être interrompus. Combiné avec `--restart-codex` ou `--restart-desktop-app`, c’est la portée étroite qui l’emporte, car perdre des conversations en cours est irrécupérable, contrairement à un sélecteur périmé.
+
+Lorsque la commande s’exécute depuis l’application Codex, le redémarrage est confié à un assistant détaché et cette session se termine avec l’application.
+
+### `ocx sync-cache [--restart-codex] [--restart-app-server-only]`
+
+Invalide le cache local du sélecteur de modèles de Codex afin qu’il soit reconstruit à partir du catalogue opencodex actif. Le même avertissement concernant un `app-server` obsolète et les mêmes options de redémarrage que pour `ocx sync` s’appliquent.
+
+### `ocx catalog pull <https-url> [--auth-env <NAME>] [--json] [--restart-codex] [--restart-app-server-only]`
+
+Installe un catalogue complet servi par le point de terminaison `/v1/catalog` d'une autre instance
+OpenCodex, puis synchronise `models_cache.json`. L'URL doit être en HTTPS ; le HTTP est accepté
+uniquement en loopback. Les identifiants intégrés à l'URL, les requêtes, les fragments, les
+redirections, les réponses trop volumineuses et les catalogues invalides sont refusés avant toute
+écriture locale. L'authentification est facultative et lue uniquement par référence à une variable
+d'environnement (`--auth-env`), jamais depuis argv.
+
+Les requêtes HTTP en loopback sont refusées avant l’ajout des en-têtes d’authentification ou tout envoi si `HTTP_PROXY` ou `http_proxy` s’applique sans exception correspondante dans `NO_PROXY` ou `no_proxy`. `ALL_PROXY`/`all_proxy` et les paramètres limités à `HTTPS_PROXY`/`https_proxy` ne déclenchent pas cette restriction HTTP ; l’acquisition de catalogues en HTTPS reste autorisée. Le message de refus ne contient ni l’adresse du proxy ni le jeton d’authentification. Les valeurs non vides de `http_proxy` et `no_proxy` ont priorité sur `HTTP_PROXY` et `NO_PROXY`, respectivement. Pour des exceptions compatibles avec Bun, utilisez des noms d’hôte, des entrées `host:port` correspondantes, des adresses IPv6 entre crochets comme `[::1]`, ou `*`, sans URL, chemin ni préfixe `*.`.
+
+Le catalogue et le cache sont écrits sous le verrou de catalogue Codex partagé ; un échec préserve
+les derniers fichiers valides connus. Des octets identiques constituent une non-opération qui
+préserve les mtimes. `--restart-codex`, `--restart-app-server-only` et l'alias déprécié
+`--restart-desktop-app` ont ici le même sens que pour `ocx sync` et `ocx sync-cache`, et ne
+s'appliquent qu'après une écriture réelle. Les requêtes conditionnelles `ETag` ne font pas partie
+de cette commande. Voir la [référence anglaise](/reference/cli/lifecycle/) pour l'enveloppe
+`--json` complète et les codes de sortie.
 
 ## Service d’arrière-plan
 
-### `ocx service [install|repair|start|stop|status|uninstall|remove]`
+### `ocx service [install|repair|restart|start|stop|status|uninstall|remove]`
 
 Exécute opencodex comme service d’arrière-plan géré à l’ouverture de session — **launchd** sous macOS, **unité utilisateur systemd** sous Linux et **Task Scheduler** sous Windows — qui démarre automatiquement à la connexion et redémarre après un plantage. Les services définissent `OCX_SERVICE=1` afin qu’un redémarrage ne réécrive pas inutilement la configuration Codex.
 
+Les installations via le Planificateur de tâches Windows utilisent une priorité de processus normale (`Priority=4`).
+L’ancienne priorité d’arrière-plan (`7`, également la valeur par défaut si le paramètre est omis) peut retarder les réponses
+aux contrôles de santé en cas de contention CPU : la zone de notification affiche alors Offline même si le processus fonctionne.
+Après la mise à jour, exécutez `ocx service repair` pour migrer cette priorité enregistrée et redémarrer le service.
+Une confirmation UAC peut être nécessaire. Une priorité déjà normale ou haute ne déclenche pas, à elle seule, de réenregistrement.
+
 | Sous-commande | Action |
 | --- | --- |
-| aucune | Crée ou met à jour le service, puis le démarre. |
+| aucune | Installe et démarre le service s’il est absent ; sinon, applique `repair` au service existant. Une définition Task Scheduler Windows saine est réutilisée ; une définition obsolète peut être réenregistrée et nécessiter une élévation. |
 | `install` | Crée et démarre le service. L’enregistrement exige une élévation sous Windows. |
-| `repair` | Actualise sur place un service installé et le redémarre, sans le réenregistrer. |
+| `repair` | Actualise sur place un service installé. Sous macOS, le gestionnaire n’est rechargé que lorsque quelque chose a changé : une tâche saine et inchangée continue donc de s’exécuter et la réparation n’est pas une interruption. Sous Linux et Windows, le service est redémarré ; une définition Task Scheduler Windows saine est réutilisée, tandis qu’une définition obsolète peut être réenregistrée et nécessiter une élévation. |
+| `restart` | La même actualisation, avec un redémarrage garanti sur toutes les plateformes. Sous macOS, une tâche inchangée déjà chargée est relancée (kickstart) sur place. N’est pas un alias de `repair`. |
 | `start` | Démarre un service installé. |
 | `stop` | Arrête le service et rétablit le fonctionnement natif de Codex. |
 | `status` | Affiche les diagnostics du service et du proxy, ainsi que les chemins des journaux. |
@@ -165,9 +216,12 @@ Exécute opencodex comme service d’arrière-plan géré à l’ouverture de se
 ocx service
 ocx service install
 ocx service repair
+ocx service restart
 ocx service status
 ocx service uninstall
 ```
+
+Sous Windows, un `ocx service` nu n'exécute le chemin d'installation qu'après avoir prouvé l'absence à la fois du Task Scheduler et de WinSW. Si l'une des requêtes de statut est inconcluante, il refuse d'enregistrer quoi que ce soit et demande d'exécuter `ocx service status` ; n'utilisez un `ocx service install` explicite qu'après avoir confirmé l'absence.
 
 Avant de signaler une réussite, `install`, `start` et `repair` vérifient, sur les trois plateformes, qu’un proxy répond effectivement sur le port inscrit dans le service installé. Elles attendent jusqu’à 20 secondes, puis affichent le port utilisé :
 
@@ -227,7 +281,7 @@ Pendant une mise à niveau, un shim Unix installé qui ne contient pas la garde 
 
 L’installation du lanceur ne prouve pas à elle seule que les requêtes Codex passeront par OpenCodex. Après une installation saine, la commande examine le routage Codex actuel et affiche un avertissement plutôt qu’un résultat positif lorsque le routage est externe, appartient à l’utilisateur ou ne peut pas être vérifié. Elle avertit aussi lorsque des variables de proxy sortant n’existent que dans le processus actuel alors que `config.proxy` est absent ou non résolu, car les lanceurs Codex et les services d’arrière-plan peuvent ne pas hériter de cet environnement. Ces contrôles sont en lecture seule et n’affichent jamais la valeur du proxy. Corrigez le transfert signalé et exécutez `ocx doctor` avant de compter sur le démarrage automatique.
 
-Si une mise à jour externe achevée de Codex remplace un shim installé, la prochaine commande `ocx` ordinaire sauvegarde le nouveau lanceur stable et rétablit le shim avant de répartir la commande. Un lanceur encore en cours de modification reste intact et sera réexaminé plus tard. Un échec de réparation produit un avertissement sans faire échouer la commande demandée. Repli manuel : `ocx codex-shim install`. Définissez `codexShimAutoRestore` sur `false`, ou `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` pour désactiver ce comportement au niveau du processus.
+Si une mise à jour externe achevée de Codex remplace un shim installé, la prochaine commande `ocx` ordinaire sauvegarde le nouveau lanceur stable et rétablit le shim avant de répartir la commande. La commande d’inspection sans effet `ocx system codex-cli-update check` et les invocations mal formées de son espace de noms réservé `ocx system codex-cli-update` n’effectuent jamais cette réparation. Un lanceur encore en cours de modification reste intact et sera réexaminé plus tard. Un échec de réparation produit un avertissement sans faire échouer la commande demandée. Repli manuel : `ocx codex-shim install`. Définissez `codexShimAutoRestore` sur `false`, ou `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` pour désactiver ce comportement au niveau du processus.
 
 | Sous-commande | Action |
 | --- | --- |
@@ -254,9 +308,11 @@ Installe et contrôle l’icône OpenCodex dans la zone de notification Windows.
 
 ### `ocx gui`
 
-Ouvre le [tableau de bord Web](/fr/guides/web-dashboard/) à l’adresse `http://localhost:<port>` et démarre automatiquement le proxy s’il n’est pas actif.
+Ouvre le [tableau de bord Web](/fr/guides/web-dashboard/) à l’adresse `http://localhost:<port>` — ou `http://127.0.0.1:<port de gestion>` lorsque l’ingress de gestion du hub est activé — et démarre automatiquement le proxy s’il n’est pas actif.
 
 ## Mise à jour
+
+`ocx update` met à jour OpenCodex lui-même, et non la CLI Codex. Utilisez `ocx system codex-cli-update check` parmi les [commandes d’inspection système](/fr/reference/cli/agents/) pour vérifier, de façon bornée et en lecture seule, la provenance du candidat Codex CLI configuré. Cette commande n’interroge aucun registre de paquets et n’installe aucune mise à jour.
 
 ### `ocx update [--tag latest|preview]`
 
@@ -270,3 +326,7 @@ ocx update --tag preview
 ```
 
 Les nouvelles versions deviennent disponibles lorsque le [workflow de publication](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml) les publie sur npm.
+
+## Cycle de vie du client Remote Hub
+
+Utilisez `ocx connect <url> --pairing-code-stdin`, `ocx connect status`, `ocx sync` et `ocx connect rotate --pairing-code-stdin`. `ocx disconnect` restaure l'état local hors ligne sans révoquer la clé du hub. Tant que le client est connecté, `ocx connect revoke --admin-token-stdin` révoque l'`apiKeyId` enregistré; après déconnexion, utilisez **Integrations → API Keys** sur le hub. Les secrets passent uniquement par stdin, jamais par argv.

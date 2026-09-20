@@ -13,7 +13,7 @@ ocx init
 
 `ocx init`은 다음 과정을 안내합니다:
 
-1. **프로바이더 선택** — 내장 레지스트리 프리셋 79개 중 하나를 고르거나 `custom`을 선택해 base URL과 adapter를 직접 입력합니다.
+1. **프로바이더 선택** — 내장 레지스트리 프리셋 95개 중 하나를 고르거나 `custom`을 선택해 base URL과 adapter를 직접 입력합니다.
 2. **API 키** — 키를 붙여넣거나 `${ANTHROPIC_API_KEY}` 같은 환경 변수를 참조합니다.
 3. **기본 모델** — 키, 로컬, custom 프로바이더에서는 프리셋을 그대로 쓰거나 모델 ID를 직접 입력합니다.
 4. **프록시 포트** — 기본값은 `10100`입니다.
@@ -39,7 +39,7 @@ ocx start --port 8080
 - 프로바이더가 지원하는 경우 실시간 모델을 찾아 네이티브와 라우팅 항목을 **Codex 모델 카탈로그에 동기화**하고,
 - `http://localhost:<port>/v1`에서 수신 대기합니다.
 
-요청한 포트가 이미 사용 중이면 `ocx start`가 빈 포트를 고르고, 그 값을 `runtime-port.json`에 기록한 뒤 Codex가 실시간 리스너를 쓰도록 갱신합니다.
+요청한 포트가 이미 사용 중이면 `ocx start`는 실행을 멈추고 무엇이 포트를 점유하고 있는지 알려 줍니다. opencodex가 응답하면 먼저 `ocx stop`을 실행하고, 빈 포트에서 시작하려면 `ocx start --port <port>`를 사용하세요. 이제 다른 포트로 자동 이동하지 않습니다. 이전 동작은 프록시 두 개를 동시에 실행한 채 Codex가 나중에 시작한 프록시를 가리키게 했습니다.
 
 확인:
 
@@ -65,7 +65,7 @@ codex -m "ollama-cloud/glm-5.2"      "Write a SQL migration"
 
 ## Sub-agent 모델 선택(선택 사항)
 
-새 구성에는 Codex의 sub-agent 선택기에 네이티브 모델 다섯 개인 `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini`가 표시됩니다. `ocx gui`를 열어 네이티브 또는 라우팅 모델을 최대 다섯 개까지 바꾸거나 순서를 다시 정할 수 있습니다. 대시보드에서는 선호하는 sub-agent 모델과 추론 강도도 설정할 수 있습니다. [Sub-agent Surface](/guides/sub-agent-surface/)에서 v1/base/v2를 고르고, guidance, 네이티브 기본값, fallback이 언제 적용되는지 확인합니다.
+새 구성에는 Codex의 sub-agent 선택기에 네이티브 모델 다섯 개인 `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`가 표시됩니다. `ocx gui`를 열어 네이티브 또는 라우팅 모델을 최대 다섯 개까지 바꾸거나 순서를 다시 정할 수 있습니다. 대시보드에서는 선호하는 sub-agent 모델과 추론 강도도 설정할 수 있습니다. [Sub-agent Surface](/guides/sub-agent-surface/)에서 v1/base/v2를 고르고, guidance, 네이티브 기본값, fallback이 언제 적용되는지 확인합니다.
 
 ## 키를 붙여넣는 대신 로그인하기
 

@@ -1,16 +1,18 @@
-import { resolveEnvValue } from "../config";
+import { resolveProviderApiKey } from "./key-store";
 import {
   CodexPoolAuthenticationError,
   headersForCodexAuthContext,
   hasCallerCodexBearer,
   isCodexAuthContextUsable,
   resolveCodexAuthContext,
+  releaseCodexAuthContextProbeLease,
   type CodexAccountSelectionAdmission,
   type CodexAuthContext,
+  type CodexAuthPolicyConfig,
 } from "../codex/auth-context";
 import { recordCodexUpstreamOutcome, type CodexUpstreamOutcome } from "../codex/routing";
-import { extractAccountId } from "../oauth/chatgpt";
-import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential } from "../server/auth-cors";
+import { inspectChatGptDomainClaim } from "../oauth/chatgpt";
+import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential, type DataPlaneAdmission } from "../server/auth-cors";
 import type { CodexAccountMode, OcxConfig, OcxProviderConfig } from "../types";
 import {
   CODEX_FORWARD_BASE_URL,
@@ -30,6 +32,8 @@ export interface ResolvedOpenAiForwardSidecar extends OpenAiForwardSidecarCandid
   authContext: CodexAuthContext;
   headers: Headers;
   recordOutcome?: (outcome: CodexUpstreamOutcome) => void;
+  /** Hand back an acquired recovery probe when no sidecar request reached upstream. */
+  releaseProbeLease?: () => void;
 }
 
 /**
@@ -76,20 +80,46 @@ export function listOpenAiForwardSidecarCandidates(config: OcxConfig): OpenAiFor
   }];
 }
 
-function directSidecarHeaders(
-  incomingHeaders: Headers,
-): Headers | undefined {
-  const bearer = incomingHeaders.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
-  if (!bearer) return undefined;
-  const derivedAccountId = extractAccountId(undefined, bearer);
-  if (!derivedAccountId) return undefined;
+/** An explicit caller bearer/account pair for canonical OpenAI destinations; never persist. */
+export type ExplicitOpenAiCallerAuth = Readonly<{ authorization: string; chatgptAccountId: string }>;
+
+function explicitSidecarAuth(incomingHeaders: Headers): ExplicitOpenAiCallerAuth | null {
+  // Combined Authorization values must not smuggle a second credential into a snapshot,
+  // and only a well-formed ChatGPT-specific account marker is domain evidence — a generic
+  // organizations claim is not.
+  const bearer = /^Bearer[\t ]+([^\s,]+)$/i.exec(incomingHeaders.get("authorization")?.trim() ?? "")?.[1];
+  if (!bearer) return null;
+  const claim = inspectChatGptDomainClaim(bearer);
+  if (claim.kind !== "valid") return null;
+  const derivedAccountId = claim.accountId;
   const requestedAccountId = incomingHeaders.get("chatgpt-account-id")?.trim();
   // JWT payloads are decoded locally but not signature-verified. Requiring the caller's
   // explicit account header, and checking it against the token claim, makes forwarding an
   // intentional ChatGPT-auth operation instead of silently reclassifying any JWT-shaped
   // provider credential as a Codex bearer.
-  if (!requestedAccountId || requestedAccountId !== derivedAccountId) return undefined;
-  const selected = headersForCodexAuthContext(incomingHeaders, { kind: "main", accountId: null });
+  if (!requestedAccountId || requestedAccountId !== derivedAccountId) return null;
+  return { authorization: incomingHeaders.get("authorization")!, chatgptAccountId: requestedAccountId };
+}
+
+export function captureExplicitOpenAiCallerAuth(incomingHeaders: Headers, config: OcxConfig): ExplicitOpenAiCallerAuth | null {
+  const auth = explicitSidecarAuth(incomingHeaders);
+  if (!auth) return null;
+  try {
+    validateForwardAdmissionCredential(incomingHeaders, config);
+  } catch (error) {
+    if (error instanceof ForwardAdmissionCredentialError) return null;
+    throw error;
+  }
+  return auth;
+}
+
+function directSidecarHeaders(
+  incomingHeaders: Headers,
+  config: CodexAuthPolicyConfig,
+  admission?: Pick<DataPlaneAdmission, "source">,
+): Headers | undefined {
+  if (!explicitSidecarAuth(incomingHeaders)) return undefined;
+  const selected = headersForCodexAuthContext(incomingHeaders, { kind: "main", accountId: null }, config, undefined, admission);
   return selected;
 }
 
@@ -99,10 +129,14 @@ export async function resolveFirstUsableOpenAiSidecar(
   config: OcxConfig,
   options: {
     exactAccount?: ExactOpenAiSidecarAccount;
+    admission?: Pick<DataPlaneAdmission, "source">;
+    codexAuthPolicy?: CodexAuthPolicyConfig;
     beginCodexAccountSelection?: () => CodexAccountSelectionAdmission | undefined;
+    signal?: AbortSignal;
   } = {},
 ): Promise<ResolvedOpenAiForwardSidecar | undefined> {
   const { exactAccount } = options;
+  const policy = options.codexAuthPolicy ?? config;
   let callerBearerMayBeForwarded = true;
   try {
     validateForwardAdmissionCredential(incomingHeaders, config);
@@ -116,20 +150,32 @@ export async function resolveFirstUsableOpenAiSidecar(
       // credential directly even when the provider is globally Direct, and never
       // consult Pool active state, affinity, probes, or alternates.
       const authContext = await resolveCodexAuthContext(incomingHeaders, config, "pool", {
+        codexAuthPolicy: policy,
         accountId: exactAccount.accountId,
         modelId: exactAccount.modelId,
+        admission: options.admission,
         beginCodexAccountSelection: options.beginCodexAccountSelection,
+        signal: options.signal,
       });
+      let selectedHeaders: Headers;
+      try {
+        options.signal?.throwIfAborted();
+        selectedHeaders = headersForCodexAuthContext(incomingHeaders, authContext, policy, exactAccount.modelId, options.admission);
+      } catch (error) {
+        releaseCodexAuthContextProbeLease(authContext);
+        throw error;
+      }
       if ((authContext.kind !== "pool" && authContext.kind !== "main-pool")
         || !isCodexAuthContextUsable(authContext, config)) {
         // Exact selection is fail-closed. A generation/runtime-state race must not fall through
         // to the caller-bearer error or let a later candidate select another account.
+        releaseCodexAuthContextProbeLease(authContext);
         throw new CodexPoolAuthenticationError("Selected Codex account is unavailable");
       }
       return {
         ...candidate,
         authContext,
-        headers: headersForCodexAuthContext(incomingHeaders, authContext),
+        headers: selectedHeaders,
         recordOutcome: (outcome: CodexUpstreamOutcome) => recordCodexUpstreamOutcome(
           config,
           authContext.accountId,
@@ -140,13 +186,17 @@ export async function resolveFirstUsableOpenAiSidecar(
             probeLeaseId: authContext.probeLeaseId,
             probeQuotaScope: authContext.probeQuotaScope,
             writerGeneration: authContext.writerGeneration,
+            // 401/403 here is evidence about this exact stored credential; without the generation a
+            // replacement inherits the quarantine (#2892 gap 4).
+            ...(authContext.kind === "pool" ? { credentialGeneration: authContext.generation } : {}),
           },
         ),
+        releaseProbeLease: () => releaseCodexAuthContextProbeLease(authContext),
       };
     }
     if (candidate.accountMode === "direct") {
       if (!callerBearerMayBeForwarded || !hasCallerCodexBearer(incomingHeaders)) continue;
-      const headers = directSidecarHeaders(incomingHeaders);
+      const headers = directSidecarHeaders(incomingHeaders, policy, options.admission);
       if (!headers) continue;
       return {
         ...candidate,
@@ -155,13 +205,27 @@ export async function resolveFirstUsableOpenAiSidecar(
       };
     }
     const authContext = await resolveCodexAuthContext(incomingHeaders, config, candidate.accountMode, {
+      codexAuthPolicy: policy,
+      admission: options.admission,
       beginCodexAccountSelection: options.beginCodexAccountSelection,
+      signal: options.signal,
     });
-    if (!isCodexAuthContextUsable(authContext, config)) continue;
+    let selectedHeaders: Headers;
+    try {
+      options.signal?.throwIfAborted();
+      selectedHeaders = headersForCodexAuthContext(incomingHeaders, authContext, policy, undefined, options.admission);
+    } catch (error) {
+      releaseCodexAuthContextProbeLease(authContext);
+      throw error;
+    }
+    if (!isCodexAuthContextUsable(authContext, config)) {
+      releaseCodexAuthContextProbeLease(authContext);
+      continue;
+    }
     return {
       ...candidate,
       authContext,
-      headers: headersForCodexAuthContext(incomingHeaders, authContext),
+      headers: selectedHeaders,
       ...(authContext.kind === "pool" || authContext.kind === "main-pool"
         ? {
           recordOutcome: (outcome: CodexUpstreamOutcome) => recordCodexUpstreamOutcome(
@@ -169,10 +233,14 @@ export async function resolveFirstUsableOpenAiSidecar(
             authContext.accountId,
             outcome,
             {
+              threadId: authContext.affinityKey,
               probeLeaseId: authContext.probeLeaseId,
               writerGeneration: authContext.writerGeneration,
+              // Same fence as the exact-account recorder above (#2892 gap 4).
+              ...(authContext.kind === "pool" ? { credentialGeneration: authContext.generation } : {}),
             },
           ),
+          releaseProbeLease: () => releaseCodexAuthContextProbeLease(authContext),
         }
         : {}),
     };
@@ -192,7 +260,7 @@ export function selectOpenAiImagesProvider(config: OcxConfig): OpenAiImagesProvi
     && provider.authMode !== "forward"
     && provider.baseUrl.replace(/\/+$/, "") === "https://api.openai.com/v1"
   ) {
-    const apiKey = resolveEnvValue(provider.apiKey)?.trim();
+    const apiKey = resolveProviderApiKey(provider.apiKey)?.trim();
     if (apiKey) selection.keyed = { providerName: OPENAI_API_PROVIDER_ID, provider, apiKey };
   }
   return selection;
@@ -230,7 +298,7 @@ export function selectImagesProvider(config: OcxConfig): OpenAiImagesProviderSel
     };
   }
 
-  const apiKey = resolveEnvValue(provider.apiKey)?.trim();
+  const apiKey = resolveProviderApiKey(provider.apiKey)?.trim();
   if (!apiKey) {
     return { forwardCandidates: [], error: `images.provider "${providerName}" has no usable API key` };
   }

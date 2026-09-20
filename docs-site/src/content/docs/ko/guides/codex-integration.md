@@ -7,6 +7,12 @@ opencodex는 Codex가 읽는 두 가지, 즉 설정(`$CODEX_HOME/config.toml`, �
 
 프록시는 bare `openai` Codex 로그인 경로 하나와 Pool(기본) 및 Direct 계정 모드, 그리고 설정된 API 키용 `openai-apikey/<model>`을 제공합니다. Pool은 메인 계정과 추가된 계정을 포함하고, Direct는 호출자/메인 bearer만 사용합니다. 경로들은 서로 fallback하지 않습니다. shipped v1 config는 marker 2로 이관되며, 수동 복원을 위해 `config.json.pre-openai-tiers-v2.bak`를 보존합니다.
 
+Pool 모드에서는 선택된 저장 계정이 쿨다운 중이고 사용 가능한 다른 저장 계정이나 복구 probe가
+없을 때, 요청에 포함된 검증된 native Codex 로그인을 사용할 수 있습니다. 상류 거절 후 재시도와
+같은 호출자 검증을 적용하므로, 전송 전에 막힌 새 요청도 이 경로를 사용할 수 있습니다. 기존 모델
+권한과 main 계정 정책 검사는 유지됩니다. 이 fallback은 저장 계정의 쿨다운을 해제하거나 호출자
+인증을 Pool 선택으로 저장하지 않습니다. 특정 계정에 정확히 고정된 요청은 그 계정에 계속 묶입니다.
+
 ## 설정 주입
 
 `ocx init`, `ocx start`, `ocx sync`는 모두 인젝터를 호출합니다. 기본 loopback 바인드에서는 Codex의 빌트인 `openai` 프로바이더 id를 그대로 유지한 채, 그 프로바이더가 opencodex를 바라보게 합니다.
@@ -16,17 +22,106 @@ opencodex는 Codex가 읽는 두 가지, 즉 설정(`$CODEX_HOME/config.toml`, �
 model_catalog_json = "/absolute/path/to/opencodex-catalog.json"
 # Auto-injected by opencodex
 openai_base_url = "http://127.0.0.1:10100/v1"
+# Auto-injected by opencodex
+experimental_realtime_ws_base_url = "http://127.0.0.1:10100/v1"
 
 # fastMode를 설정했을 때만 들어갑니다. 설정하지 않으면 [features] 자체가 생기지 않습니다
 [features]
 fast_mode = true
 ```
 
+두 번째 키는 음성 sideband 오버라이드입니다. Codex는 WebRTC 음성 통화를 `openai_base_url`로 만들지만,
+codex 0.146(openai/codex#35830)부터는 `experimental_realtime_ws_base_url`이 없으면 그 통화의 sideband
+WebSocket을 `api.openai.com`에 직접 붙입니다. Pool 모드에서는 통화가 opencodex가 고른 계정으로
+만들어지므로, 앱 자체 로그인으로 직접 붙는 join은 `realtime websocket handshake failed`(404)로
+실패합니다. 주입된 키는 join을 다시 opencodex(`GET /v1/live/{callId}`)로 보내고, Pool은 그
+session/thread 쌍에 묶어 둔 계정(프로세스 로컬 바인딩)을 그대로 씁니다. Direct 모드는 두 요청 모두
+호출자의 현재 bearer를 쓰므로, 이 키는 join을 프록시 경로에 붙잡아 두는 역할만 합니다. 이 키는
+loopback `openai_base_url` 형태에서만 쓰이고, 그 키와 함께 제거되며, 사용자가 직접 적은
+`experimental_realtime_ws_base_url`은 덮어쓰지 않습니다.
+
 주입되는 `fast_mode`는 3-상태 `fastMode` 설정을 따릅니다. `true`면 `fast_mode = true`를 쓰고,
 `false`면 `fast_mode = false`를 쓰며, 설정하지 않으면 기존 `fast_mode`를 그대로 두고
 `[features]` 테이블도 추가하지 않습니다.
 
 프록시는 기본적으로 포트 `10100`에서 듣고 `POST /v1/responses`, `POST /v1/responses/compact`, `POST /v1/images/generations`, `POST /v1/images/edits`, `GET /v1/models`, `GET /healthz`, 그리고 `/api/*` 관리 표면을 제공합니다.
+
+### 실험적 컨텍스트 관리 (Codex 0.153+)
+
+지원되는 ChatGPT 계정에서는 Codex의 `config.toml`에 다음 설정을 추가합니다.
+기존 `[features]` 테이블이 있으면 그 안에 병합하세요.
+
+```toml
+[features]
+context_management.experimental_mode = true
+```
+
+기본 내장 loopback 통합에서는 다음 `ocx sync` 또는 프록시 시작 시 관리되는 루트
+`openai_base_url`이 `http://127.0.0.1:10100/backend-api/codex`로 바뀝니다. Codex는 이 경로를
+확인한 뒤 `new_context`, history, notes 도구를 활성화합니다. 동기화 후 새 Codex 세션을
+시작하세요. 이 기능은 명시적으로 켜야 하며, 사용자 소유 URL과 원격 사용자 지정 provider
+주입은 변경하지 않습니다. 컨텍스트 창이나 압축 한도를 덮어쓰지 않습니다.
+
+이 backend 접두사는 Responses WebSocket 업그레이드를 포함한 기존 데이터 경로의 별칭입니다.
+원래 `/v1` 경로와 realtime sideband 오버라이드도 유지됩니다. 열 개의 네이티브
+`alpha/history/v2/*`, `alpha/notes/v2/*` POST 엔드포인트는 `openai-responses` 어댑터와 정식
+ChatGPT forward 목적지를 사용하는 내장 `openai` provider로만 전달합니다. Direct는 현재
+호출자/메인 로그인을, Pool은 선택된 Codex 계정을 사용합니다. `openai-apikey`는 설정된 API
+키를 사용하는 별도 경로이며 이 비공개 엔드포인트를 지원하지 않습니다. 사용자 지정 또는
+비정식 Responses provider는 이 컨텍스트 relay의 후보가 아니며 Codex 계정 자격 증명을
+전달받지 않습니다.
+
+호출자 헤더는 공통 Codex forward 허용 목록으로 제한됩니다. `authorization`,
+`chatgpt-account-id`, 승인된 OpenAI beta, originator, session 및 Codex 프로토콜 메타데이터와
+추가 헤더 `x-openai-encrypted-tool-arguments`, `x-openai-tool-output-truncation-policy`만
+전달합니다. 쿠키 등 임의 헤더는 전달하지 않습니다. 프록시 데이터 키를 bearer로 사용하면
+선택된 Codex 자격 증명으로 교체하며, Direct에서는 저장된 메인 로그인을 사용합니다.
+자격 증명이 없으면 전달 전에 실패합니다. 프록시 인증 자격 증명은 upstream으로 보내지
+않습니다. 암호화된 인수, 응답 본문, upstream 오류 상태는 보존합니다.
+
+소유권은 요청을 받아들인 opencodex API 키 단위로 분리됩니다. 두 키가 같은 ChatGPT 워크스페이스를
+가리키더라도 서로의 세션에 접근할 수 없습니다. 워크스페이스 ID는 사람이 아니라 조직을 가리키므로,
+레지스트리는 업스트림이 실제로 수락한 자격 증명이 담고 있는 사용자 식별자까지 함께 묶습니다. 같은
+사용자의 토큰 갱신은 세션을 이어가지만, 같은 워크스페이스의 다른 사용자는 이어받지 못합니다. 수락된
+자격 증명이 사용자 식별자를 증명하지 못하면 정확히 그 자격 증명만 세션을 이어갈 수 있습니다.
+여기서 principal은 요청이 제시한 opencodex API 키입니다. 원격 바인드는 이미 키를 요구하므로
+소유권이 정상 동작합니다. 기본 loopback 바인드는 키를 읽지 않고 요청을 받아들이고, 내장 loopback
+주입은 `x-opencodex-api-key` 헤더를 실을 수 없습니다. 따라서 Codex가 opencodex 키를 보내지 못해
+context history는 HTTP 403을 반환합니다. **즉 이 relay는 키가 설정된 원격 바인드, 또는
+`x-opencodex-api-key`를 직접 보내는 클라이언트에서 사용할 수 있고 기본 내장 loopback 통합에서는
+사용할 수 없습니다.** loopback 바인드에서 호출자를 식별할 수 있게 할지는 메인테이너가 정할 문제이며,
+지금은 추측하지 않고 거부합니다.
+
+relay 작업 전체는 35초 deadline 하나로 묶입니다. 본문을 읽기 전에 시작해서 자격 증명 선택까지
+포함하므로, 멈춘 클라이언트가 처리 슬롯을 붙잡고 있을 수 없습니다. 클라이언트가 끊으면 499,
+deadline이 지나면 504를 반환하며 두 경우 모두 업스트림으로 아무것도 보내지 않습니다.
+
+성공한 ChatGPT 모델 응답은 루트 세션을 실제로 처리한 계정을 크기가 제한된 프로세스 로컬
+소유권 레지스트리에 기록합니다. History와 notes는 현재 활성 계정이 바뀌어도 명시적으로
+선택된 계정을 포함해 기록된 소유 계정을 사용합니다. 저장된 계정의 토큰은 같은 실제 계정에
+한해 갱신할 수 있으며, 다른 실제 계정으로 교체되면 거부합니다. Direct 호출자 소유 세션은
+호출자 자격 증명을 유지하며 프록시 bearer로 인계할 수 없습니다. 서버 측 history를 계정 간에
+이동하는 기능은 아닙니다.
+
+소유권이 없거나 만료, 제거, 충돌 또는 재시작으로 소실된 경우 계정 선택이나 upstream 요청
+전에 HTTP 409를 반환합니다. 현재 활성 계정으로 추측하지 않습니다. 기존 세션에서는 기능을
+켜거나 컨텍스트를 초기화하기 전에 체크포인트 또는 지속적으로 보관할 요약을 먼저 저장하세요.
+기능을 켜도 이전 history나 notes를 소급해서 채우지 않으며, 소유권이 새로 확인되어도 이전
+backend 콘텐츠가 존재한다는 뜻은 아닙니다. 재시작 후에는 성공한 모델 요청으로 소유권을
+확립한 뒤 컨텍스트 도구를 사용하고, 소유권이 충돌하면 새 세션을 시작하세요.
+
+기존 모델 affinity, cooldown 및 재시도 규칙은 변경하지 않습니다. Notes 쓰기를 포함한
+컨텍스트 요청은 자동 재시도하지 않으며, ChatGPT forward 요청에 같은 키를 사용한 429
+재시도를 추가하지 않습니다. History 트래픽은 모델의 quota-recovery probe를 점유하거나
+완료 처리하지 않습니다.
+
+끄려면 실험 설정을 삭제하거나 `false`로 바꾼 뒤 `ocx sync`를 실행하고 새 세션을 시작하세요.
+관리되는 루트 URL은 `/v1`로 돌아갑니다.
+
+키가 없거나 `false`인 동안에는 relay 자체가 존재하지 않습니다. 열 개 엔드포인트는 직접 POST하는
+호출자에게도 404를 반환하고, 모델 턴은 history 소유권을 기록하지 않습니다. opencodex가 Codex 설정을
+직접 읽어 판단하므로 주입된 URL이나 클라이언트가 보내는 값에 의존하지 않으며, 끄면 재시작 없이
+반영됩니다.
 
 ### 내장 이미지 생성 (`image_gen`)
 
@@ -37,6 +132,7 @@ Codex의 내장 `image_gen` 도구는 `/v1/responses`를 거치지 않습니다.
 - **모드 인식 forward 후보 하나:** Pool은 적격한 메인/추가 계정을 선택하고, Direct는 호출자 OAuth bearer를 사용합니다. 설정된 모드는 이미지 요청에도 일관되게 적용됩니다.
 - **OpenAI API-key provider:** forward 후보 중 누구도 인증 실패를 가지지 않을 때만 사용합니다. 고장 나거나 만료된 Pool credential을 별도로 청구되는 API 사용 뒤에 숨기지 않습니다.
 - **명시적 커스텀 provider:** `images.provider`를 OpenAI Images API를 구현한 커스텀 API-key `openai-responses` provider id로 설정할 수 있습니다. 명시적으로 선택한 provider는 닫힌 상태로 실패하며, 다른 유료 upstream으로 fallback하지 않습니다. registry-managed provider id는 여기서 허용하지 않습니다. 기본 제공 OpenAI tiers를 쓰려면 `images.provider`를 생략하세요.
+- **xAI Imagine (Grok OAuth) relay:** `images.bridgeEnabled`가 `true`이고 `images.provider`가 비어 있으며 `xai` provider가 설정되어 있으면 `/v1/images/generations`와 `/v1/images/edits`가 `https://api.x.ai/v1`로 전송됩니다. 어떤 credential을 쓰는지는 provider의 `authMode`가 정합니다. `"oauth"`면 `ocx login xai`로 받은 Grok CLI grant를 재사용하고, 그 외에는 provider의 API key를 씁니다. OAuth 로그인이 key 방식 provider를 활성화하지는 않으며 반대도 마찬가지입니다. ChatGPT credential은 전달되지 않습니다. credential이 없으면 프록시는 ChatGPT에 과금하지 않고 400을 반환합니다. `images.provider`를 명시하면 `/v1/images`는 그 provider가 맡고, 그 provider의 검증 오류가 그대로 반환되며 xAI relay는 시도되지 않습니다. relay는 Codex `size` / `aspect_ratio`를 xAI Imagine body에 매핑하고 같은 `{created, data:[{b64_json}]}` 형태를 반환합니다. 배치 전체(인라인 `b64_json`과 내려받은 URL)의 디코드 바이트와 base64 인코드 출력은 합쳐서 100 MiB 미만입니다. 한도를 넘는 배치는 502를 반환합니다. xAI가 인라인 바이트 대신 이미지 URL을 돌려주면 프록시가 credential 없이 직접 내려받습니다. URL은 공개 HTTPS여야 하고(리다이렉트, `file:`, loopback·사설 주소 불가), 파일당 50 MiB 상한이 있으며, 결과는 로컬 artifact로 저장되어 인증된 management endpoint로만 제공됩니다. 이 경로는 API-key-only Responses Image Bridge 루프와 별개입니다.
 - **Google Antigravity (CCA) fallback:** OpenAI forward 후보도 keyed provider도 없을 때, `/v1/images/generations`(`/images/edits`는 제외)는 `gemini-3.1-flash-image` 모델을 사용해서 Antigravity **Cloud Code Assist** endpoint로 fallback합니다. OpenAI 인증 해석이 실패할 때(예: 만료되었거나 누락된 ChatGPT credential)에도 이 fallback이 동작하며, OpenAI 후보가 아예 없을 때만 발생하는 것은 아닙니다. 이 기능은 `ocx login google-antigravity`를 필요로 합니다. OAuth token은 오직 고정된 CCA registry host로만 전송되며, config-level `baseUrl` override로는 가지 않습니다. 응답은 Codex가 기대하는 `{created, data:[{b64_json}]}` 형식으로 반환됩니다.
 - **둘 다 없음:** 프록시는 generic 404 대신 명확한 오류를 반환합니다. 라우팅되는 provider(Cursor, Gemini, Kiro 등)는 `image_generation` tool relay를 제공할 수 없습니다. 이 도구를 아예 노출하고 싶지 않다면 Codex에서 `codex features disable image_generation`(`config.toml`의 `[features] image_generation = false`)으로 끄세요.
 
@@ -106,9 +202,39 @@ Windows에서 Orca shell은 `CODEX_HOME`과 `ORCA_CODEX_HOME`을 Orca의 번들 
 
 전용 provider 모드의 `requires_openai_auth = true`는 Codex App/TUI의 계정 게이트 화면을 네이티브 Codex와 같은 조건으로 맞춥니다. opencodex는 `/v1/responses`도 WebSocket으로 제공합니다. 전용 provider는 `"websockets": true`일 때만 `supports_websockets = true`를 광고합니다. loopback에서는 Codex의 빌트인 provider가 먼저 WebSocket을 시도할 수 있으며, 비활성화된 proxy는 `426`을 반환해서 Codex가 HTTP/SSE로 fallback합니다.
 
+네이티브 ChatGPT forward 요청의 로컬 재생 상태가 만료되었거나 없으면 opencodex는
+upstream 요청 전에 `previous_response_not_found`를 반환합니다. Codex WebSocket 클라이언트는
+일반 스트림 재시도 한도 안에서 다시 연결하고, 완료된 도구 호출과 결과를 포함한 현재 보유
+컨텍스트 전체를 다시 보낼 수 있습니다. 따라서 프록시의 재생 캐시가 만료되었다는 이유만으로
+새 작업을 만들 필요는 없습니다. 재생 상태는 24시간 보존하며 기존 메모리·디스크·항목 수
+상한은 그대로입니다. 클라이언트가 더 이상 보유하지 않는 기록을 복구하는 기능은 아닙니다.
+HTTP 클라이언트는 이 오류를 직접 처리하고 `previous_response_id` 없이 전체 컨텍스트를 다시
+보내야 합니다. 같은 ID만 재시도해서는 누락된 상태를 복구할 수 없습니다.
+
+참조한 상태의 client task scope가 현재 요청과 다를 때도 같은 거부 응답을 반환합니다. 새 요청이
+전체 입력처럼 보여도 프록시는 그것이 완전한 대화인지 증명할 수 없으므로
+`previous_response_id`를 조용히 제거하거나 일치하는 상태의 존재 여부를 노출하지 않습니다.
+전체 대화를 담고 `previous_response_id`를 뺀 요청으로 명시적으로 다시 시도하세요. 정규화된
+scope가 같거나 양쪽 scope가 모두 없거나 비어 있는 기존 unscoped continuation은 계속 replay합니다.
+
+routed 목적지에는 모두 같은 복구 신호가 적용됩니다. 프록시가 잃어버린 기록을 대신 볼 수 있는
+것은 네이티브 Responses 패스스루뿐입니다. 체인을 저장해 둔 백엔드로 `previous_response_id`를
+그대로 넘기기 때문입니다. 나머지 wire는 매 턴 요청에 담긴 입력만으로 대화를 다시 구성하므로,
+재생이 실패한 채 전달하면 이번 턴 한 줄만 올라가고 대화가 조용히 사라집니다. 상태를 들고
+있어 보이는 셋도 마찬가지입니다. Devin은 매 턴 전체 대화를 다시 보내고, Cursor의 체크포인트
+참조는 방금 만료된 그 저장소에 있어 없으면 full-replay로 떨어지며, Kiro는 넘겨받은 턴으로
+conversation history를 다시 만듭니다.
+`statelessResponses: true`로 설정한 routed Responses provider에도 같은 신호가 적용됩니다.
+routed 경로에서 custom 도구를 function으로 낮췄는데 증분 결과에 대응하는 로컬 호출 기록이
+없을 때도 전체 기록을 다시 요청합니다. 호출과 결과, reasoning을 함께 재생하며 결과 유형을
+추측하거나 버리지 않습니다. 상태를 저장하는 provider의 네이티브 function 및 네이티브 custom
+전용 continuation은 그대로 전달됩니다. 이 검사는 모델명이 아니라 선택된 wire protocol과 도구
+선언을 따릅니다. 저장된 response ID를 복원하지 못하는 gateway에는 해당 provider의
+`statelessResponses`를 명시적으로 켜세요. 다른 provider의 기본값은 바뀌지 않습니다.
+
 ## 스레드 식별자와 대화 기록
 
-기본 loopback 형식은 새 thread에 네이티브 `openai` provider 태그를 유지하므로 일반적인 resume history는 다시 매핑할 필요가 없습니다. 첫 sync 때는 더 오래된 opencodex 빌드가 태그를 붙인 thread도 `openai`로 이관합니다. non-loopback 전용 provider 모드는 활성 상태일 때만 history를 `opencodex` provider 아래로 미러링하고, 종료할 때는 백업된 메타데이터를 복원합니다. history를 건드리지 않으려면 `syncResumeHistory: false`로 설정하세요.
+기본 loopback 형식은 새 thread에 네이티브 `openai` provider 태그를 유지하므로 일반적인 resume history는 다시 매핑할 필요가 없습니다. sync와 restore는 일치하는 백업 manifest만 적용하여 각 thread의 원래 provider, source, event marker를 정확히 복원합니다. manifest가 없는 `opencodex` row는 변경하지 않으며, legacy 재태깅을 명시적으로 강제하려는 경우에만 `ocx recover-history --legacy-openai --yes`를 사용합니다. 이 명령은 의도적으로 범위가 넓습니다. 사용자 메시지가 있고 현재 `opencodex`로 표시된 모든 thread를 `openai`로 바꾸고, `exec`를 `cli`로 정규화하며 event marker를 설정합니다. 정상적인 dedicated-provider history도 포함됩니다. 상태를 백업하고 이 전체 범위를 의도한 경우에만 사용하세요. non-loopback 전용 provider 모드는 활성 상태일 때만 history를 `opencodex` provider 아래로 미러링하고, 종료할 때는 백업된 메타데이터를 복원합니다. history를 건드리지 않으려면 `syncResumeHistory: false`로 설정하세요.
 
 ## 모델 카탈로그 동기화
 
@@ -136,6 +262,13 @@ history를 업스트림 function tool로 인코딩한 다음 스트리밍된 fun
 `custom_tool_call`로 복원합니다. 네이티브 OpenAI forward routing과 지원되는 `apply_patch` custom tool은 변경되지
 않습니다.
 
+라우팅된 code-mode 턴에는 첫 호출 전에 중첩 helper에 대한 호스트 규칙도 전달됩니다.
+`tools.apply_patch`는 별도 장식 없이 패치 마커만 있는 줄로 시작하고 끝나는 하나의 문자열을 받습니다.
+isolate에서는 `import`를 사용할 수 없으며, 오래 실행되는 명령은 `write_stdin`으로 폴링합니다.
+네이티브 라우팅 Responses, Kiro 또는 Cursor 경로의 code-mode exec 결과에 호스트의 실패 메시지 중
+하나가 여전히 포함되어 있으면, opencodex는 해당 규칙을 명시하는 한 줄짜리 힌트를 덧붙입니다.
+이 변경은 모델의 코드나 패치 텍스트를 다시 작성하지 않습니다.
+
 선택한 provider는 function/tool calling을 지원해야 합니다. tool call을 지원하지 않는 text-only provider에서는
 `exec`, Browser 또는 Computer Use를 사용할 수 없습니다. 네이티브 OpenAI 항목은 업스트림 tool mode를 그대로
 유지합니다.
@@ -153,13 +286,13 @@ CLI에서 표시 이름을 추가할 수 있습니다(proxy가 live 상태면 ca
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
-원격 Codex client는 management API로 같은 생성된 catalog를 가져올 수 있습니다(다른 `/api/*` 경로와 같은 admission token을 사용합니다):
+원격 Codex client는 관리자 토큰이 아니라 일반 데이터 플레인 키(`/v1/responses`에 이미 사용하는 것과 같은 자격 증명)로 같은 생성된 catalog를 가져올 수 있습니다:
 
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/opencodex-catalog.json"
 tmp="$(mktemp "${dest}.XXXXXX")"
-curl -fsS -H "x-opencodex-api-key: $OPENCODEX_ADMIN_AUTH_TOKEN" \
-  "https://proxy.example.com/api/catalog" > "$tmp" \
+curl -fsS -H "x-opencodex-api-key: $OPENCODEX_API_AUTH_TOKEN" \
+  "https://proxy.example.com/v1/catalog" > "$tmp" \
   && mv "$tmp" "$dest"
 ocx sync-cache
 ```
@@ -168,11 +301,13 @@ ocx sync-cache
 
 또한 management API(`POST /api/custom-models`, `PUT /api/custom-models/<id>`의 `displayName` string)와 웹 대시보드에서도 설정하거나 수정할 수 있습니다. `/`는 routed-slug separator와 충돌하므로 거부됩니다.
 
+`GET /v1/catalog`은 모델 목록을 읽는 데 관리자 토큰이 필요하지 않도록 존재합니다. 읽기 전용(`GET`, `HEAD`)이며 `x-opencodex-api-key`, bearer 토큰, `x-api-key`를 허용하고 관리 라우트와 완전히 동일한 바이트를 제공합니다. 응답에는 강한 `ETag`가 포함되므로 `If-None-Match`로 다시 보내면 전체 문서 대신 `304`를 받고, `Cache-Control: private, no-cache`가 함께 설정됩니다. 여기서 허용된 데이터 플레인 키는 관리 플레인에서 **아무 권한도** 얻지 못합니다. `/api/catalog`을 비롯한 모든 `/api/*` 라우트는 여전히 관리자 토큰이나 대시보드 세션을 요구합니다.
+
 표시 이름은 **표시 전용이며 재생성 사이에서도 안정적**입니다. 모든 `ocx sync`와 catalog refresh는 `config.json`(`customModels` 포함)에서 routed entry를 다시 계산하므로, 설정된 이름이 라우팅 slug로 되돌아가지 않고 다시 적용됩니다. 관리형 service restart도 proxy가 bind된 직후 이 sync를 다시 시도합니다. 예를 들어 offline login 중이라 이 best-effort boot sync가 실패하면, 이전에 저장된 catalog는 유지되고 다음에 성공한 `ocx sync`가 설정된 이름을 다시 적용합니다. 진짜 upstream native name(예: `gpt-5.6-sol` → "GPT-5.6-Sol")은 고정된 upstream snapshot에서 오며, custom display name으로 덮어쓰지 않습니다.
 
 ### 외부 provider manager
 
-기본 `full` 모드에서 `config.toml`이 이미 `openai`나 `opencodex`가 아닌 provider를 선택하고 있으면, OpenCodex는 그 파일을 그대로 두고 profile write, catalog/cache refresh, 즉시 및 background Codex history migration을 건너뜁니다. custom provider를 관리하는 도구는 기존 session에 그 provider id를 붙이는 경우가 많고, 활성 id를 바꾸면 그 온전한 session이 Codex의 history view에서 사라질 수 있습니다. 이 보호는 legacy root profile이 선택한 외부 provider에도 동일하게 적용됩니다.
+기본 `full` 모드에서 `config.toml`이 이미 `openai`나 `opencodex`가 아닌 provider를 선택하고 있으면, OpenCodex는 그 파일을 그대로 두고 profile write, catalog/cache refresh, 즉시 및 background Codex history metadata 복원을 건너뜁니다. custom provider를 관리하는 도구는 기존 session에 그 provider id를 붙이는 경우가 많고, 활성 id를 바꾸면 그 온전한 session이 Codex의 history view에서 사라질 수 있습니다. 이 보호는 legacy root profile이 선택한 외부 provider에도 동일하게 적용됩니다.
 
 외부 provider id를 유지하면서 표준 모델 선택기를 갱신하려면 `ocx config set clientIntegrations.codex catalog-only`를 실행한 다음 `ocx sync`를 실행하세요. 이 모드는 `model_catalog_json`의 catalog와 `models_cache.json`만 갱신하며 `config.toml`, `opencodex.config.toml`, journal, history database 또는 session JSONL을 변경하지 않습니다. 외부 provider는 Responses passthrough(`wire_api = "responses"`)로 로컬 proxy를 가리켜야 합니다.
 
@@ -184,10 +319,17 @@ Codex에서 model이 빠졌거나 catalog 순서/가시성이 이상해 보이�
 
 1. provider의 **`selectedModels`** - 비어 있지 않은 allowlist는 해당 id만 Codex에 노출합니다. 비어 있거나 생략하면 발견된 model이 모두 노출됩니다. allowlist에 없는 id는 catalog에 절대 들어가지 않습니다.
 2. **`disabledModels`**(top level) - catalog와 `/v1/models`에서 model을 숨기고, bare native GPT slug는 `visibility: "hide"`로 바꿉니다.
-3. **`liveModels: false`와 비어 있는 `models`** - live discovery가 꺼져 있고 `models`가 비어 있거나 생략되면, opencodex는 그 provider에 대해 routed model을 하나도 노출하지 않습니다.
+3. **`liveModels: false`** — `liveModels: false`에서 `models`가 비어 있거나 생략되면 초기 목록은 설정된 `defaultModel`,
+   `retainModels` 순으로 구성합니다. 중복 ID는 처음 나온 항목만 남깁니다. 비어 있지 않은 `models`를
+   명시하면 `models`, `retainModels` 순으로 구성하며, 다른 `defaultModel`을 자동으로 추가하지 않습니다.
+   그 모델도 `models`나 `retainModels`에 직접 넣으면 포함할 수 있습니다. 어느 필드에도 ID가 없으면
+   초기 목록은 비어 있습니다. 이 순서는 최종 선택기의 표시 순서를 보장하지 않습니다.
+   `selectedModels`, `disabledModels`, 공급자 비활성화 정책은 그대로 적용됩니다.
+   `authMode: "forward"`는 기존 별도 분기를 따르며 이 정적 라우팅 목록을 사용하지 않습니다.
+   이 규칙은 라이브 발견 실패 시 폴백 동작을 바꾸지 않습니다.
 4. **Cursor `GetUsableModels`** - Cursor adapter는 `/models`가 아니라 protobuf `GetUsableModels` RPC로 model을 찾습니다. 그래서 Cursor 쪽 변경이 다른 provider와 무관하게 어떤 id가 보이는지 바꿀 수 있습니다.
 5. **캐시와 `ocx sync`** - live catalog는 약 5분(`modelCacheTtlMs`, 기본값 `300000`) 동안 캐시됩니다. `ocx sync`를 실행하면 새로 가져와서 catalog를 즉시 다시 쓸 수 있습니다.
-6. **실행 중인 Codex `app-server`** - 오래 살아 있는 Codex `app-server`(Desktop / CLI background host)가 이전 목록을 메모리에 쥐고 있으면 디스크 catalog를 다시 쓰는 것만으로는 부족합니다. `ocx sync`와 `ocx sync-cache`는 그런 process를 감지하면 경고합니다. `ocx sync --restart-codex`로 다시 시작하거나(아니면 일치하는 `app-server` process를 직접 중지한 뒤), Codex가 다시 만들게 해서 새 목록이 보이게 하세요.
+6. **실행 중인 Codex `app-server`** - 오래 살아 있는 Codex `app-server`(Desktop / CLI background host)가 이전 목록을 메모리에 쥐고 있으면 디스크 catalog를 다시 쓰는 것만으로는 부족합니다. `ocx sync`와 `ocx sync-cache`는 그런 process를 감지하면 경고합니다. `ocx sync --restart-codex`는 그 process를 재시작하고 macOS·Linux·Windows에서 Codex 데스크톱 앱을 완전히 종료한 뒤 다시 띄워 선택기가 카탈로그를 다시 읽게 합니다. 데스크톱 앱을 그대로 두려면 `--restart-app-server-only`를 쓰거나 일치하는 `app-server` process를 직접 중지하세요.
 
 :::caution[다른 로컬 writer]
 catalog write(`opencodex-catalog.json`, `config.toml`)는 opencodex 내부에서만 원자적입니다. 이것은 두 개의 opencodex 소유 writer가 경합할 때 반쯤만 써진 파일을 막아줄 뿐입니다. 다른 로컬 process, file watcher, sync agent가 opencodex가 쓴 뒤에 catalog visibility나 순서를 다시 쓸 가능성은 막지 못합니다. Codex는 별도의 `models_cache.json`을 유지하고 독립적으로 갱신할 수 있으므로, 이 과정에서 `opencodex-catalog.json`을 다시 쓰지 않고도 보이는 목록이 바뀔 수 있습니다. proxy가 실행 중인데 model이 예상치 않게 바뀌면, 경쟁 writer를 중지하거나 재설정한 뒤 `ocx sync`를 실행하세요. 이것은 외부 writer 위험이지, 확인된 opencodex 결함이 아닙니다.
@@ -210,11 +352,36 @@ catalog sync는 선택된 서브에이전트 모델을 Codex가 쓸 수 있게 �
 
 ## Codex 계정 워밍업
 
-ChatGPT 계정을 Codex account pool에 추가하면, opencodex는 이를 저장하기 전에 Codex Responses backend로 작은 streaming request를 보내 확인합니다. 요청은 실제 Responses item array(`input: [{ type: "message", ... }]`)를 사용하고, `response.completed`를 기다리며, 기본값은 `gpt-5.4-mini`입니다. 그 모델이 HTTP 400을 반환하면 `gpt-5.5`로 다시 시도합니다. 구조화된 upstream error detail은 보여 주되 raw response body는 노출하지 않습니다. background revalidation은 별도 기능이며 기본값은 꺼져 있습니다. Token Guardian이 활성화되고, `chatgpt` refresh policy가 `proactive`이며, `tokenGuardian.codexWarmupEnabled`가 true일 때만 실행됩니다.
+ChatGPT 계정을 추가하거나 재인증할 때 OpenCodex는 일반적으로 저장 전에 작은 모델 요청으로 확인합니다. `gpt-5.6-luna`의 `response.completed`를 기다리며 HTTP 400 또는 HTTP 404이면 `gpt-5.5`로 재시도합니다. 오류에는 고정된 실패 분류만 표시하고 원본 응답 본문은 노출하지 않습니다.
 
+새 OAuth 토큰으로 인증된 사용량 조회에서 5시간·주간·월간 한도 소진이 확인되면 모델 요청 없이 계정을 저장하고 **검증 대기**로 표시합니다. 재시작이나 토큰 갱신 후에도 요청에 사용되지 않습니다. 한도 회복 후 **사용량 새로고침**을 실행하면, 여유가 있는 완전한 최신 사용량을 확인한 뒤 작은 모델 요청을 보내고 완료 응답을 받아야 계정을 사용할 수 있습니다. 조회나 검증 실패 시 대기 상태를 유지합니다. 일반적인 화면 상태 조회는 이 모델 요청을 보내지 않습니다. 최초 등록 때 사용량이 불명확하면 기존 워밍업 검증이 필요합니다.
+
+`ocx account refresh openai`와 `ocx account list openai --quota --refresh`는 사용량만 조회합니다. 모델 검증은 할당량을 사용하므로 사람의 대시보드 세션이 필요합니다. 할당량이 복구되면 `ocx gui`를 열고 **Refresh quotas**를 클릭하세요. 헤드리스 호스트도 브라우저에서 해당 대시보드에 접속해야 하며, 관리자 토큰만으로는 검증할 수 없습니다. 일시 정지된 계정도 검증할 수 있지만 일시 정지를 해제하거나 계정을 선택하지는 않습니다. 모델 인증 실패 표시는 검증 또는 재인증에 성공할 때까지 유지됩니다.
+
+별도의 백그라운드 재검증은 기본적으로 꺼져 있습니다. Token Guardian, `openai`의 `proactive` 갱신 정책, `tokenGuardian.codexWarmupEnabled`가 필요하며 등록 검증 대기 계정은 제외합니다.
+
+### 계정이 요청을 처리하지 못하게 된 이유
+
+계정이 풀 선택에서 빠질 때 그 이유는 표시용으로 다시 계산되지 않고 판단과 함께 전달됩니다. 라우팅이 계정을 제외하는 동안 화면에서만 정상으로 보이는 일이 생기지 않습니다. `GET /api/codex-auth/accounts`는 계정마다 `needsReauth` 옆에 `reauthReason`을 함께 반환합니다. 자격 증명이 저장된 적 없으면 `missing_credential`, 갱신이 계속 실패하면 `refresh_failed`, 사용량 조회 자체가 거부되면 `quota_unauthorized`입니다.
+
+메인 계정 갱신이 끝나지 않은 경우에도 재시도로 성공할 수 있으므로 `Retry-After`와 함께 `503`을 반환합니다. 다만 실패가 계속되면 메인 계정을 다시 인증해야 한다는 내용을 메시지에 덧붙였습니다.
+
+### 등급이 내려간 계정을 로테이션에서 빼기
+
+`codexPool.excludedPlans`는 자동 풀 선택이 건너뛸 플랜 키 목록입니다. 각 계정에 저장된 플랜과 대소문자를 구분하지 않고 비교합니다. 기본값은 없음이므로 기존 설치의 로테이션은 그대로입니다.
+
+```bash
+ocx config set codexPool '{"excludedPlans":["free"]}'
+```
+
+차단이 아니라 선택 정책입니다. 제외된 계정도 자격 증명과 사용량 기록, 스레드 어피니티를 그대로 유지하고 계정 목록에도 계속 보이며 `work/gpt-5.5` 같은 명시적 지정으로는 여전히 쓸 수 있습니다. 달라지는 것은 자동 로테이션이 그 계정을 고르지 않는다는 점이고, 이미 활성 계정이거나 스레드에 묶여 있는 경우도 포함합니다. 구독이 만료된 계정이 바로 그 상태입니다.
+
+메인 Codex 계정에는 플랜 제외 정책을 적용하지 않습니다. 선택 전용 라우팅은 보호된 네이티브 자격 증명을 읽지 않습니다. 풀의 모든 사용 가능한 계정이 제외되면 자동으로 계정을 선택하지 않습니다. 계정을 직접 지정한 경로는 계속 사용할 수 있으며 일시 중지·인증·모델 사용 권한 검사는 그대로 적용됩니다. 계정 카드와 CLI에는 자격 증명 상태와 별도로 제외된 플랜이 표시됩니다. 플랜 사이에 정해진 순위가 없으므로 `minimumPlan` 설정은 없습니다.
 ## 네이티브 Codex 복원
 
-opencodex는 절대 사용자를 가두지 않습니다. **`ocx stop`은 네이티브 Codex로 완전히 되돌리는 단일 명령입니다**. proxy를 중지하고, 설치된 background service가 있으면 그것도 중지한 뒤, 주입된 모든 라인과 라우팅된 catalog 항목을 제거해서 plain `codex`가 opencodex가 처음부터 없었던 것처럼 정확히 동작하게 합니다:
+`ocx stop`은 proxy와 설치된 background service를 중지한 뒤 네이티브 Codex 복원을 시도합니다. OpenCodex 소유로 확인된 라우팅 항목을 제거하며, 설정 파일을 안전하게 복구할 수 없으면 미완료로 보고합니다.
+
+현재 config 또는 profile이 저장된 원본과 다르고 해당 파일의 주입 상태 해시가 저널에 없으면, 자동 snapshot 복원은 두 파일과 저널을 변경하지 않고 검토용으로 남깁니다. 이미 원본과 같은 파일은 다시 쓰지 않습니다. 기존 라우팅 설정의 재주입도 이 불확실한 원본을 사용하지 않으며, 네이티브 설정에서는 새 snapshot을 만들 수 있습니다. [자세한 복구 규칙](/guides/codex-integration/#recovery-without-injection-hashes)을 참고하세요.
 
 ```bash
 ocx stop       # stop the proxy + service, restore native Codex
@@ -223,3 +390,15 @@ ocx restore back # point plain Codex at the running proxy again
 ```
 
 opencodex가 managed [background service](/reference/cli/#ocx-service)로 실행될 때는 `OCX_SERVICE=1`을 설정하므로 service-driven restart가 Codex config를 흔들지 **않습니다**. 네이티브 Codex를 복원하는 것은 명시적인 `ocx stop` / `ocx service stop`뿐입니다.
+
+## 페이지 분할 기록 보호에 따른 거부
+
+영향받는 기록 저장소가 페이지 분할을 지원하면 프로바이더 전환이 `history_paginated_requires_native_writer`를 반환할 수 있습니다. 이 이유로는 Codex 설정, 참조 프로필, 모델 카탈로그를 더 이상 거부하지 않습니다. `ocx sync`와 `ocx start`는 해당 파일과 `model_catalog_json`을 계속 쓰므로 Codex 모델 선택기에는 OpenCodex가 라우팅하는 모델이 모두 그대로 보입니다. 대화 기록의 프로바이더 재지정을 건너뛰는 것은 이 이유뿐이며, 페이지 분할 순번은 Codex 자체의 네이티브 기록 작성자가 할당하고 재시도해도 달라지지 않기 때문입니다. 읽을 수 없는 상태 데이터베이스, 식별자가 바뀐 대화 원본, 실행하지 못한 사전 검사처럼 다른 기록 사전 검사 이유는 나중에 성공할 수 있으므로 전환 전체를 거부하고 되돌립니다. 이 상태에서 OpenCodex는 페이지 분할 대화 원본이나 스레드 행을 수정하지 않습니다. 기존 대화는 이미 붙어 있는 프로바이더를 유지하고 이전되지 않으며, 새 대화는 평소처럼 프록시를 통해 라우팅됩니다. 재지정을 건너뛸 때 홈에 이미 있던 `[model_providers.opencodex]` 테이블은 폐기하지 않고 유지합니다. root-override(loopback) 형식에서도 같아서, 행이 `opencodex`로 표시된 대화는 아직 존재하는 프로바이더 id를 유지합니다. 변환 가능한 저장소의 `legacy` 행도 포함됩니다. CLI는 `Codex resume history: left to Codex's native writer (history_paginated_requires_native_writer)`를 출력합니다. `ocx restore`와 Codex 설정 제거는 여전히 `history_paginated_requires_native_writer`로 거부됩니다. 스레드 행이 아직 참조하는데 `[model_providers.opencodex]` 정의를 걷어내면 그 대화를 해석할 수 없고, 복원 경로에는 호환 프로바이더 테이블을 남겨 둘 방법이 없습니다. 이미 페이지 분할된 홈은 지금은 제품으로 제거할 수 없습니다. 의도한 동작이 아니라 알려진 미해결 작업입니다.
+
+루트 URL 재정의 방식으로 돌아갈 때 OpenCodex는 기록 사전 점검이 통과하더라도 기존 `[model_providers.opencodex]` 정의를 설정 적용 전에 유지합니다. 설정 적용 후나 백그라운드 기록 작업 시작 중에 Codex가 기록 형식을 전환해도 이전 `opencodex` 대화가 제공자를 계속 찾을 수 있습니다. 새 대화는 선택된 루트 제공자를 사용하며, 명시적 복원에는 기존의 별도 제거 검사가 적용됩니다.
+
+대화를 강제로 이전하려고 실행 중인 페이지 분할 대화 원본이나 스레드 행을 고치지 마세요. 복구 전에 해당 대화를 닫은 뒤, 개인 대화 내용을 올리지 말고 정확한 오류와 버전을 보고하세요. 백업이나 스크립트 성공만으로 표시 복구가 증명되지는 않으므로 Codex를 다시 열어 확인하세요.
+
+## 메인 계정 재인증 취소
+
+메인 계정의 기기 코드 재인증을 취소할 때 DELETE 요청의 일시적 실패, 네트워크 오류, 알 수 없거나 아직 종료되지 않은 상태의 응답이 발생하면 진행 중인 흐름과 취소 실패 표시를 유지하여 취소를 다시 시도할 수 있게 합니다. 일반적으로는 상태 조회도 계속하므로 로그인이 완료되면 이를 확인할 수 있습니다. 흐름이 `pending` 또는 `committing`일 때 재시도 가능한 취소 실패와 GET 상태 조회의 2xx 이외 HTTP 응답이 겹치면, 응답 도착 순서와 관계없이 서버가 마지막으로 제공한 기기 코드·확인 URL·진행 단계를 유지하거나 복원하여 같은 흐름의 취소를 다시 시도할 수 있게 합니다. GET의 HTTP 실패는 상태 조회를 종료하지만, 두 번째 로그인 POST를 보내지 않고 취소를 다시 시도할 수 있습니다. 종료 상태인 `failed` 응답은 흐름을 해제하고 정규화된 실패 사유를 표시하며, `succeeded` 응답만 로그인 성공을 알립니다. `cancelled`로 확인된 응답은 흐름을 해제하여 새 기기 코드 로그인을 시작할 수 있게 합니다. HTTP 404와 `unknown_flow` 코드가 명확하게 반환된 경우에도 만료된 흐름 ID를 해제하여 새 기기 코드 로그인을 시작할 수 있게 하지만, 로그인 성공이나 취소 확정으로 표시하지 않습니다. 이전 흐름에서 늦게 도착한 POST·GET·DELETE 응답은 새 흐름을 변경하거나 새 흐름의 로그인이 성공했다고 알릴 수 없습니다.

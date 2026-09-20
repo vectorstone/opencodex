@@ -14,6 +14,7 @@
  *   5-byte gRPC/Connect frame makes the server mis-parse it ("illegal tag: field no 0").
  */
 import http2 from "node:http2";
+import { cursorH2Pool } from "./h2-pool";
 import { fromBinary } from "@bufbuild/protobuf";
 import type { UpstreamHttpVersion } from "../../types";
 import { readBoundedResponseBytes } from "../../lib/bounded-body";
@@ -42,7 +43,7 @@ export interface CursorUsableModelsOptions {
 }
 
 export type CursorUsableModelsResult =
-  | { ok: true; models: string[] }
+  | { ok: true; models: string[]; maxModeModels?: string[] }
   | { ok: false; error: "auth" | "http" | "policy" | "transport" | "timeout" | "decode" | "empty" | "too_large"; detail?: string };
 
 /** Test-only seam for management connectivity probes; production callers retain the HTTP/2 path. */
@@ -119,6 +120,7 @@ function decodeCursorUsableModels(bytes: Uint8Array): CursorUsableModelsResult {
     // make stale configured ids such as `composer-2` look activated.
     const ids: string[] = [];
     const seenIds = new Set<string>();
+    const maxModeIds: string[] = [];
     for (const model of response.models ?? []) {
       const rawId = (model as { modelId?: string }).modelId;
       if (typeof rawId !== "string") continue;
@@ -126,9 +128,13 @@ function decodeCursorUsableModels(bytes: Uint8Array): CursorUsableModelsResult {
       if (!isValidModelDiscoveryModelId(id) || seenIds.has(id)) continue;
       seenIds.add(id);
       ids.push(id);
+      // Preserve Max-Mode capability for ultra/big-context auto-detection (devlog 260826 070).
+      if ((model as { maxMode?: boolean }).maxMode === true) maxModeIds.push(id);
       if (ids.length >= CURSOR_MAX_DISCOVERED_MODELS) break;
     }
-    return ids.length > 0 ? { ok: true, models: ids } : { ok: false, error: "empty" };
+    return ids.length > 0
+      ? { ok: true, models: ids, ...(maxModeIds.length > 0 ? { maxModeModels: maxModeIds } : {}) }
+      : { ok: false, error: "empty" };
   } catch {
     return { ok: false, error: "decode", detail: "Invalid GetUsableModels protobuf response" };
   }
@@ -205,35 +211,29 @@ async function fetchCursorUsableModelsHttp2Once(opts: CursorUsableModelsOptions)
       resolve(value);
     };
 
-    let client: http2.ClientHttp2Session;
-    try {
-      client = http2.connect(baseUrl);
-    } catch {
-      return finish({ ok: false, error: "transport", detail: "HTTP/2 connection setup failed" });
-    }
 
-    const timer = setTimeout(() => {
-      finish({ ok: false, error: "timeout", detail: `No response within ${timeoutMs}ms` });
-      client.destroy();
-    }, timeoutMs);
-    const close = (value: CursorUsableModelsResult): void => {
-      clearTimeout(timer);
-      client.close();
-      finish(value);
-    };
+   const timer = setTimeout(() => {
+     // Cancel the borrowed pooled stream so it does not continue receiving
+     // body bytes after the caller has timed out (regression vs pre-pool behavior).
+     req?.destroy();
+     finish({ ok: false, error: "timeout", detail: `No response within ${timeoutMs}ms` });
+   }, timeoutMs);
+   const close = (value: CursorUsableModelsResult): void => {
+     clearTimeout(timer);
+     finish(value);
+   };
 
-    client.on("error", () => close({ ok: false, error: "transport", detail: "HTTP/2 session failed" }));
 
-    let req: http2.ClientHttp2Stream;
-    try {
-      req = client.request({
-        ":method": "POST",
-        ":path": CURSOR_GET_USABLE_MODELS_PATH,
-        ...cursorDiscoveryHeaders(opts),
-      });
-    } catch {
-      return close({ ok: false, error: "transport", detail: "HTTP/2 request setup failed" });
-    }
+   let req: http2.ClientHttp2Stream;
+   try {
+      req = cursorH2Pool.request(baseUrl, {
+       ":method": "POST",
+       ":path": CURSOR_GET_USABLE_MODELS_PATH,
+       ...cursorDiscoveryHeaders(opts),
+     });
+   } catch {
+     return close({ ok: false, error: "transport", detail: "HTTP/2 request setup failed" });
+   }
 
     let status = 0;
     const chunks: Buffer[] = [];
@@ -262,6 +262,7 @@ async function fetchCursorUsableModelsHttp2Once(opts: CursorUsableModelsOptions)
     req.on("error", () => close({ ok: false, error: "transport", detail: "HTTP/2 request failed" }));
     req.on("end", () => {
       if (bodyRejected) return;
+      if (status === 0) return close({ ok: false, error: "transport", detail: "HTTP/2 response ended before headers" });
       if (status === 401 || status === 403) {
         return close({ ok: false, error: "auth", detail: `HTTP ${status}` });
       }

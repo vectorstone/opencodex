@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDataSurface } from "../../data-surface";
+import { DataSurfaceSkeleton } from "../../components/data-surface";
 import { navigateHash } from "../../hash-routing";
-import { useT, type TKey } from "../../i18n/shared";
+import { useT } from "../../i18n/shared";
 import { Notice, Switch } from "../../ui";
+import ClientMark from "../../components/ClientMark";
+import { markFor } from "../../components/integration-marks";
 import IntegrationStateBadge from "./IntegrationStateBadge";
 import ConsequenceDialog, { type ConsequenceCopy } from "./ConsequenceDialog";
 import RestoreDialog from "./RestoreDialog";
+import { RollbackHistory } from "./RollbackHistory";
 import { describeRefusal } from "./refusal-copy";
+import { loadCursorIntegrationStatus } from "./cursor-api";
 import {
   buildOverviewRows,
   countOverviewRows,
@@ -22,10 +27,19 @@ import {
   loadGrokFenceStatus,
   loadIntegrationJournal,
   loadIntegrationStates,
+  previewIntegrationMutation,
   toggleIntegration,
+  bindingFor,
+  deleteJournalEntry,
+  IntegrationApiError,
+  isIntegrationPreviewUnavailable,
+  isMissingJournalEntry,
   type IntegrationJournalRow,
   type IntegrationStatus,
+  type IntegrationMutationPlan,
+  type IntegrationPlanOperation,
 } from "./integration-api";
+import type { LabeledIntegrationPlan } from "./IntegrationPlanDetails";
 import {
   loadNativeIntegrations,
   NativeApiError,
@@ -41,6 +55,15 @@ const GROK_DISABLE_COPY: ConsequenceCopy = {
   confirmKey: "integrations.dialog.grok.confirm",
 };
 
+const CODEX_DISABLE_COPY: ConsequenceCopy = {
+  titleKey: "integrations.dialog.codex.title",
+  changesKey: "integrations.dialog.codex.changes",
+  breakageKey: "integrations.dialog.codex.breakage",
+  undoKey: "integrations.dialog.codex.undo",
+  sideEffectKey: "integrations.dialog.codex.sideEffect",
+  confirmKey: "integrations.dialog.codex.confirm",
+};
+
 const DESKTOP_DISABLE_COPY: ConsequenceCopy = {
   titleKey: "integrations.dialog.desktop.title",
   changesKey: "integrations.dialog.desktop.changes",
@@ -50,12 +73,50 @@ const DESKTOP_DISABLE_COPY: ConsequenceCopy = {
   confirmKey: "integrations.dialog.desktop.confirm",
 };
 
-const KIND_KEY: Record<IntegrationJournalRow["kind"], TKey> = {
-  apply: "integrations.kind.apply",
-  disable: "integrations.kind.disable",
-  refresh: "integrations.kind.refresh",
-  restore: "integrations.kind.restore",
+const FILE_APPLY_COPY: ConsequenceCopy = {
+  titleKey: "integrations.dialog.apply.title",
+  changesKey: "integrations.dialog.apply.changes",
+  breakageKey: "integrations.dialog.apply.breakage",
+  undoKey: "integrations.dialog.apply.undo",
+  confirmKey: "integrations.dialog.apply.confirm",
 };
+
+const FILE_DISABLE_COPY: ConsequenceCopy = {
+  titleKey: "integrations.dialog.disable.title",
+  changesKey: "integrations.dialog.disable.changes",
+  breakageKey: "integrations.dialog.disable.breakage",
+  undoKey: "integrations.dialog.disable.undo",
+  confirmKey: "integrations.dialog.disable.confirm",
+};
+
+const BULK_DISABLE_COPY: ConsequenceCopy = {
+  titleKey: "integrations.bulk.title",
+  changesKey: "integrations.bulk.body",
+  breakageKey: "integrations.bulk.breakage",
+  undoKey: "integrations.bulk.undo",
+  confirmKey: "integrations.bulk.confirm",
+};
+
+interface BulkDisableAction {
+  clientId: IntegrationStatus["clientId"];
+  label: string;
+  /** Aggregate Aside mutations intentionally stay unbound; one fingerprint cannot describe every profile. */
+  plan: IntegrationMutationPlan | null;
+}
+
+interface BulkDisableState {
+  actions: BulkDisableAction[];
+  loading: boolean;
+  failure: string | null;
+  stale: boolean;
+  failures: string[];
+}
+
+function labeledPlansFor(actions: readonly BulkDisableAction[]): LabeledIntegrationPlan[] {
+  return actions.flatMap(item => item.plan
+    ? [{ clientId: item.clientId, label: item.label, plan: item.plan }]
+    : []);
+}
 
 function isApplied(status: IntegrationStatus): boolean {
   return status.state === "current" || status.state === "stale";
@@ -80,18 +141,21 @@ function OverviewCard({
   result,
   onOpen,
   onToggle,
+  onOverwrite,
 }: {
   row: OverviewRow;
   pending: boolean;
   result: { tone: "ok" | "err"; text: string } | null;
   onOpen: () => void;
   onToggle: (() => void) | null;
+  /** Present only for a conflicted file client; null everywhere else. */
+  onOverwrite: (() => void) | null;
 }) {
   const t = useT();
   const detail = row.detail ?? (row.detailKey ? t(row.detailKey, row.detailVars ?? undefined) : null);
   const toggleBlocked = row.toggleBlocked !== null
     && (row.applied || row.toggleBlocked.reason === "orphaned_marker");
-  const blockedText = toggleBlocked && row.toggleBlocked && (row.toggle === "claude" || row.toggle === "grok")
+  const blockedText = toggleBlocked && row.toggleBlocked && (row.toggle === "claude" || row.toggle === "grok" || row.toggle === "codex")
     ? describeRefusal(t, new NativeApiError(409, {
         error: "native integration change refused",
         code: "native_integration_refused",
@@ -100,9 +164,16 @@ function OverviewCard({
         message: row.toggleBlocked.message,
       }), undefined, row.togglePath ?? undefined)
     : null;
+  const toggleOn = row.toggleOn ?? row.applied;
   return (
     <li className="integration-card" data-client={row.id}>
       <div className="integration-card-head">
+        {/*
+          Before the title, not inside it: the title IS the card's one control
+          and its accessible name, so a mark inside the button would be read as
+          part of the client name. The mark is decorative and aria-hidden.
+        */}
+        <ClientMark src={markFor(row.id)} label={t(row.labelKey)} size={20} />
         <h4>
           <button type="button" className="integration-card-link" onClick={onOpen}>
             {t(row.labelKey)}
@@ -124,7 +195,7 @@ function OverviewCard({
         {row.toggle && onToggle && (
           <div className="integration-toggle-control">
             <Switch
-              on={row.toggleOn ?? row.applied}
+              on={toggleOn}
               onClick={onToggle}
               // Unknown is an unsettled native read; conflict/unsafe and an
               // advisory refusal must all be resolved before mutation.
@@ -134,7 +205,7 @@ function OverviewCard({
                 || row.state === "unsafe"
                 || toggleBlocked
                 || pending}
-              label={row.applied
+              label={toggleOn
                 ? t("integrations.action.disable")
                 : t("integrations.action.apply")}
             />
@@ -144,6 +215,16 @@ function OverviewCard({
         <button type="button" className="btn btn-ghost" onClick={onOpen} tabIndex={-1}>
           {t("integrations.action.settings")}
         </button>
+        {/*
+          Only in conflict, and only for a file client. The switch beside it stays
+          disabled -- this is not a second way to toggle, it is the way past a state
+          the toggle deliberately refuses to guess about.
+        */}
+        {onOverwrite && (
+          <button type="button" className="btn btn-danger" onClick={onOverwrite} disabled={pending}>
+            {t("integrations.action.overwrite")}
+          </button>
+        )}
       </div>
     </li>
   );
@@ -160,8 +241,22 @@ export default function IntegrationsOverview({
   const [bulkPending, setBulkPending] = useState(false);
   const [bulkResult, setBulkResult] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
   const [restoring, setRestoring] = useState<IntegrationJournalRow | null>(null);
+  /* The row awaiting delete confirmation. */
+  const [deleting, setDeleting] = useState<IntegrationJournalRow | null>(null);
   const [cardResults, setCardResults] = useState<Partial<Record<OverviewRow["id"], { tone: "ok" | "err"; text: string }>>>({});
   const [pendingToggle, setPendingToggle] = useState<OverviewRow | null>(null);
+  const [plannedCard, setPlannedCard] = useState<{
+    row: OverviewRow;
+    operation: Exclude<IntegrationPlanOperation, "restore">;
+    plan: IntegrationMutationPlan | null;
+    loading: boolean;
+    failure: string | null;
+  } | null>(null);
+  const [bulkPlans, setBulkPlans] = useState<BulkDisableState | null>(null);
+  const cardPreviewAbortRef = useRef<AbortController | null>(null);
+  const cardPreviewGenerationRef = useRef(0);
+  const bulkPreviewAbortRef = useRef<AbortController | null>(null);
+  const bulkPreviewGenerationRef = useRef(0);
   const restoreFocusRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
@@ -171,6 +266,13 @@ export default function IntegrationsOverview({
     restoreFocusRef.current = null;
     if (trigger.isConnected) trigger.focus();
   }, [pendingToggle]);
+
+  useEffect(() => () => {
+    cardPreviewGenerationRef.current += 1;
+    bulkPreviewGenerationRef.current += 1;
+    cardPreviewAbortRef.current?.abort();
+    bulkPreviewAbortRef.current?.abort();
+  }, []);
 
   const fetchStates = useCallback(
     async (signal: AbortSignal) => (await loadIntegrationStates(apiBase, signal)).clients,
@@ -205,6 +307,10 @@ export default function IntegrationsOverview({
   );
   const fetchGrok = useCallback(
     (signal: AbortSignal) => loadGrokFenceStatus(apiBase, signal),
+    [apiBase],
+  );
+  const fetchCursor = useCallback(
+    (signal: AbortSignal) => loadCursorIntegrationStatus(apiBase, signal),
     [apiBase],
   );
   const fetchNative = useCallback(
@@ -256,6 +362,12 @@ export default function IntegrationsOverview({
     fetchGrok,
     { isEmpty: value => value === null, enabled: active, sessionCacheKey: `ocx.integrations.grok.v1:${apiBase}` },
   );
+  const cursorResource = useDataSurface(
+    `integration-cursor:${apiBase}`,
+    [apiBase],
+    fetchCursor,
+    { isEmpty: value => value === null, enabled: active, sessionCacheKey: `ocx.integrations.cursor.v1:${apiBase}` },
+  );
   const nativeResource = useDataSurface<NativeStatus[] | null>(
     `integration-native:${apiBase}`,
     [apiBase],
@@ -269,11 +381,10 @@ export default function IntegrationsOverview({
   const installedFileClients = clients.filter(client => client.installed);
   /*
    * "Settled" is what separates a client the server omitted from one whose
-   * list has not answered yet. Only a cold state means we have never had an
-   * answer; a stale-with-error state still holds real rows.
+   * list has not answered yet. `undefined` covers both pre-response and cold
+   * failures, while a stale-with-error state still holds real rows.
    */
-  const clientsSettled = statesResource.state.kind !== "cold"
-    && statesResource.state.kind !== "retrying-cold";
+  const clientsSettled = statesResource.state.data !== undefined;
   const native = nativeResource.state.data ?? null;
   // `readOptional` returns null for a failed probe. Only an actual array is a
   // settled contract; an empty array is meaningful and removes both switches.
@@ -300,6 +411,7 @@ export default function IntegrationsOverview({
     claude: claudeResource.state.data ?? null,
     claudeDesktop: claudeDesktopResource.state.data ?? null,
     grok: grokResource.state.data ?? null,
+    cursor: cursorResource.state.data ?? null,
     native,
     nativeSettled,
   });
@@ -327,14 +439,51 @@ export default function IntegrationsOverview({
    * single-client PUT the card uses, so every client gets its own snapshot and
    * its own journal row, and one refusal cannot silently swallow the rest.
    */
-  const disableAll = async () => {
-    if (bulkPending || appliedClients.length === 0) return;
-    // Title then body, so the prompt names the action before its consequences.
-    const prompt = [t("integrations.bulk.title"), t("integrations.bulk.body")].join("\n\n");
-    if (!confirm(prompt)) return;
+  const requestDisableAll = async () => {
+    if (bulkPending || bulkPlans || appliedClients.length === 0) return;
+    const controller = new AbortController();
+    const generation = bulkPreviewGenerationRef.current + 1;
+    bulkPreviewGenerationRef.current = generation;
+    bulkPreviewAbortRef.current?.abort();
+    bulkPreviewAbortRef.current = controller;
+    setBulkPlans({ actions: [], loading: true, failure: null, stale: false, failures: [] });
+    try {
+      const actions = await Promise.all(appliedClients.map(async client => {
+        const row = rows.find(candidate => candidate.status?.clientId === client.clientId);
+        if (client.clientId === "aside") {
+          return { clientId: client.clientId, label: row ? t(row.labelKey) : client.clientId, plan: null };
+        }
+        const plan = await previewIntegrationMutation(apiBase, client.clientId, "disable", controller.signal);
+        return { clientId: client.clientId, label: row ? t(row.labelKey) : client.clientId, plan };
+      }));
+      if (controller.signal.aborted || generation !== bulkPreviewGenerationRef.current) return;
+      bulkPreviewAbortRef.current = null;
+      setBulkPlans({ actions, loading: false, failure: null, stale: false, failures: [] });
+    } catch (error) {
+      if (controller.signal.aborted || generation !== bulkPreviewGenerationRef.current) return;
+      bulkPreviewAbortRef.current = null;
+      if (isIntegrationPreviewUnavailable(error)) {
+        setBulkPlans(null);
+        refresh();
+        return;
+      }
+      setBulkPlans({ actions: [], loading: false, failure: t("integrations.preview.failed"), stale: false, failures: [] });
+    }
+  };
+
+  const closeBulkPlans = () => {
+    bulkPreviewGenerationRef.current += 1;
+    bulkPreviewAbortRef.current?.abort();
+    bulkPreviewAbortRef.current = null;
+    setBulkPlans(null);
+  };
+
+  const disableAll = async (state: BulkDisableState) => {
+    if (bulkPending || state.actions.length === 0) return;
     setBulkPending(true);
     setBulkResult(null);
-    const failed: string[] = [];
+    const failed = [...state.failures];
+    const staleActions: BulkDisableAction[] = [];
     /*
      * Sequential ON PURPOSE — do not convert this to `Promise.all`.
      *
@@ -349,18 +498,38 @@ export default function IntegrationsOverview({
      * Six loopback requests are cheap; a lost ownership record is not.
      */
     // Bulk disable remains file-clients-only; Grok must keep its consequence gate.
-    for (const client of appliedClients) {
+    for (const item of state.actions) {
+      if (item.plan && !item.plan.canApply) {
+        failed.push(`${item.clientId}: ${t("integrations.plan.refused")}`);
+        continue;
+      }
       try {
         // react-doctor-disable-next-line react-doctor/async-await-in-loop -- serial on purpose; see the block comment above
-        await toggleIntegration(apiBase, client.clientId, false);
+        await toggleIntegration(apiBase, item.clientId, {
+          enabled: false,
+          ...(item.plan ? { binding: bindingFor(item.plan) } : {}),
+        });
       } catch (error) {
+        if (item.plan && error instanceof IntegrationApiError && error.stalePlan) {
+          staleActions.push({ ...item, plan: error.stalePlan });
+          continue;
+        }
         // Report which clients survived rather than a single opaque failure:
         // a partial result the user cannot see is worse than none.
         // `describeRefusal` keeps the snapshot path and the residual warning,
         // which a bare message would drop for exactly the clients that need
         // manual recovery.
-        failed.push(`${client.clientId}: ${describeRefusal(t, error)}`);
+        failed.push(`${item.clientId}: ${describeRefusal(t, error)}`);
       }
+    }
+    if (staleActions.length > 0) {
+      refresh();
+      setBulkPending(false);
+      setBulkPlans({ actions: staleActions, loading: false, failure: null, stale: true, failures: failed });
+      setBulkResult(failed.length === 0
+        ? null
+        : { tone: "err", text: t("integrations.bulk.partial", { clients: failed.join("; ") }) });
+      return;
     }
     /*
      * Confirm the outcome against the server before claiming it.
@@ -381,6 +550,7 @@ export default function IntegrationsOverview({
     if (unsettled && failed.length === 0) failed.push(t("integrations.error.stale"));
     refresh();
     setBulkPending(false);
+    setBulkPlans(null);
     setBulkResult(failed.length === 0
       ? { tone: "ok", text: t("integrations.bulk.success") }
       : { tone: "err", text: t("integrations.bulk.partial", { clients: failed.join("; ") }) });
@@ -397,6 +567,7 @@ export default function IntegrationsOverview({
 
   const refreshNativeDetails = () => {
     nativeResource.refresh();
+    codexResource.refresh();
     claudeResource.refresh();
     grokResource.refresh();
   };
@@ -410,14 +581,21 @@ export default function IntegrationsOverview({
     });
   };
 
-  const toggleCard = async (row: OverviewRow, next: boolean) => {
+  const toggleCard = async (row: OverviewRow, next: boolean, plan?: IntegrationMutationPlan) => {
     if (cardPending) return;
     if (!row.toggle) return;
     setCardPending(row.id);
     setCardResult(row.id, null);
     try {
       if (row.status) {
-        await toggleIntegration(apiBase, row.status.clientId, next);
+        if (!plan && row.status.clientId !== "aside") return;
+        await toggleIntegration(apiBase, row.status.clientId, {
+          enabled: next,
+          ...(plan ? {
+            overwriteConflict: plan.operation === "overwrite",
+            binding: bindingFor(plan),
+          } : {}),
+        });
         refresh();
       } else if (row.toggle === "claude" || row.toggle === "grok" || row.toggle === "codex" || row.toggle === "claude-desktop") {
         const result = await toggleNativeIntegration(apiBase, row.toggle, next);
@@ -434,22 +612,68 @@ export default function IntegrationsOverview({
         refreshNativeDetails();
       }
     } catch (error) {
+      if (row.status && error instanceof IntegrationApiError && error.stalePlan) throw error;
       setCardResult(row.id, {
         tone: "err",
         text: describeRefusal(t, error, undefined, row.togglePath ?? undefined),
       });
       if (row.toggle === "claude" || row.toggle === "grok" || row.toggle === "codex" || row.toggle === "claude-desktop") refreshNativeDetails();
+      if (row.status) {
+        throw new Error(describeRefusal(t, error, undefined, row.togglePath ?? undefined), { cause: error });
+      }
     } finally {
       setCardPending(null);
     }
   };
 
+  const requestFilePlan = async (row: OverviewRow, operation: Exclude<IntegrationPlanOperation, "restore">) => {
+    if (!row.status || plannedCard) return;
+    const controller = new AbortController();
+    const generation = cardPreviewGenerationRef.current + 1;
+    cardPreviewGenerationRef.current = generation;
+    cardPreviewAbortRef.current?.abort();
+    cardPreviewAbortRef.current = controller;
+    setPlannedCard({ row, operation, plan: null, loading: true, failure: null });
+    try {
+      const plan = await previewIntegrationMutation(apiBase, row.status.clientId, operation, controller.signal);
+      if (controller.signal.aborted || generation !== cardPreviewGenerationRef.current) return;
+      cardPreviewAbortRef.current = null;
+      setPlannedCard({ row, operation, plan, loading: false, failure: null });
+    } catch (error) {
+      if (controller.signal.aborted || generation !== cardPreviewGenerationRef.current) return;
+      cardPreviewAbortRef.current = null;
+      if (isIntegrationPreviewUnavailable(error)) {
+        setPlannedCard(null);
+        refresh();
+        return;
+      }
+      setPlannedCard({ row, operation, plan: null, loading: false, failure: t("integrations.preview.failed") });
+    }
+  };
+
+  const closePlannedCard = () => {
+    cardPreviewGenerationRef.current += 1;
+    cardPreviewAbortRef.current?.abort();
+    cardPreviewAbortRef.current = null;
+    setPlannedCard(null);
+  };
+
   const requestToggle = (row: OverviewRow, next: boolean) => {
-    if (row.status || next || row.id === "claude" || row.toggle === null) {
+    if (row.status && row.status.clientId !== "aside") {
+      void requestFilePlan(row, next ? "apply" : "disable");
+      return;
+    }
+    if (row.status?.clientId === "aside") {
+      // Aggregate Aside mutations have no confirmation dialog to consume a rejection.
+      // toggleCard already stores the visible refusal and clears cardPending in finally.
+      void toggleCard(row, next).catch(() => {});
+      return;
+    }
+    if (next || row.id === "claude" || row.toggle === null) {
       void toggleCard(row, next);
       return;
     }
-    // Grok and Desktop disables edit another program's file.
+    // Codex, Grok, and Desktop disables edit another program's file.
     const activeElement = document.activeElement;
     restoreFocusRef.current = activeElement?.tagName === "BUTTON"
       ? activeElement as HTMLButtonElement
@@ -457,6 +681,13 @@ export default function IntegrationsOverview({
     setPendingToggle(row);
   };
 
+  /*
+   * Replace a conflicted block, after the dialog. File clients only: the native
+   * surfaces have their own ownership model and no writer path that takes this
+   * flag, which is why `row.status` gates the button that opens the dialog.
+   *
+   * Errors propagate so the dialog can show them while the user still has cancel.
+   */
   return (
     <section className="integrations-overview">
       <div className="integration-summary">
@@ -490,8 +721,8 @@ export default function IntegrationsOverview({
         <button
           type="button"
           className="btn btn-ghost"
-          onClick={() => void disableAll()}
-          disabled={bulkPending || appliedClients.length === 0}
+          onClick={() => void requestDisableAll()}
+          disabled={bulkPending || Boolean(bulkPlans) || appliedClients.length === 0}
         >
           {t("integrations.summary.disableAll")}
         </button>
@@ -504,6 +735,13 @@ export default function IntegrationsOverview({
         aggregate, and merging it into the strip would make "Manage keys" read
         as a bulk control beside "Disable all".
       */}
+      {/*
+        The outline used to go h2 (page) straight to h4 (card), so every card
+        title was an orphan level and the rollback section sat at the same depth
+        as the things it is not part of. This h3 owns the catalog; rollback
+        below is its sibling.
+      */}
+      <h3>{t("integrations.catalog.title")}</h3>
       <ApiKeysRow row={keysRow} />
 
       <p className="page-sub">{t("integrations.onboarding")}</p>
@@ -540,6 +778,9 @@ export default function IntegrationsOverview({
               result={cardResults[row.id] ?? null}
               onOpen={() => navigateHash(row.hash)}
               onToggle={row.toggle ? () => requestToggle(row, !(row.toggleOn ?? row.applied)) : null}
+              onOverwrite={row.status !== null && row.status.state === "conflict" && row.installed
+                ? () => void requestFilePlan(row, "overwrite")
+                : null}
             />
           ))}
         </ul>
@@ -551,36 +792,34 @@ export default function IntegrationsOverview({
         </div>
       )}
 
-      <h4>{t("integrations.rollback.title")}</h4>
-      {history.length === 0 ? (
+      <h3>{t("integrations.rollback.title")}</h3>
+      {/*
+        The newest operation stays visible and the rest collapse. This page
+        already carries a summary, an API row and fifteen cards, so fifty
+        bordered rows below them buried the one control a user wants after a
+        mistake. The older rows are kept rather than dropped: this is the only
+        place showing one chronology ACROSS clients, since each client tab reads
+        its own filtered journal.
+
+        Cold, failed and empty also used to look identical here, because
+        `data ?? []` collapses all three.
+      */}
+      {historyResource.state.showSkeleton ? (
+        <DataSurfaceSkeleton label={t("integrations.rollback.title")} rows={2} />
+      ) : historyResource.state.kind === "failed-cold" ? (
+        <Notice tone="err">
+          {t("integrations.rollback.failed")}{" "}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void historyResource.refresh()}>
+            {t("common.retry")}
+          </button>
+        </Notice>
+      ) : history.length === 0 ? (
         <div className="integration-empty">
           <p>{t("integrations.rollback.empty")}</p>
           <p className="page-sub">{t("integrations.rollback.emptyBody")}</p>
         </div>
       ) : (
-        <ul className="integration-history">
-          {history.map(row => (
-            <li key={row.opId}>
-              <span className="integration-history-kind">{t(KIND_KEY[row.kind])}</span>
-              <span className="integration-history-client">{row.clientId}</span>
-              <span className="integration-history-at">{new Date(row.at).toLocaleString()}</span>
-              {row.snapshot === "expired" ? (
-                <span className="badge badge-muted">{t("integrations.action.snapshotExpired")}</span>
-              ) : (
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => setRestoring(row)}
-                >
-                  {/* `undoable` picks the wording; the server owns eligibility. */}
-                  {row.undoable
-                    ? t("integrations.action.undo")
-                    : t("integrations.action.restorePoint")}
-                </button>
-              )}
-            </li>
-          ))}
-        </ul>
+        <RollbackHistory rows={history} showClient onRestore={setRestoring} onDelete={setDeleting} />
       )}
 
       {restoring && (
@@ -589,16 +828,96 @@ export default function IntegrationsOverview({
           row={restoring}
           onClose={() => setRestoring(null)}
           onRestored={refresh}
+          onReconcile={refresh}
+        />
+      )}
+      {deleting && (
+        <ConsequenceDialog
+          copy={{
+            titleKey: "integrations.dialog.deleteEntry.title",
+            changesKey: "integrations.dialog.deleteEntry.changes",
+            breakageKey: "integrations.dialog.deleteEntry.breakage",
+            undoKey: "integrations.dialog.deleteEntry.undo",
+            confirmKey: "integrations.dialog.deleteEntry.confirm",
+            vars: { path: deleting.configPath },
+          }}
+          onClose={() => setDeleting(null)}
+          onConfirm={async () => {
+            try {
+              await deleteJournalEntry(apiBase, deleting.opId, undefined, deleting.clientId === "aside" ? deleting.profileId : undefined);
+            } catch (error) {
+              // Another tab may have completed the same idempotent user action.
+              // Close the stale dialog and refresh instead of offering a retry
+              // that can only repeat the same 404.
+              if (isMissingJournalEntry(error)) {
+                setDeleting(null);
+                await historyResource.refresh();
+                return;
+              }
+              /*
+               * Rethrown as a localized message because ConsequenceDialog renders
+               * `error.message` verbatim. The 409 and 404 here carry a `code` and
+               * no `reason`, so without this the server English reaches every
+               * locale. The dialog stays open and re-enables its confirm button,
+               * which makes the same press the retry.
+               */
+              throw new Error(describeRefusal(t, error), { cause: error });
+            }
+            setDeleting(null);
+            await historyResource.refresh();
+          }}
         />
       )}
       {pendingToggle && (
         <ConsequenceDialog
-          copy={{ ...(pendingToggle.toggle === "claude-desktop" ? DESKTOP_DISABLE_COPY : GROK_DISABLE_COPY), vars: { path: pendingToggle.togglePath ?? "" } }}
+          copy={{
+            ...(pendingToggle.toggle === "claude-desktop"
+              ? DESKTOP_DISABLE_COPY
+              : pendingToggle.id === "codex"
+                ? CODEX_DISABLE_COPY
+                : GROK_DISABLE_COPY),
+            vars: { path: pendingToggle.togglePath ?? "" },
+          }}
           onClose={() => setPendingToggle(null)}
           onConfirm={async () => {
             await toggleCard(pendingToggle, false);
             setPendingToggle(null);
           }}
+        />
+      )}
+      {plannedCard && plannedCard.row.status && (
+        <ConsequenceDialog
+          copy={plannedCard.operation === "overwrite" ? {
+            titleKey: "integrations.dialog.overwrite.title",
+            changesKey: plannedCard.row.status.reason === "foreign-edit"
+              ? "integrations.dialog.overwrite.changesForeign"
+              : "integrations.dialog.overwrite.changesUnowned",
+            breakageKey: "integrations.dialog.overwrite.breakage",
+            undoKey: "integrations.dialog.overwrite.undo",
+            confirmKey: "integrations.dialog.overwrite.confirm",
+            vars: { path: plannedCard.row.status.configPath },
+          } : plannedCard.operation === "disable" ? FILE_DISABLE_COPY : FILE_APPLY_COPY}
+          plan={plannedCard.plan}
+          planLoading={plannedCard.loading}
+          planFailure={plannedCard.failure}
+          onClose={closePlannedCard}
+          onConfirm={async plan => {
+            if (!plan) return;
+            await toggleCard(plannedCard.row, plan.operation !== "disable", plan);
+            setPlannedCard(null);
+          }}
+        />
+      )}
+      {bulkPlans && (
+        <ConsequenceDialog
+          copy={BULK_DISABLE_COPY}
+          plans={labeledPlansFor(bulkPlans.actions)}
+          hasUnboundAction={bulkPlans.actions.some(item => item.plan === null)}
+          planStale={bulkPlans.stale}
+          planLoading={bulkPlans.loading}
+          planFailure={bulkPlans.failure}
+          onClose={closeBulkPlans}
+          onConfirm={async () => { await disableAll(bulkPlans); }}
         />
       )}
     </section>

@@ -4,6 +4,8 @@ import {
   type ComboItem,
   comboModelId,
   parseComboList,
+  providerQuotaStatesFromReports,
+  nextProviderQuotaStateExpiration,
   toPutBody,
 } from "../combo-workspace-data";
 import { hideRedundantChatGptForwardProviders } from "../provider-workspace/catalog";
@@ -36,6 +38,7 @@ type CachedCombosPage = {
   models: ModelOption[];
   cataloguedComboIds: string[];
 };
+type ProviderQuotasDto = { reports?: unknown };
 
 function responseError(data: unknown): string | undefined {
   if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
@@ -218,6 +221,45 @@ export default function Combos({
   );
   const { state } = resource;
 
+  const [quotaNow, setQuotaClock] = useState(() => Date.now());
+  const loadProviderQuotas = useCallback(async (signal?: AbortSignal): Promise<ProviderQuotasDto> => {
+    const response = await fetch(`${apiBase}/api/provider-quotas`, { signal });
+    if (!response.ok) throw new Error("combo quota load failed");
+    const payload = await response.json() as unknown;
+    if (!signal?.aborted) setQuotaClock(Date.now());
+    return payload && typeof payload === "object" && !Array.isArray(payload)
+      ? payload as ProviderQuotasDto
+      : {};
+  }, [apiBase]);
+  const quotaResource = useDataSurface<ProviderQuotasDto>(
+    `ocx.combos.provider-quotas.v1:${apiBase}`,
+    [apiBase],
+    loadProviderQuotas,
+    {
+      isEmpty: () => false,
+      pollMs: 60_000,
+      pauseWhenHidden: true,
+      enabled: active,
+    },
+  );
+  const quotaReports = active && quotaResource.lastAttemptOk ? quotaResource.data?.reports : undefined;
+  const providerQuotaStates = providerQuotaStatesFromReports(quotaReports, quotaNow);
+  const quotaExpiry = nextProviderQuotaStateExpiration(quotaReports, quotaNow);
+  useEffect(() => {
+    if (!active) return;
+    const recheck = () => setQuotaClock(Date.now());
+    // The render may cross this boundary before effects run. Keep its deadline and wake now.
+    // A new snapshot may be newer than this clock, so unknown state also gets one immediate check.
+    const timer = window.setTimeout(recheck,
+      quotaExpiry === undefined ? 0 : Math.max(0, quotaExpiry - Date.now()));
+    const onVisible = () => { if (document.visibilityState === "visible") recheck(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [active, apiBase, quotaResource.data, quotaResource.lastAttemptOk, quotaExpiry]);
+
   const data = state.data ?? retainedData ?? undefined;
   const combos = data?.combos ?? [];
 
@@ -328,11 +370,12 @@ export default function Combos({
         </span>
         <ComboWorkspace
           combos={combos}
+          providerQuotaStates={providerQuotaStates}
           providers={providers}
           models={models}
           cataloguedComboIds={cataloguedComboIds}
           loading={false}
-          onRefresh={() => resource.refresh()}
+          onRefresh={() => { resource.refresh(); quotaResource.refresh(); }}
           onSave={saveCombo}
           onRemove={removeCombo}
           onAdd={() => setAdding(true)}

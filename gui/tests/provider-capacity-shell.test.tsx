@@ -164,6 +164,8 @@ beforeEach(() => {
       const url = String(input);
       if (url.includes("/api/provider-quotas") && rejectQuotaFetch) throw new Error("quota unavailable");
       if (url.includes("/api/provider-quotas") && quotaFetchOverride) return quotaFetchOverride();
+      if (url.endsWith("/api/models")) return Response.json([]);
+      if (url.endsWith("/api/selected-models")) return Response.json({ selected: {}, available: {}, liveModelCounts: {} });
       const body = url.includes("/api/provider-quotas") ? quotaPayload : {};
       return quotaResponse(body);
     },
@@ -211,7 +213,10 @@ test("provider quota fetch preserves aggregate capacity through shell state and 
   expect(text).toContain("31% used");
   expect(text).toContain("Current effective account · pro");
   expect(text).toContain("8%");
-  expect(text).toContain("Incomplete coverage: 1 account(s) excluded, including 1 unknown plan(s)");
+  // #3155 split these: an uncalibrated plan is COUNTED at baseline, so it is no longer
+  // reported as excluded. The exclusion line now says only what it can prove.
+  expect(text).toContain("Incomplete coverage: 1 account(s) excluded");
+  expect(text).toContain("1 account(s) on an uncalibrated plan are counted at the baseline seat weight");
   expect(text).toContain("Next capacity recovery");
   expect(text).toContain("+19.2% pool capacity");
   const expectedRecoveryAt = new Intl.DateTimeFormat("en", {
@@ -294,7 +299,6 @@ test("a cancelled superseded quota rejection cannot rewrite state or session cac
 });
 
 test("all-stale response renders coverage only without a numeric fallback", async () => {
-  const old = Date.now() - 31 * 60_000;
   quotaPayload = {
     reports: [{
       provider: "openai",
@@ -325,6 +329,50 @@ test("all-stale response renders coverage only without a numeric fallback", asyn
   expect(text).toContain("Incomplete coverage: 2 account(s) excluded");
 });
 
+test("a fully included pool still surfaces the uncalibrated-plan notice", async () => {
+  // The #3155 reporter's own shape: every seat included, complete coverage, one seat counted
+  // at the baseline weight. The uncalibrated notice is the ONLY remaining uncertainty signal
+  // here, so it must render independently of the incomplete gate — folding it under the
+  // incomplete branch would pass every other fixture in this file and silently hide it.
+  quotaPayload = {
+    reports: [{
+      provider: "openai",
+      label: "OpenAI (Codex login)",
+      source: "chatgpt:wham",
+      updatedAt: Date.now(),
+      quota: { weeklyPercent: 44, updatedAt: Date.now() },
+      aggregation: {
+        kind: "capacity-weighted-v1",
+        scope: "routable-known",
+        presentation: "aggregate",
+        includedAccounts: 2,
+        excludedAccounts: 0,
+        unknownPlanAccounts: 1,
+        missingQuotaAccounts: 0,
+        pausedAccounts: 0,
+        reauthAccounts: 0,
+        staleQuotaAccounts: 0,
+        incomplete: false,
+        weekly: {
+          usedPercent: 44,
+          includedAccounts: 2,
+          excludedAccounts: 0,
+          incomplete: false,
+          updatedAt: Date.now(),
+        },
+        currentAccount: { isMain: false, quota: { weeklyPercent: 77, updatedAt: Date.now() } },
+      },
+    }],
+  };
+
+  await mountShell();
+
+  const text = host.textContent ?? "";
+  expect(text).toContain("1 account(s) on an uncalibrated plan are counted at the baseline seat weight");
+  expect(text).not.toContain("Incomplete coverage");
+  expect(text).toContain("44% used");
+});
+
 test("coverage-only API report remains visible in the rate-limit overview", async () => {
   quotaPayload = {
     reports: [{
@@ -350,7 +398,8 @@ test("coverage-only API report remains visible in the rate-limit overview", asyn
 
   const text = host.textContent ?? "";
   expect(text).toContain("OpenAI (Codex login)");
-  expect(text).toContain("Incomplete coverage: 3 account(s) excluded, including 1 unknown plan(s)");
+  expect(text).toContain("Incomplete coverage: 3 account(s) excluded");
+  expect(text).toContain("1 account(s) on an uncalibrated plan are counted at the baseline seat weight");
   expect(text).not.toContain("No rate-limit data yet");
   expect(text).not.toMatch(/\d+(?:\.\d+)?% used/);
 });

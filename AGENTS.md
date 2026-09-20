@@ -12,14 +12,33 @@ Bun-native TypeScript with no separate server compile step.
 ## Repository layout
 
 - `src/` — proxy runtime: routing, provider adapters, config, management API.
-- `tests/` — flat Bun tests (`tests/*.test.ts`); shared fixtures in
-  `tests/helpers/`, broader scenarios in `tests/e2e-style/`.
+- `tests/` — Bun tests in domain directories that mirror `src/`
+  (`tests/<domain>/*.test.ts`; `providers/` and `adapters/` have one more
+  level for the larger vendors). The map is `scripts/test-layout/layout.json`
+  and `tests/test-layout.test.ts` enforces it: every file resolves to a
+  domain and sits in it, and only the two layout guards live at the root.
+  Shared helpers in `tests/helpers/`, fixtures in `tests/fixtures/`, broader
+  scenarios in `tests/e2e-style/`. Source-oracle tests resolve the repository
+  through `tests/helpers/repo-root.ts` (`repoRoot()`, `repoPath()`,
+  `helperPath()`, `fixturePath()`), never `import.meta.dir + "/.."`. A new
+  test file lands in its domain directory and needs an entry in both
+  `layout.json` `explicit` and `tests/fixtures/test-layout-expected.json`
+  (`tests/test-layout-tooling.test.ts` names the missing one); the regex
+  seeds in `layout.json` place a conventionally named file until then.
+  History: `devlog/_fin/260905_test_modularization_and_windows/`.
 - `gui/` — React + Vite dashboard; packaged output is served from `gui/dist`.
 - `docs-site/` — public docs (Astro + Starlight), deployed to GitHub Pages.
 - `go/` — retired Go native-runtime experiment; kept only where the TypeScript
   runtime still references it. New work does not go here.
 - `structure/` — maintainer invariants and architecture notes; read before
-  changing shared subsystems.
+  changing shared subsystems. [`structure/INDEX.md`](./structure/INDEX.md) is the
+  reading order and the source-ownership table, and
+  [`structure/AGENTS.md`](./structure/AGENTS.md) holds the rules for changing
+  anything in there. Ownership is not advisory: changing an owned source area
+  obliges the same change to update its doc, and `bun run structure:check`
+  (wired into the suite by `tests/ci-workflows/structure-ssot.test.ts`) fails on a
+  doc that names a path this tree no longer has, on an invariant whose test is
+  gone, and on a new `src/` area nobody claimed.
 - `scripts/` — release and maintenance tooling; `scripts/release.ts` is the
   release authority.
 - `devlog/` — planning and investigation notes, tracked in this repository. See
@@ -41,7 +60,7 @@ directly or transitively:
 - `src/server/lifecycle.ts`
 - `src/server/responses/core.ts`
 
-`tests/core-lab-boundary.test.ts` enforces this by walking the runtime import
+`tests/lab/core-lab-boundary.test.ts` enforces this by walking the runtime import
 graph and printing the offending chain on failure. It is not a style rule: the
 original violation hid in a six-hop chain
 (`assemble → quota → auth-api → native-main-admission → lifecycle → lab`) where
@@ -61,6 +80,14 @@ evaluated before its evidence provider is registered. The synchronous
 subagent-fallback chain has nowhere to await, so an `await` added before the
 activation block would silently reroute subagents to a different model than the
 operator configured.
+
+That one is enforced too, in the same file: a scan reads the window between the
+`Bun.serve` call and the `labActivationRequired` check and fails on any `await`
+that would suspend `startServer` itself, plus on `startServer` being declared
+`async`. It has to ignore comments, string bodies, and nested functions to be
+usable, because the window legitimately contains three awaits inside the
+`server.stop` closure and two comments that mention the word. Until it existed,
+this paragraph was the only thing holding the guarantee.
 
 Design and audit history: `devlog/_fin/260814_lab_core_decoupling/`.
 
@@ -85,7 +112,7 @@ contributor who ignores it entirely still passes every gate. `privacy:scan` does
 read it — that is deliberate, and it is what makes a public devlog safe rather
 than merely visible.
 
-Two mechanical guards in `tests/repo-hygiene.test.ts` back this up: no `160000`
+Two mechanical guards in `tests/ci-workflows/repo-hygiene.test.ts` back this up: no `160000`
 gitlink may be tracked anywhere, and neither the vendored reference clones nor
 the security triage excised before publication may reappear in the index. Both
 were driven red once to prove they are not vacuous. The gitlink assertion exists
@@ -130,8 +157,8 @@ say where it is; do not add it to `devlog/`, `structure/`, or `docs-site/`.
 ## User-consent actions
 
 Some actions write to the **user's own accounts and identity** rather than to
-this repository, and an agent must never perform or auto-answer them. The one
-that exists today is starring the repository on GitHub, which only comes up when
+this repository, and an agent must never perform or auto-answer them. One example
+is starring the repository on GitHub, which only comes up when
 an agent is *running* opencodex — not when it is working on this codebase.
 
 The rule lives in [`AGENTS_INSTALL.md`](./AGENTS_INSTALL.md), which is the file
@@ -143,8 +170,8 @@ What matters for development work: the enforcement is code, not prose —
 [`src/cli/agent-driven.ts`](./src/cli/agent-driven.ts),
 [`src/cli/star-prompt.ts`](./src/cli/star-prompt.ts), and
 [`src/server/management/sidebar-routes.ts`](./src/server/management/sidebar-routes.ts),
-covered by `tests/startup-prompt.test.ts`, `tests/agent-driven.test.ts`, and
-`tests/sidebar-routes.test.ts`. If you add another action that spends the user's
+covered by `tests/server/startup-prompt.test.ts`, `tests/cli/agent-driven.test.ts`, and
+`tests/server/sidebar-routes.test.ts`. If you add another action that spends the user's
 identity, credits, or reputation, gate it the same way rather than relying on a
 prompt an agent can answer, and document it in `AGENTS_INSTALL.md`.
 
@@ -158,28 +185,455 @@ credential is equally reachable by both the browser and the agent, so no check
 inside this process can tell them apart. The real boundary is the rule above, and
 it binds you regardless of which mechanism is within reach.
 
+## Fork-maintained behavior and upstream synchronization
+
+This repository is a fork of `https://github.com/lidge-jun/opencodex`. Upstream
+code may be merged, but the behavioral contracts in this section belong to this
+fork and must survive an upstream synchronization. Preserve the behavior, not
+necessarily the old implementation: when upstream architecture changes, port the
+contract onto the current architecture and keep its regression coverage.
+
+The initial register below was audited against the common `v2.27.0` ancestor
+(`8e01dd4e`) before the planned synchronization to upstream `v2.33.0`. Merge
+commits and changes that leave no final tree difference are history, not
+fork-maintained behavior, and do not belong in this register.
+
+Each entry states its **upstream disposition**, verified against the recorded
+upstream commit. `fork-only` means upstream has no equivalent and the local
+implementation must be kept. `absorbed` means upstream now implements the same
+contract, so the local implementation should be deleted and only the contract
+kept. `partially overlapping` means upstream covers part of the contract and the
+entry names what remains local. Re-verify the disposition, not just the
+behavior, on every sync: an `absorbed` entry kept past its absorption is the
+most expensive kind of fork delta, because it re-conflicts every time.
+
+### Fork delta register
+
+#### F-001 — Durable three-mode Codex integration
+
+- `clientIntegrations.codex` supports `full`, `catalog-only`, and `off`. For
+  backward compatibility, a missing value or `true` means `full`,
+  `"catalog-only"` means `catalog-only`, and `false` means `off`.
+- The fork-only part of this contract is the **third state**. Upstream implements
+  `full` and `off` as a boolean (`z.boolean()` in `src/config/schema/leaf-validators.ts`);
+  `catalog-only` has no upstream equivalent, so the schema union, the persisted
+  mode, and the mode-aware sync branch are what must survive.
+- `catalog-only` refreshes the Codex model catalog and `models_cache.json` while
+  leaving provider routing, profiles, journal, history, and session data under
+  the user's existing ownership. It must not silently become full integration.
+- The management API reports the mode and accepts a mode change while retaining
+  the legacy boolean toggle contract. The GUI overview and Codex integration
+  page must show and change all three modes consistently.
+- Key paths currently include `src/types/config.ts`,
+  `src/config/schema/leaf-validators.ts` (upstream v2.56.0 moved the inline schema here),
+  `src/codex/desired-state.ts`, `src/codex/sync.ts`,
+  `src/server/management/native-integration-routes.ts`, and the Codex integration
+  GUI/API/i18n files.
+- Regression sentinels currently include `tests/codex-integration/codex-desired-state.test.ts`,
+  `tests/codex-integration/codex-sync-api.test.ts`,
+  `tests/codex-integration/native-codex-toggle.test.ts`,
+  `gui/tests/integrations-api.test.ts`, and
+  `gui/tests/integrations-overview-rows.test.ts`.
+- Known semantic conflict to re-check each sync: `GET /api/native-integrations`
+  deliberately reads `loadConfig()` for the Codex row (a mode change committed by
+  `mutatePersistedConfig` writes disk only, so the startup snapshot would report
+  the previous mode) while the sibling claude/grok/desktop rows read the passed
+  `config`. Upstream calls `codexStatus(config, ...)`. Keep the fresh read, and
+  keep it scoped to Codex; do not "unify" it onto `config`.
+- Disposition: **fork-only** as of upstream v2.56.0 (`e4a8539b9`). Upstream may
+  contain other internal operations described as catalog-only; they are not
+  equivalent unless the durable config, ownership boundary, management API, and
+  GUI contract above all remain true.
+- Original fork implementation: `0160b8f7`.
+
+#### F-002 — Safe Codex client-metadata forwarding in API-key mode
+
+- The `openai-responses` adapter preserves the incoming client's `User-Agent` as
+  a non-credential fallback in **both** auth modes, because some Responses
+  gateways select their Codex compatibility path from the real client
+  fingerprint.
+- An explicitly configured provider `User-Agent` remains authoritative in any
+  header casing, and the caller value must not be joined as a second spelling.
+  When the caller sends none, the adapter invents no client identity.
+- This relays exactly one header. It is **not** a wider caller-header contract:
+  never forward the caller's `authorization` or `chatgpt-account-id`, and never
+  reach for the `FORWARD_HEADERS` allowlist to implement it.
+- `User-Agent` must **not** be added back to `FORWARD_HEADERS`. Eleven call sites
+  read that allowlist (`src/codex/auth-context.ts`, `src/server/claude-messages.ts`,
+  `src/server/chat-completions.ts`, `src/server/ws-bridge.ts`,
+  `src/server/responses/compact.ts`, `src/vision/describe.ts`, the web-search
+  executor), so listing it there relays the caller fingerprint on the Claude
+  inbound, Chat bridge, WS bridge, and sidecar paths that never opted into this
+  contract — and it also hands key-mode upstreams the whole 17-entry forward set,
+  including `x-oai-attestation` and `x-codex-turn-metadata`.
+- The key path is `src/adapters/openai-responses/passthrough.ts`
+  (`applyCallerUserAgentFallback` plus its call site after the auth branch), and
+  the regression sentinel is `tests/codex-integration/codex-metadata-integrity.test.ts`
+  (API-key forwarding, no-wider-allowlist, case-insensitive configured value, no
+  invented identity).
+- Disposition: **absorbed** by upstream `45cfb04e9` (#4702), reachable in the
+  upstream `dev` line; not yet in the v2.56.0 release tag (`e4a8539b9`). The
+  local implementation is upstream's `applyCallerUserAgentFallback`, adopted
+  verbatim during the 2026-09-16 audit. Keep the contract and the sentinels;
+  prefer upstream's implementation whenever this file conflicts.
+- Original fork implementation: `0ac0d028` and `960e2b59`. This is a credential
+  boundary: changes require explicit security review and `bun run privacy:scan`.
+
+#### F-003 — OpenCode catalog authentication
+
+- `ocx opencode` fetches the management `/api/models` catalog with the configured
+  OpenCodex admin token, not with the data-plane admission key. If the management
+  token is unavailable, fail explicitly instead of producing a partial or
+  misleading model catalog.
+- The user-visible failure is a message on stderr and exit status `1`. Upstream
+  achieves the same outcome inline in `cmdOpencode`; the fork's former
+  `requireOpencodeManagementToken()` helper was a refactor of that same behavior
+  and was removed during the 2026-09-16 audit. Do not reintroduce a helper whose
+  sentinel tests the helper rather than the CLI contract.
+- The key path is `src/cli/opencode.ts`; the regression sentinel is
+  `tests/providers/opencode-cli.test.ts`, which drives `cmdOpencode` and asserts
+  both the admin-token fetch and the loud failure without one.
+- Modality export is **not** part of this entry: upstream `ad09340d7` (#4300,
+  tagged v2.52.0) implements the same propagation plus `attachment`, and covers
+  it in `tests/providers/opencode-cli.test.ts` and
+  `tests/config/client-config-export.test.ts`. The fork's duplicate pair was
+  removed during the 2026-09-16 audit.
+- Disposition: **absorbed** as of upstream v2.56.0 (`e4a8539b9`) — the fork's
+  remaining delta is zero beyond the error-message wording. Delete this entry
+  entirely once a sync confirms the upstream message is acceptable.
+- Original fork implementation: `41dfada4` and `0a558755`. Authentication changes
+  are security-boundary changes and require explicit security review.
+
+#### F-004 — Authoritative client-export output-token limits
+
+- Client integrations must export a per-model output limit only from authoritative
+  capability metadata. Exact generated provider/model metadata and an explicit custom-model
+  `maxOutputTokens` are valid sources; unknown capability remains omitted.
+- Never reinterpret `defaultMaxOutputTokens` or `modelMaxOutputTokens` as catalog
+  capability: those fields remain request defaults used by the OpenAI Chat adapter. Never
+  restore the retired uniform `32000` schema stand-in.
+- OpenCode emits `limit` only when authoritative context and output values are both known.
+  Pi, OMP, Prime, and Gajae preserve either known field independently; ZCode emits optional
+  `limit.output`. Combo output capability is the minimum only when every target is known.
+- Key paths include `src/types/config.ts`, `src/codex/catalog/routed-gather.ts`,
+  `src/codex/catalog/aggregation.ts`, `src/server/management/model-rows.ts`,
+  `src/server/management/model-routes.ts`, `src/clients/config-export.ts`,
+  `src/clients/config-export/model-metadata.ts`, `src/clients/config-export/contracts.ts`,
+  `src/clients/config-export/omp.ts`, `src/clients/config-export/zcode.ts`,
+  `src/cli/export-command.ts`, `src/cli/opencode.ts`, and the Models GUI/API/i18n files.
+  (`src/codex/catalog/parsing.ts` and `src/codex/catalog/model-hints.ts` were listed before the
+  2026-09-16 audit and carry no fork delta: upstream owns `CatalogModel.maxOutputTokens` and the
+  `routedMaxOutputTokens` derivation unchanged. Do not re-list a path without checking
+  `git diff <upstream-tag> dev -- <path>`.)
+- `maxOutputTokens` means the **output ceiling** — the same quantity as a vendor's published
+  `output`/`max_tokens`/`max_completion_tokens`. It is emphatically **not** the same thing as
+  `defaultMaxOutputTokens` / `modelMaxOutputTokens`, which are wire request defaults the adapters
+  substitute when a caller omits `max_output_tokens` (`src/adapters/openai-chat.ts`
+  `resolveMaxTokens`, `src/adapters/anthropic.ts`). Those two must never be read as per-model
+  capability, and `routedMaxOutputTokens` is where the distinction is enforced.
+- `summarize*` functions that report `modelsWithoutLimits` count a row as limited only when its
+  **output** capability is known too. That is a user-visible number in `ocx export` output; keep it
+  consistent with what the serializers actually emit.
+- Upstream v2.56.0 split `config-export.ts` and `catalog/provider-fetch.ts` into leaf modules and
+  reintroduced a uniform `SCHEMA_REQUIRED_OUTPUT_BUDGET` (32,000) for opencode's paired `limit`.
+  This fork keeps the authoritative rule instead and does not ship that constant; the
+  `maxOutputTokens` field must be restored on `ExportModel` and `OpencodeCatalogModel` whenever a
+  serializer is added.
+- Regression sentinels include `tests/codex-integration/codex-catalog.test.ts`,
+  `tests/codex-integration/catalog-input-modality-enum.test.ts`,
+  `tests/config/client-config-export.test.ts`, `tests/providers/opencode-cli.test.ts`,
+  `tests/server/management-client-config-route.test.ts`, `tests/cli/cli-export-command.test.ts`,
+  `tests/clients/client-export-modality-enum.test.ts`, and the relevant GUI model tests.
+- Disposition: **fork-only** as of upstream v2.56.0 (`e4a8539b9`) **and still fork-only on the
+  upstream `dev` line**, where `outputBudgetFor` and `SCHEMA_REQUIRED_OUTPUT_BUDGET` both survive.
+  This is the highest-conflict entry in the register: expect the stand-in to be reintroduced on
+  every sync and re-remove it.
+- Original fork implementation: `6272fc3f4`.
+
+#### F-005 — ZCode semantic ownership canonicalization
+
+- ZCode may rewrite the managed `provider.opencodex` block after OpenCodex
+  writes it: documented runtime metadata such as `reasoning` and derived limit
+  defaults are refreshable, and ZCode may reorder JSON object keys while doing
+  so. Such key-order drift must classify as `stale`, allowing a later provider
+  or model catalog update to refresh the block instead of becoming a permanent
+  `conflict` that requires deleting `~/.zcode/v2/config.json`.
+- Canonicalization is scoped to ZCode's protected ownership fingerprint and the
+  known generated schema. It must not weaken protection for provider identity,
+  connection options (including `options.baseURL`), model membership, names,
+  modalities, or authoritative context limits. The whole-file fingerprint stays
+  byte-exact for restore and unrelated clients retain their existing semantics.
+- Key paths are `src/integrations/ownership-policy.ts`,
+  `src/integrations/state.ts`, and `src/integrations/writer.ts`; the focused
+  regression sentinel is `tests/clients/integrations-writer.test.ts`, including the
+  key-reorder plus catalog-drift refresh case and the protected connection-edit
+  conflict case.
+- The load-bearing case is a **pre-`v2.35.0` ZCode ownership record**. Upstream
+  `63941b583` added `semanticProtectedBlockFingerprint` (v2.35.0), which makes the
+  semantic companion path available in `classifyIntegration`; a record written
+  before that carries only the byte-exact `protectedBlockFingerprint`. Measured on
+  2026-09-16 by disabling the canonicalizer against such a record with key reorder
+  plus catalog drift: with canonicalization the state is `stale` and
+  `applyIntegration` succeeds; without it the state is `conflict` and the apply is
+  refused, leaving the user to delete `~/.zcode/v2/config.json` by hand. Do not
+  describe this entry as dead code because the current records carry the semantic
+  companion — that is true only for records written after v2.35.0.
+- Disposition: **fork-only**. Upstream `63941b583` absorbed only the generic
+  semantic fingerprint; the ZCode-specific `canonicalizeZcodeValue` has no upstream
+  equivalent at either v2.56.0 (`e4a8539b9`) or on the upstream `dev` line.
+- Original fork implementation: `2780fc291`. Note for accuracy: at that commit the
+  fork tree did not yet contain `semanticContribution` or
+  `semanticProtectedBlockFingerprint` — the v2.35.0 merge (`58703ee6a`) brought them
+  in afterwards. F-005's own net delta is the canonicalizer plus its writer mount
+  point, not the semantic machinery.
+
+#### F-006 — Routed V2 collaboration plaintext delivery
+
+- Codex marks the `message` parameter on v2 collaboration tools as encrypted. Before sending
+  flattened namespace tools to a routed Responses provider, OpenCodex must remove that marker only
+  from `collaboration.spawn_agent`, `collaboration.send_message`, and
+  `collaboration.followup_task`; otherwise a compatible gateway replaces the message with ChatGPT
+  backend ciphertext. When OpenCodex restores an authorized routed call to
+  `collaboration.spawn_agent`, `collaboration.send_message`, or
+  `collaboration.followup_task`, it must attach `encrypted_function_args: []`. Codex 0.151+ uses
+  that exact marker to deliver the inter-agent payload as plaintext instead of producing a
+  ChatGPT-backend-encrypted child task that the routed provider cannot read.
+- The marker is scoped to request-authorized function aliases and those three message-bearing
+  collaboration calls. Never remove encrypted schema markers from other tools, add the delivery
+  marker to other collaboration tools or custom calls, or overwrite non-empty encrypted-function
+  metadata. Genuine ciphertext remains opaque and the `unreadable_encrypted_agent_task` guard must
+  continue to fail closed.
+- The key path is `src/responses/namespace-tool-compat.ts`; regression sentinels are
+  `tests/responses/namespace-tool-compat.test.ts` and
+  `tests/server/server-xai-responses-streaming.test.ts`, covering both streaming and JSON
+  Responses output.
+- Disposition: **partially overlapping**. Upstream `src/responses/plaintext-v2-agent-messages.ts`
+  performs the *same* `message.encrypted` strip over the *same* three tool names
+  (`hasAgentMessageEncryptionMarker` / `rewriteAgentMessageToolDeclaration`), and
+  `src/server/responses/passthrough-dispatch.ts` already calls
+  `restorePlaintextV2AgentMessageCalls`. What remains genuinely fork-only is:
+  (a) this path is **always on**, whereas upstream's compiler is behind the opt-in
+  `plaintextV2AgentMessages` config flag plus `inboundWire`/`canonicalChatGpt` gates;
+  (b) the fork additionally attaches `encrypted_function_args: []` on restore and strips it
+  again on replay (`rewriteInputItem`). Do not record this as fork-only — a future sync
+  following that label would keep a duplicate of the upstream strip and never notice that
+  the two could be unified behind upstream's compiler plus a default-on gate.
+- Original fork implementation: `0a1cff56d`.
+
+#### F-007 — Custom-model dialog accessible name
+
+- The Models page "add custom model" button carries an explicit
+  `aria-label={t("models.customAdd")}`, so a screen reader announces the action
+  even though the button's visible content is only the `+` glyph plus the label
+  text. Without it the accessible name is derived from content that changes with
+  the icon rendering.
+- Key path is `gui/src/pages/Models.tsx`; covered by the existing Models GUI
+  tests (`gui/tests/models-status-toast.test.tsx` locates the button by that
+  label), so there is no separate sentinel.
+- Disposition: **absorbed**. Upstream independently added the same attribute
+  (`gui/src/pages/Models.tsx` on the upstream `dev` line). Because both sides
+  changed the same line, this is a guaranteed textual conflict on every sync for
+  a one-attribute change; on conflict, take upstream's line and drop this entry.
+- Original fork implementation: `23906fe99`.
+
+### Registering future fork-only changes
+
+Any change that intentionally differs from upstream behavior must update this
+section in the same change set. Add a new stable `F-NNN` entry, or update the
+existing entry, with all of the following:
+
+- the user-visible or operational behavior that must survive future syncs;
+- compatibility and security boundaries, including what must never happen;
+- the current key implementation paths and focused regression tests;
+- the originating fork commit or pull request once available;
+- the upstream disposition: fork-only, partially overlapping, or verified as
+  absorbed upstream.
+
+Do not register incidental refactors, formatting, generated output, merge-only
+history, or temporary conflict resolutions. A prose entry without regression
+coverage is not sufficient for runtime behavior: add or retain a focused test.
+If paths or tests move, update the register in the same change that moves them.
+
+An entry may be marked absorbed and its local implementation removed only after
+the upstream implementation is verified against the complete behavior and
+security contract, the named regression tests pass without the local patch, and
+this register is updated with the upstream commit or release that absorbed it.
+
+### Required upstream synchronization procedure
+
+Use upstream stable release tags or the upstream `main` release commit by
+default. Synchronizing from the unreleased upstream `dev` branch requires an
+explicit decision for that sync. Never update this fork's `dev` by hard reset,
+forced rebase, wholesale file replacement, or a force push that discards fork
+ancestry.
+
+For every upstream sync:
+
+1. Require a clean worktree. Fetch the intended upstream refs and record the
+   exact source and target SHAs. Create a recoverable backup ref for the current
+   fork `dev`.
+2. Create a dedicated `codex/sync-upstream-<version>` branch from the fork's
+   current `dev`. Run a three-way merge preview and record the common ancestor,
+   left/right commit counts, overlapping paths, and predicted conflicts.
+3. Merge with history preserved, normally `git merge --no-ff --no-commit
+   <upstream-tag>`. Resolve conflicts against the current upstream architecture;
+   do not resolve a fork-owned path by blindly choosing all of `ours` or
+   `theirs`.
+4. Audit every `F-NNN` entry after the merge. Confirm its contract in code and
+   run its focused regression sentinels. Review automatically merged overlapping
+   files for semantic conflicts even when Git reported no textual conflict.
+   **Also audit for regression coverage the merge deleted.** A conflict resolved
+   by taking a whole fork-side file silently discards every upstream test added
+   to it, and nothing reports that: the file still runs green, it just runs
+   fewer tests. The v2.56.0 sync lost twelve upstream tests from
+   `tests/codex-integration/codex-metadata-integrity.test.ts` exactly this way
+   (upstream had 21, the merged file had 12) while covering live code —
+   `applyCodexRoutingHint`, the mixed-case `CODEX_RESPONSES_LITE_HEADER`
+   override, `stripBracketedModelSuffix` alias directions. Compare each
+   conflicted test file against the upstream version before resolving:
+   `git show <upstream-tag>:<path> | grep -c '  test('` versus the local count,
+   or diff the test-name lists for any file that took the fork side wholesale.
+5. Because the current register touches shared config, server management, an
+   adapter, authentication, GUI, and documentation, run the focused tests plus
+   `bun run typecheck`, `bun run test`, `bun run privacy:scan`, the required GUI
+   lint/test/build gates, and the documentation build before declaring the sync
+   complete.
+6. Inspect the final range/tree diff and retain the backup ref until the merged
+   build has passed the requested operational verification. Merge the sync branch
+   back to the fork `dev` without rewriting its published history.
+
+If upstream has absorbed a fork delta, prefer its current architecture over
+maintaining a parallel implementation, but only after satisfying the absorption
+criteria above. If the upstream target advances while the sync is in progress,
+finish against the recorded SHA or restart the evidence and validation process;
+do not silently widen the synchronization scope.
+
 ## Commands
 
 ```bash
 bun install
 bun run typecheck      # bun x tsc --noEmit (strict)
-bun run test           # full tests/ suite
+bun run test:changed   # import-graph tests against the resolved `dev` merge base
+bun run test           # full tests/ suite (PR-ready / explicit ask only)
 bun run lint:gui       # GUI eslint
 bun run privacy:scan   # credential/privacy scan used by CI
+bun run structure:check # structure/ doc-map, ownership, and invariant-binding gate
+bun run structure:index # regenerate structure/INDEX.md from structure/manifest.json
 bun run build:gui      # Vite GUI build
 ```
 
+`skills/ocx/` is the operating reference for the CLI — what an agent reads to *drive* a running
+proxy, as opposed to [`AGENTS_INSTALL.md`](./AGENTS_INSTALL.md) (installing and operating consent)
+or this file (changing the codebase). Its surface map is generated:
+
+```bash
+bun run skill:surface        # regenerate after adding a capability
+bun run skill:surface:check  # what CI asserts
+```
+
+`tests/ci-workflows/skill-ocx.test.ts` fails if the committed map drifts from `src/cli/capabilities.ts`, and
+also if the hand-written pages name a command the registry does not have. That second check is not
+hypothetical: it caught a documented `ocx request-history` that never existed.
+
 During implementation, use the smallest focused checks that directly cover the
-changed subsystem. Do not run repository-wide `bun run typecheck` or
-`bun run test` for a scoped change unless the change affects shared runtime,
-routing, config, server behavior, a focused result is failed or ambiguous, or
-the user explicitly asks for full validation.
+changed subsystem. Prefer `bun test tests/<domain>/<name>.test.ts` for a known
+file, `bun test tests/<domain>` for one subsystem, or
+`bun run test:changed` when the touch set is broader than one file. Do **not**
+run repository-wide `bun run test` or a bare `bun test` with no file arguments
+for a scoped change by default. `bun run test:changed` follows Bun's parsed module graph: it
+selects test files that import changed modules, but it cannot see dependencies
+expressed through subprocesses, source files read as data, or golden/derived
+files. Run the relevant focused tests explicitly for those paths; if no reliable
+focused set covers them, the full suite is required even for a scoped change.
+That indirect-dependency case is the explicit exception to the scoped-change
+default. The full suite is ~850 files, so otherwise reserve it for a failed or
+ambiguous focused result, an explicit user request, or the PR-ready gate below.
 
 Before creating or updating a non-trivial PR as review-ready, or before
 approving such a PR, run `bun run typecheck` and `bun run test`. CI runs these
 on Linux, Windows, and macOS.
 
 Do not rerun passing checks on unchanged code merely for additional confidence.
+
+## What a green pull request does not tell you
+
+Exact-head CI cannot see a defect that exists only in the union of two changes. Each
+branch is correct at its own head, the merge is not, and the failure lands on whoever
+pushes next. One round produced ten of these, including an hour of red `dev`, so the
+classes below are worth checking before you push rather than after.
+
+### The file-size ratchet has almost no headroom
+
+`tests/fixtures/file-size-baseline.json` records a line cap per file and
+`updateBaseline` uses `Math.min`, so a cap only ever moves **downward**. Raising one is
+not possible by design, and a cap is not a suggestion you can negotiate with.
+
+At the time of writing, 39 of the 51 tracked files sit at **exactly** their cap and three
+more are within five lines. Among them are `src/server/index.ts`, `src/config.ts`,
+`src/server/responses/core.ts`, `gui/src/pages/Models.tsx`, and the large test files
+`tests/codex-integration/codex-catalog.test.ts` and
+`tests/responses/openai-responses-passthrough.test.ts`. Adding one line to any of them
+fails `file-size ratchet: repository` for your branch and for every branch cut from
+`dev` afterwards.
+
+Two branches can each stay under a cap alone and sum over it together; that is what
+happened in #4908, #5011 and #5018. The remedy is always a move, never a number: put the
+new case in a sibling file, byte for byte, and register it in **both**
+`scripts/test-layout/layout.json` and `tests/fixtures/test-layout-expected.json`.
+`d3ca5522db` is the original precedent.
+
+A moved test is not automatically the same test. One case moved out of
+`codex-v2-gate.test.ts` failed in isolation and then failed again in place once unrelated
+blocks moved around it, because its final assertion was reading catalog state earlier
+cases had warmed rather than the contract. If a moved case changes colour, suspect the
+case before the move.
+
+### Anything exhaustive over a union
+
+A locale catalog, a `satisfies Record<Union, ...>`, a hand-maintained roster, a count in
+generated documentation. Adding a member to the union in one branch while another branch
+adds a consumer keyed by it produces a merge that typechecks in neither direction.
+
+`typecheck` precedes every job, so one missing member is not one red suite. It took down
+fourteen checks on `dev` — all four test shards, `docker smoke`, `storage policy`,
+`api usage` and all three `npm-global` smokes — when a closed translation namespace still
+listed nine locales after a tenth had landed.
+
+Counts drift the same way and more quietly, because both sides write a plausible number.
+Two branches each added one CLI capability and each wrote `47`; the merged truth was 48.
+Two each added one provider preset and each wrote `94`; the registry had 95. Prefer
+deriving a count or a member list from the thing it describes over restating it.
+
+## Minimal containers and agent sandboxes
+
+Fresh dev containers and agent sandboxes (Cursor Cloud, devcontainers, CI
+images) often ship Node but not Bun. Install it first:
+
+```bash
+curl -fsSL https://bun.sh/install | bash   # installs ~/.bun/bin/bun
+export PATH="$HOME/.bun/bin:$PATH"
+bun install && (cd gui && bun install)
+```
+
+Run the proxy with `bun run src/cli/index.ts start --port <port>`. `/healthz`
+reports status, `/` serves the dashboard, and the management API requires the
+admin token the server writes to `$OPENCODEX_HOME/admin-api-token` at startup.
+
+`bun run test` has five known environment-only failures in such containers.
+They are not regressions; do not re-investigate them:
+
+- `service diagnostics > status summary exposes the service log path`,
+  `CLI subcommand help > status prints diagnostics without starting the proxy`,
+  and `CLI subcommand help > invalid service and codex-shim usage include
+  remove alias` require a running systemd init; in a container PID 1 is
+  typically `tini` or another minimal init, so service commands report
+  "systemd not found".
+- `package tree integrity > an in-place rewrite of the same byte length is
+  still a replacement` and `Codex Log Guard inspection > repeat inspection is
+  memoized and invalidated by a write` rely on filesystem mtime granularity
+  that some container filesystems do not provide.
+
+Everything else passes (15480 pass / 16 skip / 5 fail as of 2.35.0).
 
 ## Issues and pull requests (agents)
 
@@ -203,6 +657,17 @@ than nudged.
   `Closes #<number>` to link it. GitHub auto-closes the linked issue only
   when the PR merges into the default branch (`main`); PRs here target
   `dev`, so close the issue manually once the change is on `dev`.
+- **Landing another author's work:** reimplementing, superseding, carrying, or
+  rebasing someone else's pull request requires a `Co-authored-by` trailer
+  naming that author, in the description or in a branch commit so it survives
+  the squash. Saying it in prose is not equivalent — the trailer is what GitHub
+  reads for the contributor graph, and a sentence in a commit body is read by
+  nothing. This repository did it both ways for months: `53c09a247` says "Clean
+  reimplementation of #3193" and names the author in a trailer, `5734a1caf` says
+  "Reimplements #2797 by @rrmlima" and names nobody, so that contribution is
+  invisible on its author's profile. The 27 landings already in that state are
+  recorded in [`CREDITS.md`](./CREDITS.md); `missing_coauthor_credit` in
+  `.github/scripts/pr-carry-attribution.cjs` is why the list should not grow.
 
 ## Branch policy
 
@@ -245,8 +710,15 @@ repository CI; a maintainer has to — so the gate never disproves it; a new
 push still resets every box. A disproved claim unticks the matching box and
 keeps the PR a draft.
 Authors with repository push permission skip the ancestry heuristic only. As with approval requirements in
-[`MAINTAINERS.md`](./MAINTAINERS.md), this is enforced by convention until
-branch protection is configured.
+[`MAINTAINERS.md`](./MAINTAINERS.md), the ancestry heuristic is a CI check
+rather than a branch rule. The branches themselves are protected: `dev`,
+`main`, and `preview` each require a pull request and block force-pushes and deletion.
+For `dev` only, a current maintainer with GitHub `maintain` or `admin` access may
+explicitly integrate through a PR without another maintainer approval, including
+their own PR, under the policy in `MAINTAINERS.md`. Record the decision and exact-head
+CI evidence; keep outstanding maintainer objections and security review separate.
+The bypass is PR-only, so a direct push to `dev` remains rejected regardless of
+`--no-verify`. Contributor review and `main`/`preview` rules remain unchanged.
 
 [`MAINTAINERS.md`](./MAINTAINERS.md) is authoritative for review and merge
 policy (approvals, CI requirements, security review, promotion). This file
@@ -274,8 +746,9 @@ reviewers (Codex, CodeRabbit).
   assumptions about a compile step, or code paths that break `bun run
   typecheck` / `bun run test`.
 - **Tests:** behavior changes in `src/` need a focused regression test near
-  the existing tests for that subsystem. Shared routing, adapter, config, or
-  server changes need the full suite green.
+  the existing tests for that subsystem. During implementation, run the relevant
+  focused files and use `bun run test:changed` for import-connected coverage as
+  described above; the full suite is the PR-ready gate.
 - **Docs sync:** user-facing behavior changes should update `docs-site/` (and
   keep translated locales from contradicting the English source).
 - **Privacy:** `bun run privacy:scan` must stay green; never introduce logging

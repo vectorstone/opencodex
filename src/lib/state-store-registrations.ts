@@ -9,6 +9,7 @@ import { reconcileProviderFetchWarnings } from "../codex/catalog/provider-fetch"
 import { reconcileModelCacheGeneration } from "../codex/model-cache";
 import { reconcilePoolRotationState } from "../codex/pool-rotation";
 import { reconcileCodexQuotaAccounts } from "../codex/quota";
+import { reconcileQuotaRecovery, sweepExpiredQuotaRecovery } from "../codex/quota-401-recovery";
 import {
   listLiveCodexAccountIds,
   reconcileCodexRoutingHealth,
@@ -20,6 +21,7 @@ import {
 } from "../combos/failover";
 import { reconcileComboWarningMemos } from "../combos/request";
 import { reconcileComboRotationState } from "../combos/resolve";
+import { reconcileComboRecall, sweepExpiredComboRecall } from "../server/responses/combo-session-recall";
 import { listLiveComboTargetKeys } from "../combos/types";
 import {
   listLiveConfigOwnershipRoots,
@@ -85,6 +87,13 @@ export const STATE_STORE_REGISTRATIONS = [
   { name: "anthropic-routing-health", sweepExpired: sweepExpiredAnthropicRoutingHealth },
   { name: "xai-refresh-verdicts", sweepExpired: sweepExpiredXaiPermanentFailureVerdicts },
   {
+    name: "codex-quota-401-recovery",
+    // Only backoff windows and abandoned leases expire. A spent fence is durable: expiring
+    // it would grant the same credential lineage a second refresh (#3019).
+    sweepExpired: sweepExpiredQuotaRecovery,
+    reconcileGeneration: context => reconcileQuotaRecovery(context.codexAccountIds),
+  },
+  {
     name: "responses-continuation",
     sweepExpired: sweepExpiredResponseStates,
     // Disk reclaim rides the liveness tick, not the TTL tick: sweepExpiredOnWrite puts
@@ -103,6 +112,11 @@ export const STATE_STORE_REGISTRATIONS = [
   { name: "model-cache-history", reconcileGeneration: reconcileModelCacheGeneration },
   { name: "pool-rotation", reconcileGeneration: reconcilePoolRotationState },
   { name: "combo-rotation", reconcileGeneration: reconcileComboRotationState },
+  {
+    name: "combo-session-recall",
+    sweepExpired: sweepExpiredComboRecall,
+    reconcileGeneration: reconcileComboRecall,
+  },
   { name: "guardian-backoff", reconcileGeneration: reconcileGuardianBackoff },
   { name: "codex-reauth", reconcileGeneration: reconcileCodexReauthState },
   { name: "oauth-reauth", reconcileGeneration: reconcileOAuthReauthState },

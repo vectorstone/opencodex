@@ -61,13 +61,15 @@ ocx route combo set reliable --targets ark/model-a:2,openai/gpt-5.5
 |別名 |同等のリソース |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
 ```bash
 ocx observe usage --range 30d --json
 ```
+
+一部の使用履歴を集計できない場合、人向けの出力は読み取れる行がない場合も警告を表示します。表示される合計値は読み取れる記録のみを反映します。フィルターに一致する読み取れる記録がない場合は、合計欄の代わりに警告と案内を表示します。除外した記録には一致するものが含まれる可能性があります。`--json` は応答の `usageIncomplete` 診断と理由をそのまま保持します。
 
 ### `ocx debug <provider|usage|injection|claude> <on|off|status|reset|logs [-f]>`
 
@@ -117,7 +119,7 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 ### `ocx opencode [opencode args...]`
 
-プロキシが実行されていることを確認し、OpenCode のインライン ランタイム層 (`OPENCODE_CONFIG_CONTENT`) で生成された `provider.opencodex` ブロックを使用してオープンコードを起動します。既存のインライン設定は保持され、今回の起動では `provider.opencodex` のみが置き換えられます。グローバルまたはプロジェクトの `opencode.json` ファイルは、既存の上書きについて警告するために読み取られることがありますが、ディスク上のファイルは変更されません。ルーティングされたモデルは `opencodex/<provider>/<model>` として表示されます。後でプレーン `opencode` を起動すると、以前とまったく同じように動作します。
+プロキシが実行されていることを確認し、OpenCode のインライン ランタイム層 (`OPENCODE_CONFIG_CONTENT`) で生成された `provider.opencodex` および `providers.opencodex` ブロックを使用してオープンコードを起動します。既存のインライン設定は保持され、今回の起動ではこの 2 つのキーのみが置き換えられます。グローバルまたはプロジェクトの `opencode.json` ファイルは、既存の上書きについて警告するために読み取られることがありますが、ディスク上のファイルは変更されません。ルーティングされたモデルは `opencodex/<provider>/<model>` として表示されます。後でプレーン `opencode` を起動すると、以前とまったく同じように動作します。
 
 ### `ocx grok <status|exclude|include|set|clear|apply> ...`
 
@@ -125,7 +127,7 @@ Grok Build モデル フェンスを管理および適用します。
 
 ## クライアント設定のエクスポート
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo>`
 
 実行中のプロキシに接続するクライアント設定を出力します。このコマンドは、ベース URL、モデル一覧、およびクライアントに応じた認証情報参照または `opencodex-loopback` プレースホルダーを含む `opencodex` プロバイダーブロックを、選択したクライアントのネイティブ形式でシリアル化します。
 
@@ -133,7 +135,7 @@ Grok Build モデル フェンスを管理および適用します。
 
 |旗 |アクション |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` |必須。クライアントの設定形式を選択します。 |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo>` |必須。クライアントの設定形式を選択します。 |
 | `--json` |構成 JSON のみを標準出力に出力するため、リダイレクトはバイト正確な出力をキャプチャします。 `--out` 書き込みメモを含むすべての診断は stderr に送られます。 |
 | `--out <path>` |設定を `<path>` に書き込みます。既存のファイルの置き換えを拒否します。 |
 | `--force` | `--out` が既存のファイルを置き換えることを許可します。 |
@@ -150,13 +152,21 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 |クライアント |正規の宛先 |ダウンロードファイル名 |環境変数 |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json` (設定すると `XDG_CONFIG_HOME` が勝ち) | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | なし - ブロックにリテラル `opencodex-loopback` が入ります |
+| `pi` | `~/.pi/agent/models.json` (`PI_CODING_AGENT_DIR` が設定時に優先。相対値は拒否されます) | `pi-models.json` | なし - ブロックにリテラル `opencodex-loopback` が入ります |
 | `omp` | `~/.omp/agent/models.yml` (デフォルト。空の場合も `OMP_PROFILE` が `PI_PROFILE` より優先されます) | `omp-models.yaml` | なし - リテラル `opencodex-loopback` |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | なし - loopback placeholder |
-| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
+| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | 秘密ではないループバック用プレースホルダー |
 | `dsh` | `$DSH_HOME/settings.yaml`（既定 `~/.dsh/settings.yaml`） | `settings.yaml` | なし — 秘密ではないループバック bearer プレースホルダー |
+| `mcode` | `~/.minimax/config.yaml` (`MINIMAX_DATA_DIR`、次に旧 `MAVIS_DATA_DIR` が設定時に優先。相対値は拒否されます) | `mcode-config.yaml` | なし — loopback placeholder |
+| `zcode` | `~/.zcode/v2/config.json` (`ZCODE_DATA_DIR` が設定時に優先。相対値は拒否されます) | `config.json` | なし — loopback placeholder |
+| `prime` | `~/.prime/agent/models.json` (`PRIME_AGENT_CODING_AGENT_DIR` が設定時に優先。相対値は拒否されます) | `prime-models.json` | なし — loopback placeholder |
+| `aside` | `~/.aside/u/<account>/models.json`。Aside 自身の `accounts.json` が現在のアカウントとして指す account を使います。マニフェストが読めない場合は、既定のアカウントに落とさず拒否します | `aside-models.json` | なし — loopback placeholder |
+| `raycast` | `~/.config/raycast/ai/providers.yaml` (macOS と Windows で同じ。Raycast は `XDG_CONFIG_HOME` を尊重しません) | `raycast-providers.yaml` | なし — loopback のみ。`api_keys` エントリは書き込まれません |
+| `omo` | `~/.omo/agent/models.json` (`OMO_CODING_AGENT_DIR`、次に `SENPI_CODING_AGENT_DIR`、次に `PI_CODING_AGENT_DIR` の順で設定時に優先。相対値は拒否されます) | `omo-models.json` | なし — loopback placeholder |
+
+Raycast のエクスポートは、`providers` シーケンスに `id: opencodex` 要素を 1 つだけ持つ独立した `providers.yaml` 文書です。内容は `name: OpenCodex`、プロキシの `/v1` ベース URL、および `abilities` 付きのルーティング済み全モデルです (`tools` と `system_message` は常にサポート、`vision` はカタログの入力モダリティから、`reasoning_effort` はモデルに effort ラダーがある場合、`temperature` は推論モデルではオフ)。Custom Providers は Raycast Pro の機能で、Raycast はこのファイルを監視しているため、保存した変更は再起動なしで反映されます。形式は [manual.raycast.com/ai/custom-providers](https://manual.raycast.com/ai/custom-providers) に記載されています。`api_keys` エントリは書き込まれないため、このエクスポートは loopback 専用で、loopback 以外のバインドは拒否されます。
 
 opencode は `{env:OPENCODEX_OPENCODE_API_KEY}` を補間します。opencodex が生成する Pi のエクスポートには環境変数が不要で、リテラルのプレースホルダー `opencodex-loopback` が入ります。この値は必須です。Pi はモデル リストを構築する際に `apiKey` を解決し、既存の設定に未設定の環境変数参照がある場合はプロバイダー全体を隠すためです。ループバックでは、生成されたプレースホルダーをプロキシが検査することはありません。
 
@@ -164,19 +174,46 @@ opencode は `{env:OPENCODEX_OPENCODE_API_KEY}` を補間します。opencodex �
 `ocx export` は実際のクライアント設定を書き込むことはありません。宛先は手動でマージできるように出力されます。`--out` は、`--force` なしで既存のファイルを上書きすることを拒否します。これは、設定を置き換えると、その中にすでに含まれている他のプロバイダー、エージェント、および MCP エントリが破壊されるためです。
 :::
 
-キーはシリアル化されません。opencode、Hermes、OpenClaw、Gajae の設定には環境参照のみが含まれるためシークレットは環境内に残り、Pi、OMP、Kimi、DSH の設定には認証情報ではなくループバック用プレースホルダーが入ります。ループバック プロキシ (`127.0.0.1`、デフォルト) にはアドミッション キーはまったく必要ありません。プロキシがループバックを超えてバインドする場合は、対応する `OPENCODEX_OPENCODE_API_KEY`、`OPENCODEX_HERMES_API_KEY`、または `OPENCODEX_OPENCLAW_API_KEY` を設定します。`OPENCODEX_GAJAE_API_KEY` は Gajae の provider 認証値を環境から渡しますが、remote admission header は送れないため、生成される Gajae 統合は Pi、OMP、Kimi、DSH と同様にループバック専用です。アドミッションキーの発行方法については、[リモートアクセス](/reference/configuration/#remote-access) を参照してください。上流プロバイダー自体のキーは完全に別のものであり、[プロバイダー](/guides/providers/) ごとに構成されます。
+キーはシリアル化されません。生成される設定には、文書化された環境参照か、秘密ではないループバック用プレースホルダーのいずれかが入ります。ループバック プロキシ (`127.0.0.1`、デフォルト) にはアドミッション キーはまったく必要ありません。クライアントの設定形式が対応しており、プロキシがループバック以外のアドレスにバインドする場合にのみ、参照される環境変数を設定してください。アドミッション キーの発行方法は [Remote access](/reference/configuration/#remote-access) を参照してください。上流プロバイダー自体のキーは別の設定です。[Providers](/guides/providers/) を参照してください。
+
+生成される gjc 連携は秘密ではないループバック用の値を使うため、環境変数は不要です。ループバック専用で、リモート接続の認証情報は設定しません。
 
 同じペイロードが `GET /api/client-config` によって提供され、ダッシュボードの [API] タブにレンダリングされるため、CLI、API、および GUI は同じバイトを使用します。
 
 ## ランタイムと構成
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 ヘッドレス ランタイムの設定、起動、同期、診断、更新を管理します。
+
+`ocx system codex-restart --yes` は `ocx sync --restart-codex` と同じモジュールで Codex app-server を再起動し、デスクトップ アプリも完全に終了して再起動します。プロキシ自体が Codex アプリ内で動いている場合、完了できない引き渡しを約束せず、実行可能な案内とともに拒否します。
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
+
+`ocx system update` は OpenCodex 自体を更新します。Codex CLI は次の独立した読み取り専用コマンドで検査します。
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` はパッケージレジストリに問い合わせず、設定済みのインストール候補について、秘匿化された実行ファイルの場所や所有権を示す根拠を含む来歴情報を、範囲を限定して検査します。公開ランチャー由来の信頼済みコンテキストが真正性を裏付けるのは候補のスナップショットだけであり、Codex が正常に実行されたことではありません。この単発コマンドは Codex を一切実行しないため、環境または永続化された状態から得た候補は報告対象にとどまります（`managed: false`、通常は `selection_unattested`）。`selectionAttested` は常に `false` です。JSON 出力には `candidateAvailable`、`candidateVersion`、`candidateSource`、`selectionAttested: false` が含まれます。Bun またはソースから直接起動するとランチャーの証明がないため、環境由来および永続化された候補を無視し、POSIX では `candidate_unavailable` を報告することがあります。Windows では、この最初のスライスは候補や構成のパスに対するファイルシステム I/O を一切行いません。信頼済みランチャーが取り込んだ絶対パスの環境候補だけを、アプリ同梱またはバージョンマネージャーとして字句的に報告でき、それ以外の Windows 候補はすべて失敗時閉鎖になります。このスライスは永続化された選択状態を一切読み取らないため、環境候補がキャプチャされていない Windows 実行では `candidate_unavailable` ではなく `windows_inspection_deferred` を報告します。コマンドは Codex CLI が導入されているかどうかを観測できないので、候補が存在しないと断定せず、検査が延期されたことを報告します。このコマンドは Codex やパッケージマネージャーの実行、shim の修復、設定やキャッシュ状態への書き込み、プロセスの停止、インストールを行いません。アプリ同梱、認識済みのバージョンマネージャー、未検証のスタンドアロン、曖昧な shim の各候補は管理対象外または不明として報告され、管理対象と判定されることはありません。
+
+Windows で `CODEX_CLI_PATH=codex` のような単純なコマンド名、リモートパス、デバイスパスが候補としてキャプチャされた場合は、`candidate_path_unavailable` を報告します。候補は取得されていますが、そのパスはこの検査の対象になりません。
+
+#### Windows x64 インストールの明示的な観測
+
+```text
+ocx system codex-cli-update attest [--json]
+ocx system codex-cli-update attest --candidate <absolute-path> --npm-prefix <absolute-path> --npm-cli <absolute-path> --node <absolute-path> [--json]
+```
+
+`attest` は、選択済みまたは明示した Windows x64 の npm インストールを読み取り専用で観測する任意の操作です。オプションなしでは、証明済みランチャースナップショットが特定した選択候補（設定済み `CODEX_CLI_PATH` または取り込み PATH 上の最初の `codex`）を観測し、opencodex ラッパーは名前を変えた `codex.opencodex-real.cmd` npm バックアップに解決します。4 個の絶対パスをすべて指定すると検出を上書きします。検出はパスを提案するだけで、ハンドル保持による観測が最終的な権威です。`--candidate` は標準 npm の `<prefix>/codex.cmd` または `<prefix>/node_modules/@openai/codex/bin/codex.js` を指定します。`--npm-cli` は `node_modules/npm/bin/npm-cli.js` で終わり、`--node` は明示的な `node.exe` を指定します。アプリのバンドル、認識済みバージョン管理ツールの配置、npm バックアップのない opencodex 所有の shim、独自ラッパーは拒否されます。
+
+制限付き読み取り中、ネイティブハンドルで親ディレクトリとファイルを保持します。未対応プラットフォーム、再解析ポイント・junction、競合する書き込み、安全でないパス、上限を超えるファイルは拒否されます。固定形式のレポートにパスは含まれません。`status` は `observed` または `refused` で、`installationIdentityObserved` を返します。`selectionAttested`、`managed`、`applyAllowed` は常に `false` です。拒否の報告でも終了コード 0 になり得るため、`status` を確認してください。
+
+識別値やダイジェストは観測時点のファイルを表し、持続的な更新許可ではありません。選択されたランタイム、過去のインストーラー、実効 npm 設定、ツールの真正性は証明しません。指定した Node も観測するだけで、ランチャーが選ぶ Node だとは証明しません。対象の実行、レジストリ要求、インストール、設定の書き込み、プロセス制御は行いません。既存の Windows `check` は引き続き候補・設定のファイルシステム I/O を行いません。
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 

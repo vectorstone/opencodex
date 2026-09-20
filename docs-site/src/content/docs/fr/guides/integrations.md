@@ -1,10 +1,10 @@
 ---
 title: Intégrations
-description: Connectez opencodex à OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness et MiniMax Code depuis le tableau de bord — un commutateur par client, avec une sauvegarde avant chaque écriture.
+description: Connectez opencodex à OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, gjc, DeepSeek Harness, MiniMax Code, ZCode, Prime Agent, Aside, Raycast et omo depuis le tableau de bord — un commutateur par client, avec une sauvegarde avant chaque écriture.
 ---
 
 L'onglet **Intégrations** écrit le bloc fournisseur d'opencodex dans le fichier de configuration du client,
-puis peut le retirer. Neuf clients fonctionnent ainsi, chacun avec son propre commutateur :
+puis peut le retirer. Quinze clients fonctionnent ainsi, chacun avec son propre commutateur :
 
 | Client | Fichier de configuration | Format | Prise d'effet de la modification | Identifiant |
 |---|---|---|---|---|
@@ -14,9 +14,15 @@ puis peut le retirer. Neuf clients fonctionnent ainsi, chacun avec son propre co
 | Hermes | `~/.hermes/config.yaml` | YAML | dans les nouvelles sessions | `OPENCODEX_HERMES_API_KEY` |
 | OpenClaw | `~/.openclaw/openclaw.json` | JSON5 | immédiatement, sur une passerelle en cours d'exécution | `OPENCODEX_OPENCLAW_API_KEY` |
 | Kimi Code | `~/.kimi-code/config.toml` | TOML | au redémarrage ou avec `/reload` | valeur fictive de bouclage |
-| Gajae Code | `~/.gjc/agent/models.yml` | YAML | dans les nouvelles sessions ou à l'ouverture de `/model` |`OPENCODEX_GAJAE_API_KEY` |
+| gjc | `~/.gjc/agent/models.yml` | YAML | dans les nouvelles sessions ou à l'ouverture de `/model` |non-secret loopback placeholder |
 | DeepSeek Harness (DSH) | `$DSH_HOME/settings.yaml` (`~/.dsh/settings.yaml` par défaut) | YAML | rechargement à chaud | jeton porteur fictif et non secret pour le bouclage |
 | MiniMax Code | `~/.minimax/config.yaml` | YAML | dans les nouvelles sessions ou après l’ouverture du sélecteur de modèles | valeur fictive de bouclage |
+| Prime Agent | `~/.prime/agent/models.json` | JSON | dans les nouvelles sessions | valeur fictive de bouclage |
+| ZCode | `~/.zcode/v2/config.json` | JSON | au redémarrage | valeur fictive de bouclage |
+| Aside | `~/.aside/u/<account>/models.json` | JSON | après avoir quitté complètement puis rouvert Aside | valeur fictive de bouclage |
+| Raycast | `~/.config/raycast/ai/providers.yaml` | YAML | immédiatement à l'enregistrement — Raycast surveille le fichier | aucun — bouclage uniquement |
+| omo | `~/.omo/agent/models.json` | JSON | nouvelles sessions | espace réservé de bouclage |
+| Cline CLI | `~/.cline/data/settings/providers.json` + `models.json` | JSON | après arrêt et redémarrage | bouclage uniquement |
 
 La prise en charge gérée de DSH exige au minimum **DSH 0.1.0-rc.6**. OpenCodex ne possède que le fragment
 `llm-pi-ai.providers.opencodex` : **Appliquer** et **Actualiser** remplacent ce fragment, **Désactiver** ne
@@ -29,6 +35,40 @@ MiniMax Code recherche d’abord `MINIMAX_DATA_DIR`, puis `MAVIS_DATA_DIR`, avan
 `~/.minimax`. Son bloc géré ne possède que `custom_provider.opencodex`. Il ne modifie ni `defaultModel`, ni
 la source d’identification MiniMax sélectionnée, ni la connexion MiniMax de l’utilisateur. Après l’avoir
 connecté, choisissez dans MCode une entrée `custom_provider:opencodex/<provider/model>`.
+L’actualisation de l’intégration met également à jour les fenêtres de contexte par modèle et les choix
+d’effort de raisonnement faisant autorité ; les capacités inconnues sont omises et l’effort courant,
+qui appartient à la session MCode, est préservé.
+
+Raycast a deux prérequis. Les fournisseurs personnalisés (Custom Providers) sont une fonctionnalité
+**Raycast Pro** : avec un forfait gratuit, le fichier est tout de même écrit, mais
+`ocx integration client status --client raycast` et la page Intégrations signalent un avertissement,
+car Raycast ne le lira pas. Et Raycast ne crée son dossier `ai` que lorsque vous ouvrez une fois
+Raycast → Settings → AI → **Reveal Providers Config** ; opencodex utilise ce dossier comme signal
+d'installation et indique que le client n'est pas installé tant qu'il n'existe pas. Raycast lit
+`~/.config/raycast/ai/providers.yaml` aussi bien sur macOS que sur Windows et n'honore pas
+`XDG_CONFIG_HOME` ; ce chemin ne peut donc pas être déplacé.
+
+Le bloc géré est un seul élément, `id: opencodex`, dans la séquence `providers` du fichier :
+`name: OpenCodex`, `base_url: http://<host>:<port>/v1`, et chaque modèle routé avec ses `abilities` —
+`tools` et `system_message` sont définis à `true` par convention d’export, `vision` suit les modalités d'entrée du
+catalogue, `reasoning_effort` est défini lorsque le modèle dispose d'une échelle d'effort, et
+`temperature` est désactivé pour les modèles de raisonnement. Les autres fournisseurs du fichier sont
+préservés, et la désactivation ne retire que l'élément OpenCodex. Raycast prend en compte la
+modification dès l'enregistrement du fichier, sans redémarrage ; les modèles apparaissent dans le
+sélecteur de modèles de Raycast regroupés sous **OpenCodex**. Raycast accepte le champ facultatif
+`api_keys`, mais OpenCodex l’omet volontairement et refuse les cibles hors bouclage ou exigeant
+authentification : cette intégration ne fournit pas l’en-tête d’admission requis par OpenCodex.
+Le signal Pro issu d’une préférence privée macOS est indicatif ; Windows ne la lit jamais et
+renvoie un état inconnu. Il ne bloque pas l’écriture. Les métadonnées exportées ne prouvent pas
+la prise en charge des outils pour chaque modèle. Les valeurs des autres fournisseurs sont
+préservées, sans garantie pour les commentaires ou la mise en forme YAML. Le format est documenté sur
+[manual.raycast.com/ai/custom-providers](https://manual.raycast.com/ai/custom-providers).
+
+Les exports Raycast en CLI et les téléchargements utilisent la destination et la politique
+d’admission du serveur actif, y compris son listener de bouclage sans authentification.
+`ocx ensure` ne réactualise pas Raycast depuis sa copie de configuration enregistrée, qui peut
+différer du serveur actif. Le démarrage du serveur et la synchronisation explicite restent disponibles.
+
 
 Les chemins respectent les variables de remplacement propres à chaque client, lorsqu'elles existent. Pour
 OMP, la présence de `OMP_PROFILE` l'emporte sur `PI_PROFILE`, même si sa valeur est explicitement vide. Un
@@ -58,14 +98,16 @@ opencodex lit ces variables dans son propre environnement. Si votre passerelle u
 dossier personnel déplacé, lancez opencodex avec les mêmes variables ; sinon, il suivra correctement une
 autre installation.
 
-## Les quatre autres surfaces ne sont pas des commutateurs
+## Les cinq autres surfaces ne sont pas des commutateurs
 
 **Clés API** gère les propres identifiants d'opencodex et n'est donc pas un client. **Codex CLI** est relié
 par le service du proxy lui-même : démarrer opencodex applique ce routage et l'arrêter restaure le routage
 natif ; aucun fichier ne doit donc être activé ou désactivé séparément. **Claude** conserve son propre
 indicateur d'activation et le flux **Enregistrer/Appliquer** de Desktop, tandis que **Grok Build** conserve
 sa barrière « sélectionner, puis appliquer » pour les modèles. Ces règles sont antérieures à cette
-fonctionnalité et restent inchangées.
+fonctionnalité et restent inchangées. **Cursor** n'écrit absolument rien : son onglet affiche la détection,
+les valeurs de la passerelle et la dernière requête observée, et tout le reste se passe dans Cursor Private
+Inference.
 
 ## Restauration
 
@@ -85,12 +127,30 @@ l'actualisation fusionne les changements autour de vos entrées et les conserve,
 comme `1e999`, un nombre qu'une réécriture arrondirait (un très grand entier ou une valeur si petite qu'elle
 deviendrait zéro), `-0`, une même clé écrite deux fois dans un objet ou une imbrication de plus de 1000
 niveaux. Dans ces cas, le commutateur est verrouillé afin que rien ne soit modifié ou supprimé silencieusement.
-**OMP** n'est pas affecté non plus par les modifications voisines, mais pour une autre raison : son outil
-d'écriture ne modifie, octet par octet, que sa propre plage `providers.opencodex` ; le reste du fichier
-n'est jamais réécrit. Pour les autres formats susceptibles de contenir des commentaires (Hermes, OpenClaw,
-Kimi Code, Gajae Code et MiniMax Code — documents YAML, JSON5 et TOML réécrits en entier), ou lorsque les propres entrées
+**OMP, DSH et Hermes** ne sont pas affectés non plus par les modifications voisines, mais pour une autre raison : leurs outils
+d'écriture ne modifient, octet par octet, que leur propre plage `providers.opencodex` ; le reste du fichier
+n'est jamais réécrit. Pour les autres formats susceptibles de contenir des commentaires (OpenClaw,
+Kimi Code, gjc, MiniMax Code et Raycast — documents YAML, JSON5 et TOML réécrits en entier), ou lorsque les propres entrées
 d'opencodex ont été modifiées, le commutateur se verrouille et la désactivation est refusée plutôt que de
 deviner quelles modifications vous appartiennent.
+
+## Prévisualiser et confirmer les modifications
+
+Appliquer, Remplacer, Désactiver et Restaurer commencent désormais par un aperçu. La boîte de dialogue
+indique exactement quels réglages gérés vont changer, avec les chemins concernés dans les limites prévues
+et la nature de chaque modification : ajout, mise à jour ou suppression. Examinez ce plan avant de confirmer.
+
+Lorsqu’un plan n’indique aucune modification, cela signifie que le document client géré est déjà dans l’état
+demandé. Pour un profil Aside sélectionné, la confirmation peut tout de même enregistrer sa préférence de
+synchronisation, même si le document géré ne change pas.
+
+Si le fichier change après votre examen, l'écriture est refusée car le plan est devenu obsolète. La boîte de
+dialogue remplace l'ancien plan par le nouveau et vous demande de confirmer à nouveau ; elle ne relance jamais
+l'écriture automatiquement. Si l'aperçu est temporairement indisponible, rechargez normalement la page et
+recommencez l'action.
+
+Aside utilise le même flux d'aperçu et de confirmation pour un seul profil sélectionné à la fois. **Synchroniser
+tous les profils** reste une action groupée distincte et n'est pas liée à un aperçu combiné unique.
 
 ## À quoi s'attendre, en toute transparence
 
@@ -109,7 +169,12 @@ l'application s'arrête et le signale au lieu d'écrire une valeur modifiée en 
 réussi. Le fichier concerné est indiqué et rien n'est déplacé sur le disque. Vous pouvez toujours modifier
 ce fichier manuellement ; seule la réécriture automatique est refusée.
 
-**Pi, Kimi Code, Gajae Code, MiniMax Code et l'intégration DSH gérée fonctionnent uniquement avec une adresse de
+Les dates et heures TOML empêchent également la réécriture automatique : la fusion
+les convertirait en chaînes entre guillemets, y compris dans les tableaux et les
+tables en ligne. Les dates déjà écrites entre guillemets restent prises en charge.
+Pour conserver une date typée sans guillemets, modifiez manuellement la configuration.
+
+**Pi, Kimi Code, gjc, MiniMax Code et l'intégration DSH gérée fonctionnent uniquement avec une adresse de
 bouclage.** Les quatre premiers n'ont aucun champ de configuration pour l'en-tête `x-opencodex-api-key`
 qu'exige une liaison hors bouclage. DSH possède une table d'en-têtes générique, mais rc.6 ne documente pas
 cet en-tête d'admission dédié comme contrat d'intégration pris en charge ; l'outil d'écriture géré échoue
@@ -142,12 +207,28 @@ ocx integration client history --client hermes
 ocx integration client restore --op <opId> [--confirm-drift]
 ```
 
+`--overwrite-conflict` est la forme terminale de **Replace** :
+
+```bash
+ocx integration client enable --client zcode --overwrite-conflict
+```
+
+Comme `--confirm-drift`, il n'est jamais supposé : sans lui, un conflit reste refusé.
+Il ne s'applique qu'à `enable` ; forcer un *disable* sur un conflit supprimerait un bloc
+que nous n'avons jamais écrit, donc cette combinaison est rejetée.
+
 Pour MiniMax Code, connectez une fois le fournisseur puis utilisez l’enveloppe qui vérifie la connexion :
 
 ```bash
 ocx integration client enable --client mcode
 ocx mcode
 ```
+
+Une fois l’intégration connectée, `ocx sync` et `POST /api/sync` actualisent les catalogues MCode,
+Pi, Aside, Raycast et omo gérés. Le démarrage du proxy actualise aussi le catalogue Raycast géré.
+Les changements de visibilité, de fournisseur ou de préréglage actualisent Pi, Aside, Raycast et omo.
+Les blocs absents, modifiés par un tiers, non sûrs ou supprimés manuellement restent intacts ;
+réactivez explicitement l’intégration lorsque vous souhaitez la reconnecter.
 
 Le CLI distinct de la plateforme MiniMax (`mmx`) n’est pas une intégration à commutateur de fichier. Ses
 commandes textuelles utilisent le point de terminaison compatible avec Anthropic de MiniMax ; OpenCodex
@@ -172,3 +253,15 @@ commande refuse et vous l'indique : remplacer vos modifications plus récentes r
 Les détails des clients ont été vérifiés par rapport au format de configuration propre à chaque projet ;
 consultez les notes de recherche dans
 `devlog/_fin/260802_client_toggle_api/002_client_toggle_matrix.md` pour savoir ce qui a été contrôlé et quand.
+
+## Cline CLI
+
+Cline CLI utilise providers.json et models.json. Quittez Cline avant toute modification ou synchronisation, puis redémarrez-le. Annuler restaure les deux originaux. Le fournisseur par défaut reste inchangé. Cette intégration ne migre pas le stockage des anciennes extensions VS Code.
+
+```bash
+ocx integration client enable --client cline
+ocx integration client history --client cline
+ocx integration client restore --op <operation-id>
+```
+
+[CLI / rollback / CLINE_PROVIDER_SETTINGS_PATH](/guides/integrations/#cline-cli).

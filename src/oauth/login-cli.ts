@@ -1,4 +1,6 @@
 import * as readline from "node:readline";
+import { modelSelectionGuidance } from "../cli/model-selection-guidance";
+import { initializeProviderModelSelection } from "../providers/initial-model-selection";
 import { openUrl } from "../lib/open-url";
 import { loadConfig, saveConfig } from "../config";
 import { findLiveProxy } from "../server/proxy-liveness";
@@ -6,7 +8,7 @@ import {
   requestBoundLocalProviderReload,
   type LocalProviderReloadResult,
 } from "../server/local-provider-reload-client";
-import { isPublicOAuthProvider, listOAuthProviders, runLogin } from "./index";
+import { DEPRECATED_OAUTH_PROVIDER_ALIASES, isPublicOAuthProvider, listOAuthProviders, runLogin } from "./index";
 import { KEY_LOGIN_PROVIDERS, isKeyLoginProvider, validateApiKey, type KeyLoginProvider } from "./key-providers";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import { configuredAdminToken } from "../lib/admin-secrets";
@@ -63,15 +65,37 @@ export function warnIfLiveReloadSkipped(result: LocalProviderReloadResult | null
   );
 }
 
+/**
+ * The provider wall is the first thing an unfamiliar user sees, so it names the Codex
+ * route before the ~90 provider ids. 'codex' is not in either list on purpose: it is
+ * routed to the account-pool login in dispatch.ts, and 'chatgpt' stays off the public
+ * OAuth surface (isPublicOAuthProvider) because the pool owns that credential.
+ *
+ * It names 'openai-apikey' for the same reason it exists at all: 'openai' now routes to
+ * the pool, so someone who typed it looking for a platform key no longer sees the list
+ * that used to be their only pointer to it.
+ */
+export function loginUsageMessage(): string {
+  return `Usage: ocx login <provider>\n`
+    + `  Codex / ChatGPT: ocx login codex   (account pool, needs a running proxy; 'chatgpt' and\n`
+    + `                   'openai' are the same route. An OpenAI platform key is 'openai-apikey'.)\n`
+    + `  OAuth login:   ${listOAuthProviders().join(", ")}\n`
+    + `  API-key login: ${Object.keys(KEY_LOGIN_PROVIDERS).join(", ")}`;
+}
+
 export async function handleLogin(provider?: string): Promise<void> {
   const name = (provider ?? "").trim().toLowerCase();
+  // A removed provider id reached through its alias still logs in — the merged
+  // successor owns the flow. Warn rather than silently reroute so scripts and
+  // docs that still say `devin-cli` surface the rename to whoever runs them.
+  const alias = DEPRECATED_OAUTH_PROVIDER_ALIASES[name];
+  if (alias) {
+    console.error(`${name} is deprecated; logging in as ${alias}`);
+    return handleOAuthLogin(alias);
+  }
   if (isPublicOAuthProvider(name)) return handleOAuthLogin(name);
   if (isKeyLoginProvider(name)) return handleKeyLogin(name);
-  console.error(
-    `Usage: ocx login <provider>\n` +
-      `  OAuth login:   ${listOAuthProviders().join(", ")}\n` +
-      `  API-key login: ${Object.keys(KEY_LOGIN_PROVIDERS).join(", ")}`,
-  );
+  console.error(loginUsageMessage());
   process.exit(1);
 }
 
@@ -93,6 +117,7 @@ async function handleOAuthLogin(name: string): Promise<void> {
   }
   const reload = await notifyRunningProxyAfterOAuthLogin(name);
   console.log(`\n✅ Logged in to ${name}. Try: ocx sync`);
+  for (const line of modelSelectionGuidance(name)) console.log(line);
   warnIfLiveReloadSkipped(reload);
 }
 
@@ -156,6 +181,7 @@ export async function commitKeyLoginProvider(
   onLiveReload?: (result: LocalProviderReloadResult | null) => void,
 ): Promise<OcxProviderConfig> {
   const mergedProvider = mergeKeyLoginProviderRow(provider, config.providers[name]);
+  initializeProviderModelSelection(name, mergedProvider, config.providers[name], config);
   config.providers[name] = mergedProvider;
   saveConfig(config);
   // Evaluate the reload BEFORE the optional call: `onLiveReload?.(await ...)` short-circuits
@@ -211,6 +237,7 @@ async function handleKeyLogin(name: string): Promise<void> {
   let reload: LocalProviderReloadResult | null = null;
   await commitKeyLoginProvider(config, name, provider, result => { reload = result; });
   console.log(`✅ ${def.label} added. Try: ocx sync`);
+  for (const line of modelSelectionGuidance(name)) console.log(line);
   warnIfLiveReloadSkipped(reload);
 }
 

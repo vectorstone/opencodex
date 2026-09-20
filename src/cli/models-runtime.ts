@@ -4,6 +4,7 @@ import {
   printData,
   rejectArgs,
   runCliAction,
+  RuntimeApiError,
   runtimeRequest,
   summaryLines,
   takeBooleanOption,
@@ -12,18 +13,35 @@ import {
   takeOption,
   type RuntimeApiDeps,
 } from "./runtime-api";
+import { isModelsRuntimeSubcommand } from "./models-runtime-subcommands";
+import { isValidProviderName } from "../config/provider-name";
+import { isValidModelDiscoveryModelId } from "../providers/model-discovery-limits";
+import { redactSecretString } from "../lib/redact";
+import type { ProviderCostOverlay } from "../types";
+import { MAX_COST4_RATE } from "../usage/expected-prices";
+import { isValidCost4Rate } from "../usage/user-cost-overlays";
 
 const USAGE = `Usage:
-  ocx models live [--provider <name>] [--json]
+  ocx models live [--provider <name>] [--free-only] [--json]
+  ocx models price <provider/model> [--json]
+  ocx models set-price <provider/model> --input N --output N [--cache-read N] [--cache-write N] [--json]
+  ocx models set-price <provider/model> --auto [--json]
   ocx models edit <custom-id> [--model-id <id>] [--display-name <name|->]
-      [--context-window <tokens|0>] [--modalities <text,image,audio|->]
+      [--context-window <tokens|0>] [--max-output-tokens <tokens|0>] [--modalities <text,image,audio|->]
       [--reasoning-efforts <none,minimal,low,medium,high,xhigh,max,ultra|->]
       [--default-reasoning-effort <level|->] [--json]
   ocx models <enable|disable> <provider/model|native-model> [--native] [--json]
   ocx models provider <name> <on|off> [--json]
   ocx models selected <provider> [--set <id,id...>|--clear] [--json]
+  ocx models preset show [--provider <name>] [--json]
+  ocx models preset apply <provider> [--all] [--json]
+  ocx models new-policy [on|off] [--provider <name>] [--json]
+  ocx models new-arrivals [--json]
   ocx models context <status|value <tokens> [--set-all]|provider <name> on [--value <tokens>]|provider <name> off|all <on|off>> [--json]
-  ocx models shadow <status|set> [model|-] [--enabled <on|off>] [--json]`;
+  ocx models shadow <status|set> [model|-] [--enabled <on|off>] [--json]
+
+Prices are USD per 1M tokens. Omitted cache rates default to 0.
+Price selectors use the exact upstream model ID after the first slash.`;
 
 type ModelRow = {
   provider?: string;
@@ -31,22 +49,137 @@ type ModelRow = {
   namespaced?: string;
   native?: boolean;
   disabled?: boolean;
+  initialSelectionPending?: boolean;
   custom?: boolean;
   customId?: string;
   displayName?: string;
+  pricingStatus?: "free" | "paid";
 };
 
 async function live(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const args = [...argv];
   const wantsJson = takeFlag(args, "--json");
   const provider = takeOption(args, "--provider");
+  // Absent pricingStatus means the provider published no usable per-token pair, so it is
+  // excluded here for the same fail-closed reason the classifier omits it (#3666).
+  const freeOnly = takeFlag(args, "--free-only");
   rejectArgs(args, USAGE);
   const rows = await runtimeRequest<ModelRow[]>("/api/models", {}, deps);
-  const filtered = provider ? rows.filter(row => row.provider === provider) : rows;
+  const byProvider = provider ? rows.filter(row => row.provider === provider) : rows;
+  const filtered = freeOnly ? byProvider.filter(row => row.pricingStatus === "free") : byProvider;
   printData(filtered, wantsJson, filtered.map(row => {
-    const flags = [row.native ? "native" : "routed", row.custom ? "custom" : "", row.disabled ? "disabled" : "enabled"].filter(Boolean);
+    const flags = [row.native ? "native" : "routed", row.custom ? "custom" : "", row.pricingStatus === "free" ? "free" : "", row.initialSelectionPending ? "initial discovery pending" : row.disabled ? "disabled" : "enabled"].filter(Boolean);
     return `${row.namespaced ?? `${row.provider}/${row.id}`}  [${flags.join(", ")}]`;
   }));
+}
+
+function priceRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+const PRICE_RATE_KEYS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+
+function validPriceCost(value: unknown): value is ProviderCostOverlay {
+  return priceRecord(value) && Object.keys(value).length === PRICE_RATE_KEYS.length
+    && PRICE_RATE_KEYS.every(key => Object.hasOwn(value, key) && isValidCost4Rate(value[key]));
+}
+
+async function price(write: boolean, argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  try {
+    await priceRequest(write, argv, deps);
+  } catch (error) {
+    // Duplicated, inline and stray options also reach parser diagnostics.
+    // Keep HTTP-specific RuntimeApiError exits while masking usage errors.
+    if (error instanceof CliUsageError) {
+      throw new CliUsageError(redactSecretString(error.message), error.usage);
+    }
+    throw error;
+  }
+}
+
+async function priceRequest(write: boolean, argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv];
+  const selector = args.shift() ?? "";
+  const slash = selector.indexOf("/");
+  const provider = selector.slice(0, slash);
+  const modelId = selector.slice(slash + 1);
+  if (slash < 1 || !isValidProviderName(provider) || !isValidModelDiscoveryModelId(modelId)) {
+    throw new CliUsageError("model selector must be provider/model with an exact upstream model id", USAGE);
+  }
+  if (redactSecretString(modelId) !== modelId) {
+    throw new CliUsageError("modelId cannot be displayed safely", USAGE);
+  }
+  const wantsJson = takeFlag(args, "--json");
+  const path = `/api/providers/${encodeURIComponent(provider)}/model-costs`;
+  if (!write) {
+    rejectArgs(args, USAGE);
+    const result = await runtimeRequest<unknown>(path, {}, deps);
+    if (!priceRecord(result) || result.provider !== provider || !priceRecord(result.modelCosts)
+      || !Object.values(result.modelCosts).every(validPriceCost)) {
+      throw new Error("Invalid model price response");
+    }
+    let cost: ProviderCostOverlay | null = null;
+    if (Object.hasOwn(result.modelCosts, modelId)) {
+      const stored = result.modelCosts[modelId];
+      if (!validPriceCost(stored)) throw new Error("Invalid model price response");
+      cost = { ...stored };
+    }
+    printData({ provider, modelId, cost }, wantsJson, [
+      cost === null ? `${selector}: automatic pricing` : `${selector}: ${JSON.stringify(cost)} USD per 1M tokens`,
+    ]);
+    return;
+  }
+  const auto = takeFlag(args, "--auto");
+  const input = takeOption(args, "--input");
+  const output = takeOption(args, "--output");
+  const cacheRead = takeOption(args, "--cache-read");
+  const cacheWrite = takeOption(args, "--cache-write");
+  rejectArgs(args, USAGE);
+  if (auto && [input, output, cacheRead, cacheWrite].some(value => value !== undefined)) {
+    throw new CliUsageError("--auto cannot be combined with price rates", USAGE);
+  }
+  if (!auto && (input === undefined || output === undefined)) {
+    throw new CliUsageError("--input and --output are required unless --auto is used", USAGE);
+  }
+  const rate = (raw: string, flag: string): number => {
+    const value = Number(raw);
+    if (!raw.trim() || !isValidCost4Rate(value)) {
+      throw new CliUsageError(`${flag} must be a finite number between 0 and ${MAX_COST4_RATE}`, USAGE);
+    }
+    return value;
+  };
+  const cost: ProviderCostOverlay | null = auto ? null : {
+    input: rate(input!, "--input"),
+    output: rate(output!, "--output"),
+    cacheRead: rate(cacheRead ?? "0", "--cache-read"),
+    cacheWrite: rate(cacheWrite ?? "0", "--cache-write"),
+  };
+  const result = await runtimeRequest(path, { method: "PUT", body: JSON.stringify({ modelId, cost }) }, deps);
+  const receivedCost = priceRecord(result) ? result.cost : undefined;
+  if (!priceRecord(result) || result.ok !== true || result.provider !== provider || result.modelId !== modelId
+    || (cost === null ? receivedCost !== null : !validPriceCost(receivedCost)
+      || !PRICE_RATE_KEYS.every(key => receivedCost[key] === cost[key]))) {
+    throw new Error("Invalid model price persistence receipt");
+  }
+  // Project the acknowledged fields only; unrelated response fields are not CLI output.
+  printData({ ok: true, provider, modelId, cost }, wantsJson,
+    [auto ? `${selector}: automatic pricing restored.` : `${selector}: manual pricing saved.`]);
+}
+
+/**
+ * True for the management handler's own unknown-id 404, and only that.
+ *
+ * Two different listeners answer 404 on this route. `src/server/management/model-routes.ts`
+ * means "no custom model with that id"; a listener that does not route the request at all
+ * reports `{error, method, path}` (src/client/machine-listener.ts), and runtime-api.ts already
+ * renders that shape as a routing statement. Narrowing on the absence of `method`/`path` keeps
+ * this rewrite from relabelling a not-served-here 404 as a missing record — the exact confusion
+ * #4662 was reported as.
+ */
+function unknownCustomModelId(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const record = body as Record<string, unknown>;
+  return record.method === undefined && record.path === undefined;
 }
 
 async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
@@ -58,6 +191,7 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const modelId = takeOption(args, "--model-id");
   const displayName = takeOption(args, "--display-name");
   const contextRaw = takeOption(args, "--context-window");
+  const maxOutputRaw = takeOption(args, "--max-output-tokens");
   const modalitiesRaw = takeOption(args, "--modalities");
   const reasoningEffortsRaw = takeOption(args, "--reasoning-efforts");
   const defaultEffortRaw = takeOption(args, "--default-reasoning-effort");
@@ -68,6 +202,13 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
     const value = Number(contextRaw.replace(/[_,]/g, ""));
     if (!Number.isInteger(value) || value < 0) throw new CliUsageError("--context-window must be an integer >= 0", USAGE);
     patch.contextWindow = value === 0 ? null : value;
+  }
+  if (maxOutputRaw !== undefined) {
+    const value = Number(maxOutputRaw.replace(/[_,]/g, ""));
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new CliUsageError("--max-output-tokens must be a safe integer >= 0", USAGE);
+    }
+    patch.maxOutputTokens = value === 0 ? null : value;
   }
   if (modalitiesRaw !== undefined) patch.inputModalities = modalitiesRaw === "-" ? [] : csv(modalitiesRaw);
   // "-" restores inheritance by clearing the stored ladder (null); "" stores an explicit
@@ -88,10 +229,22 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   }
   if (defaultEffortRaw !== undefined) patch.defaultReasoningEffort = defaultEffortRaw === "-" ? null : defaultEffortRaw;
   if (Object.keys(patch).length === 0) throw new CliUsageError("at least one edit option is required", USAGE);
-  const result = await runtimeRequest(`/api/custom-models/${encodeURIComponent(id)}`, {
-    method: "PUT",
-    body: JSON.stringify(patch),
-  }, deps);
+  let result: unknown;
+  try {
+    result = await runtimeRequest(`/api/custom-models/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }, deps);
+  } catch (error) {
+    if (error instanceof RuntimeApiError && error.status === 404 && unknownCustomModelId(error.body)) {
+      throw new RuntimeApiError(
+        `No custom model has id ${id}. Edits address the custom-model id, not the provider/model slug; list the ids with: ocx models list-custom`,
+        404,
+        error.body,
+      );
+    }
+    throw error;
+  }
   printData(result, wantsJson, [`Updated custom model ${id}.`]);
 }
 
@@ -162,6 +315,94 @@ async function selected(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   printData(result, wantsJson, [`${provider}: ${models.length ? models.join(", ") : "all models"}`]);
 }
 
+
+interface ModelPresetView {
+  mode: string;
+  appliedVersion?: number;
+  availableVersion: number;
+  presetIds: string[];
+  presetCount: number;
+  totalCount: number;
+  fallback?: string;
+}
+
+function presetLine(name: string, view: ModelPresetView): string {
+  const parts = [`${name}: mode=${view.mode}`];
+  if (view.appliedVersion !== undefined && view.appliedVersion !== view.availableVersion) {
+    parts.push(`applied v${view.appliedVersion}, available v${view.availableVersion}`);
+  } else {
+    parts.push(`preset v${view.availableVersion}`);
+  }
+  parts.push(`(${view.presetCount} of ${view.totalCount} models)`);
+  if (view.fallback) parts.push(`fallback=${view.fallback}`);
+  return parts.join(" ");
+}
+
+async function preset(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv];
+  const action = (args.shift() ?? "show").toLowerCase();
+  const wantsJson = takeFlag(args, "--json");
+  if (action === "show") {
+    const only = takeOption(args, "--provider")?.trim();
+    rejectArgs(args, USAGE);
+    const result = await runtimeRequest<{ providers?: Record<string, ModelPresetView> }>("/api/model-presets", {}, deps);
+    const providers = result.providers ?? {};
+    const entries = Object.entries(providers).filter(([name]) => !only || name === only);
+    const lines = entries.length > 0
+      ? entries.map(([name, view]) => presetLine(name, view))
+      // A provider with no shipped preset is not an error: it simply has nothing to curate.
+      : [only ? `${only}: no model preset is shipped for this provider` : "no providers have a shipped model preset"];
+    printData(only ? providers[only] ?? {} : result, wantsJson, lines);
+    return;
+  }
+  if (action !== "apply") throw new CliUsageError(`unknown preset action '${action}'`, USAGE);
+  const provider = args.shift()?.trim();
+  const all = takeFlag(args, "--all");
+  if (!provider) throw new CliUsageError("provider is required", USAGE);
+  rejectArgs(args, USAGE);
+  const mode = all ? "all" : "preset";
+  const result = await runtimeRequest<{ selected?: string[]; fallback?: string; appliedVersion?: number }>(
+    "/api/model-presets",
+    { method: "PUT", body: JSON.stringify({ provider, mode }) },
+    deps,
+  );
+  const selectedIds = result.selected ?? [];
+  const line = result.fallback === "preset-empty"
+    // Never silently narrow to nothing: empty means ALL, so a zero-match preset keeps what was
+    // there and says so.
+    ? `${provider}: preset matched no models — selection unchanged (fallback to all)`
+    : all
+      ? `${provider}: showing all models (allowlist cleared)`
+      : `${provider}: preset v${result.appliedVersion ?? "?"} applied — ${selectedIds.length} models selected`;
+  printData(result, wantsJson, [line]);
+}
+
+async function newPolicy(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv];
+  const state = args[0] && !args[0].startsWith("--") ? args.shift()!.toLowerCase() : undefined;
+  const provider = takeOption(args, "--provider")?.trim();
+  const wantsJson = takeFlag(args, "--json");
+  if (state !== undefined && state !== "on" && state !== "off") throw new CliUsageError("new policy must be on or off", USAGE);
+  rejectArgs(args, USAGE);
+  if (!state) {
+    const result = await runtimeRequest<{ policy: string; providers: Record<string, string> }>("/api/model-discovery", {}, deps);
+    const value = provider ? result.providers[provider] ?? "inherit" : result.policy;
+    printData(provider ? { provider, policy: value } : result, wantsJson, [`${provider ?? "global"}: ${value}`]);
+    return;
+  }
+  const result = await runtimeRequest<{ baselineBootstrapped?: boolean }>("/api/model-discovery", {
+    method: "PUT", body: JSON.stringify({ policy: state, provider: provider ?? null }),
+  }, deps);
+  printData(result, wantsJson, [`${provider ?? "global"}: ${state}${result.baselineBootstrapped ? " (current models recorded as known)" : ""}`]);
+}
+
+async function newArrivals(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+  const args = [...argv]; const wantsJson = takeFlag(args, "--json"); rejectArgs(args, USAGE);
+  const result = await runtimeRequest<{ recentArrivals: Record<string, Array<{ id: string; at: string; state: string }>> }>("/api/model-discovery", {}, deps);
+  const lines = Object.entries(result.recentArrivals).flatMap(([provider, rows]) => rows.map(row => `${provider}/${row.id}  [${row.state}]  ${row.at}`));
+  printData(result.recentArrivals, wantsJson, lines.length ? lines : ["no recent model arrivals"]);
+}
+
 async function context(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const args = [...argv];
   const action = (args.shift() ?? "status").toLowerCase();
@@ -229,13 +470,21 @@ async function shadow(argv: string[], deps: RuntimeApiDeps): Promise<void> {
 }
 
 export async function handleModelsRuntimeCommand(sub: string, argv: string[], deps: RuntimeApiDeps = {}): Promise<number | null> {
+  // The dispatch below and MODELS_RUNTIME_SUBCOMMANDS must name the same set;
+  // tests/cli/cli-models-runtime-dispatch.test.ts fails if they drift (#3094).
+  if (!isModelsRuntimeSubcommand(sub)) return null;
   let action: (() => Promise<void>) | undefined;
   if (sub === "live") action = () => live(argv, deps);
+  else if (sub === "price") action = () => price(false, argv, deps);
+  else if (sub === "set-price") action = () => price(true, argv, deps);
   else if (sub === "edit") action = () => edit(argv, deps);
   else if (sub === "enable") action = () => visibility(true, argv, deps);
   else if (sub === "disable") action = () => visibility(false, argv, deps);
   else if (sub === "provider") action = () => providerVisibility(argv, deps);
   else if (sub === "selected") action = () => selected(argv, deps);
+  else if (sub === "preset") action = () => preset(argv, deps);
+  else if (sub === "new-policy") action = () => newPolicy(argv, deps);
+  else if (sub === "new-arrivals") action = () => newArrivals(argv, deps);
   else if (sub === "context") action = () => context(argv, deps);
   else if (sub === "shadow") action = () => shadow(argv, deps);
   if (!action) return null;

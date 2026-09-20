@@ -2,6 +2,7 @@ import { codexAutoStartEnabled } from "../config";
 import { diagnoseService, type ServiceDiagnostic } from "../service";
 import type { OcxConfig } from "../types";
 import { getCodexRoutingKind, type CodexRoutingKind } from "./inject";
+import { collectRoutingAdoption, type RoutingAdoptionEvidence } from "./routing-adoption";
 import { diagnoseCodexShim, type CodexShimDiagnostic } from "./shim";
 
 export type StartupProtection = "service" | "shim" | "none";
@@ -22,6 +23,7 @@ export interface StartupHealthInputs {
   shimHealthy: boolean;
   platform: NodeJS.Platform;
   diagnosticStale?: boolean;
+  routingAdoption?: RoutingAdoptionEvidence;
 }
 
 export interface StartupHealth {
@@ -51,6 +53,7 @@ export interface StartupHealth {
     installShim: string;
     restoreNative: string;
   };
+  routingAdoption?: RoutingAdoptionEvidence;
 }
 
 const COMMANDS = {
@@ -90,9 +93,9 @@ export function deriveStartupHealth(inputs: StartupHealthInputs): StartupHealth 
     : inputs.routingKind === "custom-local" || inputs.routingKind === "unknown"
       ? COMMANDS.restoreNative
     : inputs.serviceSupported
-      // An already-registered service is refreshed in place: `repair` rewrites its assets
-      // and restarts it without re-registering, so it needs no elevation on Windows and
-      // cannot switch a WinSW install to Task Scheduler the way `install` would. Only a
+      // An already-registered service is refreshed in place: `repair` reuses healthy Windows
+      // scheduler definitions, while stale ones may be re-registered and require elevation.
+      // It still cannot switch a WinSW install to Task Scheduler the way `install` would. Only a
       // genuinely absent (or conflicting, which needs uninstall-then-install) service
       // gets the registering command.
       ? (inputs.serviceInstalled && !inputs.serviceConflict ? COMMANDS.repairService : COMMANDS.installService)
@@ -115,6 +118,7 @@ export interface StartupHealthDiagnostics {
   routingKind?: CodexRoutingKind;
   service?: ServiceDiagnostic;
   shim?: CodexShimDiagnostic;
+  routingAdoption?: RoutingAdoptionEvidence;
 }
 
 /** Collect current machine state without mutating config, services, or shims. */
@@ -124,8 +128,11 @@ export function collectStartupHealth(
 ): StartupHealth {
   const shim = diagnostics.shim ?? diagnoseCodexShim();
   const service = diagnostics.service ?? diagnoseService();
+  const routingKind = diagnostics.routingKind ?? getCodexRoutingKind();
+  const routingAdoption = diagnostics.routingAdoption
+    ?? (routingKind === "opencodex-local" ? collectRoutingAdoption({ routingKind }) : undefined);
   return deriveStartupHealth({
-    routingKind: diagnostics.routingKind ?? getCodexRoutingKind(),
+    routingKind,
     autostartEnabled: codexAutoStartEnabled(config),
     serviceInstalled: service.installed,
     serviceViable: service.viable,
@@ -137,10 +144,17 @@ export function collectStartupHealth(
     shimInstalled: shim.installed,
     shimHealthy: shim.healthy,
     platform: process.platform,
+    ...(routingAdoption ? { routingAdoption } : {}),
   });
 }
 
 export function startupHealthSummary(health: StartupHealth): string {
+  const summary = classifyStartupHealthSummary(health);
+  const action = pendingClientRestartAction(health);
+  return action ? `${summary}; ${action}` : summary;
+}
+
+function classifyStartupHealthSummary(health: StartupHealth): string {
   if (health.status === "native") return health.routingKind === "custom-remote"
     ? "custom remote Codex routing (no local restart dependency)"
     : "native Codex routing (no opencodex restart dependency)";
@@ -153,4 +167,40 @@ export function startupHealthSummary(health: StartupHealth): string {
   if (health.serviceStale) return `AT RISK after restart (background service files are stale; run '${command}')`;
   if (health.serviceInstalled && !health.serviceViable) return `AT RISK after restart (installed service is disabled, stopped, or unhealthy; run '${command}')`;
   return `AT RISK after restart (no viable background service; run '${command}')`;
+}
+
+function pendingClientRestartAction(health: StartupHealth): string | null {
+  const adoption = health.routingAdoption;
+  if (adoption?.adoption !== "pending-client-restart") return null;
+  const pids = adoption.staleClients.map(client => client.pid);
+  if (pids.length === 0) return null;
+  const pidList = pids.join(", ");
+  return pids.length === 1
+    ? `restart Codex client pid ${pidList} so it adopts the injected proxy route`
+    : `restart Codex clients pid ${pidList} so they adopt the injected proxy route`;
+}
+
+function pendingClientRestartDetail(adoption: RoutingAdoptionEvidence | undefined): string | null {
+  if (adoption?.adoption !== "pending-client-restart") return null;
+  const pids = adoption.staleClients.map(client => client.pid);
+  if (pids.length === 0) return null;
+  return `clients=pending-restart(pid ${pids.join(", ")})`;
+}
+
+/**
+ * The routing/service/shim token `ocx doctor` prints under restart safety.
+ * Extracted so `ocx status` can show the same string rather than growing a
+ * second copy that drifts (#2411). Two management routes computing the same
+ * thing separately is exactly how #2457 happened.
+ */
+export function formatStartupRoutingDetail(health: StartupHealth): string {
+  const service = health.serviceViable
+    ? "viable"
+    : health.serviceInstalled ? "installed-but-unhealthy" : "absent";
+  const shim = health.shimHealthy
+    ? "healthy"
+    : health.shimInstalled ? "stale" : "absent";
+  const base = `routing=${health.routingKind}, service=${service}, shim=${shim}`;
+  const token = pendingClientRestartDetail(health.routingAdoption);
+  return token ? `${base}, ${token}` : base;
 }

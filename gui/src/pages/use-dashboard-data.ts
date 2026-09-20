@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { classifyDataSurface } from "../data-surface";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useKeyedClientResource } from "../client-resource";
 import { replaceHash } from "../hash-routing";
 import { useI18n } from "../i18n/shared";
@@ -24,6 +25,7 @@ import {
   type DashboardEpochRefs,
 } from "./dashboard-core-poll";
 import { usageSummary30dResourceKey } from "../usage-summary-resource";
+import type { SubagentSurfaceAdvisory } from "../subagent-surface";
 import {
   type DashboardSection,
   type HealthData,
@@ -46,7 +48,7 @@ import {
   mergeSidecarSetting,
   readDashboardSectionFromHash,
   requireJson,
-  sidecarModelOptions,
+  webSearchModelOptionsForPicker,
   visionModelOptions,
   useModalDialog,
 } from "./dashboard-shared";
@@ -70,6 +72,57 @@ type CachedOverview = {
 
 type MaMode = "v1" | "default" | "v2";
 
+type CodexPreference = "codexAutoStart" | "codexDesktopAuthless" | "codexClientCompaction";
+type DashboardSettingsState = {
+  settings: SettingsData | null;
+  beforeSave: SettingsData | null;
+};
+type DashboardSettingsAction =
+  | { type: "polled"; settings: SettingsData }
+  | { type: "save-started"; key: CodexPreference; value: boolean }
+  | { type: "save-succeeded"; key: CodexPreference; settings: SettingsData }
+  | { type: "save-failed" }
+  | { type: "save-finished" }
+  | { type: "applied" };
+
+// Own both server snapshots and the local save/apply transaction. A poll has no
+// application receipt and must not overwrite a preference while it is being saved.
+function dashboardSettingsReducer(state: DashboardSettingsState, action: DashboardSettingsAction): DashboardSettingsState {
+  switch (action.type) {
+    case "polled":
+      if (state.beforeSave) return state;
+      return {
+        ...state,
+        settings: {
+          ...action.settings,
+          catalogRefreshPending: state.settings?.catalogRefreshPending === true || action.settings.catalogRefreshPending,
+        },
+      };
+    case "save-started":
+      if (!state.settings || state.beforeSave) return state;
+      return { beforeSave: state.settings, settings: { ...state.settings, [action.key]: action.value } };
+    case "save-succeeded":
+      if (!state.settings || !state.beforeSave) return state;
+      return {
+        ...state,
+        settings: {
+          ...state.settings,
+          [action.key]: action.settings[action.key],
+          catalogRefreshPending: action.key === "codexDesktopAuthless" || action.key === "codexClientCompaction"
+            ? true
+            : state.settings.catalogRefreshPending,
+          startupHealth: action.settings.startupHealth ?? state.settings.startupHealth,
+        },
+      };
+    case "save-failed":
+      return state.beforeSave ? { ...state, settings: state.beforeSave } : state;
+    case "save-finished":
+      return { ...state, beforeSave: null };
+    case "applied":
+      return state.settings ? { ...state, settings: { ...state.settings, catalogRefreshPending: false } } : state;
+  }
+}
+
 export function groupDashboardModels(models: ModelInfo[]): Array<[string, ModelInfo[]]> {
   const groups = new Map<string, ModelInfo[]>();
   for (const model of models) {
@@ -84,7 +137,7 @@ function controlsCacheKey(apiBase: string): string {
   return `${CONTROLS_CACHE_PREFIX}${apiBase}`;
 }
 
-export function useDashboardData(apiBase: string) {
+export function useDashboardData(apiBase: string, refreshEpoch = 0) {
   const { locale, t } = useI18n();
   // The hash is the source of truth for the active section (#dashboard, …).
   const [selectedSection, setSelectedSection] = useState<DashboardSection>(readDashboardSectionFromHash);
@@ -114,18 +167,34 @@ export function useDashboardData(apiBase: string) {
   const [startupHealth, setStartupHealth] = useState<StartupHealthStatus | null>(() => cachedStartup);
   const [providers, setProviders] = useState<ProviderInfo[]>(() => cachedOverview?.providers ?? []);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [settings, setSettings] = useState<SettingsData | null>(() => cachedControls?.settings ?? null);
+  const [settingsState, dispatchSettings] = useReducer(dashboardSettingsReducer, {
+    settings: cachedControls?.settings ?? null,
+    beforeSave: null,
+  });
+  const { settings } = settingsState;
+  const settingsSaving = settingsState.beforeSave !== null;
   const [sidecar, setSidecar] = useState<SidecarData | null>(() => cachedControls?.sidecar ?? null);
   const [shadowCall, setShadowCall] = useState<ShadowCallData | null>(() => cachedControls?.shadowCall ?? null);
   const [usage30d, setUsage30d] = useState<UsageSummary30d | null>(() => cachedUsage);
   const [sidecarSaving, setSidecarSaving] = useState(false);
   const [shadowCallSaving, setShadowCallSaving] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(false);
-  const [settingsSaving, setSettingsSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [maMode, setMaMode] = useState<MaMode>(() => cachedMaMode ?? "default");
- const [maBusy, setMaBusy] = useState(false);
+const [maBusy, setMaBusy] = useState(false);
   const [maError, setMaError] = useState<string | null>(null);
+ /** The runtime's one-time advisory, and whether this page load has answered it. */
+  /**
+   * The runtime's one-time advisory and any staged base/v2 selection, each tagged with the
+   * endpoint it came from. This hook stays mounted across an endpoint switch, and clearing the
+   * state from an effect would be a cascading render, so the tag is what scopes them.
+   */
+  const [maAdvisoryState, setMaAdvisoryState] = useState<{ advisory: SubagentSurfaceAdvisory | null; apiBase: string } | null>(null);
+  const [maAdvisoryAnsweredFor, setMaAdvisoryAnsweredFor] = useState<string | null>(null);
+  const [pendingMaModeState, setPendingMaModeState] = useState<{ mode: "default" | "v2"; apiBase: string } | null>(null);
+  const maAdvisory = maAdvisoryState?.apiBase === apiBase ? maAdvisoryState.advisory : null;
+  const maAdvisoryAnswered = maAdvisoryAnsweredFor === apiBase;
+  const pendingMaMode = pendingMaModeState?.apiBase === apiBase ? pendingMaModeState.mode : null;
  const [maHelpOpen, setMaHelpOpen] = useState(false);
   const [effortCapHelpOpen, setEffortCapHelpOpen] = useState(false);
   const [shadowCallHelpOpen, setShadowCallHelpOpen] = useState(false);
@@ -198,7 +267,7 @@ export function useDashboardData(apiBase: string) {
 
   const startupHealthPoll = useKeyedClientResource(
     `dashboard-startup-health:${apiBase}`,
-    [apiBase],
+    [apiBase, refreshEpoch],
     (signal) => fetchStartupHealth(apiBase, signal),
     { pollMs: 30_000 },
   );
@@ -220,23 +289,24 @@ export function useDashboardData(apiBase: string) {
   // Wave 1: status/uptime/providers must not wait on injection-model / usage.
   const overviewPoll = useKeyedClientResource(
     `dashboard-overview:${apiBase}`,
-    [apiBase],
+    [apiBase, refreshEpoch],
     (signal) => fetchDashboardOverview(apiBase, signal),
     { pollMs: 5000 },
   );
+  const overviewSurface = classifyDataSurface(overviewPoll, data => data.health === null, true);
   const overviewReady = health !== null || overviewPoll.data !== undefined;
 
   // Preferences that are just config — never gate on overview or injection.
   const maModePoll = useKeyedClientResource(
     `dashboard-ma-mode:${apiBase}`,
-    [apiBase],
+    [apiBase, refreshEpoch],
     (signal) => fetchDashboardMaMode(apiBase, signal),
     { pollMs: 5000 },
   );
 
   const sidecarPoll = useKeyedClientResource(
     `dashboard-sidecars:${apiBase}`,
-    [apiBase],
+    [apiBase, refreshEpoch],
     async (signal) => {
       const startupHealthGeneration = startupHealthGenerationRef.current;
       const data = await fetchDashboardSidecars(apiBase, signal, epochRefs);
@@ -247,7 +317,7 @@ export function useDashboardData(apiBase: string) {
 
   const settingsPoll = useKeyedClientResource(
     `dashboard-settings:${apiBase}`,
-    [apiBase],
+    [apiBase, refreshEpoch],
     async (signal) => {
       const startupHealthGeneration = startupHealthGenerationRef.current;
       const data = await fetchDashboardSettings(apiBase, signal, epochRefs);
@@ -259,30 +329,30 @@ export function useDashboardData(apiBase: string) {
   // Wave 2: heavier peers start after overview commits (or session seed) to cut contention.
   const multiAgentPoll = useKeyedClientResource(
     `dashboard-multi-agent:${apiBase}`,
-    [apiBase],
+    [apiBase, refreshEpoch],
     (signal) => fetchDashboardMultiAgent(apiBase, signal),
     { pollMs: 5000, enabled: overviewReady },
   );
 
   const usagePoll = useKeyedClientResource(
     usageSummary30dResourceKey(apiBase),
-    [apiBase],
+    [apiBase, refreshEpoch],
     (signal) => fetchDashboardUsage(apiBase, signal),
     // 30d usage is documented ~5s cold; this shared key has four subscribers, so
     // every one of them carries the same raised deadline (mount-order independent).
-    { enabled: overviewReady, deadlineMs: 60_000 },
+    { enabled: overviewReady, pollMs: 60_000, deadlineMs: 60_000 },
   );
 
   const diagnosticsPoll = useKeyedClientResource(
     `dashboard-diagnostics:${apiBase}`,
-    [apiBase],
+    [apiBase, refreshEpoch],
     (signal) => fetchProjectConfigDiagnostics(apiBase, signal),
     { pollMs: PROJECT_CONFIG_DIAGNOSTICS_POLL_MS, enabled: overviewReady },
   );
 
   const modelsPoll = useKeyedClientResource(
     `dashboard-models:${apiBase}`,
-    [apiBase, error],
+    [apiBase, error, refreshEpoch],
     (signal) => fetchDashboardModels(apiBase, signal),
     { enabled: overviewReady && !error },
   );
@@ -321,6 +391,7 @@ export function useDashboardData(apiBase: string) {
   useEffect(() => {
     if (maModePoll.data === undefined) return;
     setMaMode(maModePoll.data.maMode);
+    setMaAdvisoryState({ advisory: maModePoll.data.advisory ?? null, apiBase });
     writeSessionListCache(`${MA_MODE_CACHE_PREFIX}${apiBase}`, maModePoll.data.maMode);
   }, [maModePoll.data, apiBase]);
 
@@ -361,7 +432,9 @@ export function useDashboardData(apiBase: string) {
   useEffect(() => {
     const data = settingsPoll.data;
     if (!data) return;
-    if (data.settings !== undefined) setSettings(data.settings);
+    if (data.settings !== undefined) {
+      dispatchSettings({ type: "polled", settings: data.settings });
+    }
     // Latest-wins: only seed from settings when no newer dedicated probe has committed
     // while this settings poll was in flight. Always merge against the live ref.
     if (
@@ -373,14 +446,15 @@ export function useDashboardData(apiBase: string) {
       startupHealthRef.current = merged;
       if (merged) writeSessionListCache(`${STARTUP_CACHE_PREFIX}${apiBase}`, merged);
     }
-    if (data.settings !== undefined) {
-      const prev = readSessionListCache<CachedControls>(controlsCacheKey(apiBase)) ?? {};
-      writeSessionListCache(controlsCacheKey(apiBase), {
-        ...prev,
-        settings: data.settings,
-      });
-    }
   }, [settingsPoll.data, apiBase]);
+
+  // Cache the merged UI state, including preference saves and successful applies.
+  // Raw GET settings cannot replace the local application receipt on a revisit.
+  useEffect(() => {
+    if (!settings) return;
+    const prev = readSessionListCache<CachedControls>(controlsCacheKey(apiBase)) ?? {};
+    writeSessionListCache(controlsCacheKey(apiBase), { ...prev, settings });
+  }, [settings, apiBase]);
 
   useEffect(() => {
     if (usagePoll.data !== undefined) {
@@ -465,14 +539,17 @@ export function useDashboardData(apiBase: string) {
     return out;
   }, [grouped, modelQuery]);
   const sidecarModels = useMemo(() => {
-    const opts = sidecarModelOptions(models);
-    for (const id of [sidecar?.webSearch.model, sidecar?.vision.model]) {
-      if (id && !opts.some(option => option.value === id)) {
-        opts.unshift({ value: id, label: id });
-      }
-    }
-    return opts;
-  }, [models, sidecar]);
+    // Server-computed runnable set when present (#2188); legacy union otherwise.
+    // The shared SidecarSetting type admits vision's "routed", which the
+    // web-search picker cannot carry — narrow it away for this card.
+    const webBackend = sidecar?.webSearch?.backend;
+    return webSearchModelOptionsForPicker(
+      sidecar?.webSearchModels,
+      models,
+      sidecar?.webSearch?.model,
+      webBackend === "routed" ? undefined : webBackend,
+    );
+  }, [models, sidecar?.webSearchModels, sidecar?.webSearch]);
   const visionModels = useMemo(
     () => visionModelOptions(sidecar?.visionModels, models, sidecar?.vision?.model, sidecar?.vision?.backend),
     [sidecar?.visionModels, models, sidecar?.vision],
@@ -485,6 +562,7 @@ export function useDashboardData(apiBase: string) {
       webSearch: mergeSidecarSetting(sidecar.webSearch, patch.webSearch),
       vision: mergeSidecarSetting(sidecar.vision, patch.vision),
       ...(sidecar.visionModels ? { visionModels: sidecar.visionModels } : {}),
+      ...(sidecar.webSearchModels ? { webSearchModels: sidecar.webSearchModels } : {}),
     };
     setSidecarSaving(true);
     setSidecar(next);
@@ -499,6 +577,7 @@ export function useDashboardData(apiBase: string) {
         webSearch: data.webSearch,
         vision: data.vision,
         ...(data.visionModels ? { visionModels: data.visionModels } : {}),
+        ...(data.webSearchModels ? { webSearchModels: data.webSearchModels } : {}),
       });
       const prev = readSessionListCache<CachedControls>(controlsCacheKey(apiBase)) ?? {};
       writeSessionListCache(controlsCacheKey(apiBase), {
@@ -507,6 +586,7 @@ export function useDashboardData(apiBase: string) {
           webSearch: data.webSearch,
           vision: data.vision,
           ...(data.visionModels ? { visionModels: data.visionModels } : {}),
+          ...(data.webSearchModels ? { webSearchModels: data.webSearchModels } : {}),
         },
       });
     } catch {
@@ -539,19 +619,22 @@ export function useDashboardData(apiBase: string) {
     }
   }
 
- const switchMaMode = async (mode: "v1" | "default" | "v2") => {
-   if (maBusy || maMode === mode) return;
-   setMaBusy(true);
+  const writeMaMode = async (mode: "v1" | "default" | "v2", acknowledgeAdvisory = false) => {
+    setMaBusy(true);
     setMaError(null);
-   try {
-     const r = await fetch(`${apiBase}/api/v2`, {
-       method: "PUT",
-       headers: { "Content-Type": "application/json" },
-       body: JSON.stringify({ multiAgentMode: mode }),
-     });
-     if (r.ok) {
-       setMaMode(mode);
-       writeSessionListCache(`${MA_MODE_CACHE_PREFIX}${apiBase}`, mode);
+    try {
+      const payload: { multiAgentMode: "v1" | "default" | "v2"; multiAgentSurfaceAdvisoryAcknowledged?: true } = { multiAgentMode: mode };
+      // One request, so the recommended answer cannot leave the notice raised on a mode it applied.
+      if (acknowledgeAdvisory) payload.multiAgentSurfaceAdvisoryAcknowledged = true;
+      const r = await fetch(`${apiBase}/api/v2`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        setMaMode(mode);
+        if (acknowledgeAdvisory) setMaAdvisoryAnsweredFor(apiBase);
+        writeSessionListCache(`${MA_MODE_CACHE_PREFIX}${apiBase}`, mode);
       } else {
         let message = t("dash.maSwitchFailed", { status: String(r.status) });
         try {
@@ -559,12 +642,67 @@ export function useDashboardData(apiBase: string) {
           message = (typeof body.error === "string" && body.error) || (typeof body.message === "string" && body.message) || message;
         } catch { /* non-JSON error body */ }
         setMaError(message);
-     }
+      }
     } catch (e) {
       setMaError(e instanceof Error ? e.message : t("dash.maNetworkError"));
     }
-   finally { setMaBusy(false); }
- };
+    finally { setMaBusy(false); }
+  };
+
+  const switchMaMode = async (mode: "v1" | "default" | "v2") => {
+    if (maBusy || maMode === mode) return;
+    // v1 applies immediately: confirming a move toward the safe default would be noise. base
+    // and v2 both put ChatGPT-native parents on the surface whose task a routed child cannot
+    // read, so they wait for an answer.
+    if (mode !== "v1") { setPendingMaModeState({ mode, apiBase }); return; }
+    await writeMaMode("v1");
+  };
+
+  /** Answer the advisory without moving the mode. Failure just means it asks again. */
+  const acknowledgeMaAdvisory = async () => {
+    // Answered for this page load either way: the operator did answer. If the write did not
+    // land the runtime raises the notice again next load, so a failure costs one more prompt
+    // rather than a lost setting — but say so instead of swallowing it.
+    setMaAdvisoryAnsweredFor(apiBase);
+    try {
+      const r = await fetch(`${apiBase}/api/v2`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ multiAgentSurfaceAdvisoryAcknowledged: true }),
+      });
+      if (!r.ok) setMaError(t("dash.maSwitchFailed", { status: String(r.status) }));
+    } catch (e) {
+      setMaError(e instanceof Error ? e.message : t("dash.maNetworkError"));
+    }
+  };
+
+  /** The ghost button: apply the mode that was selected, or keep the stored one. */
+  const keepMaMode = async () => {
+    const pending = pendingMaMode;
+    setPendingMaModeState(null);
+    // A selection answers the advisory too. Without that, continuing to base or v2 leaves the
+    // notice raised and the next poll asks the same question the operator just answered.
+    // Unconditionally, not gated on the poll's current `required`: that projection goes false
+    // while the mode is v1 without the version having been stored, so a later confirmed base or
+    // v2 would skip the acknowledgement and be asked all over again.
+    if (pending) { await writeMaMode(pending, true); return; }
+    await acknowledgeMaAdvisory();
+  };
+
+  /** The primary button: v1, and the advisory answered in the same request when it is raised. */
+  const chooseMaV1 = async () => {
+    setPendingMaModeState(null);
+    if (maMode === "v1") { await acknowledgeMaAdvisory(); return; }
+    await writeMaMode("v1", true);
+  };
+
+  /** Escape or backdrop: abandon a selection, or leave the advisory unanswered for next load. */
+  const dismissMaSurfaceDialog = () => {
+    if (pendingMaMode) { setPendingMaModeState(null); return; }
+    setMaAdvisoryAnsweredFor(apiBase);
+  };
+
+  const maAdvisoryOpen = !pendingMaMode && !maAdvisoryAnswered && maAdvisory?.required === true;
 
   const saveInjection = async (patch: {
     multiAgentGuidanceEnabled?: boolean;
@@ -601,29 +739,33 @@ export function useDashboardData(apiBase: string) {
     finally { setInjectionSaving(false); }
   };
 
-  const toggleCodexAutoStart = async () => {
-    if (!settings || settingsSaving) return;
-    const next = !settings.codexAutoStart;
-    setSettingsSaving(true);
+  const toggleCodexSetting = async (key: CodexPreference) => {
+    if (!settings || settingsSaving || syncing) return;
+    const next = !(settings[key] ?? (key === "codexAutoStart"));
     settingsMutationInFlightRef.current = true;
-    setSettings({ ...settings, codexAutoStart: next });
+    dispatchSettings({ type: "save-started", key, value: next });
     try {
       const res = await fetch(`${apiBase}/api/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ codexAutoStart: next }),
+        body: JSON.stringify({ [key]: next }),
       });
-      const data = await requireJson<{ codexAutoStart: boolean; startupHealth?: SettingsData["startupHealth"] }>(res, "save failed");
+      const data = await requireJson<SettingsData>(res, "save failed");
       settingsMutationEpochRef.current += 1;
-      setSettings(prev => prev ? { ...prev, codexAutoStart: data.codexAutoStart, startupHealth: data.startupHealth ?? prev.startupHealth } : prev);
+      dispatchSettings({ type: "save-succeeded", key, settings: data });
+      if (key === "codexDesktopAuthless" || key === "codexClientCompaction") await runSync();
     } catch {
-      setSettings(prev => prev ? { ...prev, codexAutoStart: !next } : prev);
+      dispatchSettings({ type: "save-failed" });
       setError(true);
     } finally {
       settingsMutationInFlightRef.current = false;
-      setSettingsSaving(false);
+      dispatchSettings({ type: "save-finished" });
     }
   };
+
+  const toggleCodexAutoStart = () => toggleCodexSetting("codexAutoStart");
+  const toggleCodexDesktopAuthless = () => toggleCodexSetting("codexDesktopAuthless");
+  const toggleCodexClientCompaction = () => toggleCodexSetting("codexClientCompaction");
 
   // Clears the sync result/error in this hook. The dashboard toast owns its own dismissal
   // timer but must publish the dismissal here: syncResult/syncError live above the dashboard
@@ -643,6 +785,9 @@ export function useDashboardData(apiBase: string) {
       const res = await fetch(`${apiBase}/api/sync`, { method: "POST" });
       const data = await requireJson<SyncResult & { projectConfigGrouped?: ProjectCodexConfigGroup[] }>(res, "sync failed");
       setSyncResult(data);
+      if (data.ok && data.status === "applied") {
+        dispatchSettings({ type: "applied" });
+      }
       if (data.projectConfigGrouped) setProjectConfigWarnings(data.projectConfigGrouped);
     } catch (err) {
       setSyncError(err instanceof Error ? err.message : String(err));
@@ -771,19 +916,22 @@ export function useDashboardData(apiBase: string) {
     usageLoading: usagePoll.loading && !usage30d,
     healthLoading: overviewPoll.loading && !health,
     sidecarSaving, shadowCallSaving, modelsLoading, settingsSaving, syncing,
-   maMode, maModeResolved, maBusy, setMaHelpOpen, maHelpOpen,
-    maError,
+maMode, maModeResolved, maBusy, setMaHelpOpen, maHelpOpen,
+   maError,
+    maAdvisory, maAdvisoryOpen, pendingMaMode, keepMaMode, chooseMaV1, dismissMaSurfaceDialog,
    effortCapHelpOpen, setEffortCapHelpOpen, shadowCallHelpOpen, setShadowCallHelpOpen,
     injectionModel, injectionEffort, injectionEfforts, injectionAvailable, injectionSaving,
     multiAgentGuidanceEnabled, syncCodexSubagentDefaults, saveInjection,
     effortCap, subagentEffortCap, effortCapSaving, setEffortCap, setSubagentEffortCap, setEffortCapSaving,
     syncResult, syncError, projectConfigWarnings,
     updateOpen, updateChannel, setUpdateRestart, updateRestart, updateLoading,
-    updateCheck, updateError, updateJob, reconnecting, error,
+    updateCheck, updateError, updateJob, reconnecting, error: error || overviewSurface.showError,
+    connectionFailure: overviewPoll.data?.failure ?? (overviewSurface.showError ? "unavailable" : undefined), refreshDashboard: overviewPoll.refresh,
     effortCapHelpTriggerRef, updateTriggerRef, maHelpTriggerRef, shadowCallHelpTriggerRef,
     effortCapHelpDialogRef, updateDialogRef, maHelpDialogRef, shadowCallHelpDialogRef,
     filteredGroups, sidecarModels, visionModels,
-    saveSidecar, saveShadowCall, switchMaMode, toggleCodexAutoStart, runSync, clearSyncFeedback,
+    saveSidecar, saveShadowCall, switchMaMode, toggleCodexAutoStart, toggleCodexDesktopAuthless,
+    toggleCodexClientCompaction, runSync, clearSyncFeedback,
     fetchUpdateCheck, closeUpdateDialog, openUpdateDialog, changeUpdateChannel, runUpdate,
   };
 }

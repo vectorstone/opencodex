@@ -218,6 +218,35 @@ test("the controller loads once on mount", async () => {
   expect(seen.current!.loadState).toBe("ready");
 });
 
+test("forced quota reads remain GET unless deferred validation is explicitly requested", async () => {
+  const seen = await mountController();
+  const originalTimeout = AbortSignal.timeout;
+  const deadlines: number[] = [];
+  AbortSignal.timeout = (ms: number) => {
+    deadlines.push(ms);
+    return new AbortController().signal;
+  };
+  try {
+    calls = [];
+    await act(async () => { await seen.current!.load(true); });
+    expect(calls).toContain("GET codex-auth/accounts?refresh=1");
+    expect(calls.some(call => call.startsWith("POST codex-auth/accounts"))).toBe(false);
+    expect(deadlines.at(-1)).toBe(20_000);
+    calls = [];
+    let finishValidation!: () => void;
+    nextAccountsResponseGate = new Promise<void>(resolve => { finishValidation = resolve; });
+    let validation!: Promise<boolean>;
+    await act(async () => { validation = seen.current!.load(true, { validatePending: true }); });
+    expect(calls).toContain("POST codex-auth/accounts/refresh");
+    expect(deadlines.at(-1)).toBeGreaterThan(8_000 + 2 * 30_000);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)); });
+    expect(calls.filter(call => call.includes("codex-auth/accounts"))).toEqual(["POST codex-auth/accounts/refresh"]);
+    await act(async () => { finishValidation(); expect(await validation).toBe(true); });
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+});
+
 test("the controller joins 30-day usage to accounts by the displayed log label", async () => {
   accounts = [
     { id: "main", email: "main", isMain: true, paused: false, priority: 0, hasCredential: true, quota: null },
@@ -532,6 +561,29 @@ test("an accepted manual switch moves the pin before reconciliation lands", asyn
     releaseActive();
     await new Promise((resolve) => setTimeout(resolve, 30));
   });
+});
+
+test("a post-switch read accepts a newer server-side active account", async () => {
+  accounts = [
+    { id: "a1", email: "main", isMain: true, paused: false, priority: 0, hasCredential: true, quota: null },
+    { id: "a2", email: "selected", isMain: false, paused: false, priority: 0, hasCredential: true, quota: null },
+    { id: "a3", email: "failover", isMain: false, paused: false, priority: 0, hasCredential: true, quota: null },
+  ];
+  const seen = await mountController();
+
+  // The PUT accepts a2, but routing legitimately moves to a3 before the
+  // reconciliation read. That fresh response must retire the optimistic marker.
+  activeGetId = "a3";
+  await act(async () => {
+    expect(await seen.current!.switchAccount("a2")).toEqual({ ok: true, activeId: "a2" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  });
+  // One mismatch may be the eventually-consistent response the optimistic marker
+  // exists to absorb.
+  expect(seen.current!.activeId).toBe("a2");
+
+  await act(async () => { await seen.current!.load(); });
+  expect(seen.current!.activeId).toBe("a3");
 });
 
 test("the main sentinel writes through to its distinct account row", async () => {

@@ -78,8 +78,9 @@ guidance-сообщений, которые opencodex пишет сам, на о
 `injectionModel` достаточно, чтобы отобразить пользовательский prompt; если значение без селектора
 нельзя разрешить однозначно, `{{model}}` заменяется пустой строкой.
 
-На v1 opencodex внедряет только upstream-style proactive guidance о делегировании на уровнях
-effort `max` или `ultra`. Предпочитаемую модель, ростер, fallback list и custom prompt на v1 он
+На v1 opencodex внедряет тот же текст о проактивном делегировании, что и рекомендуемый пресет v2, только на уровнях effort `max` или `ultra`.
+Меняется только условие запуска: отдельный запрос на делегирование не требуется; инструкции пользователя, полномочия, рамки задачи и правила инструментов совместной работы остаются в силе.
+Предпочитаемую модель, ростер, fallback list и custom prompt на v1 он
 не добавляет.
 
 Опция `syncCodexSubagentDefaults`, выключенная по умолчанию, отделена от guidance. Когда
@@ -111,8 +112,9 @@ opencodex по-прежнему читает устаревшую строку `
 `subagentModelFallbackPollMs` (по умолчанию 60 секунд).
 
 Fallback не делает несовместимые encrypted task читаемыми. Когда задача потомка зашифрована для
-ChatGPT, выбор ограничивается каноническими нативными целями ChatGPT, даже если внешняя модель
-появляется раньше в цепочке.
+ChatGPT, выбор ограничивается каноническими нативными целями ChatGPT и прямыми key-auth
+Responses-маршрутами, явно доверенными через `allowEncryptedV2AgentTasks: true`, даже если другая
+внешняя модель появляется раньше в цепочке. Combo по-прежнему использует только нативные цели.
 
 ## Доставка шифрованных задач v2
 
@@ -123,7 +125,8 @@ Codex может отправить задачу child v2 из native-to-routed 
 opencodex завершаетcя безопасно и не пересылает пустую или нечитаемую задачу:
 
 - Прямой не-нативный маршрут возвращает HTTP 400 с
-  `error.code = "unreadable_encrypted_agent_task"` и не отражает ciphertext назад.
+  `error.code = "unreadable_encrypted_agent_task"` и не отражает ciphertext назад, если его
+  key-auth Responses-провайдер явно не включил `allowEncryptedV2AgentTasks: true`.
 - Combo для такой задачи рассматривает только канонические нативные цели ChatGPT, включая retry.
   Если ни одной подходящей цели нет, возвращается тот же HTTP 400.
 - Читаемая plaintext-задача сохраняет обычное поведение маршрутизации и fallback.
@@ -166,7 +169,7 @@ ocx v2 threads 8
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
-ocx agent fallback set gpt-5.4-mini,xai/grok-4.5 --poll-ms 60000
+ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx agent effort set --subagent max
 ```
 

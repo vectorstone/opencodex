@@ -86,8 +86,10 @@ ChatGPT パススルーカタログには GPT-5.6 Sol/Terra/Luna の名前空間
 
 OAuth ログインを使うプロバイダープリセットは 8 つで、これに実験的な非公式デバイスフロー
 ブリッジ経由の GitHub Copilot が加わります。認証情報は `~/.opencodex/auth.json` に保存され、
-自動更新されます。ログイン CLI は `chatgpt` も受け付けます。このコマンドは ChatGPT 認証情報を
-発行し `forward` モードのプロバイダーエントリを作成します。
+自動更新されます。`ocx login codex` も受け付けますが、これは上記のプロバイダーではありません。
+Codex アカウントプールのログイン (`ocx account login codex` と同じフロー) に転送されます。
+プールは独自の台帳を持ち、この経路はプロキシの起動を必要とします。`chatgpt` と `openai` は
+同じ経路の別名です。
 
 ```bash
 ocx login xai          # xAI Grok
@@ -98,21 +100,43 @@ ocx login kiro         # kiro-cli 認証情報の取り込み(トークンフォ
 ocx login google-antigravity
 ocx login cursor       # Cursor 専用 PKCE ログイン
 ocx login command-code # Command Code のブラウザ OAuth (または ~/.commandcode/auth.json を取り込み)
+ocx login devin       # Cognition/Devin: Devin CLI の資格情報を優先インポート、なければ Auth0 ブラウザサインイン
 ocx login github-copilot  # GitHub デバイスフロー → Copilot トークン (Copilot Pro/Business)
-ocx login chatgpt      # 別途 ChatGPT OAuth ログイン
+ocx login codex        # Codex アカウントプール (別名: chatgpt, openai / プロキシの起動が必要)
 ocx logout <provider>
 ```
 
 | プロバイダー | アダプター | ベース URL | 備考 |
 | --- | --- | --- | --- |
-| `xai` | `openai-chat` | `https://api.x.ai/v1` | ライブ一覧を優先し、フォールバックのデフォルトモデルは `grok-4.5`。 |
+| `xai` | `openai-chat` | `https://cli-chat-proxy.grok.com/v1` | OAuth は独立した Grok CLI サブスクリプションゲートウェイを使用します。API キーのオーバーライドは `https://api.x.ai/v1` を使用し、Priority Processing を注入する場合があります。ライブ一覧を優先し、フォールバックのデフォルトモデルは `grok-4.5`。 |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | Claude モデル; ライブモデル一覧は `/v1/models` から取得。 |
 | `kimi` | `openai-chat` | `https://api.kimi.com/coding/v1` | Kimi K2.7/K2.6/K2.5 コーディングモデル。 |
 | `nous` | `openai-chat` | `https://inference-api.nousresearch.com/v1` | Nous Research サブスクリプションゲートウェイ（Hermes Agent と同じバックエンド）。`portal.nousresearch.com` へのデバイスグラントログイン; access トークンはリクエストごとの inference JWT。有料 + `:free` モデルの混在カタログ（`tencent/hy3:free`、`stepfun/step-3.7-flash:free` など）はサインイン中のアカウントからライブ探索されます。Refresh トークンは単回使用で、更新のたびにローテーションされます。 |
 | `kiro` | `kiro` | `https://runtime.us-east-1.kiro.dev` | 初回ログインは、インストール済みでサインインした `kiro-cli` セッションを取り込みます（Unix では `curl -fsSL https://cli.kiro.dev/install` &#124; `bash`、Windows PowerShell では `irm 'https://cli.kiro.dev/install.ps1'` &#124; `iex` でインストールしてから `kiro-cli login` を実行）。**アカウントを追加**は `kiro-cli` をログアウトして新しいブラウザログインを開始し、`kiro-cli` 自体のアカウントを切り替えてアカウント別プロファイルメタデータを保存します。既存の OpenCodex アカウントは保持され、キャンセルまたは失敗時には以前の `kiro-cli` セッションが復元されます。 |
 | `google-antigravity` | `google` | `https://daily-cloudcode-pa.googleapis.com` | Google OAuth を Cloud Code Assist wire で使用。ライブ探索は認証済みの CCA `v1internal:fetchAvailableModels` エンドポイントを使用し、ログイン中のアカウントで利用可能な agent モデルのみを公開します。管理されたカタログはフォールバックとして残ります。 |
 | `cursor` | `cursor` | `https://api2.cursor.sh` | 実験的 PKCE ログイン、HTTP/2 トランスポート、アカウント別モデル探索をサポート。 |
+| `devin` | `devin` | `https://server.codeium.com` | 実験的な非公式 Cognition/Devin ブリッジ。ログインはまず、インストール済み Devin CLI が保持する認証情報を取り込みます（`devin auth login` が `devin-session-token` を自身の `credentials.toml` に書き込みます）。なければ Auth0 のブラウザサインインを開き、貼り付けたトークンを `RegisterUser` で長期 API キーに交換します。`ocx login devin-cli` は非推奨エイリアスとして引き続き使えます。モデル一覧は `GetCascadeModelConfigs` でアカウントごとに取得し、ストリーミングは Connect-RPC 上の `runTurn` 経路のみを使います。ダッシュボードのプリセットには既定で含まれません。 |
 | `github-copilot` | `openai-chat` | `https://api.githubcopilot.com` | 実験的。GitHub デバイスフロー + `copilot_internal` 交換（VS Code OAuth クライアント）。有効な Copilot サブスクリプションが必要で、公式のサードパーティ API ではありません。 |
+
+Google Antigravity のアカウント・プロバイダーのクォータ確認は、モデル一覧へのフォールバックも含め、固定の Google エンドポイントを使用します。その宛先では透過 Fake-IP DNS に対応し、TLS 検証、リダイレクト拒否、プライベートアドレス検査を維持します。カスタム base URL はモデル要求にのみ適用されます。`NO_PROXY` は直接接続のポリシーを維持します。
+
+### Google ツールスキーマ損失診断
+
+Google のツール宣言は、選択されたエンドポイントクラスに合わせてコンパイルされます。
+`ocx debug provider on`、ダッシュボードの Logs トグル、または `OCX_DEBUG=1` でプロバイダー
+デバッグを有効にすると、ポリシーの省略時または `compatible` の互換性変換でのスキーマ損失は
+`[ocx:google:google-tool-schema-loss]` レコードを出力します（`ocx debug provider logs -f` で
+追跡できます）。レコードに含まれるのは、レポートのバージョン、エンドポイントクラス、
+`lossy` インジケーター、判定不能な比較の上限付き件数、上限付き件数を伴う固定の損失カテゴリ、切り詰めフラグだけです。
+ツール名、プロパティ名、パス、値、スキーマ本文は含まれません。ポリシーの省略時または
+`compatible` では変換を拒否せず観測します。`reject-lossy` では、初期コンパイルに損失がある場合、
+または上限付き比較が判定不能な場合、送信前に拒否します。拒否されたリクエストに別の損失レコードは
+出力されません。`reject-lossy` では、制約を消す Vertex または Cloud Code Assist の修復は同様に内容を含まない
+`google-tool-schema-repair` を出力し、変更送信を行わず元の 400 を返します。ポリシーの省略時または
+`compatible` では、修復済みリクエストを従来どおり再送します。直接 AI Studio は
+この修復を行いません。ネイティブ出力スキーマは両方のポリシー経路の対象外です。
+[デバッグコマンドのリファレンス](/ja/reference/cli/agents/)も参照してください。
+
 
 Nous の refresh が終端失敗した場合は、再認証に `ocx login nous` を実行してください。
 
@@ -161,7 +185,7 @@ Kiro のログインには Kiro CLI が必要です。Unix では `curl -fsSL ht
 
 ## 3. API キーカタログ
 
-opencodex には組み込みプリセットが 79 個含まれています。キー方式 67、OAuth 8、ローカル 3、
+opencodex には組み込みプリセットが 95 個含まれています。キー方式 79、OAuth 12、ローカル 3、
 デフォルト ChatGPT 転送プリセット 1 です。ダッシュボードの **Add provider** ピッカーはキー発行ページを開き、
 入力したキーを検証した後保存します(検証はプロバイダー固有です)。主な項目は以下のとおりです:
 
@@ -202,6 +226,7 @@ Cline IDE/CLI のみで API からは使えません。`minimax/minimax-m2.5` �
 | Command Code | `https://api.commandcode.ai/provider/v1` |
 | SambaNova Cloud | `https://api.sambanova.ai/v1` |
 | Nebius Token Factory | `https://api.tokenfactory.nebius.com/v1` |
+| Crusoe | `https://api.inference.crusoecloud.com/v1` |
 | DigitalOcean Serverless Inference | `https://inference.do-ai.run/v1` |
 | Scaleway Generative APIs | `https://api.scaleway.ai/v1` |
 | Featherless AI | `https://api.featherless.ai/v1` |
@@ -213,6 +238,7 @@ Cline IDE/CLI のみで API からは使えません。`minimax/minimax-m2.5` �
 | NVIDIA NIM | `https://integrate.api.nvidia.com/v1` |
 | Z.AI (GLM Coding) | `https://api.z.ai/api/coding/paas/v4` |
 | Zhipu AI (BigModel) | `https://open.bigmodel.cn/api/paas/v4` |
+| [BigModel Coding Plan — Responses (静的モデル一覧)](/guides/providers/#bigmodel-coding-plan-over-responses) | `https://open.bigmodel.cn/api/v1` |
 | Qwen Cloud | トークンプラン(デフォルト): `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` · 従量課金: `https://dashscope.aliyuncs.com/compatible-mode/v1` · またはカスタム |
 | Tencent Cloud Coding Plan | `https://api.lkeap.cloud.tencent.com/coding/v3` |
 | SiliconFlow | `https://api.siliconflow.cn/v1` |
@@ -227,9 +253,13 @@ Cline IDE/CLI のみで API からは使えません。`minimax/minimax-m2.5` �
 **OpenCode Zen**（`opencode-zen`）とキー不要の **OpenCode Free** プリセットは
 `https://opencode.ai/zen/v1` を共有します。このゲートウェイ上の無料モデルは、しばしばおおよそ毎分 15–20 リクエストの短時間レート制限に当たります（コミュニティ計測。OpenCode は RPM を公表しません）。Zen は `Retry-After` / `X-RateLimit-*` ヘッダーなしの汎用 429 を返すことがあります。これはキー不要デスクトップ枠（`opencode-free` で Big Pickle/無料モデル約 200 回 / 5 時間）とは別です。Zen がそのような 429 で `Retry-After` を省略した場合、opencodex はクライアント向けエラーに案内を足し、合成 `Retry-After` を付けます（上流の `Retry-After` があればそれが優先されます）。同一キーの待機再試行は [`retryOn429`](/ja/reference/configuration/) でオプトインします。
 
+**キー不要の `opencode-free` 枠は、現在サードパーティのクライアントに閉じられています。** Zen は `x-opencode-session` ヘッダーを伴わないリクエストをすべて拒否し、エラータイプ `MissingSessionID` と "OpenCode's free tier can only be used in OpenCode" というメッセージを返します。関門はヘッダーの有無だけを見るため、プロキシは値をでっち上げれば通過できますが、opencodex はそうしません。セッション識別子とバージョン付きの `opencode/<version>` User-Agent を作って送ることは、自分が OpenCode クライアントであると主張することであり、OpenCode はこのキー不要の枠についてサードパーティ連携の契約を公開していません。その方法で得た HTTP 200 は許可ではなく、突破された関門にすぎません。そこで opencodex は回避せずに制限を報告します。`opencode-free` へのリクエストは、上流の関門を説明するエラーを返します。
+
+同じモデルに至るサポートされた経路は、[opencode.ai/auth](https://opencode.ai/auth) で発行した OpenCode Zen API キーを使う **`opencode-zen`** プリセットです。OpenCode が後にキー不要の枠へのサードパーティ経路を公開すれば、opencodex もそれに従えます。それまでこのプリセットは制限を記録する役割を担います。上流の規約: [opencode.ai/docs/zen](https://opencode.ai/docs/zen/)。
+
 大半は bearer キーと共に `openai-chat` アダプターを使い、Anthropic 互換エンドポイントのみを公開する一部
 (例: **Xiaomi MiMo**)は `anthropic` アダプター(`x-api-key`)を使います。
-Volcengine Agent Plan は `openai-responses` アダプターでネイティブ Responses エンドポイントを使用します。
+Volcengine Coding Plan と Agent Plan は `openai-responses` アダプターでネイティブ Responses エンドポイントを使用します。検証済みの Ark Coding Plan のツール継続では、前のターンが返した Responses の `reasoning` item をそのまま返すと `400 InvalidParameter` になるため、Coding Plan プリセットは継続入力を転送する前にその item を取り除きます。そのターンの reasoning 状態は失われるので、`dropResponsesReasoningItems: false` で無効にできます。すでに `openai-chat` で保存されている Coding Plan の設定は書き換えられず Chat のままです。切り替えるときは `adapter` を `openai-responses` に、`responsesPath` を `/responses` に手動で変更するか、プリセットを削除して追加し直してください。
 
 > **Volcengine の 3 つの課金経路:** `volcengine` は従量課金 Ark API、
 > `volcengine-coding-plan` は Coding Plan の割り当て、`volcengine-agent-plan` は Agent Plan
@@ -240,7 +270,7 @@ Volcengine Agent Plan は `openai-responses` アダプターでネイティブ R
 > Agent Plan ゲートウェイには `/models` リソースがありません。従量課金のデフォルトは
 > `doubao-seed-2-1-pro-260628` で、静的カタログには現在の DeepSeek と GLM のテキストモデルも
 > 含まれます。Coding Plan のデフォルトは `ark-code-latest`、Agent Plan は
-> `deepseek-v4-pro` です。
+> `deepseek-v4-flash` です。
 
 **Chutes の discovery:** `chutes` preset は Chutes の固定された共有 OpenAI 互換 LLM gateway を使います。
 公開 `/v1/models` catalog から `supported_features` が `tools` を示す行だけを残し、スラッシュを含む
@@ -277,6 +307,13 @@ discovery エンドポイントから取得します。チャットリクエス�
 
 **Command Code の quota:** ダッシュボードと `ocx account refresh` は、正規ホスト `https://api.commandcode.ai` 上の `/alpha/billing/credits` ウィンドウ（5時間と週次）を照会します。OAuth プリセット (`command-code`) は保存済みアカウント bearer を使い、Provider-API キープリセット (`commandcode`) は設定済みの有効キーを使います。ユーザーが編集した類似ホストは照会しません。期間支出が返る場合は、残りの monthly / purchased / free credits を USD ウィンドウとして表示します。
 
+OrcaRouter のブラウザーログイン（`ocx login orcarouter-oauth`）では、キー交換の成功応答本文は
+64 KiB 以下の有効な UTF-8 JSON である必要があります。このキー交換リクエストの既存の
+30 秒制限には、応答ヘッダーと本文全体の受信が含まれ、サイズ超過または不正な本文はキーの
+保存前に拒否されます。この制限はログイン時のキー交換にのみ適用され、推論リクエストの
+ペイロードを制限するものではありません。`scope` の検証規則は変わらず、省略は許可され、
+明示された不正な値は拒否されます。
+
 **SambaNova Cloud の discovery:** preset は固定 API ホスト上の SambaNova Cloud の公開 `/v1/models` 一覧を読み、
 プロバイダー固有の ID を保持し、discovery を 128 KiB と raw 128 行に制限します。カタログは認証不要のため、
 CLI の login flow は公開レスポンスをキーの有効性の証拠にせず、キーを検証不能として報告します。chat リクエストは
@@ -289,6 +326,19 @@ CLI の login flow は公開レスポンスをキーの有効性の証拠にせ�
 ネイティブ ID と、報告された context / input modality metadata を保持し、discovery を 512 KiB と raw
 512 行に制限します。dedicated deployment のホストは対象外です。キーは
 [Nebius Token Factory](https://tokenfactory.nebius.com) で作成します。
+
+**Crusoe の discovery:** キー方式のプリセットは `openai-chat` adapter を使用し、Bearer key は
+Crusoe の固定 Serverless Inference host にだけ送信します。`/v1/models` は未認証リクエストを 401 で
+拒否するため、list の成功を key の検証として扱います。discovery は `zai-org/GLM-5.3` や
+`moonshotai/Kimi-K2.6` のようなスラッシュ区切りのネイティブ id を Crusoe が返すままに保持し、256 KiB と
+raw 256 行に制限します。`is_public: true` かつ `architecture.modality` が text または multimodal の row だけを残すため、アカウント専用のデプロイや embedding・メディア系の row は除外されます。reasoning model は思考内容を Chat Completions の `reasoning` field で返し、
+adapter はこれを読み取ります。`reasoning_effort` のラダー（`low`、`medium`、`high`）を受け付けるのは
+`openai/gpt-oss-120b` のみで、他の reasoning model はこの field をオン/オフの切り替えとして扱うため、
+provider 全体の effort ラダーと parallel tool call は宣伝しません。レート制限は project と model ごとに
+適用され（超過時は 429、共有 deployment のスケール中は 503）、新規アカウントには $5 の無料クレジットが
+付与されます。キーは [Crusoe Cloud console](https://console.crusoecloud.com) の
+Intelligence Foundry > Inference で作成します。
+
 **DigitalOcean の discovery:** preset は model access key を固定の共有 Serverless Inference ホストで使い、
 認証済み `/v1/models` の応答と DigitalOcean の公式ドキュメントで確認した Chat Completions allowlist の
 積集合だけを公開します。未知、Responses 専用、embedding、media generation の id は fail closed で除外し、
@@ -335,7 +385,7 @@ model ごとに capability が異なるため、provider 全体の parallel tool
 > コーディングツール専用としています。一般的な API 自動化、カスタムアプリのバックエンド、
 > 非対話型バッチ利用は禁止されており、プランキーが停止される場合があります。
 
-> **GLM の経路は 2 つあります:** `zai` は Z.AI の国際コーディングプラン契約、`zhipu-bigmodel`
+> **GLM の課金経路:** `zai` は Z.AI の国際コーディングプラン契約、`zhipu-bigmodel`
 > は Zhipu の中国国内向け BigModel 従量課金エンドポイントです。ホストもキーも課金も別で、
 > 一方で発行したキーはもう一方では認証されません。
 
@@ -380,8 +430,8 @@ Amazon Bedrock ネイティブ API のような、これらの実装のいずれ
 **サブスクリプショントークン**(通常の API キーではない)で認証します。**Cloudflare AI
 Gateway** は URL にアカウント + ゲートウェイ ID を埋める必要があります。
 
-Copilot は混在 wire カタログを提供します。GPT-5 系モデル（`gpt-5.3-codex`、`gpt-5.4`、
-`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`）はエージェント
+Copilot は混在 wire カタログを提供します。モデル（`gpt-5.3-codex`、`gpt-5.4`、
+`gpt-5.4-mini`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-6-astra`, `grok-4.5`, `grok-4.6`, `mai-code-1.1-flash`, `mai-code-1-flash-picker`）はエージェント
 通信の `/chat/completions` を拒否するため、opencodex はこれらのモデルを組み込みデフォルトで
 Responses API 経由にルーティングし、他の Copilot モデルはすべて chat completions のままです。
 優先順位は次のとおりです: ハード wire ピン → 明示的な
@@ -412,13 +462,20 @@ MCP、画面録画、computer-use はエグゼキューターフックで開か�
 
 ### Ollama Cloud
 
-Ollama Cloud はホステッド型(ローカルではない)Ollama で、`https://ollama.com/v1` で OpenAI 互換、キーは
-[ollama.com/settings/keys](https://ollama.com/settings/keys) で発行されます。opencodex はクラウド
+Ollama Cloud はホステッド型(ローカルではない)Ollama です。`https://ollama.com/v1` を設定し、キーは
+[ollama.com/settings/keys](https://ollama.com/settings/keys) で発行します。opencodex は OpenAI 互換
+サーフェスではなく Ollama 自身の REST API(`POST /api/chat`)で接続し、モデル一覧はプロバイダーから
+動的に取得するため、新しい Ollama Cloud モデルは設定変更なしで現れます。opencodex はクラウド
 ラインナップをビジョン機能で分類し、[ビジョンサイドカー](/ja/guides/sidecars/)がテキスト専用モデルにのみ
-動作するようにします。テキスト専用モデル(例: `glm-5.2`、`deepseek-v4-pro`、`gpt-oss`、`qwen3-coder`、
+動作するようにします。テキスト専用モデル(例: `glm-5.2`、`deepseek-v4-flash`、`gpt-oss`、`qwen3-coder`、
 `minimax-m2.x`、`nemotron-3-*`)は `noVisionModels` に列挙され、ビジョンネイティブモデル(例:
 `kimi-k2.6`、`minimax-m3`、`gemma4`、`qwen3.5`、`gemini-3-flash-preview`)は含まれません。マッチングは
 Ollama の `:size` タグに寛容なので `gpt-oss` は `gpt-oss:120b` と `gpt-oss:20b` の両方を含みます。
+
+Ollama は現在、構造化出力は Ollama Cloud では未対応であるとドキュメントしています。正規の
+`ollama-cloud` に対する構造化出力リクエスト（`text.format`）は、自由文を黙って返す代わりに
+opencodex が明示的なエラーで拒否します。ローカル / カスタムの `ollama-native` エンドポイントは
+Ollama ネイティブの `format` 動作を保持します。
 
 ## 4. ローカルプロバイダー
 

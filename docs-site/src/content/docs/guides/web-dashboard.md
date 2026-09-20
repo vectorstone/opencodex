@@ -13,7 +13,8 @@ settings, and request traffic.
 ocx gui
 ```
 
-This opens `http://localhost:<port>` in your browser, auto-starting the proxy first if needed. In
+This opens `http://localhost:<port>` in your browser — or `http://127.0.0.1:<management port>` when hub
+management ingress is enabled — auto-starting the proxy first if needed. In
 development you can run the GUI dev server separately against a running proxy:
 
 ```bash
@@ -34,6 +35,47 @@ password manager can offer to save and autofill it. The dashboard itself still k
 in memory and does not write it to `localStorage` or `sessionStorage`; whether it is saved is entirely
 the browser or password manager's decision.
 
+### Finding the admin token
+
+You only need this on a non-loopback bind. A local dashboard never asks, and if a local one
+*does* ask, the token is not the problem — see [When a local dashboard cannot start a
+session](#when-a-local-dashboard-cannot-start-a-session) below.
+
+The proxy generates the token for you the first time it starts. It is not printed anywhere,
+by design, so read it from the file:
+
+```bash
+cat ~/.opencodex/admin-api-token
+```
+
+If `OPENCODEX_HOME` is set, the file lives at `$OPENCODEX_HOME/admin-api-token` instead. On
+Windows that is `%USERPROFILE%\.opencodex\admin-api-token`. A generated token looks like
+`ocx_admin_` followed by 43 characters; the proxy refuses a file that does not match that
+shape rather than silently regenerating one.
+
+To choose the value yourself, set `OPENCODEX_ADMIN_AUTH_TOKEN` before starting the proxy. It
+takes precedence over the file, and the file is then neither read nor created. Pick something
+distinct from your data-plane credential (`OPENCODEX_API_AUTH_TOKEN` or a configured API key) —
+reusing one is rejected.
+
+There is no CLI command that prints the token. `ocx doctor` deliberately reports whether a
+credential is present without ever revealing its value.
+
+### When a local dashboard cannot start a session
+
+A dashboard on `localhost` mints its own session, so it will not prompt you for a token. If it
+reports that it could not start a session, the cause is the address you are using rather than a
+missing credential — the proxy did not recognise the request as loopback. Open the dashboard at
+the address the proxy prints on startup (usually `http://127.0.0.1:<port>`), and prefer that exact
+host and port over a LAN IP or an alias.
+
+## Dashboard layout
+
+Overview uses matching status cards and full-width settings rows. On wide screens, labels share
+one column and model/effort controls share another. On narrower screens, controls move below their
+labels in the same reading order. Long version labels are shortened visually; hover the version
+badge or the version value to read the full value.
+
 ## What you can do
 
 | Area | What it does |
@@ -45,15 +87,49 @@ the browser or password manager's decision.
 | **Startup safety** | Show whether injected Codex routing survives a restart, with separate service and launcher-shim health plus exact repair commands. |
 | **Windows tray** | Install a per-user login tray for one-click proxy start, stop, restart, dashboard access, and status. The tray is a controller, not a proxy restart service. |
 | **Codex autostart** | Allow an already-installed Codex launcher shim to run `ocx ensure`. This toggle does not install a shim or background service. |
-| **Providers** | Add, edit, set the default (enabled providers only), enable/disable, and remove providers; manage OAuth account pools and API-key pools where supported. Removing the current default switches to the first remaining enabled provider when one exists; otherwise deletion is refused and the current default is kept. Provider Settings can disable live model discovery for endpoints with missing, slow, or oversized `/models` catalogs. For Claude (Anthropic) OAuth pools, each logged-in account shows its own 5-hour and weekly rate-limit bars (usage is per credential); a failed probe keeps the last-known bars and marks them unavailable until the next successful refresh. |
-| **Add provider** | Search registry-backed presets for account login, API-key services, local servers, or a custom endpoint. |
+| **Providers** | Add, edit, set the default (enabled providers only), enable/disable, and remove providers; manage OAuth account pools and API-key pools where supported. Removing the current default switches to the first remaining enabled provider when one exists; otherwise deletion is refused and the current default is kept. Provider Settings can disable live model discovery for endpoints with missing, slow, or oversized `/models` catalogs. For Claude (Anthropic) OAuth pools, each logged-in account shows its own 5-hour and weekly rate-limit bars (usage is per credential); a failed probe keeps the last-known bars and marks them unavailable until the next successful refresh. The Provider Overview shown when no provider is selected carries a **Refresh all quotas** control that forces one server-side re-read of every configured provider; a provider whose upstream probe fails keeps its last-good row, so the status line reports that the check completed rather than claiming every value is fresh, and each row's own age stays the per-provider freshness signal. |
+| **Add provider** | One search above the tabs reaches all four at once — Accounts, Free, Local, Paid. While a query is live the results are grouped by tab with a count each, and the selected tab stays put rather than jumping. Press ArrowDown in the search box to focus the first available result action, skipping disabled buttons; if no action is available, focus stays in the search box. Local runtimes (Ollama, vLLM, LM Studio, LiteLLM) have their own tab, and a long provider note clamps to two lines with the full text one click away. |
 | **Codex Auth** | Add ChatGPT/Codex pool accounts, select the next-session account, refresh 5h / weekly / 30d quotas, enable or disable quota auto-switch, set its 1–100% threshold, and configure transient-failure failover. |
 | **Subagents** | Feature up to five bare native or namespaced routed models in the `spawn_agent` override list. |
-| **Models** | Toggle native GPT and routed models, set provider allowlists and context caps, choose v1/base/v2, and configure the v2 thread limit. Configured providers stay visible as zero-model groups when discovery is off or returns no rows. |
+| **Models** | Toggle native GPT and routed models, set provider allowlists and context caps, choose v1/base/v2, and configure the v2 thread limit. The page distinguishes a catalog saved on the hub, a catalog fetched by this client, and activation in a running client. A fetch timestamp does not prove it includes the latest hub save, and runtime activation is shown as unverified. Configured providers stay visible as zero-model groups when discovery is off or returns no rows. |
 | **Logs** | Auto-refresh recent requests with tokens, requested effort and (when available) effective outbound effort, resolved model, provider, status, request id, duration, and error details. The detail view includes the exact reasoning wire field when the adapter emits one. Filter by opaque conversation/session id (when the client sends one) to total tokens and estimated list-price cost for the currently loaded Logs ring. |
 | **Usage / Debug** | Inspect token-usage coverage and trends, or enable opt-in provider transport and usage-extraction diagnostics. |
 | **Storage** | Read-only CODEX_HOME disk breakdown (sessions, archives, DBs, attachments). Optional archived cleanup: preview the oldest N%, then quarantine to `CODEX_HOME/.trash` (default) or permanently delete behind an explicit checkbox. **Auto-cleanup policy** is opt-in and **default OFF** (`storageCleanupPolicy.enabled`); configure threshold/target/schedule/mode on the Storage page, or trigger **Run now**. Quarantined entries can be restored from the Storage page (JSONL + threads). Active sessions stay read-only. Cleanup and restore are refused while Codex holds the newest/active `state_*.sqlite` locked. |
-| **Stop** | Gracefully stop the proxy and installed background service, restore native Codex, and exit (`POST /api/stop`). |
+| **Stop** | Gracefully stop the proxy and installed background service, restore native Codex, and exit (`POST /api/stop`). On Windows with the Task Scheduler backend the dashboard refuses and asks you to run `ocx stop` instead: that wrapper can respawn the proxy after the task ends, and only a stop running outside this process can verify the restart window before restoring your client config. Nothing is changed when it refuses. |
+
+If some usage records cannot be included, the Usage page, Dashboard, provider workspace, provider
+catalog, and API key views show a warning even when no readable records remain. Counts, dates, and
+usage rankings reflect readable records only. **Models → Most used snapshot → Apply order** refuses
+to save an incomplete snapshot; choose another order or repair the history before retrying.
+
+### Account selection
+
+Account selection is shared with request routing. Selecting an OAuth account takes effect on the
+next request even when a pool is enabled. A healthy selection is not replaced merely because
+another generic OAuth account has more unused quota. If the account returns 429, automatic
+failover can still select another usable account with the pool off. A committed automatic
+selection updates the dashboard immediately; account changes do not wait for the quota refresh
+timer. Requests already sent upstream retain their original credentials.
+
+### Filtering request logs
+
+Logs filters combine surface, intercepted requests, provider, exact model, status, time,
+speed, and conversation ID over the currently loaded request ring. Provider and model
+choices also include fallback attempts; model matching ignores case and surrounding spaces
+but does not match partial names. Choices that disappear from the ring reset to All.
+
+Time windows cover the last 15 minutes, hour, or day and refresh every 30 seconds while the
+Logs tab is active, even with auto-refresh off. Windows use the proxy timestamp from
+the logs response and advance with elapsed browser time, so a different browser clock
+does not shift the cutoff. Older proxies without that timestamp retain the browser-clock
+fallback until a valid sample is available. Speed uses output tokens per second over the
+full request duration: below 15, 15 to below 50, or at least 50. Unavailable speed values are
+excluded when a speed filter is active. Success means 2xx; errors mean 4xx or 5xx.
+
+Active filters show the matching count out of the loaded total. Reset filters restores all
+rows and returns keyboard focus to the All surface control; “No matching requests”
+differs from an empty log ring. Use arrow keys or Home/End in
+the surface selector. These controls do not query historical records beyond the loaded ring.
 
 ### Linking to a section
 
@@ -64,12 +140,57 @@ on. **Logs** works the same way with `#logs` and `#logs/debug`. An older `#provi
 bookmark now lands on `#providers`.
 
 Cost values in **Logs** and **Usage** are API list-price equivalents calculated from reported tokens.
-They are not billing receipts or evidence of an actual charge; subscription usage or provider credits
+For a custom usage interval, the server must confirm the exact requested start and end times.
+If an older running proxy does not support those bounds, the dashboard and CLI reject its report;
+upgrade and restart that proxy before retrying. Resetting a manual model price affects only that
+model, preserving other rates saved independently.
+The **Usage** Models and Providers tables show the estimated priced portion for each row. Requests
+without a matching price or usable usage are counted as excluded beside that amount when the proxy
+reports pricing coverage fields. A row with only excluded requests shows an em dash with that count
+instead of a zero-dollar estimate, and a displayed zero-dollar value is a confirmed priced estimate.
+An older proxy that reports no coverage fields keeps a bare em dash with no count, so missing
+coverage stays distinct from an all-excluded row and from a confirmed zero estimate.
+These are not billing receipts or evidence of an actual charge; subscription usage or provider credits
 may apply instead.
+
+Provider model rows may include **unresolved requested model usage**: the saved route sent the
+requested name unchanged to the default provider. These tokens belong to that serving provider,
+not necessarily the vendor named in the request. The dashboard preserves the original name and
+usage rather than guessing which model ran. For slash-containing unresolved names, a different
+vendor's model price alone is not enough to estimate cost; an exact provider or configured price
+still applies. Model shares are calculated within the selected provider. Requests for an unknown
+reserved `policy/` name now fail before reaching an upstream provider; historical usage is retained.
+
+The selected provider's **Overview** and **Usage** tabs show **Current account usage** below the
+usage statistics. **Accounts** and **API keys** show each supported credential's own quota,
+including credit balances. The provider-wide overview still shows pooled capacity where available;
+it is not substituted for a missing current-account reading. Unsupported lookup, no passive
+observation yet, loading, failed lookup with last-known values, and measured zero are separate
+states. **Quota check completed** means the read settled—not that a passive observation became
+new or that every upstream measurement was refreshed.
 
 ## Model visibility
 
 The **Models** switches show final Codex visibility: a routed model is on only when its provider allowlist includes it (or no allowlist is set) and it is not disabled. Turning a model on reconciles both filters atomically; **All on** clears the provider allowlist so newly discovered models are also on.
+
+### Managing models in a provider workspace
+
+In a provider’s **Models** tab, **Delete** removes the stored custom definition. An underlying
+native or live-discovered model may then appear again, so the model count can stay the same.
+**Hide** changes catalog visibility only: it does not delete the definition or change direct
+routing policy. Use **Manage visibility in Models** to open the **Models** page and restore
+visibility, even when the provider tab has no rows left.
+
+**Add** saves a custom definition; it does not clear an existing hide or provider selection rule.
+A saved model can therefore remain hidden. If the model is already known, manage its visibility
+in **Models**. A confirmed save with a failed catalog refresh is still saved: follow the refresh
+message instead of adding it again. If the change cannot be confirmed, refresh the model state
+before retrying.
+
+The provider’s model count is the number of unique, non-disabled entries in the current model
+inventory returned by the server, before search or display truncation. It is not the provider
+allowlist size, a live-discovery count, or proof that an entry was discovered upstream. Selection
+badges and discovery information remain separate from that count.
 
 ## Delegation picker vs spawn routing
 
@@ -92,6 +213,10 @@ they have been synchronized. See
 [Sub-agent Surface](/guides/sub-agent-surface/) for the canonical v1/base/v2 behavior.
 :::
 
+## Remote Hub sessions, keys, and usage
+
+The dashboard's management plane is separate from direct client→hub model traffic. **Integrations → API Keys** shows pending rotations, displays a replacement secret only once, and requires explicit commit or abort. Browser logout invalidates only the current remote session. Connected usage is the hub store filtered by the client's `apiKeyId`; disconnected usage is local, with no mirroring.
+
 The spawn override guarantee applies to the **built-in** v2 guidance text. A custom
 `injectionPrompt` replaces that text entirely and must include `{{model}}` and `{{effort}}`
 placeholders (and optionally `{{roster}}`) or those values will not appear in the injected
@@ -110,6 +235,17 @@ In-flight requests keep their captured credentials, and a 401/403 reauthenticati
 may clear affinity and rotate to another eligible Pool account. This is separate from `openai-apikey`
 and other providers.
 
+:::caution[Provider-policy responsibility]
+The account pool is a technical account-management, routing, and resilience feature. It does not
+claim that having multiple accounts is itself prohibited; compliance depends on the account setup and
+use pattern. OpenCodex does not endorse using additional accounts to circumvent rate limits, quotas,
+plan limits, or other provider restrictions, or sharing account credentials between people. You are
+responsible for complying with the provider's current terms for every connected account and use
+pattern. Provider restrictions, suspension, or termination are outside OpenCodex's control;
+maintainers do not provide policy advice and cannot resolve provider enforcement. Review
+[OpenAI's current Terms of Use](https://openai.com/policies/terms-of-use/).
+:::
+
 - Manually choosing an account applies immediately: an already-bound thread moves to it on its next
   request, and only requests already in flight keep the account they captured. A manual choice is also
   pinned: the card shows a **PINNED** badge, and a higher selection order cannot preempt that account
@@ -120,9 +256,11 @@ and other providers.
   thread that is already bound. The Codex Desktop (main) account is ordered like any other, so it can
   be set to **Last** and kept as the reserve. An order set from `ocx account priority` outside those
   five presets stays visible and selectable on the card.
-- Thread affinity prevents per-request flapping. With quota auto-switch enabled, a long-running
-  thread is periodically re-evaluated and may rebind after its relevant usage reaches the threshold
-  and a strictly lower-usage eligible account exists.
+- Thread affinity prevents per-request flapping. With `pool.cacheAffinity` on (the default), a
+  long-running thread is not rebound merely because usage crossed the threshold; it stays until the
+  account is exhausted or cannot serve, and then only onto an account with genuine quota headroom
+  and strictly lower usage. Set the flag `false` to restore threshold rebinding, still only onto
+  such a destination.
 - New sessions can choose the lowest-usage eligible account. Paid plans score the hottest known 5h,
   weekly, or 30d window; Go/Free plans use the 30d window only.
 - When WHAM supplies `limit_window_seconds`, Codex Auth classifies a primary window of at least 28
@@ -199,17 +337,28 @@ The GUI is a thin client over the proxy's JSON management API. Useful endpoints 
 | `GET /api/models` · `PUT /api/disabled-models` | List native/routed model rows and update the shared disabled-model set. |
 | `GET /api/selected-models` · `PUT /api/model-visibility` | Read provider allowlists and atomically change the final visibility of one model or provider group. |
 | `GET /api/key-providers` · `GET /api/oauth/providers` | Read the API-key and OAuth provider catalogs. |
+| `GET /api/oauth/accounts?provider=...&quota=1` · `GET /api/providers/keys?name=...&quota=1` | Read each account or key's quota where supported, without changing the active credential. Add `refresh=1` to bypass settled quota cache; an in-flight same-credential read can be shared. Omit `quota=1` for a cheap local list with each row's `quotaMode`: `probe`, `passive`, or `unsupported`. Passive reads return existing observations without a network probe. No reading is not the same as 0% used, and quotas for multiple keys are not summed. |
 | `POST /api/oauth/login` · `GET /api/oauth/status` | Start a provider OAuth flow and poll for completion. |
 | `GET /api/codex-auth/accounts?refresh=1` | List main and pool accounts, force quota refresh, and report main-account `hasCredential` / terminal `needsReauth` state. |
 | `PUT /api/codex-auth/active` · `PUT /api/codex-auth/auto-switch` · `PUT /api/codex-auth/failover` | Select the account for the next request and configure pool routing. |
 | `GET /api/codex-auth/active` · `PUT /api/codex-auth/accounts/priority` | Read the effective account (including `pinned` and which account is `pinnedAccountId`) and set one account's selection order. |
 | `POST /api/codex-auth/login` · `GET /api/codex-auth/login-status` | Add a pool account through browser login. |
-| `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | Read recent request metadata with optional tail, provider, and exact/class status filters. With `limit`/`offset`, paging walks backward from the newest row (`offset=0` returns the latest page). Response shape: `{ timeZone, total, logs }` where `total` is the filtered row count before pagination. |
+| `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | Read recent request metadata with optional tail, provider, and exact/class status filters. With `limit`/`offset`, paging walks backward from the newest row (`offset=0` returns the latest page). Response shape: `{ timeZone, generatedAt, total, logs }` where `total` is the filtered row count before pagination. |
 | `GET` / `PUT /api/subagent-models` | Read or set the five featured `spawn_agent` override models. |
-| `POST /api/stop` | Stop the proxy/service, restore native Codex, and exit. |
+| `POST /api/stop` | Stop the proxy/service, restore native Codex, and exit. Refused with `respawnable_service` on the Windows Task Scheduler backend, with `self_unload_service` when this proxy is itself the installed launchd/systemd job, and with `service_state_unknown` when the Task Scheduler state cannot be read; nothing is changed in any of those cases. |
 
 :::tip
 Adding **Ollama Cloud** or another catalog provider from the dashboard copies its text-versus-vision
 classification into the saved provider config, so the [vision sidecar](/guides/sidecars/)
 is gated correctly without manual classification.
 :::
+
+### Pairing this browser with a hub
+
+Machine enrollment and browser authentication are separate. The pairing panel names the hub and displays an `ocx gui pair --origin` command for the exact origin currently open in your browser. Run that command on the hub, or send it to the hub operator and request a one-time pairing code. Paste that code into the panel; a data API key or admin token is not a pairing code.
+
+While browser authentication is pending, the dashboard does not recommend restarting a healthy connected client. Completing pairing refreshes the dashboard data immediately, including a previously cached authentication failure. Session expiry returns to pairing; permission denial keeps its own access-settings guidance. Other failed refreshes may show the last received data with a stale-data notice and retry action.
+
+### Usage chart keyboard and touch controls
+
+Usage heatmap days have one Tab entry point. Use Up/Down for adjacent days and Left/Right for adjacent weeks. Weekly bars expose the same day details on keyboard focus, pointer hover, or touch. Day labels include the date, request count, and token count; tooltip overlays stay within the viewport.

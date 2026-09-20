@@ -8,11 +8,12 @@ import { clearModelCache, DEFAULT_MODEL_CACHE_TTL_MS, getFreshCached, getStaleCa
 import { buildModelsRequest, resolveModelsAuthToken } from "../../oauth";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
 import { modelInList } from "../../types";
-import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, modelRecordValue, sanitizeCodexReasoningEfforts } from "../../reasoning-effort";
+import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, modelRecordValue, resolveEffortAtOrBelow, sanitizeCodexReasoningEfforts } from "../../reasoning-effort";
 import { getModelMetadata, getModelMetadataCaseInsensitive, listModelMetadata, resolveMetadataProvider } from "../../generated/model-metadata";
 import { enrichProviderFromRegistry, shouldCaseFoldMetadataModelId } from "../../providers/derive";
 import { getProviderRegistryEntry } from "../../providers/registry";
 import { applyProviderContextCap, providerContextCap } from "../../providers/context-cap";
+import { clampAutoCompactTokenLimit } from "../../providers/auto-compact-budget";
 import { routedSlug, slugEquals, slugEquivalenceKey, slugsEquivalent } from "../../providers/slug-codec";
 import { CODEX_GPT5_IDENTITY_LINE } from "../../adapters/identity";
 import { filterCursorConfiguredModelsByLiveDiscovery } from "../../adapters/cursor/discovery";
@@ -33,7 +34,7 @@ import upstreamModelsSnapshot from "../data/upstream-models.json";
 
 
 import { catalogModelSlug } from "./parsing";
-import type { CatalogModel } from "./parsing";
+import type { CatalogModel, RawEntry } from "./parsing";
 
 export const openAiApiCollisionWarnings = new Set<string>();
 
@@ -76,20 +77,16 @@ export function intersectStrings(values: readonly string[][]): string[] {
   return [...new Set(values[0])].filter(value => rest.every(set => set.has(value)));
 }
 
+/**
+ * The catalog's view of a combo's default effort. Delegates to the shared leaf
+ * resolver so the request path (src/combos/request.ts) cannot drift from what the
+ * catalog advertised (#3108).
+ */
 export function effectiveComboDefault(
   configured: string | null | undefined,
   common: readonly string[],
 ): string | undefined {
-  if (!configured) return undefined;
-  if (configured && common.includes(configured)) return configured;
-  const requestedRank = codexEffortRank(configured);
-  const ranked = common
-    .map(effort => ({ effort, rank: codexEffortRank(effort) }))
-    .filter(item => item.rank >= 0)
-    .sort((a, b) => a.rank - b.rank);
-  if (ranked.length === 0) return undefined;
-  const atOrBelow = ranked.filter(item => item.rank <= requestedRank);
-  return atOrBelow.at(-1)?.effort ?? ranked[0]!.effort;
+  return resolveEffortAtOrBelow(configured, common);
 }
 
 /**
@@ -137,10 +134,18 @@ export function deriveComboCatalogModel(
     : derivedInputModalities;
   if (inputModalities.length === 0) return null;
   // Unknown ladders (`undefined`) are wildcards for catalog derivation — same
-  // boundary as the GUI picker. An explicit empty ladder still constrains.
-  const advertisedLadders = members
+  // boundary as the GUI picker. Under the default `strict` mode an explicit empty
+  // ladder still constrains, so one target that advertises no effort control empties
+  // the whole combo's picker. `adaptive` is the opt-in for mixed-capability groups:
+  // empty ladders drop out of the published intersection while non-empty ladders
+  // still define it. Dispatch is unaffected either way — each concrete target
+  // resolves its own effort at request time.
+  const knownLadders = members
     .map(member => member.reasoningEfforts)
     .filter((ladder): ladder is string[] => ladder !== undefined);
+  const advertisedLadders = combo.reasoningEffortMode === "adaptive"
+    ? knownLadders.filter(ladder => ladder.length > 0)
+    : knownLadders;
   const reasoningEfforts = advertisedLadders.length === 0
     ? []
     : intersectStrings(advertisedLadders);
@@ -154,7 +159,25 @@ export function deriveComboCatalogModel(
   // combo would have the same window even without the cap.
   const contextCapped = limitingMembers.every(member => member.contextCapped === true);
   const maxInputTokens = Math.min(
+    contextWindow,
     ...members.map(member => member.maxInputTokens ?? member.contextWindow!),
+  );
+  const knownMaxOutputTokens = members
+    .map(member => member.maxOutputTokens)
+    .filter((value): value is number => (
+      typeof value === "number"
+      && Number.isSafeInteger(value)
+      && value > 0
+    ));
+  const maxOutputTokens = knownMaxOutputTokens.length === members.length
+    ? Math.min(...knownMaxOutputTokens)
+    : undefined;
+  const autoCompactTokenLimit = Math.min(
+    ...members.map(member => clampAutoCompactTokenLimit(
+      member.contextWindow!,
+      member.maxInputTokens,
+      member.autoCompactTokenLimit,
+    )),
   );
   const defaultReasoningEffort = effectiveComboDefault(
     combo.defaultEffort,
@@ -167,6 +190,8 @@ export function deriveComboCatalogModel(
     owned_by: COMBO_NAMESPACE,
     contextWindow,
     maxInputTokens,
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+    autoCompactTokenLimit,
     ...(hasLimitingContextCapMetadata ? { contextCapped } : {}),
     inputModalities,
     reasoningEfforts,
@@ -183,6 +208,12 @@ export function deriveComboCatalogModel(
         ? { supportsServiceTier: false }
         : {}),
     ...(members.some(member => member.supportsReasoningSummaries === false) ? { supportsReasoningSummaries: false } : {}),
+    // A combo is only as capable as its least capable member. One member that cannot honour
+    // text.verbosity is enough to make the control a no-op for the whole combo, so the
+    // conservative false propagates — the same rule supportsReasoningSummaries uses above.
+    // Without this, routing a combo through an xAI or Kiro member re-advertised a control the
+    // upstream accepts and ignores.
+    ...(members.some(member => member.supportsVerbosity === false) ? { supportsVerbosity: false } : {}),
     ...(members.every(member => member.codexToolMode === "shell")
       ? { codexToolMode: "shell" as const }
       : {}),
@@ -193,6 +224,85 @@ export function safeCatalogWarningLabel(value: string): string {
   return redactSecretString(value)
     .replace(/[\u0000-\u001f\u007f]/g, "?")
     .slice(0, 200);
+}
+
+/**
+ * Keep the first row of each slug and drop the rest (#4730).
+ *
+ * First-win is the only answer that agrees with the ordering already decided upstream: the merge
+ * ranks rows, so its first occurrence is the row it chose. Distinct slugs are never touched — an
+ * alias row and the canonical routed row of the same provider model are two different public names
+ * and both survive — and a row without a string slug passes through untouched.
+ */
+export function dedupeCatalogEntriesBySlug(models: RawEntry[]): RawEntry[] {
+  const seen = new Set<string>();
+  const out: RawEntry[] = [];
+  for (const entry of models) {
+    if (typeof entry.slug !== "string") {
+      out.push(entry);
+      continue;
+    }
+    if (seen.has(entry.slug)) continue;
+    seen.add(entry.slug);
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * Every slug this proxy writes into the Codex catalog must appear exactly once (#4730).
+ *
+ * The cost of breaking it is the whole file: a slug-unique validating consumer refuses the catalog
+ * outright, so one duplicated row takes every model with it. A 2.56.0 report carried 507 rows for
+ * 72 unique slugs, every duplicate byte-identical, and Codex rejected the file as `source-invalid`.
+ *
+ * This is a write-boundary invariant rather than a repair of one producer, and that distinction is
+ * deliberate: the reported catalog is evidence that some emit path can double a row, but nothing in
+ * this tree has been shown to be that path, and a guard that only covered the producer someone
+ * guessed at would leave the file corruptible by the next one. Both writers that serialize a merged
+ * catalog call this as their LAST mutation — `writeRetainedCatalogSync` and the management
+ * convergence commit — so uniqueness holds for the exact bytes that land on disk.
+ *
+ * Ordering is load-bearing. Running the guard before the effort clamp would be unsound:
+ * `clampCatalogModelsToObservedCodexSupport` splices whole rows out when an exact-reserve ladder
+ * clamps empty, so dropping a later same-slug row first can leave the slug with no row at all once
+ * the surviving one is spliced.
+ *
+ * @param models - The finished row list, already clamped and finalized.
+ * @param warn - Whether to report on `console.warn`. The convergence path merges under
+ *   `warningPolicy: "suppress"` and stays silent for the same reason.
+ * @returns The original array when it was already unique, so an unchanged catalog stays a no-op
+ *   write; otherwise a first-win copy.
+ */
+export function enforceCatalogSlugUniqueness(models: RawEntry[], warn: boolean): RawEntry[] {
+  const deduped = dedupeCatalogEntriesBySlug(models);
+  if (deduped.length === models.length) return models;
+  if (warn) {
+    // A dropped row that differs from the kept one means two emit paths disagree about the same
+    // slug's content. First-win still stands, but the operator needs to see WHICH slugs diverged
+    // instead of silently losing data. The baseline is the row the dedupe actually keeps — the
+    // FIRST occurrence — so the reported divergence is measured against what lands on disk.
+    const keptBySlug = new Map<string, RawEntry>();
+    for (const entry of models) {
+      if (typeof entry.slug !== "string" || keptBySlug.has(entry.slug)) continue;
+      keptBySlug.set(entry.slug, entry);
+    }
+    const divergentSlugs = new Set<string>();
+    for (const entry of models) {
+      if (typeof entry.slug !== "string") continue;
+      const kept = keptBySlug.get(entry.slug);
+      if (kept && kept !== entry && JSON.stringify(kept) !== JSON.stringify(entry)) {
+        divergentSlugs.add(entry.slug);
+      }
+    }
+    const divergentNote = divergentSlugs.size > 0
+      ? `; divergent content on: ${[...divergentSlugs].slice(0, 5).map(safeCatalogWarningLabel).join(", ")}${divergentSlugs.size > 5 ? ", …" : ""}`
+      : "";
+    console.warn(
+      `[opencodex] catalog sync dropped ${models.length - deduped.length} duplicate slug row(s), keeping the first occurrence of each slug (#4730)${divergentNote}.`,
+    );
+  }
+  return deduped;
 }
 
 export function comboCatalogWarningSignature(
@@ -210,6 +320,8 @@ export function comboCatalogWarningSignature(
       key,
       contextWindow: member?.contextWindow ?? null,
       maxInputTokens: member?.maxInputTokens ?? null,
+      maxOutputTokens: member?.maxOutputTokens ?? null,
+      autoCompactTokenLimit: member?.autoCompactTokenLimit ?? null,
       inputModalities: [...new Set(member?.inputModalities ?? [])].sort(),
       reasoningEfforts: [...new Set(member?.reasoningEfforts ?? [])].sort(),
       parallelToolCalls: member?.parallelToolCalls === true,
@@ -299,6 +411,8 @@ export function normalizedOpenAiApiSignature(model: CatalogModel): string {
     id: model.id,
     contextWindow: model.contextWindow ?? null,
     maxInputTokens: model.maxInputTokens ?? null,
+    maxOutputTokens: model.maxOutputTokens ?? null,
+    autoCompactTokenLimit: model.autoCompactTokenLimit ?? null,
     inputModalities: [...new Set(model.inputModalities ?? [])].sort(),
     reasoningEfforts: [...new Set(model.reasoningEfforts ?? [])].sort(),
     ownedBy: model.owned_by ?? null,

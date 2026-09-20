@@ -1,4 +1,5 @@
 import type { AdapterEvent } from "../../types";
+import { encodeCursorCallId } from "./call-id";
 import { cursorExecResult } from "./exec-policy";
 import type { CursorClientMessage, CursorServerMessage } from "./types";
 import type { CursorKvStore } from "./kv-store";
@@ -18,7 +19,9 @@ export function mapCursorServerMessage(
     case "thinking":
       return [{ type: "thinking_delta", thinking: message.thinking }];
     case "tool_call_start":
-      return [{ type: "tool_call_start", id: message.id, name: message.name }];
+      // Cursor composite ids can contain a literal newline; Responses call_ids
+      // must stay single-line (see call-id.ts).
+      return [{ type: "tool_call_start", id: encodeCursorCallId(message.id), name: message.name }];
     case "tool_call_delta":
       return [{ type: "tool_call_delta", arguments: message.arguments }];
     case "tool_call_end":
@@ -43,7 +46,8 @@ export function mapCursorServerMessage(
       state.writeClient(cursorExecResult(message.requestId, message.execCase));
       return [];
     case "local_side_effect":
-      // Internal retry-safety signal only; keep the bridge alive without producing protocol output.
-      return [{ type: "heartbeat" }];
+      // Internal retry-safety signal only; keep the bridge alive without producing protocol output,
+      // while preventing server-level failover from replaying the completed local operation.
+      return [{ type: "heartbeat", replayUnsafe: true }];
   }
 }

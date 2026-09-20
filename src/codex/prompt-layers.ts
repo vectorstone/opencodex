@@ -26,12 +26,11 @@
  * CODEX_HOME is resolved at CALL time (the `features.ts:58-67` pattern) so tests
  * can point fixtures via env or an explicit path.
  */
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { expandUserPath } from "../config";
-import { CODEX_CONFIG_PATH } from "./paths";
-import { OCX_SECTION_MARKER } from "./injected-marker";
+import { resolveCodexHomeDir } from "./home";
 import {
   durableWrite,
   durableWriteExclusive,
@@ -100,6 +99,24 @@ export const LAYER_INVENTORY: readonly LayerDescriptor[] = Object.freeze([
   { id: "tools", class: "feature-gated", key: "features.deferred_tool_world_state", default: false, order: 12 },
   { id: "skills", class: "config-toggle", key: "skills.include_instructions", default: true, order: 13 },
   { id: "multi-agent-mode", class: "feature-gated", key: "features.multi_agent_v2.enabled", default: false, order: 14 },
+  /**
+   * Commit and pull-request attribution, contributed by `ext/git-attribution` rather
+   * than by a world_state.rs section — which is why it is absent from the order list
+   * above and carries `order: null`: it registers through
+   * `extensions.context_contributors()` (`core/src/session/world_state.rs:64-66`),
+   * whose position is registration-order dependent.
+   *
+   * `runtime-conditional`, NOT feature-gated. `ext/git-attribution/src/lib.rs:33-80`
+   * resolves enablement from the AUTH SERVER via `resolve_attribution_policy`, caches
+   * it on the thread store, and falls back to disabled when the lookup fails.
+   * `features/src/lib.rs:277` records the old config flag as removed, so there is no
+   * key for this GUI to write and nothing in [features] to point a user at.
+   *
+   * Both states emit text: enabled sends the `Co-authored-by: Codex` trailer plus the
+   * `Generated with Codex.` PR marker, disabled sends an explicit countermand. So the
+   * row's condition line must name the policy rather than claiming "always on".
+   */
+  { id: "git-attribution", class: "runtime-conditional", key: null, default: null, order: null },
 ] as const);
 
 /**
@@ -122,224 +139,100 @@ export function isToggleId(value: string): value is ToggleId {
   return Object.prototype.hasOwnProperty.call(TOGGLE_KEYS, value);
 }
 
-// ---------------------------------------------------------------------------
-// Paths
-// ---------------------------------------------------------------------------
+export { activeConfigPath, activeStorePath, activeBaseVariantDir } from "./prompt-layers/paths";
+export type { Paths } from "./prompt-layers/paths";
+export { computeRevision, readFileBytes } from "./prompt-layers/revision";
+export { normalizeBody, findInvalidCharacter, encodeBasicString, decodeBasicString } from "./prompt-layers/encoding";
+export type { CharacterFinding } from "./prompt-layers/encoding";
+export { inspectOwnership } from "./prompt-layers/toml-read";
+export type { Ownership } from "./prompt-layers/toml-read";
 
-export interface Paths {
-  configPath?: string;
-  storePath?: string;
-}
-
-function activeCodexHome(): string {
-  const raw = process.env.CODEX_HOME?.trim();
-  if (!raw) return CODEX_CONFIG_PATH.slice(0, -"/config.toml".length);
-  const path = resolve(expandUserPath(raw));
-  try {
-    return realpathSync.native(path);
-  } catch {
-    return path;
-  }
-}
-
-export function activeConfigPath(opts?: Paths): string {
-  return opts?.configPath ?? join(activeCodexHome(), "config.toml");
-}
-
-export function activeStorePath(opts?: Paths): string {
-  return opts?.storePath ?? join(activeCodexHome(), "opencodex-prompt.json");
-}
-
-function journalPathFor(storePath: string): string {
-  return `${storePath.replace(/\.json$/, "")}.journal`;
-}
-
-function lockPathFor(storePath: string): string {
-  return `${storePath.replace(/\.json$/, "")}.lock`;
-}
-
-// ---------------------------------------------------------------------------
-// Character policy — see the header. Defined over Unicode SCALAR VALUES, not
-// UTF-16 code units, because a lone surrogate is not a scalar value and UTF-8
-// encoding would silently substitute U+FFFD.
-// ---------------------------------------------------------------------------
-
-export interface CharacterFinding {
-  /** code-point index, consistent across module, route and editor */
-  position: number;
-  reason: "control" | "unpaired-surrogate";
-  codePoint: number;
-}
-
-/** Tab to four spaces, CRLF and lone CR to LF. Applied BEFORE validation. */
-export function normalizeBody(body: string): string {
-  return body.replace(/\r\n?/g, "\n").replace(/\t/g, "    ");
-}
-
-/** First offending scalar, or null. Run AFTER normalizeBody. */
-export function findInvalidCharacter(body: string): CharacterFinding | null {
-  let position = 0;
-  for (let i = 0; i < body.length; ) {
-    const code = body.codePointAt(i)!;
-    const unit = body.charCodeAt(i);
-    const isHighSurrogate = unit >= 0xd800 && unit <= 0xdbff;
-    const isLowSurrogate = unit >= 0xdc00 && unit <= 0xdfff;
-    // codePointAt only combines a well-formed pair, so a surviving surrogate
-    // code point here is unpaired by construction.
-    if ((isHighSurrogate || isLowSurrogate) && code === unit) {
-      return { position, reason: "unpaired-surrogate", codePoint: code };
-    }
-    const isNewline = code === 0x0a;
-    const isC0 = code < 0x20 && !isNewline;
-    const isDel = code === 0x7f;
-    const isC1 = code >= 0x80 && code <= 0x9f;
-    if (isC0 || isDel || isC1) {
-      return { position, reason: "control", codePoint: code };
-    }
-    i += code > 0xffff ? 2 : 1;
-    position += 1;
-  }
-  return null;
-}
+import { activeConfigPath, activeStorePath, activeBaseVariantDir, journalPathFor, lockPathFor, type Paths } from "./prompt-layers/paths";
+import { readFileOrNull, computeRevision, updateFingerprintField } from "./prompt-layers/revision";
+import { normalizeBody, findInvalidCharacter, decodeBasicString } from "./prompt-layers/encoding";
+import { rootArrayEntries, hasRootKey, rootLines, tableLines, boolInLines, inspectOwnership } from "./prompt-layers/toml-read";
+import { setRootBool, setRootString, setTableBool, setProjection, removeUnownedProjection } from "./prompt-layers/toml-edit";
 
 /**
- * TOML basic-string encoding, total over the accepted set: three rules, none of
- * them in the range where `Bun.TOML.parse` misbehaves. `\r` cannot appear
- * because normalizeBody removed it; control characters cannot appear because
- * findInvalidCharacter rejected them.
+ * Instruction documents the prompt probe renders out of CODEX_HOME, in the
+ * precedence order Codex itself applies: an `AGENTS.override.md` shadows
+ * `AGENTS.md`. Both are hashed into the probe fingerprint, because either one
+ * changes the rendered project document without touching a managed file.
  */
-export function encodeBasicString(body: string): string {
-  return `"${body.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`;
-}
+const PROBE_INSTRUCTION_FILES = ["AGENTS.override.md", "AGENTS.md"] as const;
 
 /**
- * Inverse of `encodeBasicString`, deliberately narrow: it accepts ONLY the three
- * escapes we emit. `\t`, `\f`, `\b`, `\r` and `\uXXXX` are refused rather than
- * guessed — decoding them correctly is exactly the ambiguity the restricted set
- * exists to avoid.
+ * The project-document filenames Codex would look for in a given home, in its own
+ * order: the two built-ins first, then whatever `project_doc_fallback_filenames`
+ * adds, de-duplicated (`core/src/agents_md.rs` `candidate_filenames`).
+ *
+ * Read from config rather than hard-coded, because a user who configures
+ * `TEAM.md` renders TEAM.md, and a fingerprint that only knew about AGENTS.md
+ * would let an edit to it pass unnoticed.
+ *
  */
-export function decodeBasicString(literal: string): string | null {
-  if (literal.length < 2 || !literal.startsWith('"') || !literal.endsWith('"')) return null;
-  const inner = literal.slice(1, -1);
-  let out = "";
-  for (let i = 0; i < inner.length; i += 1) {
-    const ch = inner[i]!;
-    if (ch !== "\\") {
-      if (ch === '"') return null; // unescaped quote: not a single literal
-      out += ch;
-      continue;
-    }
-    const next = inner[i + 1];
-    if (next === "\\") out += "\\";
-    else if (next === '"') out += '"';
-    else if (next === "n") out += "\n";
-    else return null; // any other escape is outside what we will decode
-    i += 1;
+function probeInstructionFilenames(configBytes: string | null): string[] {
+  const names: string[] = [...PROBE_INSTRUCTION_FILES];
+  for (const entry of rootArrayEntries(configBytes, "project_doc_fallback_filenames")) {
+    // Upstream trims each configured name and drops whitespace-only entries
+    // (`core/src/config/mod.rs`), so " TEAM.md " and "TEAM.md" are one filename.
+    const name = entry.trim();
+    if (name === "") continue;
+    if (!names.includes(name)) names.push(name);
   }
-  return out;
+  return names;
 }
 
-// ---------------------------------------------------------------------------
-// Byte-level hashing. The revision covers COMPLETE file bytes plus existence,
-// so removing the marker while leaving the value intact still changes it.
-// ---------------------------------------------------------------------------
 
-function readFileOrNull(path: string): string | null {
-  try {
-    if (!existsSync(path)) return null;
-    return readFileSync(path, "utf8");
-  } catch {
-    return null;
+/**
+ * The directories Codex would look in for a project document, given the home the
+ * probe runs in.
+ *
+ * Upstream finds the nearest ancestor holding a `project_root_markers` entry
+ * (default `.git`) and then searches every directory from that root down to the cwd,
+ * inclusive; with no such ancestor it searches the cwd alone
+ * (`core/src/agents_md.rs` `agents_md_paths`).
+ *
+ * This was originally written off as unreachable on the grounds that the probe runs
+ * in CODEX_HOME with no checkout around it. That was wrong, and a review round caught
+ * it: `~/.codex` inside a dotfiles repository is an ordinary setup, and there the
+ * walk finds real documents. The walk is cheap — a bounded number of `existsSync`
+ * calls beside a subprocess spawn — so it is performed rather than assumed away.
+ */
+function probeProjectDocDirs(home: string, configBytes: string | null): string[] {
+  const markers = projectRootMarkers(configBytes);
+  // An explicitly empty array disables root detection upstream, which is not the same
+  // as an absent key falling back to the default.
+  if (markers.length === 0) return [home];
+  let root: string | null = null;
+  for (let dir = home; ; ) {
+    if (markers.some(marker => existsSync(join(dir, marker)))) { root = dir; break; }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
-}
-
-export function computeRevision(configBytes: string | null, storeBytes: string | null): string {
-  const hash = createHash("sha256");
-  hash.update("cfg:");
-  hash.update(configBytes ?? "\0absent");
-  hash.update("\nstore:");
-  hash.update(storeBytes ?? "\0absent");
-  return `sha256:${hash.digest("hex")}`;
-}
-
-export { readFileOrNull as readFileBytes };
-
-// ---------------------------------------------------------------------------
-// Scoped TOML scanning. Line-based like `features.ts:80-93`: booleans need no
-// escaping, and line editing preserves the user's comments and formatting
-// exactly where a re-serialize would not.
-// ---------------------------------------------------------------------------
-
-const TABLE_HEADER = /^\s*\[/;
-
-/** Lines of the root scope: everything before the first `[table]` header. */
-function rootLines(content: string): string[] {
-  const lines = content.split("\n");
-  const first = lines.findIndex(l => TABLE_HEADER.test(l));
-  return first === -1 ? lines : lines.slice(0, first);
-}
-
-/** Lines of `[header]`'s body, up to the next table header. */
-function tableLines(content: string, header: string): string[] | null {
-  const lines = content.split("\n");
-  const escaped = header.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const start = lines.findIndex(l => new RegExp(`^\\s*\\[${escaped}\\]\\s*(?:#.*)?$`).test(l));
-  if (start === -1) return null;
-  const rest = lines.slice(start + 1);
-  const end = rest.findIndex(l => TABLE_HEADER.test(l));
-  return end === -1 ? rest : rest.slice(0, end);
-}
-
-function boolInLines(lines: string[], key: string): boolean | null {
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`^\\s*${escaped}\\s*=\\s*(true|false)\\s*(?:#.*)?$`);
-  for (const line of lines) {
-    const m = pattern.exec(line);
-    if (m) return m[1] === "true";
+  if (root === null) return [home];
+  const dirs: string[] = [];
+  for (let dir = home; ; ) {
+    dirs.push(dir);
+    if (dir === root) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
-  return null;
+  // Root first, matching upstream's reversed search order. Order is load-bearing:
+  // the digest must not change merely because the walk was traversed the other way.
+  return dirs.reverse();
 }
 
-// ---------------------------------------------------------------------------
-// Ownership of the generated projection.
-//
-// Canonical physical form, always exactly two lines at the top of the document:
-//
-//     # Auto-injected by opencodex
-//     developer_instructions = "<single-line basic string>"
-//
-// Replacement is "find the marker, replace the next line" — never a span search.
-// Adjacency mirrors `injected-marker.ts:53-60`, tightened by a shape check.
-// ---------------------------------------------------------------------------
-
-const DEV_INSTRUCTIONS_KEY = "developer_instructions";
-const CANONICAL_LINE = /^developer_instructions = "(?:[^"\\]|\\.)*"$/;
-const ANY_DEV_INSTRUCTIONS = /^\s*(?:developer_instructions|"developer_instructions"|'developer_instructions')\s*=/;
-
-export type Ownership =
-  /** no such key anywhere in the root scope */
-  | { state: "absent" }
-  /** marker-adjacent and canonically shaped: ours to rewrite */
-  | { state: "owned"; line: number; literal: string }
-  /** marker-adjacent but reshaped: refuse, offer repair */
-  | { state: "owned-malformed"; line: number; raw: string }
-  /** no marker: externally authored, refuse and offer adoption */
-  | { state: "external"; line: number; raw: string };
-
-export function inspectOwnership(configBytes: string | null): Ownership {
-  if (configBytes === null) return { state: "absent" };
-  const lines = rootLines(configBytes);
-  for (let i = 0; i < lines.length; i += 1) {
-    const raw = lines[i]!;
-    if (!ANY_DEV_INSTRUCTIONS.test(raw)) continue;
-    const marked = i > 0 && lines[i - 1]!.includes(OCX_SECTION_MARKER);
-    if (!marked) return { state: "external", line: i + 1, raw };
-    if (!CANONICAL_LINE.test(raw)) return { state: "owned-malformed", line: i + 1, raw };
-    const literal = raw.slice(`${DEV_INSTRUCTIONS_KEY} = `.length);
-    return { state: "owned", line: i + 1, literal };
-  }
-  return { state: "absent" };
+/** `project_root_markers`, defaulting to `.git` when the key is absent. */
+function projectRootMarkers(configBytes: string | null): string[] {
+  if (!hasRootKey(configBytes, "project_root_markers")) return [".git"];
+  // Present-but-empty disables root detection upstream, which is why presence is
+  // tested separately from the decoded entries rather than inferred from them.
+  return rootArrayEntries(configBytes, "project_root_markers").filter(m => m !== "");
 }
+
 
 // ---------------------------------------------------------------------------
 // Store — the single source of truth for custom layers.
@@ -411,6 +304,32 @@ export type Drift =
   | "owned-malformed"
   | null;
 
+/** One authored base-prompt variant. `default` is never represented here. */
+export interface BaseVariant {
+  id: string;
+  title: string;
+  body: string;
+  bytes: number;
+}
+
+/**
+ * Which base prompt is in force. THREE values, not two.
+ *
+ * - `default` — `model_instructions_file` is absent, so Codex uses its own base prompt.
+ *   This is the absence of a key, not a body we store: there is nothing to edit and
+ *   nothing to delete, which is what makes the default structurally immutable rather
+ *   than merely guarded.
+ * - a variant id — the key points inside our own variant directory.
+ * - `external` — the key is set and points somewhere else.
+ *
+ * The third value is load-bearing and an audit forced it. Collapsing it into `default`
+ * would have shown a user "Codex's own base prompt" while their base prompt was in fact
+ * replaced by a file they had set by hand. The panel already ships a notice for that
+ * state in ten locales; this keeps reporting it instead of overwriting a key we do not
+ * own.
+ */
+export type BaseSelection = { kind: "default" } | { kind: "variant"; id: string } | { kind: "external"; path: string };
+
 export interface PromptLayerSnapshot {
   configPath: string;
   storePath: string;
@@ -422,6 +341,8 @@ export interface PromptLayerSnapshot {
   toggles: ToggleState[];
   custom: CustomLayer[];
   modelInstructionsFile: string | null;
+  baseVariants: BaseVariant[];
+  baseSelection: BaseSelection;
   revision: string;
 }
 
@@ -447,10 +368,93 @@ function readToggle(configBytes: string | null, id: ToggleId): ToggleState {
 function readModelInstructionsFile(configBytes: string | null): string | null {
   if (configBytes === null) return null;
   for (const line of rootLines(configBytes)) {
-    const m = /^\s*model_instructions_file\s*=\s*"([^"]*)"\s*(?:#.*)?$/.exec(line);
-    if (m) return m[1]!;
+    // Capture the whole literal INCLUDING its quotes and decode it, rather than
+    // returning the raw inner text. `setRootString` writes this key through
+    // `encodeBasicString`, which escapes backslashes, so on Windows the stored
+    // literal is "C:\\Users\\..." while the path is "C:\Users\...". Reading the
+    // inner text verbatim returned the doubled form: the round trip did not
+    // survive, `baseSelection` compared a doubled path against the real variant
+    // path and reported `external` for a variant this code had just selected.
+    //
+    // `[^"]*` cannot span an escaped quote either. That is not a new limit -- it
+    // is the same one the writer's restricted escape set is built around, and
+    // `decodeBasicString` refuses anything outside it rather than guessing.
+    const m = /^\s*model_instructions_file\s*=\s*("[^"]*")\s*(?:#.*)?$/.exec(line);
+    if (m) return decodeBasicString(m[1]!);
   }
   return null;
+}
+
+/** Variant ids are ours to generate, so they stay in one narrow shape. */
+const BASE_VARIANT_ID = /^[a-z0-9]{6}$/;
+
+/**
+ * The variant files on disk, newest-id-last so the picker order is stable.
+ *
+ * `default.md` is SKIPPED rather than read: `default` names the absence of a key, so a
+ * file claiming that id would appear as a fourth variant whose selection could never be
+ * expressed. Anything not matching our own id shape is skipped for the same reason - we
+ * only report what we could also write.
+ */
+export function readBaseVariants(opts?: Paths): BaseVariant[] {
+  const dir = activeBaseVariantDir(opts);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    // Absent directory is an ordinary first run, not an error.
+    return [];
+  }
+  const out: BaseVariant[] = [];
+  for (const name of names.sort()) {
+    if (!name.endsWith(".md")) continue;
+    const id = name.slice(0, -3);
+    if (!BASE_VARIANT_ID.test(id)) continue;
+    const body = readFileOrNull(join(dir, name));
+    if (body === null) continue;
+    // First line is the title when it is a markdown heading; the rest is the prompt.
+    // Storing the title inside the file keeps one artifact per variant instead of a
+    // sidecar index that can disagree with it.
+    const nl = body.indexOf("\n");
+    const firstLine = nl === -1 ? body : body.slice(0, nl);
+    const titled = firstLine.startsWith("# ");
+    out.push({
+      id,
+      title: titled ? firstLine.slice(2).trim() : id,
+      body: titled ? body.slice(nl === -1 ? body.length : nl + 1) : body,
+      bytes: Buffer.byteLength(body, "utf8"),
+    });
+  }
+  return out;
+}
+
+/**
+ * Resolve which base prompt is in force, given the config bytes and the variants.
+ *
+ * Comparison is by RESOLVED path: `~/.codex/opencodex-prompt-base/abc123.md` and an
+ * absolute spelling of the same file are the same selection, and treating them as
+ * different would report `external` for a variant we wrote ourselves.
+ */
+export function resolveBaseSelection(
+  configBytes: string | null,
+  variants: readonly BaseVariant[],
+  opts?: Paths,
+): BaseSelection {
+  const raw = readModelInstructionsFile(configBytes);
+  if (raw === null) return { kind: "default" };
+  const dir = activeBaseVariantDir(opts);
+  let resolved: string;
+  try {
+    resolved = resolve(expandUserPath(raw));
+  } catch {
+    return { kind: "external", path: raw };
+  }
+  for (const variant of variants) {
+    if (resolved === resolve(join(dir, `${variant.id}.md`))) {
+      return { kind: "variant", id: variant.id };
+    }
+  }
+  return { kind: "external", path: raw };
 }
 
 /**
@@ -472,6 +476,7 @@ export function readPromptLayers(opts?: Paths): PromptLayerSnapshot {
   const projection = ownership.state === "owned"
     ? decodeBasicString(ownership.literal)
     : null;
+  const baseVariants = readBaseVariants(opts);
 
   let drift: Drift = null;
   if (existsSync(`${storePath.replace(/\.json$/, "")}.journal`)) {
@@ -496,8 +501,129 @@ export function readPromptLayers(opts?: Paths): PromptLayerSnapshot {
     toggles: TOGGLE_IDS.map(id => readToggle(configBytes, id)),
     custom: layers ?? [],
     modelInstructionsFile: readModelInstructionsFile(configBytes),
+    baseVariants,
+    baseSelection: resolveBaseSelection(configBytes, baseVariants, opts),
     revision: computeRevision(configBytes, storeBytes),
   };
+}
+
+/**
+ * Identity for prompt-text probe admission, deliberately separate from the
+ * optimistic-concurrency revision above. The revision covers only config/store
+ * transaction bytes; an edit to the selected base variant changes the prompt
+ * without changing that transaction contract.
+ *
+ * The instruction documents in CODEX_HOME are hashed for the same reason, and they
+ * are read from `resolveCodexHomeDir()` rather than from `activeConfigPath`'s
+ * directory. Those two are deliberately different under test — the route fixtures
+ * inject `codexPromptPaths` at a temp root while CODEX_HOME points at a decoy — and
+ * the probe renders whatever lives in the home it actually runs in. Deriving the
+ * path from the injected config would name a file the probe never reads, which is
+ * a fingerprint that cannot fail rather than evidence.
+ *
+ * A BOUNDED invalidation key, not prompt identity. It covers opencodex-managed writes,
+ * the selected base prompt, the project documents Codex would discover from this home,
+ * and each skill's manifest. Plugin manifests, live MCP availability, and the clock
+ * also move the rendered prompt and are not files this process can name.
+ *
+ * The distinction is worth stating exactly, because the obvious phrasing is wrong: for
+ * a COVERED input the key moves and a late caller is refused with `busy`. For an
+ * UNCOVERED one the key does not move, so a late caller joins and reads the older
+ * rendering. That is the residual, bounded to one in-flight window in a read-only view.
+ *
+ * "Hash every input" is only closable against a pinned Codex — the dependency graph is
+ * upstream's and moves on its own. An enumeration-free alternative exists (admit only
+ * when the probe started after the request arrived) and is recorded in the plan; it
+ * costs the coalescing this work exists to provide unless arrivals are batched first.
+ * See devlog/_plan/260829_bugpr_lane_h_residual_issues/130_pr2872_probe_fingerprint.md.
+ */
+export function computePromptProbeStateFingerprint(opts?: Paths): string {
+  const configBytes = readFileOrNull(activeConfigPath(opts));
+  const storeBytes = readFileOrNull(activeStorePath(opts));
+  const variants = readBaseVariants(opts);
+  const selection = resolveBaseSelection(configBytes, variants, opts);
+  const hash = createHash("sha256");
+  updateFingerprintField(hash, "revision", computeRevision(configBytes, storeBytes));
+  updateFingerprintField(hash, "selected-base", selection.kind === "variant" ? `variant:${selection.id}` : selection.kind);
+  if (selection.kind === "variant") {
+    updateFingerprintField(hash, "variant-bytes", readFileOrNull(join(activeBaseVariantDir(opts), `${selection.id}.md`)));
+  }
+  if (selection.kind === "external") {
+    // The selected base file is hashed whether or not we manage it. Hashing the
+    // managed variant's bytes while recording an external selection as the bare
+    // word "external" would make the guarantee depend on who authored the file,
+    // which is not a distinction the probe's caller can see.
+    //
+    // Its path is part of the identity as well as its contents: pointing the key
+    // at a different file changes the prompt even when both files read alike.
+    updateFingerprintField(hash, "external-path", selection.path);
+    let externalBytes: string | null = null;
+    try {
+      // Relative to the CONFIG FILE's directory, which is what Codex does with its
+      // relative path fields. resolve() alone would use this process's cwd — the
+      // proxy's working directory, which has nothing to do with either the config
+      // or the probe child's cwd — and would hash an unrelated file.
+      externalBytes = readFileOrNull(resolve(dirname(activeConfigPath(opts)), expandUserPath(selection.path)));
+    } catch {
+      // An unresolvable path is a state, not a failure: it hashes as absent, and
+      // resolveBaseSelection has already reported the selection as external.
+      externalBytes = null;
+    }
+    updateFingerprintField(hash, "external-bytes", externalBytes);
+  }
+  // Codex prefers AGENTS.override.md over AGENTS.md, so both spellings are hashed
+  // in that order: an override edit changes the rendered project document exactly
+  // as a plain edit does.
+  const probeHome = resolveCodexHomeDir();
+  const filenames = probeInstructionFilenames(configBytes);
+  for (const dir of probeProjectDocDirs(probeHome, configBytes)) {
+    for (const name of filenames) {
+      // The path goes in the CONTENTS, never in the field name. Only contents are
+      // length-framed, so a name built from a path would reintroduce exactly the
+      // ambiguity this helper exists to remove. Path and bytes are separate fields
+      // because two directories in the walk can both hold an AGENTS.md.
+      const path = join(dir, name);
+      updateFingerprintField(hash, "doc-path", path);
+      updateFingerprintField(hash, "doc-bytes", readFileOrNull(path));
+    }
+  }
+  for (const path of probeSkillManifests(probeHome)) {
+    updateFingerprintField(hash, "skill-path", path);
+    updateFingerprintField(hash, "skill-bytes", readFileOrNull(path));
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+/**
+ * `SKILL.md` manifests under the home's skills directory.
+ *
+ * These were written off as unobservable in an earlier version of this function's
+ * comment. They are not: Codex reads each manifest's frontmatter and renders its
+ * description into `<skills_instructions>`, and a review round demonstrated a live
+ * description edit changing the probe's output while the fingerprint stood still.
+ *
+ * One directory listing plus one `readFileOrNull` per skill, beside a subprocess that
+ * costs orders of magnitude more. Sorted, because `readdirSync` order is not a
+ * contract and a digest must not depend on it.
+ *
+ * Only the top-level manifest per skill is read. A skill's bundled scripts and
+ * references do not reach the rendered section, so hashing the whole tree would buy
+ * redundant invalidations at a real cost on large skill sets.
+ */
+function probeSkillManifests(home: string): string[] {
+  const root = join(home, "skills");
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return [];
+  }
+  const manifests: string[] = [];
+  for (const entry of entries.sort()) {
+    const manifest = join(root, entry, "SKILL.md");
+    if (existsSync(manifest)) manifests.push(manifest);
+  }
+  return manifests;
 }
 
 // ---------------------------------------------------------------------------
@@ -512,108 +638,16 @@ export type WriteError =
   | "store_unreadable"
   | "invalid_characters"
   | "write_superseded"
+  // The filesystem refused a rename that passed every precondition: a directory on
+  // the store path, a mode change, a full disk. Distinct from write_superseded,
+  // which means another writer won a race — here nobody won and nothing landed.
+  | "write_failed"
   | "recovery_required"
   | "locked";
 
 export type WriteResult =
   | { ok: true; changed: boolean; snapshot: PromptLayerSnapshot }
   | { ok: false; error: WriteError; detail?: string };
-
-/** Line editing, not re-serialization: the user's comments and layout survive. */
-function dominantEol(content: string): "\r\n" | "\n" {
-  const crlf = (content.match(/\r\n/g) ?? []).length;
-  if (crlf === 0) return "\n";
-  const bareLf = (content.match(/\n/g) ?? []).length - crlf;
-  return crlf >= bareLf ? "\r\n" : "\n";
-}
-
-function splitLines(content: string): string[] {
-  return content.replace(/\r\n/g, "\n").split("\n");
-}
-
-function joinLines(lines: string[], eol: "\r\n" | "\n"): string {
-  const text = lines.join("\n");
-  return eol === "\n" ? text : text.replace(/\n/g, "\r\n");
-}
-
-function firstTableIndex(lines: string[]): number {
-  const idx = lines.findIndex(l => TABLE_HEADER.test(l));
-  return idx === -1 ? lines.length : idx;
-}
-
-/** Set a root-scope boolean, inserting above the first table when absent. */
-function setRootBool(content: string, key: string, value: boolean): string {
-  const eol = dominantEol(content);
-  const lines = splitLines(content);
-  const limit = firstTableIndex(lines);
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`^(\\s*${escaped}\\s*=\\s*)(?:true|false)(\\s*(?:#.*)?)$`);
-  for (let i = 0; i < limit; i += 1) {
-    const m = pattern.exec(lines[i]!);
-    if (m) {
-      lines[i] = `${m[1]}${value}${m[2]}`;
-      return joinLines(lines, eol);
-    }
-  }
-  lines.splice(limit, 0, `${key} = ${value}`);
-  return joinLines(lines, eol);
-}
-
-/** Set a boolean inside `[table]`, appending the table when absent. */
-function setTableBool(content: string, table: string, key: string, value: boolean): string {
-  const eol = dominantEol(content);
-  const lines = splitLines(content);
-  const escaped = table.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const start = lines.findIndex(l => new RegExp(`^\\s*\\[${escaped}\\]\\s*(?:#.*)?$`).test(l));
-  if (start === -1) {
-    const tail = lines.length > 0 && lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
-    lines.splice(tail, 0, `[${table}]`, `${key} = ${value}`);
-    return joinLines(lines, eol);
-  }
-  const keyEscaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`^(\\s*${keyEscaped}\\s*=\\s*)(?:true|false)(\\s*(?:#.*)?)$`);
-  let end = start + 1;
-  while (end < lines.length && !TABLE_HEADER.test(lines[end]!)) end += 1;
-  for (let i = start + 1; i < end; i += 1) {
-    const m = pattern.exec(lines[i]!);
-    if (m) {
-      lines[i] = `${m[1]}${value}${m[2]}`;
-      return joinLines(lines, eol);
-    }
-  }
-  lines.splice(end, 0, `${key} = ${value}`);
-  return joinLines(lines, eol);
-}
-
-/**
- * Replace, insert, or remove the generated two-line block. Canonical form is
- * marker + assignment at the top of the document; replacement is "find the
- * marker, replace the next line" rather than a span search.
- */
-function setProjection(content: string | null, projection: string | null): string {
-  const base = content ?? "";
-  const eol = dominantEol(base);
-  const lines = splitLines(base);
-  const limit = firstTableIndex(lines);
-
-  let markerAt = -1;
-  for (let i = 0; i < limit; i += 1) {
-    if (i > 0 && lines[i - 1]!.includes(OCX_SECTION_MARKER) && ANY_DEV_INSTRUCTIONS.test(lines[i]!)) {
-      markerAt = i - 1;
-      break;
-    }
-  }
-
-  if (markerAt !== -1) {
-    if (projection === null) lines.splice(markerAt, 2);
-    else lines[markerAt + 1] = `${DEV_INSTRUCTIONS_KEY} = ${encodeBasicString(projection)}`;
-    return joinLines(lines, eol);
-  }
-
-  if (projection === null) return joinLines(lines, eol);
-  lines.splice(0, 0, OCX_SECTION_MARKER, `${DEV_INSTRUCTIONS_KEY} = ${encodeBasicString(projection)}`);
-  return joinLines(lines, eol);
-}
 
 function serializeStore(layers: readonly CustomLayer[]): string {
   return `${JSON.stringify({ layers }, null, 2)}\n`;
@@ -663,7 +697,7 @@ function commit(
       return { ok: false, error: "stale_revision" };
     }
 
-    const snapshot = readPromptLayers({ configPath, storePath });
+    const snapshot = readPromptLayers({ ...opts, configPath, storePath });
     const built = build(snapshot, configBytes, storeBytes);
     if ("error" in built) return { ok: false, error: built.error, detail: built.detail };
 
@@ -691,19 +725,39 @@ function commit(
 
     // 4/5. each target re-verifies ITS OWN bytes immediately before its rename,
     //      so a third party writing between step 2 and here is not overwritten.
-    if (configChanged) {
-      if (hashBytes(readFileOrNull(configPath)) !== record.preConfig) {
-        return rollback(record, journalPath, "stale_revision");
+    //
+    //      Wrapped, because a THROW here used to escape the transaction entirely.
+    //      Only `config` readability is pre-checked, so an unwritable STORE — a
+    //      directory sitting on its path, a permission change, a full disk — raised
+    //      out of `durableWrite` after the config had already been renamed into
+    //      place. The caller saw an exception, the config carried a projection whose
+    //      store did not exist, and the journal stayed behind claiming an
+    //      uncommitted intent. Every later write then failed recovery_required.
+    //
+    //      Rolling back on the way out restores the pre-state we recorded and drops
+    //      the journal, so a failed write leaves the pair exactly as it was found.
+    try {
+      if (configChanged) {
+        if (hashBytes(readFileOrNull(configPath)) !== record.preConfig) {
+          return rollback(record, journalPath, "stale_revision");
+        }
+        if (nextConfig === null) durableDelete(configPath);
+        else durableWrite(configPath, nextConfig);
       }
-      if (nextConfig === null) durableDelete(configPath);
-      else durableWrite(configPath, nextConfig);
-    }
-    if (storeChanged) {
-      if (hashBytes(readFileOrNull(storePath)) !== record.preStore) {
-        return rollback(record, journalPath, "stale_revision");
+      if (storeChanged) {
+        if (hashBytes(readFileOrNull(storePath)) !== record.preStore) {
+          return rollback(record, journalPath, "stale_revision");
+        }
+        if (nextStore === null) durableDelete(storePath);
+        else durableWrite(storePath, nextStore);
       }
-      if (nextStore === null) durableDelete(storePath);
-      else durableWrite(storePath, nextStore);
+    } catch (error) {
+      // `rollback` is byte-hash driven and refuses to touch a file it does not
+      // recognise, so it is safe to run against a partially applied pair. If it
+      // cannot account for what it finds it returns recovery_required, which is the
+      // honest answer — better than a silent half-write either way.
+      const undone = rollback(record, journalPath, "write_failed");
+      return { ...undone, detail: error instanceof Error ? error.message : String(error) } as WriteResult;
     }
 
     // 6. verify COMPLETE bytes, not just our two lines: another writer could
@@ -716,7 +770,10 @@ function commit(
     if (!stillHeld(handle)) return { ok: false, error: "write_superseded" };
 
     durableDelete(journalPath);   // this deletion is the commit
-    return { ok: true, changed: true, snapshot: readPromptLayers({ configPath, storePath }) };
+    // The FULL opts, not just the two paths this transaction owns: rebuilding the
+    // snapshot from a narrowed object dropped the injected variant directory, so every
+    // successful write reported an empty variant list back to its caller.
+    return { ok: true, changed: true, snapshot: readPromptLayers({ ...opts, configPath, storePath }) };
   } finally {
     release(handle);
   }
@@ -754,6 +811,142 @@ export function setToggle(id: string, enabled: boolean, revision: string, opts?:
       : setRootBool(configBytes ?? "", spec.key, enabled),
     nextStore: storeBytes,
   }));
+}
+
+/**
+ * Point `model_instructions_file` at a variant, or remove it for the default.
+ *
+ * Refusals, each for a reason the GUI cannot be trusted to enforce alone:
+ * - an unknown variant id, because the key would name a file Codex cannot read;
+ * - the `external` state, because retargeting a key somebody else set silently
+ *   discards their base prompt. Adopting it is a separate, explicit act.
+ */
+export function selectBaseVariant(selection: BaseSelection, revision: string, opts?: Paths): WriteResult {
+  if (selection.kind === "external") return { ok: false, error: "unknown_layer", detail: "cannot select the external state" };
+  const dir = activeBaseVariantDir(opts);
+  return commit(opts, revision, (snapshot, configBytes, storeBytes) => {
+    if (snapshot.baseSelection.kind === "external") {
+      return { error: "developer_instructions_not_owned", detail: snapshot.baseSelection.path };
+    }
+    if (selection.kind === "variant") {
+      const variant = snapshot.baseVariants.find(v => v.id === selection.id);
+      if (!variant) return { error: "unknown_layer", detail: selection.id };
+    }
+    const next = selection.kind === "default"
+      ? null
+      : resolve(join(dir, `${selection.id}.md`));
+    return {
+      nextConfig: setRootString(configBytes ?? "", "model_instructions_file", next),
+      nextStore: storeBytes,
+    };
+  });
+}
+
+/** How many authored variants a user may keep. Two plus the default is the ask. */
+export const MAX_BASE_VARIANTS = 2;
+
+/**
+ * Write or delete one authored variant body.
+ *
+ * Ordering is deliberate and was learned from a defect in this same module: the FILE is
+ * written and verified before `config.toml` is ever pointed at it. Pointing first would
+ * leave the key naming a file that may not exist, which is a worse failure than a written
+ * file nothing references yet.
+ *
+ * Deleting the variant that is currently SELECTED also clears the key in the same
+ * transaction, so the config can never outlive the file it names.
+ */
+export function writeBaseVariant(
+  input: { id: string | null; title: string; body: string } | { id: string; delete: true },
+  revision: string,
+  opts?: Paths,
+): WriteResult {
+  const dir = activeBaseVariantDir(opts);
+  const deleting = "delete" in input;
+  if (!deleting) {
+    const normalized = normalizeBody(input.body);
+    const invalid = findInvalidCharacter(normalized);
+    if (invalid !== null) {
+      return { ok: false, error: "invalid_characters", detail: `at code point ${invalid.position}` };
+    }
+  }
+  const existing = readBaseVariants(opts);
+  const targetId = deleting
+    ? input.id
+    : input.id ?? newBaseVariantId(existing);
+  if (!BASE_VARIANT_ID.test(targetId)) return { ok: false, error: "unknown_layer", detail: targetId };
+  if (deleting && !existing.some(v => v.id === targetId)) {
+    return { ok: false, error: "unknown_layer", detail: targetId };
+  }
+  if (!deleting && input.id === null && existing.length >= MAX_BASE_VARIANTS) {
+    return { ok: false, error: "unknown_layer", detail: `at most ${MAX_BASE_VARIANTS} variants` };
+  }
+  const path = join(dir, `${targetId}.md`);
+  const before = readFileOrNull(path);
+  const next = deleting
+    ? null
+    : `# ${input.title.replace(/[\r\n]+/g, " ").trim() || targetId}\n${normalizeBody(input.body)}`;
+
+  // Whether this id is the live selection has to be decided while the file still
+  // EXISTS. Deleting first made `resolveBaseSelection` fall through to `external` - the
+  // path no longer matched a known variant - so the config half saw a state it refuses
+  // to touch and left the key pointing at a file that was already gone.
+  const selectedBefore = resolveBaseSelection(readFileOrNull(activeConfigPath(opts)), existing, opts);
+  const clearingKey = deleting
+    && selectedBefore.kind === "variant"
+    && selectedBefore.id === targetId;
+
+  // On a CREATE or EDIT the file goes first: pointing config.toml at a file that does
+  // not exist yet is worse than writing a file nothing references. On a DELETE the
+  // order is reversed for the same reason read the other way - the key must stop
+  // naming the file before the file disappears.
+  if (!deleting) {
+    ensureDir(path);
+    try {
+      durableWrite(path, next!);
+    } catch (error) {
+      return { ok: false, error: "write_failed", detail: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  const result = commit(opts, revision, (_snapshot, configBytes, storeBytes) => ({
+    nextConfig: clearingKey
+      ? setRootString(configBytes ?? "", "model_instructions_file", null)
+      : configBytes,
+    nextStore: storeBytes,
+  }));
+
+  if (!result.ok) {
+    // Undo the file half rather than leaving a variant the caller was told was not
+    // written. A delete has not touched the file yet, so there is nothing to undo.
+    if (!deleting) {
+      try {
+        if (before === null) durableDelete(path);
+        else durableWrite(path, before);
+      } catch { /* the returned error already tells the caller to look */ }
+    }
+    return result;
+  }
+
+  if (deleting) {
+    try {
+      durableDelete(path);
+    } catch (error) {
+      // The key is already clear, so the prompt is correct; the stale file is inert.
+      return { ok: false, error: "write_failed", detail: error instanceof Error ? error.message : String(error) };
+    }
+    // Re-read so the caller sees the variant actually gone.
+    return { ok: true, changed: true, snapshot: readPromptLayers(opts) };
+  }
+  return result;
+}
+
+function newBaseVariantId(existing: readonly BaseVariant[]): string {
+  const taken = new Set(existing.map(v => v.id));
+  for (;;) {
+    const id = randomBytes(4).toString("hex").slice(0, 6);
+    if (!taken.has(id)) return id;
+  }
 }
 
 /** Replace the whole custom-layer list; order is composition order. */
@@ -877,20 +1070,6 @@ export function adoptDeveloperInstructions(revision: string, opts?: Paths): Writ
       nextStore: serializeStore(layers),
     };
   });
-}
-
-/** Remove an unowned or reshaped `developer_instructions` from the root scope. */
-function removeUnownedProjection(content: string): string {
-  const eol = dominantEol(content);
-  const lines = splitLines(content);
-  const limit = firstTableIndex(lines);
-  for (let i = 0; i < limit; i += 1) {
-    if (!ANY_DEV_INSTRUCTIONS.test(lines[i]!)) continue;
-    const marked = i > 0 && lines[i - 1]!.includes(OCX_SECTION_MARKER);
-    lines.splice(marked ? i - 1 : i, marked ? 2 : 1);
-    return joinLines(lines, eol);
-  }
-  return joinLines(lines, eol);
 }
 
 // ---------------------------------------------------------------------------

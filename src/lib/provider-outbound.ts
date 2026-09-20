@@ -7,7 +7,7 @@ import {
   resolvePublicAddresses,
 } from "./destination-policy";
 import { pinnedHttpGet, pinnedHttpPost } from "./pinned-http";
-import { outboundProxyConfigured } from "./proxy-env";
+import { configuredOutboundFetch, effectiveProxyFor, noProxyMatches, normalizeProxyHostname, outboundProxyConfigured } from "./proxy-env";
 import { publicProviderBaseUrl } from "./provider-url";
 
 type ProviderGetInit = Omit<RequestInit, "body" | "method" | "redirect">;
@@ -19,6 +19,14 @@ export interface ProviderOutboundDependencies {
   resolveAddresses?: typeof resolvePublicAddresses;
   pinnedGet?: typeof pinnedHttpGet;
   pinnedPost?: typeof pinnedHttpPost;
+  /**
+   * Canonical-URL proof for the transparent fake-IP exception (Clash TUN mode
+   * without proxy env). Injected so this transport core stays decoupled from
+   * the registry module; production compares the final request URL against the
+   * registry's own fixed discovery URL. Defaults to "not canonical" so a caller
+   * that forgets the seam fails closed, never open.
+   */
+  isCanonicalUrl?: (name: string, url: string) => boolean;
 }
 
 export class ProviderOutboundPolicyError extends Error {
@@ -29,47 +37,39 @@ function pickPinnedAddress(addresses: Array<{ address: string; family: number }>
   return addresses.find(address => address.family === 4) ?? addresses[0]!;
 }
 
-function configuredProxyFor(): boolean {
-  return outboundProxyConfigured();
-}
-
-function normalizeProxyHostname(hostname: string): string {
-  const normalized = hostname.trim().toLowerCase().replace(/\.+$/, "");
-  return normalized.startsWith("[") && normalized.endsWith("]")
-    ? normalized.slice(1, -1)
-    : normalized;
-}
-
-function noProxyMatches(url: URL): boolean {
-  const raw = process.env.NO_PROXY ?? process.env.no_proxy ?? "";
-  const hostname = normalizeProxyHostname(url.hostname);
-  const port = url.port || (url.protocol === "https:" ? "443" : "80");
-  for (const rawEntry of raw.split(",")) {
-    let entry = rawEntry.trim().toLowerCase();
-    if (!entry) continue;
-    if (entry === "*") return true;
-    entry = entry.replace(/^https?:\/\//, "").split("/", 1)[0]!;
-
-    let entryHost = entry;
-    let entryPort = "";
-    const bracketed = /^\[([^\]]+)](?::(\d+))?$/.exec(entry);
-    if (bracketed) {
-      entryHost = bracketed[1]!;
-      entryPort = bracketed[2] ?? "";
-    } else if ((entry.match(/:/g)?.length ?? 0) === 1) {
-      const separator = entry.lastIndexOf(":");
-      const possiblePort = entry.slice(separator + 1);
-      if (/^\d+$/.test(possiblePort)) {
-        entryHost = entry.slice(0, separator);
-        entryPort = possiblePort;
-      }
-    }
-    if (entryPort && entryPort !== port) continue;
-    entryHost = normalizeProxyHostname(entryHost.replace(/^\*?\./, ""));
-    if (!entryHost) continue;
-    if (hostname === entryHost || hostname.endsWith(`.${entryHost}`)) return true;
-  }
-  return false;
+/**
+ * Registry-owned fake-IP transparency exception (Clash/Surge/Mihomo TUN mode).
+ *
+ * Under TUN mode the packet path intercepts the fake-IP destination itself, so a
+ * canonical registry destination whose local DNS answers include Clash fake-IP
+ * space (198.18.0.0/15 or fdfe:dcba:9876::/48) is reachable by pin-connecting through the TUN — no
+ * outbound HTTP(S) proxy env is required. The exception is deliberately narrow:
+ *
+ * - hostname-only: a literal 198.18.x.x URL never reaches it (the literal gate
+ *   in `resolvePublicAddresses` rejects before DNS answers are examined);
+ * - canonical-URL-only: `isCanonicalUrl` must prove the FINAL request URL is
+ *   the registry's own fixed discovery URL for this provider (not merely that
+ *   the provider NAME matches — OAuth/forward names match any baseUrl by
+ *   design, and the bearer is pinned to the registry destination independently
+ *   in `buildModelsRequest`). A retargeted row or a renamed custom row sends
+ *   its credential to the registry URL anyway, so the proof must be on the URL
+ *   actually fetched. The check is injected so the transport core stays
+ *   decoupled from the registry module;
+ * - per-answer validation: benchmark and public answers may coexist. The exception
+ *   does not admit loopback/RFC1918/link-local/metadata companions; those still
+ *   follow the resolver's private-network policy. Benchmark admission leaves
+ *   `privateNetwork` false; proxy/NO_PROXY semantics are unchanged.
+ *
+ * Image/Lab fetch never passes the underlying flag and is unaffected.
+ */
+function transparentFakeIpException(
+  url: string,
+  parsed: URL,
+  isCanonicalUrl: (name: string, url: string) => boolean,
+  name: string,
+): boolean {
+  if (noProxyMatches(parsed)) return false;
+  return isCanonicalUrl(name, url);
 }
 
 let proxyBoundaryWarned = false;
@@ -104,19 +104,67 @@ export async function providerRedirectError(response: Response, requestUrl: stri
   return `provider returned ${response.status} redirect to ${target}; configure the final provider URL directly`;
 }
 
+/**
+ * Default client identity for proxy-originated provider outbound requests.
+ *
+ * Every request through the provider outbound wrapper — connection tests, model
+ * discovery, quota probes — is initiated by the proxy itself, so there is no
+ * client request to inherit a User-Agent from, and the pinned Node-style
+ * transport sends none. WAF/CDN front ends commonly answer UA-less requests
+ * with a 403 that surfaced as "provider added but no models" (#5104). A caller
+ * that materializes its own User-Agent — registry static headers, provider
+ * `headers`, or a vendor-specific client fingerprint — keeps that value and is
+ * never given a second User-Agent; this only fills the name nobody claimed.
+ * The value is what survives, not its spelling: both the pinned transport and
+ * the SOCKS transport rebuild the set through `new Headers()`, which lowercases
+ * every name before it reaches the wire. Inference traffic never uses this
+ * wrapper, so the client-fingerprint rationale of #1751 is unaffected.
+ */
+const PROVIDER_OUTBOUND_DEFAULT_USER_AGENT = "opencodex";
+
+function hasUserAgentHeader(headers: HeadersInit | null | undefined): boolean {
+  if (!headers) return false;
+  if (headers instanceof Headers) return headers.has("user-agent");
+  if (Array.isArray(headers)) return headers.some(([name]) => name.toLowerCase() === "user-agent");
+  return Object.keys(headers).some(name => name.toLowerCase() === "user-agent");
+}
+
+function withDefaultOutboundUserAgent(
+  init: ProviderGetInit | ProviderPostInit,
+): ProviderGetInit | ProviderPostInit {
+  const headers = init.headers;
+  if (hasUserAgentHeader(headers)) return init;
+  if (headers instanceof Headers) {
+    const merged = new Headers(headers);
+    merged.set("User-Agent", PROVIDER_OUTBOUND_DEFAULT_USER_AGENT);
+    return { ...init, headers: merged };
+  }
+  if (Array.isArray(headers)) {
+    return { ...init, headers: [...headers, ["User-Agent", PROVIDER_OUTBOUND_DEFAULT_USER_AGENT]] };
+  }
+  return { ...init, headers: { ...(headers ?? {}), "User-Agent": PROVIDER_OUTBOUND_DEFAULT_USER_AGENT } };
+}
+
 async function providerOutboundRequest(
   name: string,
   provider: ProviderOutboundConfig,
   url: string,
   method: "GET" | "POST",
-  init: ProviderGetInit | ProviderPostInit,
+  rawInit: ProviderGetInit | ProviderPostInit,
   dependencies: ProviderOutboundDependencies = {},
 ): Promise<Response> {
+  // See PROVIDER_OUTBOUND_DEFAULT_USER_AGENT: this wrapper only carries proxy-originated
+  // diagnostic traffic, so it identifies itself unless the caller already did.
+  const init = withDefaultOutboundUserAgent(rawInit);
   const postUrl = method === "POST" ? new URL(url) : undefined;
   if (postUrl?.protocol !== undefined && postUrl.protocol !== "https:") {
     throw new ProviderOutboundPolicyError("provider POST URL must use HTTPS");
   }
-  if (provider.fetch) {
+  // A provider entry keeps unknown configuration keys, so `fetch` can arrive as a value the
+  // operator wrote into the file rather than an executor a caller attached. Calling that would
+  // throw inside discovery and fail the provider for a reason nothing in its configuration
+  // explains; the built-in transport is what a configured value means.
+  if (typeof provider.fetch === "function") {
     // A caller-owned executor cannot be peer-pinned here. This branch keeps literal/config
     // checks and redirect blocking, but does not provide the resolved-address guarantees of
     // the built-in transport. Main-request migration must define that executor contract first.
@@ -138,7 +186,14 @@ async function providerOutboundRequest(
     return provider.fetch(url, { ...init, method, redirect: "manual" });
   }
   const parsed = postUrl ?? new URL(url);
-  const proxyConfigured = configuredProxyFor();
+  const proxyConfigured = outboundProxyConfigured();
+  // Snapshot the scheme-matched proxy once, before the DNS await, so admission and transport
+  // below reason about the same value. `null` here means "no proxy fetch would actually use",
+  // even if some other proxy variable is set.
+  const effectiveProxy = effectiveProxyFor(parsed);
+  const isCanonicalUrl = dependencies.isCanonicalUrl ?? (() => false);
+  const allowMihomoIpv6FakeIp = (effectiveProxy !== null && !noProxyMatches(parsed))
+    || transparentFakeIpException(url, parsed, isCanonicalUrl, name);
   const resolveAddresses = dependencies.resolveAddresses ?? resolvePublicAddresses;
   const pinnedGet = dependencies.pinnedGet ?? pinnedHttpGet;
   const pinnedPost = dependencies.pinnedPost ?? pinnedHttpPost;
@@ -154,7 +209,19 @@ async function providerOutboundRequest(
       // destination or being pin-connected to the fake-IP (credit #1748). A NO_PROXY
       // match is a direct route, so it keeps the benchmark answer rejected. Image/Lab
       // fetch never passes this flag.
-      allowBenchmarkAddresses: proxyConfigured && !noProxyMatches(parsed),
+      //
+      // TUN-mode transparency: with no proxy env, Clash/Surge/Mihomo TUN still
+      // intercepts the fake-IP destination itself, so the REGISTRY's own fixed
+      // discovery URL stays reachable by pin-connecting through the TUN. The
+      // proof is on the final request URL — not the provider name — because an
+      // OAuth/forward name matches any baseUrl by design while the bearer is
+      // pinned to the registry destination independently.
+      allowBenchmarkAddresses: (proxyConfigured && !noProxyMatches(parsed))
+        || transparentFakeIpException(url, parsed, isCanonicalUrl, name),
+      // Mihomo IPv6 fake-IP (fdfe:dcba:9876::/48) answers are admitted either when bound
+      // to a scheme-matched proxy (#3462) or under the TUN transparency exception for a
+      // canonical registry/accounting destination.
+      allowMihomoIpv6FakeIp,
     });
   } catch (error) {
     const dnsResolutionFailed = error instanceof DestinationDnsResolutionError
@@ -165,11 +232,16 @@ async function providerOutboundRequest(
     if (!proxyConfigured) throw error;
     warnProxyBoundaryOnce();
     warnProxyDnsDegradationOnce();
-    return globalThis.fetch(url, { ...init, method, redirect: "manual" });
+    return configuredOutboundFetch(url, { ...init, method, redirect: "manual" });
   }
-  if (proxyConfigured && !resolved.privateNetwork) {
+  // A canonical TUN exception with no scheme-matched proxy must retain the
+  // validated address, even when an unrelated HTTP_PROXY/ALL_PROXY is present.
+  if (proxyConfigured && !resolved.privateNetwork && (effectiveProxy !== null || !allowMihomoIpv6FakeIp)) {
     warnProxyBoundaryOnce();
-    return globalThis.fetch(url, { ...init, method, redirect: "manual" });
+    // When the Mihomo exception could have admitted an answer, pin the transport to the
+    // proxy the admission assumed instead of letting fetch re-infer it from the environment.
+    const proxy = (allowMihomoIpv6FakeIp && effectiveProxy) ? effectiveProxy : undefined;
+    return configuredOutboundFetch(url, { ...init, method, redirect: "manual", ...(proxy ? { proxy } : {}) });
   }
   if (proxyConfigured && resolved.privateNetwork && !noProxyMatches(parsed)) {
     const hostname = normalizeProxyHostname(parsed.hostname);

@@ -1,5 +1,6 @@
-import { usageSummary30dResourceKey } from "../usage-summary-resource";
-import { useEffect, useMemo, useReducer, useRef } from "react";
+import { usageSummary30dResourceKey, type UsageReadMetadata } from "../usage-summary-resource";
+import { UsageIncompleteNotice } from "./usage-incomplete-notice";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { IconX } from "../icons";
 import { useT } from "../i18n/shared";
 import { useKeyedClientResource } from "../client-resource";
@@ -12,8 +13,10 @@ import {
 import { oauthTosRisk } from "../oauth-tos-risk";
 import OAuthTosWarningModal from "./OAuthTosWarningModal";
 import ProviderCatalog from "./provider-catalog/ProviderCatalog";
+import ProviderNoteModal from "./provider-catalog/ProviderNoteModal";
 import type { AccountLoginRow, AccountLoginStatus } from "./provider-catalog/ProviderCatalog";
 import type { CatalogPreset } from "./provider-catalog/provider-presets";
+import type { CatalogLoginHint } from "./provider-catalog/login-hint-visibility";
 import { baseUrlForChoice, matchChoiceId, resolvedBaseUrlForChoice } from "../base-url-choice";
 import { AddProviderOAuthPane } from "./add-provider-oauth-pane";
 import { AddProviderFormPane } from "./add-provider-form-pane";
@@ -29,7 +32,8 @@ type Preset = CatalogPreset;
 
 export default function AddProviderModal({
   apiBase, existingNames, onClose, onAdded, initialTier, initialCustom = false,
-  accountRows, accountStatus, accountBusy, onAccountLogin, onAccountCancelLogin, onAccountLogout, onAccountManage, onOpen,
+  accountRows, accountStatus, accountBusy, accountLoginHint = null,
+  onAccountLogin, onAccountCancelLogin, onAccountLogout, onAccountManage, onOpen,
 }: {
   apiBase: string;
   existingNames: string[];
@@ -40,6 +44,8 @@ export default function AddProviderModal({
   accountRows?: AccountLoginRow[];
   accountStatus?: Record<string, AccountLoginStatus>;
   accountBusy?: string | null;
+  /** Login hint for an Accounts-tab login in flight, owned by the providers page. */
+  accountLoginHint?: CatalogLoginHint | null;
   onAccountLogin?: (provider: string, addAccount?: boolean) => void;
   onAccountCancelLogin?: (provider: string) => void;
   onAccountLogout?: (provider: string) => void;
@@ -58,6 +64,13 @@ export default function AddProviderModal({
   const aliveRef = useRef(true);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  // The full-note popup is owned here, not in the catalog: it has to render as a sibling
+  // of this overlay, and its open state has to be visible to the Escape handler below.
+  const [notePreset, setNotePreset] = useState<Preset | null>(null);
+  // The unified search text is owned here for the same reason: Escape has to clear a
+  // non-empty query instead of closing the dialog, and the handler that decides is this
+  // component's.
+  const [catalogQuery, setCatalogQuery] = useState("");
 
   const oauthPoll = useKeyedClientResource(
     `add-provider-oauth:${apiBase}`,
@@ -85,7 +98,7 @@ export default function AddProviderModal({
     async (signal) => {
       const res = await fetch(`${apiBase}/api/usage?range=30d`, { signal });
       if (!res.ok) throw new Error(String(res.status));
-      return await res.json() as { providers?: Array<{ provider: string; requests: number }> };
+      return await res.json() as UsageReadMetadata & { providers?: Array<{ provider: string; requests: number }> };
     },
     { deadlineMs: 60_000 }, // shared usage-summary key: all four subscribers raise the deadline together
   );
@@ -96,6 +109,7 @@ export default function AddProviderModal({
   const usageRank = Object.fromEntries((usagePoll.data?.providers ?? []).map(row => [row.provider, row.requests]));
   const {
     preset, form, saving, error, oauthBusy, oauthMsg, oauthMsgTone, oauthUrl, oauthUrlProvider,
+    oauthDeviceCode, oauthInstructions,
     manualCode, manualCodeBusy, manualCodeMsg, manualCodeOk, endpointChoice, oauthTosPending,
   } = state;
 
@@ -120,11 +134,23 @@ export default function AddProviderModal({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !oauthTosPending) onClose();
+      // This listener is on `window` and does not read `defaultPrevented`, so a native
+      // <dialog> cancel does not stop it. Every stacked overlay has to be named here or
+      // Escape closes the whole add-provider modal out from under it.
+      // Kept as a `!oauthTosPending` expression on purpose: tests/gui/oauth-tos-warning.test.ts
+      // source-scans this file for that exact substring, because the guard is the only thing
+      // stopping Escape from closing the modal out from under a stacked overlay.
+      const noOverlayOpen = !oauthTosPending && !notePreset;
+      if (e.key !== "Escape" || !noOverlayOpen) return;
+      // Escape unwinds one layer at a time: the note popup, then a live search, then the
+      // dialog. Closing the modal on the keystroke that was meant to clear a query throws
+      // away everything the user typed into the form behind it.
+      if (catalogQuery) { setCatalogQuery(""); return; }
+      onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, oauthTosPending]);
+  }, [onClose, oauthTosPending, notePreset, catalogQuery]);
 
   const presetDescription = (candidate: Preset): string | undefined => {
     const key = codexPresetDescriptionKey(candidate);
@@ -192,13 +218,18 @@ export default function AddProviderModal({
     }
   };
 
-  const { loginOAuth, submitManualCode: submitManualCodeApi } = useAddProviderOAuth({ apiBase, t, aliveRef, onAdded });
+  const {
+    cancelLoginOAuth,
+    loginOAuth,
+    submitManualCode: submitManualCodeApi,
+  } = useAddProviderOAuth({ apiBase, t, aliveRef, onAdded });
 
   const oauthSetters = {
     setOauthBusy: (busy: boolean) => dispatch({ type: "set-oauth-busy", busy }),
     setOauthMsg: (msg: string) => dispatch({ type: "set-oauth-msg", msg }),
     setOauthMsgTone: (tone: "ok" | "warn") => dispatch({ type: "set-oauth-tone", tone }),
-    setOauthUrl: (url: string, providerId: string) => dispatch({ type: "set-oauth-url", url, providerId }),
+    setOauthUrl: (url: string, providerId: string, deviceCode?: string, instructions?: string) =>
+      dispatch({ type: "set-oauth-url", url, providerId, deviceCode, instructions }),
     setManualCode: (code: string) => dispatch({ type: "set-manual-code", code }),
     setManualCodeMsg: (msg: string) => dispatch({ type: "set-manual-code-msg", msg }),
     setManualCodeOk: (ok: boolean) => dispatch({ type: "set-manual-code-msg", msg: manualCodeMsg, ok }),
@@ -240,14 +271,18 @@ export default function AddProviderModal({
           <button type="button" className="btn btn-ghost btn-icon" aria-label={t("common.close")} onClick={onClose}><IconX /></button>
         </div>
 
+        {!preset && <UsageIncompleteNotice data={usagePoll.data} />}
         {!preset ? (
           <ProviderCatalog
             presets={presets}
             usageRank={usageRank}
             presetsLoading={presetsLoading}
             initialTier={initialTier}
+            query={catalogQuery}
+            onQueryChange={setCatalogQuery}
             onSelectPreset={p => choosePreset(p)}
             onSelectCustom={() => choosePreset(fallbackPresets[0]!)}
+            onShowNote={p => setNotePreset(p)}
             accountRows={accountRows}
             accountStatus={accountStatus}
             busyProvider={accountBusy}
@@ -255,6 +290,15 @@ export default function AddProviderModal({
             onCancelLogin={onAccountCancelLogin}
             onLogout={onAccountLogout}
             onManage={onAccountManage}
+            loginHint={accountLoginHint}
+            paste={{
+              value: manualCode,
+              busy: manualCodeBusy,
+              message: manualCodeMsg,
+              ok: manualCodeOk,
+              onChange: code => dispatch({ type: "set-manual-code", code }),
+              onSubmit: providerId => { void submitManualCode(providerId); },
+            }}
           />
         ) : form && (
           preset.auth === "oauth" && form.authMode === "oauth" ? (
@@ -265,17 +309,24 @@ export default function AddProviderModal({
               oauthMsg={oauthMsg}
               oauthMsgTone={oauthMsgTone}
               oauthUrl={oauthUrlProvider === preset.oauthProvider ? oauthUrl : ""}
+              oauthDeviceCode={oauthUrlProvider === preset.oauthProvider ? oauthDeviceCode : ""}
+              oauthInstructions={oauthUrlProvider === preset.oauthProvider ? oauthInstructions : ""}
               manualCode={manualCode}
               manualCodeBusy={manualCodeBusy}
               manualCodeMsg={manualCodeMsg}
               manualCodeOk={manualCodeOk}
               onRequestLogin={requestLoginOAuth}
+              onCancelLogin={providerId => { void cancelLoginOAuth(providerId, oauthSetters, preset.label); }}
               onUseApiKeyInstead={() => {
+                if (oauthBusy && preset.oauthProvider) void cancelLoginOAuth(preset.oauthProvider, oauthSetters, preset.label);
                 dispatch({ type: "use-api-key-instead", form: { ...form, authMode: "key" } });
               }}
               onManualCodeChange={code => dispatch({ type: "set-manual-code", code })}
               onSubmitManualCode={providerId => { void submitManualCode(providerId); }}
-              onBack={() => dispatch({ type: "back" })}
+              onBack={() => {
+                if (oauthBusy && preset.oauthProvider) void cancelLoginOAuth(preset.oauthProvider, oauthSetters, preset.label);
+                dispatch({ type: "back" });
+              }}
             />
           ) : (
             <AddProviderFormPane
@@ -311,6 +362,16 @@ export default function AddProviderModal({
           dispatch({ type: "set-oauth-tos-pending", providerId: null });
           void loginOAuth(id, oauthSetters);
         }}
+      />
+    )}
+    {notePreset?.note && (
+      <ProviderNoteModal
+        key={notePreset.id}
+        providerId={notePreset.id}
+        label={notePreset.label}
+        adapter={notePreset.adapter}
+        note={notePreset.note}
+        onClose={() => setNotePreset(null)}
       />
     )}
     </>

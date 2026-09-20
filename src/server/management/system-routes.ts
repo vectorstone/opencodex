@@ -15,8 +15,9 @@
  * further: it is the proxy's previous_response_id continuation store, so a
  * growing responseState.totalBytes under rising observed memory points at
  * conversation retention rather than the runtime allocator. Spill counts,
- * payload-byte totals, tombstones, and failure counters remain finite scalars;
- * response ids, filenames, digests, paths, and payload content never leave the owner.
+ * payload-byte totals, tombstones, failure counters, fixed health/error enums,
+ * and event timestamps remain finite scalars; response ids, raw errors,
+ * filenames, digests, paths, and payload content never leave the owner.
  *
  * `activeTurnCount` / `isDraining` are scalar lifecycle counters for the
  * dashboard drain-and-restart confirm UX — never request bodies or IDs.
@@ -38,6 +39,7 @@ import {
 } from "../../lib/codex-restart-contract";
 import { jsonResponse } from "../auth-cors";
 import { getInspectionCounters } from "../relay";
+import { spendLedgerDiagnosticsSnapshot } from "../../lib/spend-reservation-ledger";
 import type {
   performCodexRestart,
   readCodexAppServerState,
@@ -48,7 +50,20 @@ import { acceptSystemRestart } from "./system-restart";
 const ENDPOINT_SAMPLE_LIMIT = 60;
 
 export async function handleSystemRoutes(ctx: ManagementContext): Promise<Response | null> {
-  const { req, url, config } = ctx;
+  const { req, url, config, version } = ctx;
+  if (url.pathname === "/api/system/health" && req.method === "GET") {
+    // Authenticated management counterpart to /healthz. Remote Hub deliberately keeps the
+    // unauthenticated liveness route off its management ingress, while the connected dashboard
+    // still needs bounded process identity and PID replacement evidence (#3158).
+    return jsonResponse({
+      status: "ok",
+      service: "opencodex",
+      version,
+      uptime: process.uptime(),
+      pid: process.pid,
+      spendLedger: spendLedgerDiagnosticsSnapshot(),
+    });
+  }
   if (url.pathname === "/api/system/memory" && req.method === "GET") {
     const usage = process.memoryUsage();
     let jscHeap: { heapSize: number; heapCapacity: number; objectCount: number } | null = null;

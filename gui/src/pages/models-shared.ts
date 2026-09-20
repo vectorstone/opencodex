@@ -1,4 +1,4 @@
-import type { TFn } from "../i18n/shared";
+import type { TFn, TKey } from "../i18n/shared";
 import type { ProviderDiscoverySummary } from "../models-groups";
 import { modelVisible, type ProviderModelMap } from "../model-visibility";
 import { formatNamespacedModelId } from "../provider-icons";
@@ -30,16 +30,94 @@ export interface ModelRow {
   id: string;
   namespaced: string;
   disabled: boolean;
+  initialSelectionPending?: boolean;
   native?: boolean;
   custom?: boolean;
   customId?: string;
   displayName?: string;
+  displayNameOverride?: string;
+  displayNameSource?: "operator" | "provider" | "fallback";
+  manualPricing?: boolean;
+  /**
+   * Listed but currently unable to serve, because every usable target is quota-exhausted
+   * (#1711). Distinct from `disabled`, which is the operator's own choice, and from visibility:
+   * the row is still offered.
+   */
+  quotaInactiveReason?: "no_credit";
+  /**
+   * Provider-published cost class from model discovery (#3666). Absent means unknown — either
+   * the provider publishes no per-token rates, or the row was cached by a build that predates
+   * the field. Absent is never treated as free.
+   */
+  pricingStatus?: "free" | "paid";
   inputModalities?: string[];
   contextWindow?: number;
+  maxOutputTokens?: number;
   contextCap?: number;
   contextCapped?: boolean;
   /** Stored custom-row override (not the inherited ladder); only present on custom rows. */
   reasoningEfforts?: string[];
+}
+
+/** The pricing shape both Free-only consumers read; keeps the helpers usable from either page. */
+export type PricedRow = { pricingStatus?: "free" | "paid" };
+
+/**
+ * Whether a Free-only control should be offered for this set of rows at all (#3666).
+ *
+ * A provider that publishes no per-token prices — Ollama, a static catalog, anything whose
+ * /models rows carry no usable rate pair — leaves every row unclassified, so a Free switch
+ * there could only ever empty the list. That reads as a broken filter rather than as "this
+ * provider does not say", so the control is hidden instead.
+ */
+export function modelPricingKnown(rows: readonly PricedRow[]): boolean {
+  return rows.some(row => row.pricingStatus !== undefined);
+}
+
+/**
+ * Apply the Free-only narrowing (#3666).
+ *
+ * Absent `pricingStatus` is never free: the discovery classifier omits the field exactly when
+ * the provider's rates were missing, one-sided, non-numeric, or negative, and a cached row from
+ * an older build has no field either. Both consumers call this BEFORE their own search, sort,
+ * and page slice, or free models stay stranded behind Show more on a long provider list.
+ */
+export function filterFreeModelRows<T extends PricedRow>(rows: readonly T[], freeOnly: boolean): T[] {
+  return freeOnly ? rows.filter(row => row.pricingStatus === "free") : [...rows];
+}
+
+/**
+ * Whether the Free-only narrowing is actually in force for this set of rows.
+ *
+ * The switch is offered only where discovery returned prices, but the operator's choice is
+ * component state that outlives the rows it was made against. When the evidence goes away —
+ * a refresh that comes back without pricing, a re-auth, a discovery fallback to a static
+ * catalog — the control disappears while the stale `true` keeps filtering, and every row is
+ * unclassified, so the list empties with no visible way to turn it off. Gate the filter on the
+ * same condition that gates the switch and the narrowing lapses with the control.
+ */
+export function freeOnlyInForce(freeOnly: boolean, rows: readonly PricedRow[]): boolean {
+  return freeOnly && modelPricingKnown(rows);
+}
+
+function containsDisplayNameControlCharacter(value: string): boolean {
+  return [...value].some(character => {
+    const codePoint = character.codePointAt(0)!;
+    return codePoint <= 0x1f
+      || (codePoint >= 0x7f && codePoint <= 0x9f)
+      || codePoint === 0x2028
+      || codePoint === 0x2029;
+  });
+}
+
+/** Mirror the server display-name contract for immediate form feedback. */
+export function modelDisplayNameValidationKey(value: string): TKey | null {
+  const trimmed = value.trim();
+  if (!trimmed) return "models.displayNameRequired";
+  if (trimmed.length > 128) return "models.displayNameTooLong";
+  if (trimmed.includes("/")) return "models.displayNameNoSlash";
+  if (containsDisplayNameControlCharacter(trimmed)) return "models.displayNameNoControl";
+  return null;
 }
 
 /**
@@ -55,6 +133,7 @@ export interface ProviderContextCapsResponse {
   cap?: number;
   value?: number;
   caps?: Record<string, number>;
+  values?: Record<string, number>;
 }
 
 export interface V2Status {
@@ -63,6 +142,8 @@ export interface V2Status {
   maxConcurrentThreadsPerSession?: number | null;
   multiAgentMode?: "v1" | "default" | "v2";
   keepNativeChatGptOnV1?: boolean;
+  /** Response-only; absent on a runtime older than the v1-default advisory. */
+  multiAgentSurfaceAdvisory?: unknown;
 }
 
 export interface ShadowCallData {
