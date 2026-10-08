@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../../src/config";
@@ -14,6 +14,9 @@ import type { OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { ManagementRequest } from "../helpers/management-auth";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { repoPath } from "../helpers/repo-root";
+import { resetCodexRuntimeResolveCacheForTests, setCodexRuntimeResolveCacheForTests } from "../../src/codex/runtime";
+import { resetBundledCatalogCacheForTests, setBundledCatalogCacheForTests } from "../../src/codex/catalog/bundled";
 
 // Full-suite Windows load: startServer + discovery GETs exceed the default 5s budget
 // (same flake class as 810fa115 / claude-management-api).
@@ -21,7 +24,28 @@ setDefaultTimeout(30_000);
 
 let testDir = "";
 let previousHome: string | undefined;
+let previousCliPath: string | undefined;
 let isolatedCodexHome: IsolatedCodexHome | null = null;
+
+// Catalog discovery is the subject, not the developer's installed CLI. A real runtime probe
+// can take the entire file's deadline under full-suite load and leave server cleanup unfinished.
+function installDiscoveryRuntimeFixture(): string {
+  const scriptPath = join(testDir, "codex-discovery-fixture.js");
+  const catalog = readFileSync(repoPath("src/codex/data/upstream-models.json"), "utf8");
+  writeFileSync(scriptPath, [
+    'if (process.argv.includes("--version")) console.log("codex-cli 0.145.0");',
+    `else process.stdout.write(${JSON.stringify(catalog)});`,
+  ].join("\n"));
+  if (process.platform === "win32") {
+    const command = join(testDir, "codex-discovery-fixture.cmd");
+    writeFileSync(command, `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`);
+    return command;
+  }
+  const command = join(testDir, "codex-discovery-fixture");
+  writeFileSync(command, `#!/bin/sh\nexec "${process.execPath}" "${scriptPath}" "$@"\n`);
+  chmodSync(command, 0o755);
+  return command;
+}
 
 // Discovery fixtures own their temporary homes; a live host service is not their subject.
 const startDiscoveryServer = async () => {
@@ -48,13 +72,21 @@ const startDiscoveryServer = async () => {
 
 beforeEach(() => {
   previousHome = process.env.OPENCODEX_HOME;
+  previousCliPath = process.env.CODEX_CLI_PATH;
   isolatedCodexHome = installIsolatedCodexHome("ocx-claude-discovery-");
   testDir = mkdtempSync(join(tmpdir(), "ocx-claude-discovery-"));
   process.env.OPENCODEX_HOME = testDir;
+  process.env.CODEX_CLI_PATH = installDiscoveryRuntimeFixture();
+  resetCodexRuntimeResolveCacheForTests();
+  resetBundledCatalogCacheForTests();
 });
 
 afterEach(() => {
   resetCodexModelEntitlementCacheForTests();
+  resetCodexRuntimeResolveCacheForTests();
+  resetBundledCatalogCacheForTests();
+  if (previousCliPath === undefined) delete process.env.CODEX_CLI_PATH;
+  else process.env.CODEX_CLI_PATH = previousCliPath;
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   isolatedCodexHome?.restore();
@@ -652,6 +684,12 @@ test("with no inbound or runtime version, /v1/models still exposes the gated row
   const { resetCodexModelEntitlementCacheForTests } = await import("../../src/codex/model-entitlements");
   resetCatalogRuntimeStateForTests();
   resetCodexModelEntitlementCacheForTests();
+
+  // Keep this regression on the no-version tier rather than letting the fixture's version
+  // answer for it. The existing owner seams avoid falling back to the host's actual CLI.
+  const runtime = { command: process.env.CODEX_CLI_PATH!, version: null, source: "fallback" as const };
+  setCodexRuntimeResolveCacheForTests({ runtime, failures: [] }, { discoverAlternatives: false });
+  setBundledCatalogCacheForTests(runtime, JSON.parse(readFileSync(repoPath("src/codex/data/upstream-models.json"), "utf8")));
 
   const askedVersions: string[] = [];
   const originalFetch = globalThis.fetch;
