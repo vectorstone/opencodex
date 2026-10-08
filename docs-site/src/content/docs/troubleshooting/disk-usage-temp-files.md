@@ -50,6 +50,34 @@ running process can own those.
 The safety rules are unchanged: a file younger than 15 minutes is never removed,
 and the proxy never removes a file it is writing itself.
 
+## How often the snapshot is written
+
+Writes are debounced, and the debounce is derived from the size of the **last
+snapshot actually written**: while that file is small the next write is scheduled
+about two seconds after a change, and once it is near the 24 MB bound the wait
+stretches to at most thirty seconds. A cache that has only just grown therefore
+still takes the short wait once — the longer cadence applies from the write after
+it. A flush is skipped only when this process already wrote the same bytes to the
+same file, that file still matches on disk, and — outside Windows — its mode is
+still owner-only. A fresh process rewrites an identical snapshot once, and a file
+whose contents or permissions changed underneath the proxy is rewritten through the
+hardening path rather than left alone.
+
+Each ordinary background cadence performs at most one full atomic rewrite. If the
+continuation cache changes while that write is in progress, opencodex schedules one
+follow-up on the normal delayed cadence instead of rewriting the whole snapshot again
+immediately. Graceful shutdown keeps its bounded retry behavior after in-flight
+requests have drained so the final snapshot can catch up before the process exits.
+
+Together these keep the write rate roughly flat as the cache grows, instead of
+re-serializing and replacing the whole file every two seconds.
+
+A graceful shutdown flushes immediately rather than waiting out the timer, so the
+longer wait mainly widens the window in which a hard kill loses the most recent
+continuation entries — which are cache, as above. That flush is still a disk
+write and can fail like any other, so a shutdown on a full or read-only volume
+can lose the same entries.
+
 ## Reclaiming files that already accumulated
 
 If the proxy runs, this happens automatically within a minute or two.
@@ -80,3 +108,35 @@ so you can run it again.
 
 This covers response-state snapshot temps specifically. Other components write
 their own temp files with a similar name, and those are not touched here.
+
+## Spill files (`responses-state-spill/`)
+
+A sibling directory, `~/.opencodex/responses-state-spill/`, holds spilled
+conversation continuations. When the in-memory continuation cache outgrows its
+resident budget, opencodex moves the oldest payloads to these files and keeps
+only a small stub in `responses-state.json`. This is what keeps the snapshot
+small without dropping long `previous_response_id` chains.
+
+The store is bounded, so this directory cannot grow without limit while the
+proxy runs:
+
+- at most **1 GiB** of spilled payload total,
+- at most **1000** stored responses,
+- each entry expires **24 hours** after it was stored.
+
+When a bound is hit, the oldest entries are evicted and their spill files are
+removed with them.
+
+**Restart preserves every spill file the snapshot still references.** A restart
+reloads the stubs and re-owns the files behind them, so nothing needed is lost
+by rebooting. A file becomes garbage only when it is no longer referenced —
+crash leftovers and failed cleanups — and opencodex reclaims those itself after
+a 15-minute grace period.
+
+**Do not delete spill files manually.** Files still referenced are part of a
+live continuation chain, and the reclaim already handles the unreferenced ones.
+`ocx doctor` reports the split without touching anything: a "Response-state
+spill files" section shows total files and bytes on disk, how much is still
+owned by the store or the persisted snapshot, and how much sits as reclaimable
+orphan candidates. The same counts are on the management API at
+`/api/system/memory` under `responseSpill`.

@@ -1,0 +1,527 @@
+# Codex Home
+
+Quota activation restores deadlines from OpenCodex settings; its retry backoff remains process-local. See the [quota activation contract](providers/openai-tiers.md#public-provider-contract).
+
+Catalog HTTP acquisition follows the [proxy-routing contract](catalog.md#remote-catalog-http-proxy-routing).
+
+A lock in the Codex credential store is governed by [descriptor identity and age](catalog.md#accounts-namespaces-and-pool-rotation), so the mere presence of its filename is neither acquisition nor release authority. Failed path-identity probes leave the lock for stale recovery and preserve the refresh callback outcome. Cooperating lock metadata changes serialize through the existing SQLite mutation transaction; release keeps the descriptor open through identity comparison and any unlink, then closes it. Failed metadata writes remove only a matching owned path after successful coordination; unknown identity, failed probes or unavailable coordination retain the path for stale recovery. Async refresh work holds no metadata transaction.
+
+CLI installation inspection reason codes, including Windows deferral, follow the [runtime inspection contract](runtime.md#lifecycle).
+
+Explicit Codex CLI installation observation does not discover a Codex home or read/write its state. See the [read-only observation contract](runtime.md#explicit-codex-cli-installation-observation).
+
+## Orca source-owned account import
+
+`src/codex/orca-import.ts` reads only accounts listed in an explicitly selected Orca registry.
+Each host-managed home must match its UUID directory and ownership marker. Preview is offline
+and read-only; applying requires an initialized target and a stopped proxy. Existing main,
+configured and orphan credential identities participate in account-ID deduplication.
+Retry can complete an interrupted registration only for a sole, untouched importer-owned
+pending credential matching the registered source path and identity; it retains that record's ID.
+
+Imported pool records retain an access-token snapshot and a local source reference, with no
+refresh token. `src/codex/orca-auth-source.ts` bounds reads and rejects linked or nonlocal paths.
+`src/codex/account-store.ts` rereads the source before returning credentials, pins account and
+subject identity, and fails closed for missing, expired or changed-identity sources. Orca owns
+refresh; even forced refresh never exchanges its refresh token. A new source bearer advances
+the target generation while retaining validation state and the same account's quota-history identity.
+Writers captured under the old generation become stale; already retained history is not reset.
+New imports remain validation-pending.
+
+`src/codex/auth-api/pool-quota-probe.ts` also rechecks linked sources after asynchronous quota validation before
+issuing deferred inference warmups. Already dispatched requests retain their captured bearer.
+
+## Codex home
+
+`src/codex/paths.ts` resolves Codex state from `CODEX_HOME` when set and valid, otherwise from
+`~/.codex`. An unset `CODEX_HOME` falls back to `~/.codex`, including WSL discovery. On WSL,
+discovery of a Windows Desktop home applies when the Linux `~/.codex` is absent, is not a directory,
+or is a directory holding no Codex state (none of `config.toml`, `auth.json`, `sessions`,
+`history.jsonl`; `defaultCodexHome` in `src/codex/home.ts`). A fresh local home Codex is already using
+stays the home before `config.toml` exists (issue 5441), a bare directory does not move an existing
+user off a Windows home they were running against, and a stat failure other than absence keeps the
+local home rather than switching to a different one. Codex runtime discovery (src/codex/runtime.ts) also reads this home on Linux: after an explicit runtime, PATH, and the ordinary install locations, it enumerates the direct children of <effective CODEX_HOME>/bin/wsl/<version-hash>/codex newest first, probes each through the isolated --version seam, and re-enumerates on every resolve so a Desktop update that replaces the hash directory is picked up (issue 5635). An explicitly
+set path that is unreadable or not a directory is an error, not a fallback: silently using a
+different home than the operator named would write provider state where nobody is looking for it. A fresh install can have that directory but no `config.toml` yet; applying the integration then creates an empty `config.toml` there (never overwriting an existing file) and continues, while a missing home directory is refused with instructions to start Codex once or set `CODEX_HOME` (issue 5422).
+`src/codex/home.ts` imports path expansion directly from `src/config/paths.ts`, so a fresh WSL process can resolve its Codex home without re-entering the config facade before the resolver initializes.
+The managed files are:
+
+```text
+$CODEX_HOME/config.toml
+$CODEX_HOME/opencodex.config.toml
+$CODEX_HOME/opencodex-catalog.json
+$CODEX_HOME/opencodex-journal.json
+$CODEX_HOME/models_cache.json
+$CODEX_HOME/.opencodex-native-main-profiles/
+```
+
+Never assume macOS-only paths. Windows, service installs, and app-launched Codex can all depend on
+the resolved `CODEX_HOME`.
+
+Log Guard reclaim in `src/codex/log-guard/maintenance.ts` refuses a non-regular or redirected
+database path. It compares canonical path and full-width filesystem device and file identity
+from path observations before and immediately after SQLite opens the database, before maintenance
+statements. Reclaim is unavailable where the filesystem does not report a usable stable file
+identity: missing or zero inode values return `unsafe_path`. File size and timestamps are
+measurements, not identity evidence. These path observations do not attest SQLite's opened handle
+or continuous file identity between the observations.
+
+Observed catalog/cache rows and restore output follow the [retired-native policy](catalog.md#shared-catalog).
+Restore filters retired bare and trusted account-qualified native rows from its output with or
+without a backup. The original backup, historical user-selected settings and session records remain intact.
+
+Journal restoration compares config and profile independently against their saved originals and
+recorded injected hashes. If either changed artifact lacks its injected hash, the config/profile
+pair and journal remain untouched and the result is explicitly unverified; callers must not
+convert that refusal into successful fallback cleanup. Already-original bytes need no rewrite,
+and absence is distinct from an empty file. The injector checks a retained hashless journal against
+the same `baselineContent` it snapshots, plus the current profile, before writing or assigning a new
+injected hash. Native content can establish a fresh snapshot; routed content cannot promote an
+unverified older original. Existing hash-backed edit preservation and external-provider opt-out
+remain separate paths.
+
+`src/codex/journal.ts` distinguishes restored state from actual writes with `configRewritten`
+and `profileRewritten`; removing a generated profile counts as a write, while already-original
+state and an ENOENT removal outcome do not. `reconcileJournal` checks unverified recovery first,
+then incomplete recovery, before its silent no-write return. Both dead-process and mismatched-client
+recovery warn without file contents or client identity when either artifact remains unrestored,
+return false and retain the journal, including when config was rewritten but profile removal failed.
+Only complete recovery with an actual write reports a restore; complete already-original recovery
+removes the stale journal silently, and warns instead when the journal file is still present
+afterwards (`removeJournal` ignores unlink errors such as a Windows lock). Ownership/hash checks and `profileRestoreFailed` remain intact.
+`tests/codex-integration/codex-journal-recovery.test.ts` covers these diagnostics and write flags.
+
+The source-built Docker image explicitly keeps `CODEX_HOME=/home/bun/.codex` separate
+from `OPENCODEX_HOME=/home/bun/.opencodex`. Compose persists them in `codex-state` and
+`ocx-state` respectively, retaining a read-only root. The image creates owner-only
+writable homes for `bun`; existing volume ownership and permissions are not repaired.
+The catalog resolver is unchanged; a writable empty home is not a materialized catalog.
+
+> Decision record: [ADR-0005](decisions/ADR-0005-codex-home.md)
+
+`docker compose down` retains both volumes. `docker compose down --volumes` deletes
+both `ocx-state` and `codex-state`, including their credentials and catalog/state;
+treat it as destructive, not as an upgrade or restart command.
+
+Service install-state ownership uses this same resolver. In WSL, an unset `CODEX_HOME` may resolve
+to the single discoverable Windows Desktop home; recording Linux `~/.codex` instead would make a
+later repair or uninstall look foreign even though the service and runtime were started from the
+same environment. A record written before that discovery still names Linux `~/.codex`; service
+commands refuse it and name the recorded home to rerun with, because stop and repair would otherwise
+restore a different home. A recorded spelling that still resolves to the same physical directory —
+a junction or symlink alias — counts as the same home for the ownership check, the recorded SQLite
+home, and the unattended ownership preflight. Access or transient I/O errors are unknown rather
+than foreign in preflight; distinct spellings with missing/non-directory paths remain mismatches.
+Lifecycle guards still fail closed on unknown and can throw `ServiceOwnershipError`.
+An explicit `CODEX_HOME` remains authoritative; nothing migrates implicitly.
+
+> Decision record: [ADR-0006](decisions/ADR-0006-codex-home.md)
+
+SQLite-backed thread state may live outside `CODEX_HOME`. The one resolver in `src/codex/paths.ts`
+uses Codex's precedence: root `sqlite_home` in the effective `config.toml`, then
+`CODEX_SQLITE_HOME`, then the effective `CODEX_HOME`; relative SQLite homes resolve from the current
+working directory. History jobs resolve the database and its hashed backup identity together at
+call time, and admission/residue checks consume the same database path. Storage retention still
+owns the Codex-home tree separately and does not gain deletion authority over an external SQLite
+root from this resolver alone. Durable service launchers preserve an explicitly supplied
+`CODEX_SQLITE_HOME` so a background service resolves the same split state as the installing shell.
+Service install state records that effective SQLite home beside `CODEX_HOME` and `OPENCODEX_HOME`,
+and a lifecycle command requires the recorded value to match the current effective resolution; a
+legacy record without the field keeps its existing behavior.
+An absent `config.toml` or absent root `sqlite_home` permits the environment/home fallback. Any
+other read failure, malformed TOML, wrong-typed or blank `sqlite_home` is indeterminate and fails
+closed so history code cannot select a different database by accident. This strict parse is scoped
+to SQLite ownership; the tolerant root-string helper used by injection and catalog reads is unchanged.
+
+> Decision record: [ADR-0007](decisions/ADR-0007-codex-home.md)
+
+Native-main profile ownership is bound to the real `CODEX_HOME`, not to an OpenCodex instance.
+Its encrypted vault, transaction journal, recovery marker, and referenced quarantine files live in
+the owner-only `.opencodex-native-main-profiles` directory. The unchanged
+`.opencodex-native-profile.lock.sqlite` beside that directory serializes every process sharing the
+home. Only plaintext login staging is instance-local under
+`$OPENCODEX_HOME/native-main-profile-staging`; a stage from one instance is invalid in another.
+These paths and the OS keyring are owner-only: the operating-system account that owns them is the
+trust boundary and already has direct access to active native credentials. OpenCodex detects and
+fails closed on file identities that change during an operation, but it does not claim isolation
+from a malicious process already running as that same trusted OS account.
+
+Startup and the periodic stage cleaner do not acquire the profile transaction lock when both the
+stage registry and this instance's staging tree are proven absent. This keeps an unused profile
+subsystem from fencing native traffic or creating lock contention. Presence, an unsafe entry type,
+or any observation error still takes the locked sweep and fails closed; the fast path is based only
+on proven absence, never on an unreadable path.
+
+Native-main admission is one process-global gate. Releasing the last reference to a startup entry
+returns a snapshot published by that startup generation to the process-initial `ready` state
+synchronously, before the release awaits anything, so a server stopped in the middle of startup
+convergence cannot leave the process fenced for the servers that follow it. A same-home recovery
+fence published independently by a profile transaction survives release. An entry created
+afterwards for the same home arms its own gate, and the retired generation's late convergence
+writes are ignored.
+Recovery-completion provenance is separate from the convergence promise: release retains the owner through the pending recovery and its following stage sweep.
+`tests/codex-integration/native-profile-startup-release.test.ts` pins that ordering.
+
+A sibling instance is `ocx start --port <other>` while a live proxy serves the configured port, or a start where the cross-home owner check proves a different live proxy at a managed client destination. It gets past the spend-ledger
+lease only with its own `OPENCODEX_HOME`, and still shares this Codex home, `~/.claude`, `~/.grok` and
+the launchd domain with the live owner. `handleStart` marks the process through
+`src/codex/sibling-start.ts` before the server binds, and the mark is one-way for the process's
+lifetime. The cross-home check follows same-home discovery and precedes journal reconciliation. It reads the default home's protected runtime record plus every home nominated by the shared owner registry, plus managed Grok and Codex loopback URLs as location hints. The registry (~/.opencodex/ocx-homes/<hash>.json, home path only, written beside runtime-port.json publication; OCX_OWNER_REGISTRY_DIR overrides the anchor for tests only) is the locator that lets one custom home find another; it lives in OpenCodex's own namespace, never inside a protected client home, and pointers whose home no longer publishes a record are pruned before the reader's entry cap while a truncated listing fails closed as indeterminate. It accepts a different process only when the listener's PID matches a record and a fresh `/healthz` challenge proves possession of its attestation secret; an unauthenticated listener at a stale managed destination is not an owner, and a sole custom-home start still syncs. When a managed destination answers but ownership cannot be decided - a live listener no registered record names, a legacy record without an attestation secret, or an unreadable transport - the verdict is indeterminate and the start still takes the sibling mark, so a competing owner never rewrites shared clients on unverifiable evidence. The mark closes `localClientSyncAllowed` in `src/codex/desired-state.ts` with its own skip reason
+`sibling`, so startup sync, cache invalidation, Grok, the retained catalog writers and the native-main
+lifecycle stand down (the sibling runs the no-op lifecycle, so it never contends for the owner lease;
+its data-plane `auth.json` refresh still runs under the machine-wide exclusive claim). Owner-level
+checks cover what the gate reads backwards or never reaches: both restore entry points and the
+injector return before their external-provider journal cleanup, the management catalog funnel,
+`src/integrations/catalog-refresh.ts`, `connectClient`/`syncConnectedClient`/`disconnectClient`,
+the Claude roster and system env refuse, the exit teardown comes from `decideStartExitTeardown`, and
+`POST /api/stop` answers `sharedTeardown: "not-owned"` without touching the service manager. The guard refuses the native-main
+profile and reauth routes among the others listed in
+[`gui-and-management-api.md`](gui-and-management-api.md#api-ownership). The runtime record carries
+`siblingOfPort`, and `ocx stop` of such a runtime, live or left behind by a hard kill, claims no
+receipt, runs no shared teardown, does not revert the system env and does not ask the service
+manager: a sibling never runs under one, so an installed service is the live owner's. When the
+recorded sibling no longer answers and discovery reaches the owner instead (`siblingStopFoundOwner`),
+the stop leaves that proxy running, clears the stale sibling records and exits 0. A clean sibling
+exit removes that record; a later `ocx stop` refuses a discovered listener unless it proves possession of this home's runtime-record secret through a fresh `/healthz` challenge, so the configured-port fallback cannot stop the owner. The sibling's own drain-and-restart (`src/server/management/system-restart.ts`) and standalone recycle
+(`src/client/runtime.ts`) hand the mark to their replacement through `OCX_SIBLING_OF_PORT` and
+`OCX_SIBLING_HANDOFF_NONCE`, backed by a one-use `src/codex/sibling-handoff.ts` record bound to the
+prior sibling runtime and `OPENCODEX_HOME`. Connected-client recycle issues it before stopping
+the listener or removing that runtime record. `handleStart` consumes the record before any probe;
+a forged port env or replay grants no sibling status. A valid replacement stays a sibling while
+the owner is down, and its journal recovery remains skipped.
+Every other detached `ocx start` (`ocx ensure`, the tray, the `ocx claude`/`opencode`/`minimax`
+auto-start and the updater's restart) starts an ordinary owner and strips an inherited marker
+through `withoutSiblingMarker`.
+
+The startup sync is not the owner's last look at `config.toml`. Once it settles, `handleStart`
+starts `src/codex/routing-healer.ts` in an unmarked owner (never in a sibling or the
+connected-client runtime), and the exit cleanup stops it before any teardown. An unref'd timer
+reads `config.toml` every 10 s; unchanged bytes cost nothing more. `src/codex/routing-drift.ts`
+calls routing foreign only when it is opencodex-owned (the marker line, the journaled value, or the
+`opencodex` provider table), names a loopback endpoint with an explicit port that is neither the
+bound port nor the loopback listener's, and no external `model_provider` is selected, so native,
+user, custom, external, restored, LAN and admission-token routing never is. Every distinct foreign
+hostname and port is probed with `probeEndpointLiveness`: a live opencodex is left alone with one
+log line per endpoint, `unknown`
+never advances the streak, and a heal needs dead on at least two probes spanning 20 s, dead again
+on a final probe, and every gate open (no sibling mark, no recycle or drain, the runtime record
+names this process, Codex ON and not hub-gated, no admission-token routing, a write target this
+process serves, no client connection and no client-owned journal). The heal is
+`injectCodexConfig` with no catalog path, a 1 s lock timeout and a synchronous `beforeClientWrite`
+guard that re-reads `config.toml` under the lock and aborts if any admitted bytes or destination
+endpoint changed. A coordinated
+home re-reads its admission under the lock before that guard runs, so a rewrite between plan and
+lock comes back as a stale-admission refusal instead: any refused or failed write whose
+`config.toml` bytes moved since the proof is the same abort, with no wait and no warning, and the
+next heal needs a fresh streak. A busy lock retries on the next tick. A refusal over the proven
+bytes waits 10 minutes, and that wait ends once routing is no longer foreign. Six attempts, or a
+fourth heal, within an hour pause probing and writing until the oldest one leaves the hour; the
+loop then resumes with a fresh streak and never stops for good. An `unknown` answer is asked again
+every 30 s, not every tick. Each heal prints one warning; a failure line carries only the first
+message line, with home paths masked. Detection, gates and probes read the
+journal only through the read-only accessors, `journalOwner({ readOnly: true })` included, so
+watching never deletes an unreadable journal; only a heal write goes through the injector's
+ordinary journal handling. Threads Codex opened while routing named the dead port keep that address until they are
+reopened. `ocx status` reports the same drift, also while the loop is gated off, through
+`codexRoutingDriftWarning` in `src/cli/status.ts`, which reads the journal the same read-only way.
+It says nothing in a sibling's home, whose routing names the owner beside it, and it promises only
+`ocx sync`, because it cannot see whether a healer runs, is gated, or is paused.
+
+The native main slot also accepts one same-identity device reauth (#3898):
+`/api/codex-auth/main/reauth-device` (start/status/cancel) plus
+`ocx account main reauth`. The grant is the OpenAI deviceauth grant already
+used for pool accounts, but nothing routes through the pool login surface —
+`/api/codex-auth/login` keeps rejecting `__main__` — and the commit is a
+sibling of the refresh write: same-identity check against the snapshot
+captured at start, owner-independent exclusive claim (a headless hub runs no
+owner lifecycle), path/hash/inode re-verification inside the claim, and one
+atomic write of access/refresh/id token + account_id. The old identity token
+is never retained beside the new grant. No claim is held while the human
+completes the device page, and no DTO, log, or error carries tokens, emails,
+or raw account ids. Cancellation is bound to the commit's exclusive claim and
+is rechecked immediately before publication, so a cancel delivered while the
+claim is contended aborts the wait and a cancelled flow cannot replace
+`auth.json` or clear its reauthentication quarantine. A cancel that arrives
+after the write still reports `succeeded`: the credential was replaced, so
+that is the honest terminal.
+
+> Decision record: [ADR-0008](decisions/ADR-0008-codex-home.md)
+
+The native-write coordinator is keyed by the canonical `CODEX_HOME` in the effective-user runtime
+namespace. A pathname alone is not authority: SQLite can expose a zero-byte file before its first
+schema write, and a terminated process can leave that remnant behind. Eligibility treats the file
+as non-authoritative only after an immutable SQLite read proves version zero with no tables, the
+filesystem identity remains unchanged, and the file has been settled for at least one second; a
+fresh zero-byte creator stays on the coordinated path so its lock cannot be bypassed. `ocx doctor` inspects the
+coordinator with immutable read-only SQLite flags so diagnosis never creates WAL/SHM sidecars. It
+distinguishes absent, zero-byte, unversioned, rowless, valid, unsupported, changed, unsafe, and
+unreadable states and prints the exact path. Explicit recovery is available only after the proxy is
+stopped and only for a proven zero-byte state. The command revalidates the same private
+regular-file identity under a non-blocking SQLite write lock and moves it to a same-directory
+backup; it never deletes or auto-adopts legacy routed residue.
+
+> Decision record: [ADR-0009](decisions/ADR-0009-codex-home.md)
+
+OpenCodex never overrides an explicit `CODEX_HOME`. On Windows, `ocx doctor` and `ocx status`
+nevertheless diagnose the high-confidence Orca dual-home case: both `CODEX_HOME` and
+`ORCA_CODEX_HOME` select Orca's `orca/codex-runtime-home/home`, while the ChatGPT/Codex app uses the
+default `%USERPROFILE%\\.codex`. Sync and restore output always prints the exact target Codex home;
+display and JSON paths redact the OS username. The diagnostic tells users to invoke OpenCodex with
+the app home explicitly rather than silently claiming that an unrelated app was configured. If a
+service was installed under the Orca home, it must first be uninstalled from that original Orca
+environment and then reinstalled under the app home; changing only the current shell cannot migrate
+the recorded service ownership.
+
+> Decision record: [ADR-0010](decisions/ADR-0010-codex-home.md)
+
+`atomicWriteFile` uses a temp file named `{path}.ocx.{pid}.{seq}.tmp` (process ID + incrementing
+sequence number) to avoid collisions when concurrent writers (e.g. `ocx stop` and the proxy's own
+shutdown handler) both restore Codex config simultaneously. The temp is renamed atomically into place.
+Storage cleanup run metadata uses the field-scoped persisted-config mutation path, so a background
+Worker cannot restore unrelated API keys or provider settings from a snapshot read before the lock.
+If that metadata write is unavailable after cleanup has already completed, the job retains the
+cleanup outcome and exposes a bounded persistence error instead of relabeling the run as a Worker failure.
+
+Cleanup manifests and satellite backups share the stage-local atomic publisher: an exclusive
+private temporary file is fully written and file-synced before the existing Windows-tolerant
+rename replaces the destination. Handled publication failures retain the previous record;
+directory syncing remains best-effort. This does not make a partial permanent purge reversible:
+restore still fails closed when a recorded logical entry has no surviving file.
+
+Windows secret-file hardening resolves the effective token SID through an absolute, trusted
+PowerShell path before granting the owner and removing inherited broad ACL entries. The normal
+path obtains System32 from `GetSystemDirectoryW`. Windows ARM64 Bun builds that cannot execute
+`bun:ffi` use a narrower ACL-only fallback to the fixed protected default installation path
+`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`. The fallback never applies to UAC or
+Task Scheduler launch, never consults environment variables or `PATH`, and fails closed when the
+fixed executable is absent.
+
+Direct PowerShell children rely on the process launcher's `windowsHide`/hidden-host mechanism and
+must not also receive the PowerShell CLI pair `-WindowStyle Hidden`. On affected Windows 11 systems,
+Bun 1.3.14 exits that direct invocation before the command runs, which turns a valid SID or process
+lookup into `EACLIDENTITY` or a failed sync. This does not apply to `Start-Process -WindowStyle
+Hidden` inside an already-running PowerShell script, nor to .NET/VBS process-window settings.
+
+> Decision record: [ADR-0011](decisions/ADR-0011-codex-home.md)
+
+> Decision record: [ADR-0012](decisions/ADR-0012-codex-home.md)
+
+The durable response-spill directory `~/.opencodex/responses-state-spill/` is bounded in
+aggregate, not only per file. Continuation state demoted out of the in-memory cap
+(`MAX_STORED_RESPONSE_BYTES`) is written there, and eviction past
+`MAX_SPILLED_RESPONSE_BYTES` removes oldest-first through the same deletion point that serves
+TTL and count eviction, so an evicted entry unlinks its file. One function owns that ceiling and
+three callers drive it: mutation pruning, the lazy load that follows a restart, and the periodic
+sweep. The periodic caller is not redundant — the mutation path runs only when traffic arrives, so a
+process that comes up over budget from a snapshot written under a larger ceiling would otherwise
+stay over it while idle.
+
+The ceiling bounds what the store can account for, which is every entry in the map plus the
+superseded generations queued for unlink, and deliberately not the directory as a whole. Spill files
+orphaned by a crash are absent from the map, so this accounting can neither see nor price them; they
+are reclaimed by `recoverOrphanedResponseSpills`, a bounded scan that unlinks owned names past
+`RESPONSE_SPILL_ORPHAN_GRACE_MS` unless the process still references them — referenced means a live
+spill stub, a superseded generation queued for unlink, or a queued or in-flight publication's temp,
+destination, or superseded file. The sweep runs once inside the lazy load and again on each liveness
+tick with the tighter `PERIODIC_SPILL_SWEEP_OPTS` bounds, so orphans created mid-run do not wait for a
+restart. A host that crashes repeatedly can therefore hold spill bytes above
+this ceiling for up to `RESPONSE_SPILL_ORPHAN_GRACE_MS` past each crash. Without that aggregate bound the
+directory was limited only per file (256 MiB) and per entry (1000) — a 250 GiB product — which
+left `RESPONSE_TTL_MS` as the only effective limit and made disk use a function of client
+request rate rather than of anything the process controls. The durable snapshot that
+re-establishes these references after a restart is budgeted too, and its bounded stub and
+tombstone rows are selected before resident payloads under that budget, so a full resident
+cohort cannot crowd a spill reference out of `responses-state.json` and strand a file the
+store still owns.
+
+> Decision record: [ADR-0013](decisions/ADR-0013-codex-home.md)
+
+Response-state loading performs a bounded recovery pass for interrupted snapshot writes. It only
+matches regular files named `responses-state.json.ocx.<pid>.<sequence>.tmp`, waits at least 15
+minutes, and skips the current or any live PID. Eligible files are truncated before unlinking so a
+matching stale path is unlinked without following it. Path-based truncation is intentionally avoided:
+a same-user replacement could otherwise turn cleanup into a write through a symlink. Unrelated
+temporary files, symlinks, directories, and young/active writes are never touched; directory entries
+are consumed incrementally and at most 512 stale files are attempted per process start.
+
+> Decision record: [ADR-0014](decisions/ADR-0014-codex-home.md)
+
+Windows runtime response spills never wait on `icacls` through `Bun.spawnSync`. Linux and macOS
+retain the immediate synchronous publication path. On Windows, the resident continuation enters one
+serialized publication queue and remains replayable while `hardenSecretDirAsync` and
+`hardenSecretPathAsync` run. Publication installs a spill stub only when the map still contains the
+same resident object; a superseded job deletes its newly published file instead of overwriting newer
+state. Pending payloads are pinned and capped at 256 MiB, so an ACL outage cannot grow an unbounded
+queue or be misreported as evictable memory. One caller-owned retry is allowed after a real
+`ETIMEDOUT`; the first timeout does not install a `spill-failed` tombstone. Required ACL failures
+remain fail-closed after that bounded recovery. Optional config-directory hardening uses a separate
+per-directory async single-flight, while required config mutation writers retain their existing
+awaited or synchronous fail-closed boundary.
+
+Each ordinary async spill write attempt owns one 30-second ACL budget shared across directory, temp,
+and exclusive-copy destination hardening; the single timeout retry receives one fresh whole-attempt
+budget. No harden step may reopen an independent 30-second window inside either attempt.
+Both icacls and effective-principal subprocess waits are settlement-bounded: at deadline the child is
+killed, unref'd, and abandoned without awaiting `proc.exited`. The caller-level deadline also bounds
+injected/shared runners, so a child that ignores termination cannot pin the serialized spill queue.
+
+Graceful shutdown drains that serialized publication queue to a stable fixed point before snapshot
+serialization. The drain has a wall-clock cap with a reserved synchronous fallback budget; expiry
+supersedes the async writer, claims and removes any temp or destination it still owns, and only then
+starts fallback publication. The writer rechecks supersession before no-replace publication, while
+the fallback splits its reserve across the directory and file ACL hardens. This ordering is
+load-bearing because resident entries over 2 MiB are deliberately excluded from
+`responses-state.json`: serializing first could omit the resident before its durable spill stub
+exists, losing the continuation on restart. Cleanup is attempted for every abandoned writer; any
+failure is retained while fallback and snapshot persistence continue, then returned through the
+shutdown status so process exit is non-zero without sacrificing unrelated replay state.
+If the fallback reserve expires, every remaining resident candidate is terminalized as a bounded
+`spill-failed` tombstone before pruning, so no payload remains eligible for shutdown requeue and the
+snapshot flush always regains control.
+The terminalization pass itself is hard-capped at `MAX_STORED_RESPONSES + 1`; exceeding that
+structural bound records a bounded failure, fail-closes every remaining resident, and returns control
+to snapshot persistence instead of relying on the progress argument alone.
+
+> Decision record: [ADR-0015](decisions/ADR-0015-codex-home.md)
+
+## Config-backed catalog removals
+
+A refresh removes a provider's OpenCodex-authored routed rows wholesale only when config.json agrees
+the provider is gone (#6529). `src/codex/catalog/routed-removal.ts` lists the namespaces whose rows
+are in the active catalog, missing from the candidate, and not enabled by the driving config. Native
+aliases and combo-owned rows with the generated description prefix count as `combo`, including bare
+and slashed aliases; ownership alone does not establish authorship. Foreign and trusted account-bound
+rows never count. Both catalog writers —
+retained sync (`ocx start`/`ensure`/`sync`) and the convergence commit (management writes, login,
+auto-refresh) — hold the catalog lock K, then config mutation lock C, from the config.json
+re-read through replacement. A busy C also refuses the retained sync write. When the file is
+missing, unreadable or salvaged, or still enables one of those namespaces, the write is refused and the
+active catalog and models cache keep their bytes, so a config-less process (an empty
+`OPENCODEX_HOME` reads defaults, which route nothing) cannot publish a native-only catalog into this
+home. Removals inside an enabled namespace (discovery, disabled models, deleted custom rows) and
+catalogs without routed rows are unaffected; see the [shared catalog](catalog.md#shared-catalog).
+`ocx sync` reports the refusal as one count-only warning, and `ocx restore` stays the deliberate way
+to drop routed rows. Coverage: `tests/codex-integration/codex-catalog-routed-removal.test.ts`,
+`tests/codex-integration/codex-catalog-sync-hardening.test.ts`, and
+`tests/codex-integration/codex-convergence-contract.test.ts`.
+
+## Catalog writer ownership and intent
+
+`src/codex/codex-home-owner.ts` reads the injection journal's `opencodexHome` binding without modifying recovery evidence. A readable legacy journal has no binding; the next injection records its owner. Canonical aliases of the same physical OpenCodex home remain owned. A proven vanished home is stale and can be adopted, while foreign active or unknown ownership refuses writes. Every acquisition rechecks ownership under K before issuing its live permit; later calls re-evaluate the evidence.
+
+Injection and both native-restore paths check ownership before cleanup and at publication. The exported journal snapshot and injected-state writers also check ownership themselves before mutation, including direct calls; a foreign binding protects both its identity and recovery metadata. Successful deliberate config/profile restoration releases ownership at the native restoration boundary. Exact restoration removes the journal; successful field-level restoration preserves its recovery data and releases only the home binding. Catalog-only restore retains the binding. A later catalog failure remains a failed artifact. This does not add a new transaction across native and catalog restoration or guarantee custom-path recovery after the original journal was released.
+
+Each `withCatalogWriteSerialization` call supplies `refresh`, `cache`, `pull` or `restore` intent and a writer label. The existing permit registry binds that context to one live acquisition. `src/codex/internal/catalog-writer.ts` skips identical catalog/cache bytes and preserves their mtime. A refresh cannot clear all routed rows without readable file-backed config; restore deliberately clears them, pull keeps the hub's authority, and a cache permit cannot replace the catalog. Remote pull accepts an unchanged derived cache as success. Sync and sync-cache report owner refusals without private paths.
+
+These checks coordinate cooperating processes running as the same OS user. They do not isolate files from an arbitrary process with that user's direct filesystem access.
+
+## Catalog write audit
+
+Catalog and cache writes and admission refusals leave bounded diagnostic records through `src/codex/catalog/write-audit.ts`. The catalog serialization owner coordinates every append and compaction under K; denied writers never receive a publication permit. Identical bytes produce no event. Audit failure preserves the catalog operation's outcome.
+
+Records contain fixed categories, time and process identifiers, redacted bounded home identity, routed counts and config provenance. They contain no model/provider names or raw command arguments. Each event is at most 2 KiB; retention keeps complete newest records within both 256 KiB and 400 records. Reads are bounded to the tail. On POSIX, owner creation is private and regular-file-only; a foreign writer can append only to an existing valid file within capacity, without creating or compacting it. Windows owner creation uses an exclusive blank file and required NTFS ACL hardening with a one-second deadline before diagnostic bytes, checking descriptor/path identity before and after hardening and refreshing metadata after legitimate ACL changes. ACL failure or timeout leaves the new file blank and skips the diagnostic. Existing Windows files are skipped by owner and foreign callers without ACL mutation because no read-only NTFS privacy verifier exists; mode 0600 does not establish NTFS privacy. Consequently Windows records at most the first event in a newly created audit file: subsequent events are skipped in the same process and after restart. This fallback does not provide a complete Windows audit stream; a failed initial harden leaves a blank residual and later events remain skipped.
+
+The audit artifact is `opencodex-catalog-audit.jsonl` under the Codex home. New owner-created files with file-backed config attempt existing uninstall registration. A separate Codex home lies outside the config manifest's ownership root, so its audit remains an explicit cleanup residual; this does not broaden uninstall deletion authority.
+
+## Owner catalog healing
+
+`src/codex/catalog-self-heal.ts` is preloaded without timers before the owner's startup sync. `src/cli/claude-agent-startup-sync.ts` forwards the sync readiness verdict and starts observation synchronously on successful settlement, before deferred Claude roster or Desktop registry awaits. Successful no-op and OFF syncs establish observation; OFF remains gated until enabled, and failed sync never adopts a baseline. Observation stops before teardown. Its unreferenced 30-second timer observes the selected catalog's file identity and parses bounded regular-file content only after a change. Importing admission or catalog writers starts no timer.
+
+A lost routed namespace is repaired through ordinary management convergence only while its provider remains enabled and the owner is idle: no sibling, shutdown/recycle, connected client or client-owned journal; integration remains enabled, runtime ownership is current, and the Codex-home binding permits this writer. A synchronous precommit guard rechecks lifecycle, path and ownership inside K→C after gathering. Observation reuse, target changes, publication/release, precommit/postcommit and expected-target admission compare native realpaths with `samePath`; if either realpath is unavailable they use lexical `samePath`. Null selections remain unavailable. Directory symlink aliases and Windows casing refer to the same target; distinct paths and hardlinks do not. Missing/corrupt selected custom catalogs remain unavailable; healing does not select another target implicitly.
+
+A matching committed owner publication establishes the baseline even while lifecycle gates prevent healing; baseline acceptance performs no write. Publications during this healer's own convergence remain fenced until its terminal result. Deliberate restore/native release fences pending work and clears retry state; successful owner empty publication is accepted. Failed or refused convergence retains an explicit pending retry, including catalog-success/cache-failure when no missing namespace remains on disk. Retries wait five minutes and obey rolling limits of six attempts and three successful heals per hour. Successful convergence accepts its result, while configuration deletion or a target change retires the old obligation. These are local cooperative recovery rules, not proof of installed Desktop or live-provider behavior.
+
+## Codex-home diagnostics
+
+Desktop executable membership uses the [discovered installation root](runtime.md#codex-desktop-process-membership), independently of the Codex state directory resolved here.
+
+Some Codex-home conditions are reported rather than repaired, because repairing them would overwrite
+a deliberate user choice:
+
+- Bundled-plugin marketplace state on Windows (`src/codex/plugins-doctor.ts`), surfaced by
+  `ocx status`.
+- Project-level Codex config that bypasses managed routing
+  (`src/codex/project-config-warnings.ts`), surfaced by `ocx doctor` as a warning rather than an
+  override. Project candidates and opened handles must be regular files of at most 1 MiB;
+  nonblocking descriptor reads reject changed size or timestamps. Global config reads are unchanged.
+
+Codex display-cache expiry, retained blocking main-policy evidence, and reset history follow the
+[quota cache contract](providers/openai-tiers.md#quota-cache-and-short-window-history).
+
+Plan-based automatic exclusions leave native credential files untouched and preserve the native-main exemption in the [selection policy](providers/openai-accounts.md#automatic-pool-plan-exclusions).
+
+## Prompt text probe
+
+`src/codex/prompt-text-probe.ts` reports the prompt Codex assembles for the resolved Codex home. It
+runs `codex debug prompt-input` in that home, bounded in time and in bytes, maps each rendered section
+onto a layer, and takes no caller-supplied directory. Captured process output is never serialized
+back: a failure is a classified kind plus a fixed phrase and the resolved command.
+
+The base prompt is absent from that output, because Codex discards `base_instructions` before
+rendering `prompt.input`. It is read from configuration instead, and it is read before the subprocess
+starts, so an unresolved Codex runtime, a failed probe and a cancelled request all still answer with
+it. Precedence follows Codex: a `model_instructions_file` decides the answer whenever the key is set,
+including when the file it names is missing, blank or unreadable, and otherwise the selected model's
+catalog row supplies `base_instructions`, with `model_messages.instructions_template` as the fallback.
+Only the first form is reported as text Codex sends. A template is reported as a template and the
+legacy `base-instructions` layer slot carries no text for it: that slot has five coarse reasons and no
+representation, and its dialog labels every readable layer as text sent to the model.
+
+Each configured source is opened once, non-blocking, and read to at most the probe's byte ceiling,
+which is what keeps a FIFO, a device node or an oversized file from stalling or ballooning a
+synchronous request. The regular-file check reads the opened descriptor rather than the path, and the
+whole TOML document parses before any key from it is trusted, because Codex rejects a malformed
+config outright. Every failure is a reason on the response rather than an exception, so the
+management read degrades instead of returning an error page.
+
+## Paginated history writer boundary
+
+`src/codex/history-provider.ts` rejects provider-history changes with `history_paginated_requires_native_writer` when a target begins with an ordinal-bearing record, later contains a paginated record after a legacy start (#4311), or declares `history_mode=paginated`. The first line alone is not sufficient: a rollout that started unnumbered and was later migrated is also refused. Apply, manifest-backed restore, and explicit legacy recovery preflight all selected targets before changing database rows or manifests. The append boundary checks again. Codex owns ordinal allocation and the live projection cursor; reading the last ordinal and appending N+1 is not safe concurrent coordination. Legacy unnumbered rollouts retain their existing behavior. History Worker targets resolve the canonical manifest first and an existing pre-normalization Windows filename second, so passing an explicit target cannot bypass upgrade recovery. This guard prevents the observed stable-format corruption; it does not implement native-writer integration.
+
+Injection preflights affected history using the normalized config candidate before writing config/profile/journal, then checks again after the complete artifact write. Native restore also rechecks after successful journal restoration or fallback removal, while exact config/profile/journal preimages and any coordinated remove transaction remain available for compensation.
+
+The preflight opens the state store read-write-free and in that order deliberately. `{ readonly: true }` is the primary open and the only one that joins a live writer's WAL shared memory, so a thread another process just migrated to paginated history is visible and refuses here. A WAL store whose last writer closed cleanly has no `-shm` to join and a read-only connection may not create one, so that open fails `SQLITE_CANTOPEN` on a perfectly healthy store and the catch-all turned it into `history_injection_preflight_unavailable` on every attempt (#4943). The immutable fallback (`immutable=1` over a `file:` URI, the same idiom as the storage scanner and the log-guard inspector) is admitted only when neither `-wal` nor `-shm` is on disk, because that is the state in which the main database is the whole store and an immutable read is exact rather than stale. Either sidecar present, or any other open failure, keeps the original error and the refusal that follows: an immutable read is a snapshot, and a refusal this preflight fails to observe is a config transition over history Codex owns. The guard covers the whole primary attempt, not only the constructor. `sqlite3_open_v2` never reads page 1, so a WAL header is not inspected until the first prepare, and on macOS that is where the absent `-shm` is raised; the first read therefore happens inside the attempt, where the error can still be classified. Bun's bundled SQLite on Linux materializes both sidecars on that same read and never fails, which is why Linux and Windows evidence could not see this gap.
+
+What a detected migration does depends on which refusal it is, and on direction. The reason that stands down is one exported constant, `HISTORY_RELABEL_STANDS_DOWN` in `src/codex/history-provider.ts`, because apply and restore have to agree on it exactly and once did not.
+
+On apply, that reason retires the relabel unit and the config/profile/journal write stands when the admitted candidate preserves any existing provider table. Retention is decided before witness construction and does not depend on history preflight passing: apply keeps any existing provider definition while selecting the requested root provider. This also protects references when native migration begins after artifact commit or during worker startup, without compensating over newer native writes. Background worker failures remain reported, and candidate bytes never change after admission. Any other reason there — an unreadable state database, a changed rollout identity, a preflight that could not run — may succeed on a later attempt, so it still restores all three preimages before returning a structured refusal, including on legacy-uncoordinated homes.
+
+`history_paginated_openai_requires_native_writer` is the one apply-side reason that is neither of those. It means a provider-table transition found an `openai`-tagged row already paginated, and the transition as planned would take the root `openai_base_url` out from under it. `applyPaginatedOpenaiCompat` in `src/codex/inject/paginated-openai-compat.ts` resolves it in the same window as the provider-table retention above, before the witness: it keeps the marker-owned root override beside the table and downgrades the reason to the stand-down constant, so the relabel unit never starts and the paginated row is neither read nor written. The retained line is journaled as OpenCodex's own, which is what lets restore remove it later; a line the user owns is left in place and journaled as theirs. Only an admission-token form still refuses, because Codex's built-in `openai` entry cannot carry `x-opencodex-api-key`, and that refusal names the configuration that resolves it rather than telling the operator not to retry (#5321).
+
+On restore and removal, that same reason no longer refuses the config half. It selects a degraded restore: every OpenCodex root routing key comes out, `[model_providers.opencodex]` is retained verbatim including its ownership marker, and the history relabel is skipped rather than attempted. The retained table is captured from the pre-transform bytes and re-appended into the same buffer, so the write is one atomic transformation — a config carrying root `model_provider = "opencodex"` without a matching table fails the whole Codex config load, not one thread, which makes that intermediate state strictly worse than the routing it replaces. If an exact journal restore brings back a same-named provider table, retention accepts it only when the parsed provider values match. `src/codex/inject/provider-table.ts` captures lossless table spans using the shared lexical lines in `src/codex/toml-source-lines.ts`, also consumed by the native defaults editor. Header-shaped text and blank lines inside multiline values stay intact; only the isolated provider block is parsed so unrelated large integers do not prevent retention. Capture and removal own only an adjacent structural comment whose trimmed text is exactly the bare ownership marker or its routing undo-hint form; marker substrings in user comments and multiline values remain untouched. Root URL and web-search ownership likewise requires an exact adjacent structural marker and a complete root assignment, with quoted keys decoded as TOML keys. Journal-recorded injected values are separate ownership evidence for marker-less app rewrites. Managed root assignment edits consume their complete validated lexical spans; value-free removal and capture accept scalar TOML integers throughout the signed 64-bit range without JavaScript number decoding, while value-based ownership still requires decoded values and malformed assignments refuse; the web-search journal field retains the whole replaced assignment, including multiline values, for re-enabling or fallback restore. Catalog and feature edits exclude header/key-shaped multiline data. Fallback blank-line normalization applies only to structural document lines, preserving opaque multiline values. Cosmetic spacing and comments do not change equality, but multiline string contents do. Invalid, duplicate, array-root or unsupported inline provider definitions refuse; retained bytes are never regenerated from parsed values. A different table fails the restore and compensation reinstates the pre-restore files rather than rebinding tagged threads to another destination. `resolveRestoreHistoryDisposition` in `src/codex/inject/restore.ts` is the single place that reads the preflight reason and answers the separate question of whether routing may come out. Every other reason keeps the hard refusal and compensates on every artifact, because retiring a provider definition its thread rows still name would orphan them. A failed config restore stops catalog/history work; coordinated restore rolls back its published remove transition. Legacy first-line provider patches are bound to the validated file identity before and after writing. These compensating checks do not provide a native-writer lock or authorize external ordinal allocation.
+
+The legacy external writer is now refused for affected rows in any store whose schema includes history_mode, even while their row mode is still legacy. This deliberately sacrifices automatic relabeling on migration-capable stores rather than racing native conversion. It no longer costs the home its ability to be uninstalled: synchronous and asynchronous restore, inline journal restore, and direct config removal all take routing down on that reason while keeping the provider table, so an already-paginated home can be stopped and uninstalled and plain `codex` returns to the built-in provider. Rows naming `opencodex` still resolve through the retained table; their requests reach a proxy that is gone and fail with an ordinary connection error, which is a per-conversation failure rather than a broken config. `ocx restore --remove-codex-provider-table` removes the table for a user who accepts that those conversations stop opening; nothing selects it implicitly.
+
+Provider-table routing can leave retained rows tagged `openai` while new rows use `opencodex`. Some native app-server/mobile versions scope an omitted `thread/list.modelProviders` filter to the default provider and therefore hide those retained rows; an explicit empty provider list includes all providers. The native app-server owns this RPC and the remote client talks to it directly, so the inference proxy cannot repair the filter. A successful sync/start and the dashboard's active provider-table setting show the warning; failed root routing and inactive settings do not, and the dashboard renders it once when both preferences are stored. They do not relabel history for presentation: preserving Codex's paginated-writer boundary is more important than making an incompatible remote list complete.
+
+> Decision record: [provider-table remote history visibility](decisions/ADR-5848-provider-table-remote-history-visibility.md)
+
+A degraded restore reports `artifacts.config.state = "partial"` with `action = "routing-restored-provider-retained"`, carries the retained lines and the follow-up command, and leaves `historyPreflightRefusal` unset — that field still means nothing was attempted at all, and a stop obligation that was in fact discharged must release its receipt rather than preserve it.
+
+Native restore preflight also checks manifest-owned targets whose rows already returned to `openai`, including interrupted restores. Preimage capture distinguishes absent files from unreadable artifacts and aborts before mutation when a complete snapshot cannot be read.
+A config restoration that was attempted and failed retains its failed artifact in the restore
+result; unattempted catalog and history artifacts remain skipped. Successful preimage compensation
+preserves config/profile/journal bytes without relabeling the failure as a skipped operation.
+Incomplete compensation still raises the explicit partial-write error.
+
+The [explicit model-capability contract](config.md#explicit-per-model-capability-declarations) preserves operator declarations through provider storage and catalog capture; it does not infer upstream capability or change this surface's routing behavior.
+
+Exact [model input declarations](config.md#explicit-per-model-capability-declarations) now feed text-only eligibility and catalog hints; existing image-description/omission handling consumes them before the main upstream send.
+
+Provider-scoped approval reviewer settings are projected by the [catalog owner](catalog.md#provider-scoped-approval-reviewer); this surface retains its existing routing, transport and account-selection behavior.
+
+Private pool credential metadata follows the [quota-history publication identity contract](providers/openai-accounts.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
+
+Pool quota producers and account commands follow the [bounded raw-observation contract](providers/openai-accounts.md#bounded-pool-quota-observations), separate from the latest display snapshot and capacity estimates.
+
+The account history response can include a [low-confidence effective capacity estimate](providers/openai-accounts.md#observed-effective-token-capacity); usage normalization retains local-answer provenance so local responses cannot supply samples.
+
+Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-accounts.md#reset-first-account-ordering), including independent-quota fallback, preserved affinity, strategy-specific threshold summaries, and shared short-observation freshness for switch warnings.
+
+Upstream API-key usage follows the [physical-attempt account attribution contract](dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
+
+Stored Direct substitution follows the [credential identity contract](providers/openai-accounts.md#sidecars-management-and-ui): both synchronous and asynchronous materializers discard the caller account header before applying the stored credential; ordinary native Direct passthrough is unchanged.
+
+Native-main owner claims and credential-generation backoff remain authoritative during [priority failback priming](providers/openai-accounts.md#ongoing-priority-failback); the preference grants no access through a fenced main profile.
+
+Automatic account exhaustion and recovery use the [spendable Codex credit evidence contract](providers/openai-tiers.md#spendable-codex-credits), including independent freshness, upstream refusal, and reset-ticket separation.

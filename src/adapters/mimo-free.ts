@@ -6,6 +6,8 @@ import { recordOwnedConfigPath } from "../lib/config-ownership";
 import type { OcxProviderConfig, OcxParsedRequest } from "../types";
 import { createOpenAIChatAdapter } from "./openai-chat";
 import type { ProviderAdapter, AdapterRequest, IncomingMeta } from "./base";
+import { createAdapterPhysicalSend } from "./physical-send";
+import { SendBudgetExhaustedError } from "../lib/upstream-retry";
 
 const BOOTSTRAP_URL = "https://api.xiaomimimo.com/api/free-ai/bootstrap";
 export const MIMO_CHAT_URL = "https://api.xiaomimimo.com/api/free-ai/openai/chat";
@@ -103,19 +105,19 @@ export function resetMimoJwtCache(): void {
   inFlightJwt = null;
 }
 
-async function fetchJwt(signal?: AbortSignal): Promise<string> {
-  // Bounded bootstrap: request-abort propagates, and a stalled bootstrap can never
-  // hang past BOOTSTRAP_TIMEOUT_MS.
+async function fetchJwt(): Promise<string> {
+  // Bounded bootstrap: a stalled bootstrap can never hang past BOOTSTRAP_TIMEOUT_MS. It carries
+  // no caller signal because concurrent requests share it; each caller aborts its own wait.
   const timeout = AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS);
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
   const response = await fetch(BOOTSTRAP_URL, {
     method: "POST",
+    redirect: "manual",
     headers: {
       "Content-Type": "application/json",
       "User-Agent": randomUserAgent(),
     },
     body: JSON.stringify({ client: getMimoClientId() }),
-    signal: combined,
+    signal: timeout,
   });
   if (!response.ok) {
     try { await response.body?.cancel(); } catch { /* already consumed */ }
@@ -156,25 +158,45 @@ async function fetchJwt(signal?: AbortSignal): Promise<string> {
   return data.jwt;
 }
 
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+}
+
+/** Wait for the shared bootstrap, or stop waiting when this caller aborts; the bootstrap keeps running. */
+function awaitForCaller(shared: Promise<string>, signal?: AbortSignal): Promise<string> {
+  if (!signal) return shared;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<string>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    shared.then(
+      jwt => { signal.removeEventListener("abort", onAbort); resolve(jwt); },
+      error => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
+}
+
 export async function getMimoJwt(signal?: AbortSignal): Promise<string> {
   if (cachedJwt && Date.now() < jwtExpiresAt - JWT_EXPIRY_BUFFER_MS) {
     return cachedJwt;
   }
+  if (signal?.aborted) throw abortReason(signal);
   // Single-flight: concurrent callers await the same bootstrap instead of issuing
-  // parallel bootstraps.
+  // parallel bootstraps. One caller aborting must not fail the others, so the shared
+  // bootstrap is bound only to its timeout and each caller races it against its own signal.
   if (!inFlightJwt) {
-    inFlightJwt = (async () => {
-      try {
-        const jwt = await fetchJwt(signal);
-        cachedJwt = jwt;
-        jwtExpiresAt = parseJwtExp(jwt);
-        return jwt;
-      } finally {
-        inFlightJwt = null;
-      }
-    })();
+    const shared = fetchJwt().then(jwt => {
+      cachedJwt = jwt;
+      jwtExpiresAt = parseJwtExp(jwt);
+      return jwt;
+    });
+    inFlightJwt = shared;
+    // Registered before any waiter, so the slot is cleared first; it also handles a failure that
+    // arrives after every waiter has left. A reset during the flight owns the slot and is kept.
+    const release = () => { if (inFlightJwt === shared) inFlightJwt = null; };
+    shared.then(release, release);
   }
-  return inFlightJwt;
+  return awaitForCaller(inFlightJwt, signal);
 }
 
 /**
@@ -220,11 +242,11 @@ export function createMimoFreeAdapter(provider: OcxProviderConfig): ProviderAdap
     name: "mimo-free",
 
     async buildRequest(parsed: OcxParsedRequest, incoming: IncomingMeta): Promise<AdapterRequest> {
-      const jwt = await getMimoJwt();
+      const jwt = await getMimoJwt(incoming?.abortSignal);
 
       // Let the base adapter build the wire body (handles reasoning, tools, etc.)
       // but override the URL and headers after.
-      const baseReq = base.buildRequest(parsed, incoming) as AdapterRequest;
+      const baseReq = await base.buildRequest(parsed, incoming);
       const baseBody = JSON.parse(baseReq.body as string) as unknown;
       const markedBody = injectMimoSystemMarker(baseBody);
 
@@ -247,31 +269,46 @@ export function createMimoFreeAdapter(provider: OcxProviderConfig): ProviderAdap
     },
 
     async fetchResponse(request: AdapterRequest, ctx): Promise<Response> {
-      const response = await fetch(request.url, {
+      const send = createAdapterPhysicalSend(ctx);
+      const response = await send({ url: request.url, dispatch: executor => executor(request.url, {
         method: request.method,
+        redirect: "manual",
         headers: request.headers as Record<string, string>,
         body: request.body,
         signal: ctx?.abortSignal,
-      });
+      }) });
 
       // Retry predicate: 401 (expired/invalid JWT) retries ONCE with a fresh token.
       // 403 is NOT retried — Xiaomi uses it for anti-abuse "Illegal access" and there is
       // no documented token-expiry signature that would mark a 403 as retryable.
       if (response.status === 401) {
-        // Drain the first response body before issuing the retry.
-        try { await response.body?.cancel(); } catch { /* already consumed */ }
-        resetMimoJwtCache();
-        const freshJwt = await getMimoJwt(ctx?.abortSignal);
-        const retryHeaders = {
-          ...(request.headers as Record<string, string>),
-          "Authorization": `Bearer ${freshJwt}`,
-        };
-        return fetch(request.url, {
-          method: request.method,
-          headers: retryHeaders,
-          body: request.body,
-          signal: ctx?.abortSignal,
-        });
+        let retryHeaders = request.headers;
+        try {
+          return await send({ url: request.url, sendClass: "auth-recovery", recovery: "oauth-401",
+            beforeDispatch: async () => {
+              // Drain the first response body and refresh the JWT only after admission: a
+              // refused replay still returns THIS response to the caller, body intact.
+              // Draining comes first within the block because getMimoJwt issues its own
+              // network call and may throw, and the 401 body would then never be released.
+              try { void response.body?.cancel().catch(() => {}); } catch { /* already consumed */ }
+              resetMimoJwtCache();
+              const freshJwt = await getMimoJwt(ctx?.abortSignal);
+              retryHeaders = {
+                ...(request.headers as Record<string, string>),
+                "Authorization": `Bearer ${freshJwt}`,
+              };
+            },
+            dispatch: executor => executor(request.url, {
+              method: request.method,
+              redirect: "manual",
+              headers: retryHeaders,
+              body: request.body,
+              signal: ctx?.abortSignal,
+            }) });
+        } catch (error) {
+          if (error instanceof SendBudgetExhaustedError) return response;
+          throw error;
+        }
       }
 
       return response;

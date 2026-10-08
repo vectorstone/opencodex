@@ -8,7 +8,7 @@ This file applies to `src/` and inherits the repository-wide rules in `/AGENTS.m
 - Do not assume a separate server compilation step.
 - Prefer Bun and Web-platform APIs. Introduce a Node-only runtime dependency only when the task explicitly requires compatibility code and the owning module already has that role.
 - Preserve existing public exports and configuration compatibility unless the task explicitly changes them.
-- Read the applicable documents in `structure/` before changing shared routing, adapters, transports, sidecars, authentication, configuration, or server architecture.
+- Read the applicable documents in `structure/` before changing shared routing, adapters, transports, sidecars, authentication, configuration, or server architecture. [`structure/INDEX.md`](../structure/INDEX.md) maps each source area to the docs that describe it — usually more than one, because those docs are organised by topic while `src/` is organised by module — and every doc listed for an area is updated in the same change that changes the area.
 
 ## Implementation rules
 
@@ -23,6 +23,7 @@ This file applies to `src/` and inherits the repository-wide rules in `/AGENTS.m
 
 - Place focused regression coverage near the existing tests for the affected subsystem.
 - For focused behavior, run the relevant `bun test tests/<name>.test.ts` and `bun run typecheck`.
-- For shared routing, adapters, config, OAuth, or server behavior, also run `bun run test`.
+- If the change set is broader than one file, run `bun run test:changed` instead of the full suite.
+- Run `bun run test` only before marking a PR review-ready, or when the user explicitly asks for the full suite.
 - For logging, requests, credentials, account data, or fixtures, also run `bun run privacy:scan`.
 - Update `docs-site/` when the change affects user-visible behavior or configuration.

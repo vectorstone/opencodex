@@ -23,19 +23,27 @@ ocx export --client pi
       "baseUrl": "http://127.0.0.1:10100/v1",
       "api": "openai-completions",
       "apiKey": "$OPENCODEX_API_KEY",
+      "compat": {
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false
+      },
       "models": [
         {
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         }
       ]
     }
   }
 }
 ```
+
+生成される Pi プロバイダーでは `compat.sendSessionAffinityHeaders` が有効です。設定をマージしたり手動で編集したりする際も、このフラグを保持してください。Pi が送る安定したセッション識別子から、OpenCodex が正規の OpenCode Go 接続先用の affinity を生成します。`cacheRetention` が `none` の場合、Pi は識別子を送信しないことがあります。
+
+生成される Pi プロバイダーでは `compat.supportsDeveloperRole` も `false` に設定され、Pi はシステムプロンプトを `developer` ではなく `system` ロールで送ります。OpenCodex は Chat Completions のロールを受け取ったまま転送しますが、OpenAI 互換のアップストリームの中には `developer` を 400 で拒否するものがあります。`system` はすべてのアップストリームが受け付けます。
 
 モデル ID はプロキシの正規セレクターであるため、ルーティングされたモデルは `provider/model` (`anthropic/claude-opus-5`) として表示され、ネイティブ OpenAI スラグはプレフィックスなし (`gpt-5.6-sol`) のままになります。 `name` サフィックス (`(anthropic)`、`(native)`、`(routed)`) により、異なるアップストリームの 2 つの同じ名前のモデルが Pi のピッカーで区別できるようになります。
 
@@ -75,13 +83,13 @@ export OPENCODEX_API_KEY=<your key>
 
 その名前はパイだけです。 opencode は別の変数 (`OPENCODEX_OPENCODE_API_KEY`、`{env:…}` 形式) を使用します。[オープンコードガイド](/guides/opencode/) を参照してください。
 
-**ループバック プロキシにはキーはまったく必要ありません。** opencodex はデフォルトで `127.0.0.1` をバインドし、そこでは何も認証しないため、`$OPENCODEX_API_KEY` 参照は不活性であり、変数を設定しないままにすることができます。これは、`hostname` がループバックを超えて設定されている場合にのみ問題になります。これは、プロキシがトークンなしでの開始を拒否する場合でもあります。[リモートアクセス](/reference/configuration/#remote-access) を参照してください。
+**ループバック プロキシにはキーはまったく必要ありません。** opencodex はデフォルトで `127.0.0.1` をバインドし、そこでは何も認証しないため、`$OPENCODEX_API_KEY` 参照は不活性であり、変数を設定しないままにすることができます。これは、`hostname` がループバックを超えて設定されている場合にのみ問題になります。これは、プロキシがトークンなしでの開始を拒否する場合でもあります。[リモートアクセス](/ja/reference/configuration/server/#リモートアクセス) を参照してください。
 
 ## モデルのメタデータ
 
-`contextWindow` および `maxTokens` は、カタログが権限のあるコンテキスト ウィンドウを報告する場合にのみ発行されます。そうでない場合、そのモデルでは両方のフィールドが省略され、Pi は独自のデフォルトを適用します。 `ocx export` は、そのケースに該当する行数を出力します。
+`contextWindow` と `maxTokens` は独立した権威ある能力値です。それぞれ、値が判明している場合にのみ出力され、不明な値には Pi の既定値が使われます。`ocx export` は完全な制限情報がないモデル数を報告します。
 
-`maxTokens` は、`32000` のスキーマを満たすバジェットであり、コンテキスト ウィンドウに固定されているため、小さなコンテキスト モデルにはコンテキストを超える出力が与えられません。これは、特定のモデルの真の最大値について主張するものではありません。
+`maxTokens` は正確な provider メタデータ、または custom model の明示設定から取得されます。context も既知の場合はその値以下に制限され、旧来の `32000` プレースホルダーは使用されません。
 
 2 つのフィールドは意図的に省略されています。 `cost` には 4 つの価格フィールドがすべて必要ですが、opencodex にはルーティング モデルの価格データがありません。ゼロを出力すると、すべてのモデルが無料であると主張されます。 `reasoning` は Pi のブール値ですが、カタログにはエフォート ラダーが記載されており、一方をもう一方にマッピングするのは推測になります。
 

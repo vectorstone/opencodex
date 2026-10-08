@@ -1,0 +1,419 @@
+# Cursor Provider
+
+The configuration-only [plaintext V2 contract](../subagents.md#plaintext-v2-agent-messages)
+is scoped to canonical ChatGPT Responses forwarding; other source-area behavior described here is unchanged.
+
+Codex-native retirement does not retire a Cursor-owned model name. Cursor transport and
+namespace handling retain their provider contract; the bounded native scope lives in
+[the shared catalog](../catalog.md#shared-catalog).
+
+Cursor's direct adapter does not enter the OpenAI Chat serializer's
+[chronological instruction ordering](chat-compat.md#chronological-in-conversation-instructions).
+
+Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts.
+
+## Cursor Native Exec
+
+Cursor's experimental live transport can receive server-driven local read/write/delete/ls/grep,
+shell, and fetch exec frames. These frames are denied by default because they bypass Codex's normal
+approval and sandbox path. `nativeLocalExec: "on"` is the explicit config-owner opt-in for trusted
+local experiments; `off` and the backwards-compatible `codex-sandbox` spelling both fail closed.
+MCP, screen recording, and computer-use stay on their separate explicit executor/MCP config paths.
+
+Foreground `shellArgs` and `shellStreamArgs` are unavailable on every platform, including with
+`nativeLocalExec: "on"`. `src/adapters/cursor/native-foreground-shell.ts` rejects them before spawn
+until a kernel-backed descendant owner exists; process-group disappearance is not cleanup proof.
+The streaming form still sends start, aborted exit, typed failure, and stream close, with no output
+frames. The synchronous form sends one typed failure. Both preserve catalog-specific client-tool
+redirects. Transport teardown seals the foreground owner, and queued frames then report cancellation.
+No child, output buffer, timer, or process-table scan is created. This does not change background
+shell admission, synchronous filesystem tools, or separately configured MCP/desktop executors.
+
+> Decision record: [ADR-0047](../decisions/ADR-0047-cursor-native-exec.md)
+> Decision record: [ADR-0105](../decisions/ADR-0105-cursor-foreground-shell-ownership.md)
+> Decision record: [ADR-0122](../decisions/ADR-0122-cursor-foreground-admission.md)
+
+Cursor's generic tool-use prompt filter must preserve every Responses-owned execution-path tool
+that survives the transport budget: unified Desktop `exec` as well as the legacy
+`exec_command`/`shell_command` aliases. The legacy aliases receive Cursor-specific shell guidance;
+unified `exec` keeps its own schema and is surfaced back to Codex as a client tool. It must never
+fall through to the separate native-local-exec dispatcher.
+
+Denied native fs/shell/fetch frames carry a catalog-aware redirect (`cursorNativeExecRedirectHint`).
+When the visible catalog is Codex code mode — a freeform unified `exec` and no bare shell bridge —
+the redirect steers the model INSIDE `exec`: shell, file, search, and fetch are nested
+`tools.<name>(...)` helpers of the JavaScript cell with `text(...)` required for output, and the
+wording never recommends the top-level `shell_command`/`exec_command` bridge code mode does not
+expose; separately listed namespaced tools remain callable as usual. A flat catalog with a bare
+bridge or a non-freeform unified `exec` keeps the default bridge wording, and a catalog with no
+execution path at all keeps naming the request's actual client/MCP wire names.
+
+Explicit Claude-family targets (`claude-*`, including `cursor/claude-*` selections) receive
+factual tool guidance and native-exec redirects from `src/adapters/cursor/tool-wording.ts`:
+they name available catalog tools, state that Cursor-native tools are unavailable, and end with
+“Continue the task with that tool call.” An empty client/MCP catalog instead states that no client
+tools are available and asks for an answer without tools or a report of the limitation; it never
+names assumed shell/edit tools. Catalog-less dispatcher fallback uses its advertised definitions.
+They impose no tool-routing narration restrictions. `src/adapters/cursor.ts` leaves the routing-
+commentary sniffer unarmed for these targets so factual routing prose can precede a tool call;
+tool-envelope echo guards remain active under their existing predicates.
+`src/adapters/cursor/protobuf-request.ts` uses the final request model for system guidance;
+`src/adapters/cursor/live-transport.ts` re-derives the redirect and `plainToolWording` exec flag
+on every turn. The flag also covers catalog-less fallback and apply-patch mutation refusals.
+Other targets, including Auto/default whose underlying family is unknown, retain byte-identical
+legacy wording. Execution policy, tool names, argument schemas, and denial wire shapes are unchanged.
+`tests/providers/cursor/cursor-tool-wording.test.ts` covers encoded roots, per-turn target changes,
+all denied fs/shell/fetch frame kinds, empty catalogs, factual-prose continuations through the next
+tool call, and pre-change non-Claude wording snapshots.
+
+In non-Claude external Cursor turns using code mode or shell aliases, the bounded leading-commentary guard in `src/adapters/cursor/envelope-echo.ts` counts `Shell`, `네이티브 셸`, and `네이티브 쉘` as one `shell` identity, including spacing variants and names split across text deltas. Korean aliases require a Unicode-aware left token boundary so wording embedded in a larger word or identifier is not counted; punctuation and following Korean grammatical suffixes remain supported. Rejection still requires a failure claim plus either an explicit redirect or at least two distinct native-tool identities; repeated aliases alone do not count as multiple tools.
+
+> Decision record: [ADR-0048](../decisions/ADR-0048-cursor-native-exec.md)
+
+## Client tool wire names and transport budget
+
+`src/adapters/cursor/tool-naming.ts` derives client wire names from the turn's tool catalog.
+Recognized bare Claude client tools such as `Bash`, `Read`, `Write`, `Edit`, `Grep`, `Glob`, and
+`Task` keep their names when the catalog has no bare Codex `exec_command` or `shell_command`
+bridge. When either bare bridge is present, those tools receive the `ocx_client_` prefix to avoid
+Cursor-private tool collisions. Other non-proxy-owned bare tools always receive that prefix;
+proxy-owned execution/edit tools and namespaced MCP tools retain their existing identities.
+Registration, guidance, denied-native-exec redirects, live call mapping, and protobuf history
+replay use this catalog-dependent rule. Return mapping restores the client's semantic tool name.
+Claude factual redirects resolve each tool against the complete visible request catalog, regardless
+of declaration order, so their listed names match registration with or without a bare shell bridge.
+`tests/providers/cursor/cursor-tool-wording.test.ts` checks both bridge orders and no-bridge catalogs
+through redirect guidance and live transport request preparation.
+Request construction resolves accepted bare wire aliases in forced and allowed-tool choices to
+semantic names against the original catalog, retaining only the originally selected identities
+before prompt and budget filtering so a removed bridge cannot invalidate registration or widen
+the choice to a namespaced sibling.
+
+`src/adapters/cursor/tool-definitions.ts` measures actual repeated protobuf entries using the
+same catalog context for tool-choice matching and wire naming as registration.
+`src/adapters/cursor/request-builder.ts` passes the eligible catalog to every admission and
+eviction size calculation, so both serialized name fields include alias bytes. The transport
+budget remains 330 tools and 120,000 bytes. If a bridge is omitted, surviving Claude tools can
+use shorter bare names; the eligible-catalog measurement remains conservative in that case.
+`tests/providers/cursor/cursor-blob-claude-client-tools.test.ts` covers replay naming and mixed
+catalogs exactly at, and immediately above, the byte limit.
+
+## Structured final output
+
+Cursor's Connect wire has no native Responses `text.format` schema field. The adapter preserves
+`json_object` and `json_schema` in `src/adapters/cursor/types.ts` and renders the final-output
+contract through `src/adapters/cursor/structured-output.ts`. The protobuf builder includes it in
+system roots and repeats it in active user-message actions, including tool-result continuations.
+This is a prompt fallback, not constrained decoding or response-schema validation. Tool calls
+remain available before the final answer; ordinary text requests receive no JSON instruction.
+The checkpoint instruction digest includes the format, so a changed schema forces full replay.
+`tests/providers/cursor/cursor-request-compat.test.ts` checks the encoded action and
+`tests/providers/cursor/cursor-request-builder.test.ts` checks checkpoint invalidation.
+
+## Cursor parameterized models
+
+Cursor Router's parameterized `default` model is represented in Codex by four catalog rows:
+`cursor/auto` preserves Cursor's team/account default, while `cursor/auto-cost`,
+`cursor/auto-balance`, and `cursor/auto-intelligence` make each optimization level explicit.
+All four route to the `default` Cursor wire model. Explicit variants additionally populate
+`AgentRunRequest.requested_model.parameters` with the `optimization` parameter; this is the same
+parameterized-model channel used by current Cursor clients. Router rows are static capabilities and
+must survive a live `GetUsableModels` response that omits `default`.
+
+`cursor/grok-4.5-fast`, `cursor/grok-4.6-fast`, and `cursor/grok-4.7-fast` are stable Codex-facing rows.
+For 4.5 and 4.6 Fast, OpenCodex sends the matching Grok base id through
+`requested_model` with separate `effort` and `fast=true` parameters, leaving legacy `model_details`
+unset for that parameterized external selection. Grok 4.7 instead sends its flattened, unprefixed
+`grok-4.7-{effort}-fast` id directly. Grok 4.5 stops at `high`; Grok 4.6 and 4.7 additionally
+advertise and send `xhigh`. The 2026-09-23 Cursor roster and probes in
+`devlog/_plan/260923_grok47_parity/010_probe-evidence.md` show unprefixed
+`grok-4.7-{low,medium,high,xhigh}` and `grok-4.7-{low,medium,high,xhigh}-fast` wire ids;
+the bare `grok-4.7-fast` id is rejected. For 4.5 and 4.6, live discovery recognizes Cursor's flattened
+`cursor-grok-{version}-{effort}-fast` variants, plus the older
+`grok-{version}-fast-{effort}` ordering, as availability evidence only.
+
+## Cursor live discovery is seed-gated
+
+`filterCursorConfiguredModelsByLiveDiscovery` filters the configured roster by live
+availability; it does not union live ids into the catalog. A wire id `GetUsableModels`
+advertises but no capability base claims is therefore invisible to the picker, however many
+effort variants the roster carries. That is deliberate — Cursor advertises ids whose every
+`Run` returns `not_found`, which is what `CURSOR_KNOWN_UNCALLABLE_MODEL_IDS` and the
+variant-level quarantine exist for — so a new family is admitted by adding its capability row,
+not by relaxing the filter.
+
+Synthetic ultra rows (`<base>-1m` markers such as `kimi-k3-1m`, kept in `configured` by legacy
+pins or retain lists) clear that base-availability check and one more: the live roster must flag
+Max Mode for the base (`GetUsableModels.maxMode`), or the row stays hidden. Base availability
+alone is not enough — an account on a plan without Max Mode would otherwise see a row whose
+ultra request it cannot serve.
+
+A seeded ladder carries only rungs supported by vendor evidence. `muse-spark-1.3` is seeded at
+`minimal` through `xhigh` even though Cursor's roster also advertises `muse-spark-1.3-max`:
+Meta publishes no `max` rung for Muse Spark and an independent probe rejected it, both already
+recorded on `META_MUSE_REASONING_EFFORTS`. A reseller advertising a wire id is not evidence the
+wire accepts it, so a Codex request at `max` clamps to `xhigh` rather than sending a rung two
+sources say does not exist.
+
+## Cursor active-context usage
+
+Cursor's `conversationCheckpointUpdate.tokenDetails.usedTokens` is treated as the authoritative
+absolute active-context size for a Cursor conversation. Some client-tool suspension turns must end
+before Cursor emits a new checkpoint; those turns carry forward the last observed total for the same
+Cursor conversation instead of reporting only the tiny current-turn output delta. The carry-forward
+cache is process-local, numeric-only, bounded, and keyed by Cursor conversation id. Compaction
+boundaries clear the carry so pre-compaction totals are not reused after Codex replaces history.
+Historical compaction markers restored by `previous_response_id` expansion are acknowledged as a
+replayed prefix and do not clear a fresh post-compaction checkpoint again on every later turn.
+Compaction summarizer turns may still report their own checkpoint for that response, but their
+pre-compaction checkpoint is not persisted for later carry-forward.
+
+> Decision record: [ADR-0053](../decisions/ADR-0053-cursor-active-context-usage.md)
+
+## Cursor conversation checkpoint reuse
+
+After a successful no-tool turn, the Cursor adapter keeps the returned ConversationStateStructure in
+a process-local store and reuses that snapshot on the next validated linear continuation instead of
+rebuilding rootPromptMessagesJson and conversationTurns. Tool-result turns reuse the last completed
+checkpoint plus only the uncovered suffix. A request without checkpointRef may use the prefix index
+only when a remembered Cursor conversation or stable client thread owns the resolved conversation id.
+The stable owner may be the Codex parent-thread header or the existing bounded process-local HMAC of
+the complete Desktop session-id/thread-id pair. The request must also have a covered message prefix
+and system/developer digest that match exactly one snapshot for that same
+conversation. Headerless requests without a stable owner full-replay. Isolated helper/shadow turns
+never join the parent or sibling conversation. An explicit missing checkpointRef full-replays. Compaction, account or model mismatch, missing refs, decode failures, and
+invalid_argument recovery keep the existing full-replay path. previous_response_id may select a
+branch's opaque checkpointRef; it is never a Cursor conversation ownership key. Cursor Connect still
+does not expose authoritative cache_read_tokens.
+
+> Decision record: [ADR-0054](../decisions/ADR-0054-cursor-conversation-checkpoint-reuse.md)
+
+## External tool continuations
+
+`src/adapters/cursor/protobuf-request.ts` repeats the latest actual user request in the active
+external-model tool continuation; `src/adapters/cursor/current-request.ts` selects that request.
+Canonical compaction summaries, opaque-compaction notes and
+standalone ambient-browser wrappers stay in history without being promoted to that request.
+Those wrappers are recognized by their exact canonical shape, the same prefix rule the Codex
+client uses to detect a stored summary; the wire carries no other provenance, so a user message
+that is itself an exact wrapper is treated as host context and the preceding real request stays
+the labeled one. Quoting a marker inside other text keeps the message as the request; an
+ambient wrapper followed by user text also remains the request. On an external-model echo retry,
+the active action carries the replayed tool-result provenance warning even with a checkpoint.
+Blank or image-only user input stops the search instead of reviving an older goal.
+Grok 4.6 code-mode continuations distinguish emitted observations from an empty completed cell:
+the latter is not proof of failure and never authorizes replay of a completed side effect.
+Copyable shell examples emit results through `text()`. Missing output is recovered with a
+read-only state check; existing observations inform the next action or requested final answer.
+Repetition maxima reset at user/developer boundaries, including a fresh active user action.
+Counts produce conditional advice, not a failure verdict: requested polling remains valid.
+`tests/providers/cursor/cursor-continuation-invariants.test.ts` covers scope preservation through
+repeated summaries, result-normalization idempotence, and executable code-mode examples.
+On an envelope-echo corrective retry, tool evidence uses the user wire role with an explicit
+system instruction to treat it as data; truncation and argument restoration preserve that role.
+These are adapter guidance and replay repairs, not a guarantee of identical provider answers.
+
+## Cursor root replay budgets
+
+`src/adapters/cursor/protobuf-request.ts` bounds the replayed root set at 192 blobs and 512 KiB, and
+caps the serialized arguments named inside one replayed tool-result envelope at 2 KiB. That per-call
+cap is what keeps a 600 KiB argument from consuming the aggregate budget and evicting the output it
+describes, and it still decides admission. Because it is charged while the envelope is being built,
+a small replay would otherwise clip a completed call's arguments with nearly the whole envelope
+unused. After every pruning and truncation decision is final, a second pass re-widens clipped
+invocation lines out of the leftover aggregate bytes only: newest tool result first, skipping a root
+whose own output was already elided, and never dropping, shrinking or reordering a retained root.
+Before materializing a widened root, the pass uses a bounded UTF-8 scan to reject arguments whose
+raw byte growth alone cannot fit the spare budget, and reuses its single argument serialization.
+The elision skip is load bearing, reached through initiator recovery rather than through truncation
+alone: a truncated root undershoots its own budget by far less than a restoration costs, but after
+the equal-share pass elides a trailing run, recovery drops an elided sibling to fit the user turn and
+the freed bytes become spare. It requires the share to land in a narrow window where the clipped
+invocation line survives but `output:` does not; outside that window the clipped-line lookup declines
+the root first.
+If carried checkpoint roots exceed either aggregate limit, the builder retries once with a full
+replay of available raw history; the same limits and final overflow error still apply.
+Token estimation includes retained external root blobs, including checkpoint-carried roots.
+Missing or invalid UTF-8 blobs are skipped with bounded provider diagnostics; estimating does not
+alter blob-retention metrics.
+Root-echo eligibility is `cursorNeedsExternalToolContinuation`, which includes native
+`composer-2.5` and `composer-2.5-fast`, not only external wire models, so the restoration reaches
+every replay that carries an invocation line. Coverage lives in
+`tests/providers/cursor/cursor-tool-result-invocation.test.ts`.
+
+## Cursor executable tool schema ownership
+
+`src/adapters/cursor/tool-schemas.ts` owns advertised and argument-normalization
+schemas; `tool-definitions.ts` remains the public facade and protobuf encoder.
+Advertisement and normalization intentionally differ for shell bridges: Cursor may
+emit `cmd`, while the declared Responses contract decides whether it becomes
+`command`. Both paths preserve execution-control fields. Freeform tools use one
+required string `input` in a closed object, retaining that tool's string-valued
+input description from the parser (including patch-envelope guidance). Other input
+constraints cannot widen the canonical shape. Bare shell bridge names are rejected
+on the freeform path.
+Namespaced tools do not acquire bare-shell behavior. Regression coverage lives in
+`tests/providers/cursor/cursor-tool-definitions.test.ts`.
+
+Google's [tool-schema loss report](google.md#google-tool-schema-loss-reporting) is confined to the
+Google final compiler and does not change Cursor's advertised or normalized schema ownership.
+
+Canonical Spark Lite metadata follows the final serialized model and surviving nonempty Lite tool catalog; see [Responses transport](../transports/responses.md).
+
+Shared raw-reasoning events retain content-channel presentation; provider-authored thinking keeps its existing summary path. See [bridge contract](chat-compat.md).
+
+Combo child requests normalize effort and thinking controls against the selected target while retaining reasoning summaries; strict unknown targets preserve caller controls. The [Responses transport owner](../transports/responses.md) documents this boundary, and native Chat removes effort only for an explicit empty declaration or no-reasoning model.
+
+## Textual pseudo tool-call quarantine
+
+Cursor models sometimes emit `[TOOL_CALL]name[ARGS]{…}` inside `textDelta` instead of a
+real `toolCall*` frame. `src/adapters/cursor/text-toolcall.ts` strips every complete
+marker from the assistant text channel and yields the parsed name/args. It retains split
+markers up to a byte-counted cap, then switches to a constant-space suppressed scan until
+the JSON object closes; neither an oversized tail nor a malformed payload returns to prose.
+Malformed argument diagnostics contain only the failure class and an optional tool name,
+never the argument content. `src/adapters/cursor/protobuf-events.ts` buffers advertised textual calls
+until turn finalization, charging each retained argument immediately against the normal per-call
+and per-turn translator budgets. It flushes them onto the atomic tool-call path only when the turn
+contained no real client-tool frame; any real frame, including one left incomplete, wins and
+drops the whole textual buffer and releases its charges. A missing advertised-name set is fail-closed. Finalize also
+clears any held or suppressed prefix. Coverage lives in
+`tests/providers/cursor/cursor-protobuf-events.test.ts`.
+
+## Observed checkpoint window
+
+`conversationCheckpointUpdate.tokenDetails.maxTokens` is the account-advertised
+ceiling for that wire model. A positive value is stored in a process-local map
+keyed by the normalized Cursor identity scope and model id
+(`src/adapters/cursor/discovery.ts`) and preferred by `inferCursorContextWindow`
+only for that scope. Missing scopes normalize to the distinct `local` scope, so
+they cannot inherit an authenticated account's observation. The map evicts its
+oldest insertion above 2,048 entries. Zero and missing values are ignored — the
+first checkpoint is often 0. The next turn's
+`cursorRequestSizeContext` feeds that window into the existing 0.5-window
+overflow vs 429 prior so a tiny request against a plan-gated 32k ceiling stays
+on the 429 class, while a request that is large relative to the real window
+classifies as overflow. Coverage lives in
+`tests/providers/cursor/cursor-errors.test.ts` and
+`tests/providers/cursor/cursor-protobuf-events.test.ts`.
+
+## Overflow remint boundary
+
+`src/adapters/cursor.ts` surfaces the first bare context overflow before attempting conversation remint on later eligible requests. `cursorClientThreadOwner` recognizes both client thread aliases; `src/adapters/cursor/thread-continuity.ts` limits recovery to three remints per retained identity-scoped owner, with a one-hour idle TTL and 2,048-entry bound. Conversation-only requests have no stable owner and do not automatically remint. Quota/rate errors, tool-result resumes, partial output, local side effects, isolated helper/shadow requests and compaction remain fail-closed. Isolated requests neither consume the parent allowance nor invalidate its checkpoint. Eligible overflow checks refresh existing retention timestamps and LRU position even after the cap is exhausted, without allocating absent scopes. Retention expiry, eviction or process restart resets the in-memory allowance; this is not a persistent lifetime cap or semantic-progress policy.
+
+An incomplete client-tool stream is fail-closed for the current turn: `finalizeTurnEvents` emits the prefix owned by `CURSOR_INCOMPLETE_TOOL_CALL_MESSAGE_PREFIX` and does not retry that send. After the error is streamed, eligible non-isolated turns remint the Cursor conversation id, persist the thread override, and invalidate the inherited checkpoint so the next turn does not resume a conversation left waiting for `mcpResult`. `src/adapters/cursor/thread-continuity.ts` permits three such rotations per retained identity-scoped thread owner in a separate bounded counter; exhaustion keeps reusing the conversation and records an `incomplete-tool-remint-exhausted` diagnostic, while a clean completed turn clears that scope's counter. This allowance never consumes or replenishes the overflow resend budget. Isolated helper and compaction turns neither remint nor change the parent's allowance or checkpoint. Native Composer replay synthesizes `[missing tool_result for this tool_use in history]` for unpaired `toolCallStep` history; external wire models skip native `mcpToolCall` replay, so conversation remint is their recovery path.
+
+Translated Chat request construction uses the [inline-image budget](../transports/streaming-health.md#translated-chat-inline-image-budget); the shared normalizer counts retained bytes even when a wire-specific drop callback keeps the image attached, rejects inputs above the safe decoded-pixel ceiling, caps native decode work process-wide, and stops queued work when the request is cancelled.
+
+## Mid-stream envelope echo
+
+External root replay replaces duplicate runs at their recorded entry index, preserving the
+original message position without rescanning the accumulated roots. Construction still visits
+the complete supplied history before the existing count and byte admission rules; it does not
+cut a raw-message suffix that could lose the initiating user instruction or checkpoint offsets.
+
+Held quarantine output is bounded by the aggregate `CURSOR_OUTPUT_GUARD_MAX_HOLD_BYTES` (8 KiB)
+budget in `src/adapters/cursor.ts`. Text deltas are fed to the armed echo and
+routing-commentary sniffers BEFORE the cap check, so a single oversized first delta cannot
+disarm the guards without being classified; each sniffer reads only the bounded leading window
+its decision needs. Retained bytes are projected from payload length before any serialized
+copy exists, so a multi-megabyte frame cannot force a same-size encoded allocation. An event
+that cannot fit the remaining budget settles both sniffers, releases the held events, and is
+emitted directly.
+Each adapter feed is limited to 512 UTF-16 code units for envelope detection and 2,048 for
+routing-commentary detection. Matches beyond that frame prefix intentionally do not trigger a
+corrective retry; the later text still passes the independent line-aware echo filter and
+diagnostic observer. These feed limits bound temporary copies and do not promise
+frame-independent prefix classification.
+
+Adjacent midstream markers retain separate findings, capped at eight. A new marker closes the
+previous corruption window before consuming its line, including a call-id on the marker's own
+line. Only marker identities, offsets and corruption booleans survive; held reasoning is released
+in order before terminal errors, preserving upstream error visibility.
+
+The prefix sniffer only watches the opening bytes of a turn. For later text, the shared
+`ToolEnvelopeEchoFilter` in the shared lib filter holds only a possible
+line-leading marker suffix across deltas, emits prose on divergence, and suppresses the
+marker and remaining echo tail. A harmless partial suffix is flushed on normal completion;
+a distinctive truncated marker at end is dropped. `CursorMidstreamEchoObserver` still
+records findings, and eligible non-isolated turns remint the conversation id for the NEXT
+turn. The current send is never retried because leading prose may already have escaped.
+Markers inside a Markdown fenced code block are quoted examples. Fences follow CommonMark: an
+opener is a run of at least three backticks or tildes indented at most three spaces, and only a run
+of the same character, at least as long and followed by nothing but whitespace, closes it. A marker
+line inside a fence starts a bounded hold (64K characters): a matching closer releases the held text as
+code, and a turn that ends with the fence still open drops it as an echo, so an envelope pasted
+into a block that never closes cannot escape. A line-start marker in ordinary prose outside a fence
+is still treated as an echo; that is the deliberate tradeoff of a sentinel filter. The assistant-history
+replay scrub keeps a marker line only inside a fence that closes later in the stored text
+(`closedFenceLines`), and the remint follows the filter's verdict (a confirmed echo, or a fenced marker
+released by hold overflow): `CursorMidstreamEchoObserver` findings are diagnostics only. The filter and the next-turn remint
+are armed for every model that replays tool results as root text
+(`cursorNeedsExternalToolContinuation`, which includes the native-wire composer-2.5 builds);
+the opening-bytes prefix retry stays external-only, because its corrective continuation text is
+encoded for external wire models alone.
+
+That rotation has its own bounded allowance in `src/adapters/cursor/thread-continuity.ts`,
+separate from the incomplete-tool budget and from the overflow budget. It is bounded because a
+model that echoes every turn would otherwise rotate the conversation forever, and it is separate
+because echoing is cheap and repeatable while an incomplete client-tool stream is rare and
+structural — one shared counter would let the cheap failure spend the allowance the other
+recovery depends on. Exhaustion records a `midstream-envelope-echo-remint-exhausted` diagnostic
+and keeps the conversation; a turn that completes without an echo clears only this counter. When
+an incomplete-tool remint already fired in the same turn, the echo arm does not rotate again.
+The allowance follows the identity-scoped original conversation through remints, even when
+the client omits or changes its thread owner. A bounded, one-hour conversation rewrite map
+redirects restored provider-state ids only within the same opaque credential scope.
+
+Assistant root replay drops echoed envelopes before they are sent back upstream
+(`stripAssistantEchoedToolEnvelope`), so the transcript stops feeding itself. The strip starts at
+a whole-line marker (the live filter's rule, `isWholeLineEchoMarker`: a result or error marker alone on its
+line, or a `[Tool call:` line; prose that starts with a result marker is kept) and ends at the next blank line rather than at the end of the message: the
+envelope has no recognisable terminator and observed copies are not byte-exact, and truncating to
+the end discarded a genuine answer whenever the model resumed after the echo. An envelope whose
+pasted body contains its own blank line therefore leaves a remainder in replay; conversation
+remint, not this filter, is the primary defence against a poisoned conversation.
+
+`resolveCursorConversationId` prefers the retained thread override over a stored
+`_cursorConversationId`, and rewrites either when it names a reminted conversation. Only
+the remint path writes that store, so a stored id that disagrees with it is the pre-remint
+value. Isolated helper turns
+still bypass both and mint their own id.
+
+Translated audio/file admission follows the [final-adapter input contract](../adapters/registry.md#untranslated-input-media); native raw passthrough remains separate.
+Canonical Responses identity sanitation and narrowly scoped pre-output combo recovery follow [request-local target compatibility](../runtime.md#request-local-target-compatibility); other adapter contracts remain unchanged.
+
+Upstream API-key usage follows the [physical-attempt account attribution contract](../dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
+
+Unicode pattern normalization uses [copy-on-write traversal](../transports/byte-accounting.md#unicode-pattern-normalization) while preserving the existing schema and wire semantics.
+
+## Inbound stream-health clock ownership
+
+The T04 inbound stream-health watchdog in `src/adapters/cursor/live-transport.ts` fails a turn that
+received its first frame and then went silent for `CURSOR_STREAM_SILENCE_FAIL_MS` (30s) or
+produced only liveness frames for `CURSOR_STREAM_HEARTBEAT_ONLY_FAIL_MS` (90s), instead of waiting
+out the 300s bridge stall watchdog. One timer covers both thresholds and re-arms on every
+decoded frame, so the deadline is always recomputed from the newest frame.
+
+Those two budgets are the production contract and a test does not move them to make itself
+pass. What a test may replace is the watchdog's time source: `streamHealthClock` on
+`CursorTransportFactoryInput` supplies `now`, `setTimeout` and `clearTimeout`, defaulting to the
+globals, and the seam is deliberately scoped to T04 alone — the first-frame timer, the
+turn-ended close grace, the client-tool finalize grace and the outbound heartbeat all stay on
+the global timers, as does the `elapsedMs` diagnostic, whose `turnStartedAt` is stamped on the
+wall clock.
+
+The seam exists because the re-arming half of the contract cannot be stated against real
+timers without also asserting that the machine keeps up: showing that a deadline did NOT expire
+means keeping a synthetic server ahead of the silence budget for several multiples of it, which
+is what failed in the unsharded macOS lane while the watchdog was correct. Scaling the budget
+lengthens the window rather than shrinking the exposure. Every claim of that shape therefore lives
+under the seam in `tests/providers/cursor/cursor-stream-health.test.ts`: that meaningful frames
+re-arm both clocks, that liveness-only frames refresh the silence clock while the progress clock
+still expires, and that the silence deadline is the one that fires when it is the earlier of the
+two. That last one is load-bearing: a watchdog that dropped the `min()` and read only the progress
+deadline would relax silence detection from 30s to 90s while every real-timer case stayed green,
+because a later deadline still produces the same message. The firing half needs no seam and stays
+on real timers in the same file: silence after the first frame, the progress budget alone failing a
+turn when the silence budget is out of reach, and `turnEnded` cancelling the watchdog while the
+server holds the stream open.

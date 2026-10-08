@@ -47,6 +47,19 @@ function routingEnvelope(
 
 export const ROUTING_ENVELOPE = routingEnvelope();
 
+function finalAnswerEnvelope(withTaskName: boolean, taskName = "/root/worker", sender = "/root"): string {
+  return [
+    "Message Type: FINAL_ANSWER",
+    ...(withTaskName ? [`Task name: ${taskName}`] : []),
+    `Sender: ${sender}`,
+    "Payload:",
+    "",
+  ].join("\n");
+}
+
+export const FINAL_ANSWER_ENVELOPE = finalAnswerEnvelope(false);
+export const FINAL_ANSWER_TASK_ENVELOPE = finalAnswerEnvelope(true);
+
 export function agentMessage(content: Array<Record<string, unknown>>): unknown[] {
   return [{
     type: "agent_message",
@@ -147,7 +160,7 @@ export async function post(
   input: unknown[],
   headers: HeadersInit = {},
   abortSignal?: AbortSignal,
-  options: { tools?: unknown[]; translatorBudget?: TranslatorBudget } = {},
+  options: { tools?: unknown[]; translatorBudget?: TranslatorBudget; promptCacheKeyIsSharedCohort?: boolean } = {},
 ): Promise<Response> {
   return handleResponses(new Request("http://localhost/v1/responses", {
     method: "POST",
@@ -156,7 +169,11 @@ export async function post(
       ...Object.fromEntries(new Headers(headers)),
     },
     body: JSON.stringify({ model, input, stream: false, ...(options.tools ? { tools: options.tools } : {}) }),
-  }), config, { model: "", provider: "" }, { abortSignal, translatorBudget: options.translatorBudget });
+  }), config, { model: "", provider: "" }, {
+    abortSignal,
+    translatorBudget: options.translatorBudget,
+    promptCacheKeyIsSharedCohort: options.promptCacheKeyIsSharedCohort,
+  });
 }
 
 export function encryptedInput(options: {

@@ -1,0 +1,790 @@
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { SPAWN_BUDGET_MS } from "../helpers/test-budget";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+const repoRoot = dirname(fileURLToPath(new URL("../../package.json", import.meta.url)));
+const cliPath = join(repoRoot, "src", "cli", "index.ts");
+const isolatedCodexHome = mkdtempSync(join(tmpdir(), "ocx-prov-codex-home-"));
+
+// Every case below spawns the real CLI. Cold Bun starts on a loaded windows-latest runner
+// routinely blow the 5s default before --help returns; the spawn IS the assertion.
+setDefaultTimeout(SPAWN_BUDGET_MS);
+
+function runCli(args: string[], env: Record<string, string> = {}, noProxy = false) {
+  const preload = noProxy ? join(env.OPENCODEX_HOME!, "no-proxy.ts") : undefined;
+  if (preload) writeFileSync(preload, `
+    import { mock } from "bun:test";
+    const path = ${JSON.stringify(join(repoRoot, "src/server/proxy-liveness.ts"))};
+    const original = await import(path);
+    mock.module(path, () => ({ ...original, findLiveProxy: async () => null }));
+    globalThis.fetch = () => { throw new Error("fixture network forbidden"); };
+  `);
+  return spawnSync(process.execPath, [...(preload ? ["--preload", preload] : []), cliPath, ...args], {
+    cwd: repoRoot,
+    // ALWAYS isolate CODEX_HOME: `provider add --sync` runs syncModelsToCodex, which rewrites the
+    // catalog under CODEX_HOME. With the real ~/.codex and a config.port matching the live proxy,
+    // a test run would WIPE the user's routed catalog entries (live-catalog pollution).
+    env: { ...process.env, CODEX_HOME: isolatedCodexHome, ...env },
+    encoding: "utf8",
+    // Contended windows-latest cold starts regularly exceed Bun's 5s default before --help
+    // even prints; keep the child deadline under the test budget so status is not null.
+    timeout: SPAWN_BUDGET_MS - 5_000,
+  });
+}
+
+function freshConfig(extra?: Record<string, unknown>) {
+  const dir = mkdtempSync(join(tmpdir(), "ocx-prov-"));
+  const config = {
+    port: 10100,
+    providers: {
+      openai: {
+        adapter: "openai-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authMode: "forward",
+      },
+    },
+    defaultProvider: "openai",
+    ...extra,
+  };
+  writeFileSync(join(dir, "config.json"), JSON.stringify(config), "utf8");
+  return { dir, configPath: join(dir, "config.json") };
+}
+
+function readConfig(dir: string) {
+  return JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+}
+
+describe("ocx provider", () => {
+  for (const option of ["--api-key", "--key", "--secret", "--password", "--admin-token"]) {
+    for (const syntax of ["inline", "separated"]) {
+      test(`add redacts leftover ${option} ${syntax} values without saving`, () => {
+        const { dir, configPath } = freshConfig();
+        const before = readFileSync(configPath, "utf8");
+        const secret = "synthetic-private-value";
+        const credential = syntax === "inline" ? [`${option}=${secret}`] : [option, secret];
+        try {
+          const result = runCli([
+            "provider", "add", "fixture", "--adapter", "openai-chat", "--base-url", "https://provider.example.test/v1",
+            // The first supported key is consumed; a repeated key remains an argument error.
+            ...(option === "--api-key" && credential.length === 2 ? ["--api-key", "fixture-value"] : []),
+            ...credential, "--json",
+          ], { OPENCODEX_HOME: dir });
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain(option);
+          expect(result.stderr).toContain("<redacted>");
+          expect(result.stdout + result.stderr).not.toContain(secret);
+          expect(readFileSync(configPath, "utf8")).toBe(before);
+        } finally { removeTreeWithRetry(dir); }
+      });
+    }
+  }
+
+  test("new provider registration initializes model selection but force overwrite preserves it", () => {
+    const { dir } = freshConfig();
+    try {
+      const args = ["provider", "add", "model-fixture", "--adapter", "openai-chat", "--base-url", "https://models.example.test/v1", "--json"];
+      const added = runCli(args, { OPENCODEX_HOME: dir });
+      expect(added.status).toBe(0);
+      expect(JSON.parse(added.stdout).modelSelection.commands.list).toBe("ocx models live --provider model-fixture");
+      const first = readConfig(dir);
+      expect(first.providers["model-fixture"].initialModelSelection.status).toBe("pending");
+      const registrationId = first.providers["model-fixture"].initialModelSelection.registrationId;
+      first.providers["model-fixture"].selectedModels = ["chosen"];
+      writeFileSync(join(dir, "config.json"), JSON.stringify(first));
+      expect(runCli([...args, "--force"], { OPENCODEX_HOME: dir }).status).toBe(0);
+      const next = readConfig(dir).providers["model-fixture"];
+      expect(next.selectedModels).toEqual(["chosen"]);
+      expect(next.initialModelSelection.registrationId).toBe(registrationId);
+      expect(next.disabled).not.toBe(true);
+    } finally { removeTreeWithRetry(dir); }
+  });
+
+  test("provider --help prints usage", () => {
+    const result = runCli(["provider", "--help"]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Usage: ocx provider");
+    expect(result.stdout).toContain("list");
+    expect(result.stdout).toContain("add");
+    expect(result.stdout).toContain("remove");
+  });
+
+  test("provider list shows configured providers", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "list"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("openai");
+      expect(result.stdout).toContain("(default)");
+      expect(result.stdout).toContain("Available from registry");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider list --json returns valid JSON", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "list", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.configured).toBeArray();
+      expect(parsed.configured[0].name).toBe("openai");
+      expect(parsed.configured[0].isDefault).toBe(true);
+      expect(parsed.registryCount).toBeGreaterThan(0);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider list --jsonl matches JSON configured records with escaped model values", () => {
+    const escapedModel = 'model-"quoted"\\path\nnext\r\ttab-한글';
+    const { dir } = freshConfig({
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+        },
+        "custom.models-1": {
+          adapter: "openai-chat",
+          baseUrl: "https://models.example.test/v1",
+          defaultModel: escapedModel,
+          models: ["plain-model", escapedModel],
+        },
+      },
+      defaultProvider: "custom.models-1",
+    });
+    try {
+      const result = runCli(["provider", "list", "--jsonl"], { OPENCODEX_HOME: dir });
+      const json = runCli(["provider", "list", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(json.status).toBe(0);
+      // Keep every physical line: embedded newlines must be escaped, and only
+      // the final record terminator may produce an empty split element.
+      const lines = result.stdout.split(/\r?\n/);
+      expect(lines.pop()).toBe("");
+      expect(lines).toHaveLength(2);
+      const records = lines.map(line => JSON.parse(line));
+      const envelope = JSON.parse(json.stdout);
+      expect(records).toEqual(envelope.configured);
+      expect(envelope.registryCount).toBeGreaterThan(0);
+      expect(records).toEqual([
+        {
+          name: "openai",
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+          defaultModel: null,
+          isDefault: false,
+          source: "registry",
+          models: [],
+        },
+        {
+          name: "custom.models-1",
+          adapter: "openai-chat",
+          baseUrl: "https://models.example.test/v1",
+          authMode: "key",
+          defaultModel: escapedModel,
+          isDefault: true,
+          source: "custom",
+          models: ["plain-model", escapedModel],
+        },
+      ]);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test.each([
+    ["--json", "--jsonl"],
+    ["--jsonl", "--json"],
+  ])("provider list rejects %s %s without stdout", (first, second) => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "list", first, second], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Use only one of --json or --jsonl");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add registry provider seeds config", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "deepseek", "--api-key", "sk-test"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("deepseek");
+      expect(result.stdout).toContain("DeepSeek");
+
+      const config = readConfig(dir);
+      expect(config.providers.deepseek).toBeDefined();
+      expect(config.providers.deepseek.adapter).toBe("openai-chat");
+      expect(config.providers.deepseek.apiKey).toBe("sk-test");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add rejects a configured Codex account namespace without mutating config", () => {
+    const { dir, configPath } = freshConfig({
+      codexAccountNamespaces: { deepseek: "side-account-id" },
+    });
+    try {
+      const before = readFileSync(configPath, "utf8");
+      const result = runCli(["provider", "add", "deepseek", "--api-key", "sk-test"], { OPENCODEX_HOME: dir });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("must not collide with a configured Codex account namespace");
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test.each(["xai", "deepseek"])("login %s rejects a configured Codex account namespace before prompting", provider => {
+    const { dir, configPath } = freshConfig({
+      codexAccountNamespaces: { [provider]: "side-account-id" },
+    });
+    try {
+      const before = readFileSync(configPath, "utf8");
+      const result = runCli(["login", provider], { OPENCODEX_HOME: dir });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("must not collide with a configured Codex account namespace");
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add custom provider requires --adapter and --base-url", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "my-custom"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("--adapter");
+      expect(result.stderr).toContain("--base-url");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider show --json never prints secret-shaped modelCosts keys", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+        },
+        blsc: {
+          adapter: "openai-chat",
+          baseUrl: "https://llmapi.blsc.cn",
+          modelCosts: {
+            "deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+            "sk-abcdef1234567890": { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0 },
+          },
+        },
+      },
+    });
+    try {
+      const result = runCli(["provider", "show", "blsc", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(result.stdout).not.toContain("sk-abcdef1234567890");
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.modelCosts).toEqual({
+        "deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+      });
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add --force preserves an existing modelCosts overlay", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: {
+          adapter: "openai-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authMode: "forward",
+        },
+        blsc: {
+          adapter: "openai-chat",
+          baseUrl: "https://llmapi.blsc.cn",
+          apiKey: "sk-old",
+          modelCosts: {
+            "deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+          },
+        },
+      },
+    });
+    try {
+      const result = runCli([
+        "provider", "add", "blsc",
+        "--adapter", "openai-chat",
+        "--base-url", "https://llmapi.blsc.cn",
+        "--api-key", "sk-rotated",
+        "--force",
+      ], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const config = readConfig(dir);
+      expect(config.providers.blsc.apiKey).toBe("sk-rotated");
+      expect(config.providers.blsc.modelCosts).toEqual({
+        "deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+      });
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add custom provider with full flags", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli([
+        "provider", "add", "my-llm",
+        "--adapter", "openai-chat",
+        "--base-url", "http://localhost:8080/v1",
+        "--allow-private-network",
+        "--api-key", "test-key",
+        "--default-model", "my-model",
+      ], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+
+      const config = readConfig(dir);
+      expect(config.providers["my-llm"]).toBeDefined();
+      expect(config.providers["my-llm"].adapter).toBe("openai-chat");
+      expect(config.providers["my-llm"].baseUrl).toBe("http://localhost:8080/v1");
+      expect(config.providers["my-llm"].allowPrivateNetwork).toBe(true);
+      expect(config.providers["my-llm"].apiKey).toBe("test-key");
+      expect(config.providers["my-llm"].defaultModel).toBe("my-model");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test.each(["compatible", "reject-lossy"] as const)("provider add persists Google tool-schema policy %s", policy => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli([
+        "provider", "add", "google-policy",
+        "--adapter", "google",
+        "--base-url", "https://generativelanguage.googleapis.com",
+        "--api-key", "test-key",
+        "--google-tool-schema-policy", policy,
+      ], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(readConfig(dir).providers["google-policy"].googleToolSchemaPolicy).toBe(policy);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add rejects invalid or non-Google tool-schema policy without changing config", () => {
+    const { dir, configPath } = freshConfig();
+    try {
+      const before = readFileSync(configPath, "utf8");
+      const invalid = runCli([
+        "provider", "add", "google-policy",
+        "--adapter", "google",
+        "--base-url", "https://generativelanguage.googleapis.com",
+        "--google-tool-schema-policy", "silent-loss",
+      ], { OPENCODEX_HOME: dir });
+      expect(invalid.status).toBe(1);
+      expect(invalid.stderr).toContain('must be "compatible" or "reject-lossy"');
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+
+      const wrongAdapter = runCli([
+        "provider", "add", "chat-policy",
+        "--adapter", "openai-chat",
+        "--base-url", "https://example.test/v1",
+        "--google-tool-schema-policy", "reject-lossy",
+      ], { OPENCODEX_HOME: dir });
+      expect(wrongAdapter.status).toBe(1);
+      expect(wrongAdapter.stderr).toContain("requires the google adapter");
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add rejects duplicate without --force", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "openai"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("already exists");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add with --force overwrites", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "openai", "--force"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add --set-default changes defaultProvider", () => {
+    const { dir } = freshConfig();
+    try {
+      runCli(["provider", "add", "deepseek", "--api-key", "k", "--set-default"], { OPENCODEX_HOME: dir });
+      const config = readConfig(dir);
+      expect(config.defaultProvider).toBe("deepseek");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider remove works for non-default provider", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
+        deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com/v1", apiKey: "k" },
+      },
+    });
+    try {
+      const result = runCli(["provider", "remove", "deepseek"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+
+      const config = readConfig(dir);
+      expect(config.providers.deepseek).toBeUndefined();
+      expect(config.providers.openai).toBeDefined();
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider remove drops that provider's custom models (#1273)", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
+        huggingface: { adapter: "openai-chat", baseUrl: "https://api.hf.test/v1", apiKey: "k" },
+      },
+      customModels: [
+        { id: "keep-1", provider: "openai", modelId: "kept-model" },
+        { id: "drop-1", provider: "huggingface", modelId: "DeepSeek-V4-Flash-0731" },
+      ],
+      // Seeded so the assertion below proves removal does not rewrite one-time
+      // ownership: an older binary must keep seeing the same legacy slugs.
+      customModelCatalogMigration: {
+        version: 1,
+        legacyOwnedSlugs: ["huggingface/DeepSeek-V4-Flash-0731", "openai/kept-model"],
+      },
+    });
+    try {
+      const result = runCli(["provider", "remove", "huggingface", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        action: "removed",
+        provider: "huggingface",
+        droppedCustomModels: 1,
+      });
+
+      const config = readConfig(dir);
+      expect(config.customModels).toEqual([
+        { id: "keep-1", provider: "openai", modelId: "kept-model" },
+      ]);
+      expect(config.customModelCatalogMigration).toEqual({
+        version: 1,
+        legacyOwnedSlugs: ["huggingface/DeepSeek-V4-Flash-0731", "openai/kept-model"],
+      });
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider remove rejects default provider", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "remove", "openai"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("default provider");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider remove rejects last provider", () => {
+    const { dir } = freshConfig();
+    try {
+      // Only one provider (openai is also default) - should fail on default check first
+      const result = runCli(["provider", "remove", "openai"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider show displays config with masked secret", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
+        deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com/v1", apiKey: "test-dummy-key-for-masking" },
+      },
+    });
+    try {
+      const result = runCli(["provider", "show", "deepseek"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("deepseek");
+      expect(result.stdout).toContain("openai-chat");
+      expect(result.stdout).not.toContain("test-dummy-key-for-masking");
+      expect(result.stdout).toContain("****");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider show --json returns valid JSON", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "show", "openai", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.name).toBe("openai");
+      expect(parsed.isDefault).toBe(true);
+      expect(parsed.adapter).toBe("openai-responses");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider set-default changes default", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
+        deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com/v1", apiKey: "k" },
+      },
+    });
+    try {
+      const result = runCli(["provider", "set-default", "deepseek"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+
+      const config = readConfig(dir);
+      expect(config.defaultProvider).toBe("deepseek");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider set-default rejects unconfigured provider", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "set-default", "nonexistent"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("not configured");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("help provider shows provider help entry", () => {
+    const result = runCli(["help", "provider"]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Non-interactive provider management");
+  });
+
+  test("provider add warns on --api-key for oauth provider", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "anthropic", "--api-key", "test"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("OAuth");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+});
+
+describe("ocx provider strict args", () => {
+  test("provider list rejects unknown flags", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "list", "--bogus"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Unknown flag");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add rejects unknown flags", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "deepseek", "--unknown-thing"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Unknown flag");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider show rejects unknown flags", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "show", "openai", "--bogus"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Unknown flag");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+});
+
+describe("ocx provider mutating --json", () => {
+  test("provider add --json returns structured output", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "deepseek", "--api-key", "sk-test", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.action).toBe("added");
+      expect(parsed.provider).toBe("deepseek");
+      expect(parsed.source).toBe("registry");
+      expect(parsed.needsSync).toBe(true);
+      expect(parsed.adapter).toBeDefined();
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider remove --json returns structured output", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
+        deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com/v1", apiKey: "k" },
+      },
+    });
+    try {
+      const result = runCli(["provider", "remove", "deepseek", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.action).toBe("removed");
+      expect(parsed.provider).toBe("deepseek");
+      expect(parsed.remainingProviders).toContain("openai");
+      expect(parsed.needsSync).toBe(true);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider set-default --json returns structured output", () => {
+    const { dir } = freshConfig({
+      providers: {
+        openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward" },
+        deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com/v1", apiKey: "k" },
+      },
+    });
+    try {
+      const result = runCli(["provider", "set-default", "deepseek", "--json"], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.action).toBe("set-default");
+      expect(parsed.defaultProvider).toBe("deepseek");
+      expect(parsed.needsSync).toBe(true);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+});
+
+describe("ocx provider add --sync", () => {
+  test("provider add --sync preserves save but fails honestly without a proxy", () => {
+    const { dir } = freshConfig();
+    try {
+      // A requested sync cannot succeed without a running proxy; the local save survives.
+      const result = runCli(["provider", "add", "deepseek", "--api-key", "sk-test", "--sync"], { OPENCODEX_HOME: dir }, true);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("deepseek");
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  }, 15_000);
+
+  test("provider add --sync --json attempts sync and reports unavailable", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "deepseek", "--api-key", "sk-test", "--sync", "--json"], { OPENCODEX_HOME: dir }, true);
+      expect(result.status).toBe(1);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.needsSync).toBe(true);
+      expect(parsed.sync).toEqual({ status: "not-running", ok: false });
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+});
+
+
+test("provider add --force preserves all explicit model capability axes", () => {
+  const declarations = { ModelA: { inputModalities: ["text"], contextTier: "long_context", video: { processing: "agentic" } }, modela: { inputModalities: ["text", "image"] } };
+  const { dir } = freshConfig({ defaultProvider: "caps", providers: { caps: {
+    adapter: "openai-chat", baseUrl: "https://example.test/v1", modelCapabilities: declarations, modelContextTiers: { ModelA: "long_context" },
+  } } });
+  try {
+    const result = runCli(["provider", "add", "caps", "--adapter", "openai-chat", "--base-url", "https://example.test/v1", "--force", "--json"], { OPENCODEX_HOME: dir });
+    expect(result.status, result.stderr).toBe(0);
+    expect(readConfig(dir).providers.caps.modelCapabilities).toEqual(declarations);
+    expect(readConfig(dir).providers.caps.modelContextTiers).toEqual({ ModelA: "long_context" });
+  } finally { removeTreeWithRetry(dir); }
+});
+
+
+test("provider add --text-only preserves other capability axes during force overwrite", () => {
+  const { dir } = freshConfig({ defaultProvider: "caps", providers: { caps: {
+    adapter: "openai-chat", baseUrl: "https://example.test/v1",
+    modelCapabilities: { ModelA: { contextTier: "long_context", video: { processing: "agentic" } }, modela: { inputModalities: ["text", "image"] } },
+  } } });
+  try {
+    const result = runCli(["provider", "add", "caps", "--adapter", "openai-chat", "--base-url", "https://example.test/v1", "--force", "--model", "ModelA", "--text-only", "--json"], { OPENCODEX_HOME: dir });
+    expect(result.status, result.stderr).toBe(0);
+    expect(readConfig(dir).providers.caps.modelCapabilities).toEqual({
+      ModelA: { inputModalities: ["text"], contextTier: "long_context", video: { processing: "agentic" } }, modela: { inputModalities: ["text", "image"] },
+    });
+  } finally { removeTreeWithRetry(dir); }
+});
+
+
+describe("local provider add validates the full config before saving", () => {
+  test.each([
+    { baseUrl: "http://127.0.0.1:9/v1", flags: [], reason: "loopback address", hint: true },
+    { baseUrl: "http://169.254.169.254/v1", flags: ["--allow-private-network"], reason: "blocked metadata endpoint", hint: false },
+    { baseUrl: "https://fixture:synthetic-userinfo@provider.example.test/v1", flags: [], reason: "must not include embedded credentials", hint: false },
+  ])("invalid destination $baseUrl leaves config bytes unchanged", ({ baseUrl, flags, reason, hint }) => {
+    const { dir, configPath } = freshConfig();
+    try {
+      const before = readFileSync(configPath, "utf8");
+      const result = runCli(["provider", "add", "local-fixture", "--adapter", "openai-chat",
+        "--base-url", baseUrl, ...flags, "--json"], { OPENCODEX_HOME: dir }, true);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain(reason);
+      if (hint) expect(result.stderr).toContain("add --allow-private-network");
+      expect(result.stderr).not.toContain("synthetic-userinfo");
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+    } finally { removeTreeWithRetry(dir); }
+  });
+  test("intentional local destination remains saveable with --allow-private-network", () => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli(["provider", "add", "local-fixture", "--adapter", "openai-chat",
+        "--base-url", "http://127.0.0.1:9/v1", "--allow-private-network", "--json"], { OPENCODEX_HOME: dir }, true);
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout).action).toBe("added");
+      expect(readConfig(dir).providers["local-fixture"].allowPrivateNetwork).toBe(true);
+      const diagnosis = runCli(["config", "show", "--source", "--json"], { OPENCODEX_HOME: dir }, true);
+      expect(diagnosis.status).toBe(0);
+      expect(JSON.parse(diagnosis.stdout)).toMatchObject({ source: "file", error: null });
+    } finally { removeTreeWithRetry(dir); }
+  });
+});

@@ -1,0 +1,223 @@
+import { isolateCodexShimEnvironment, withInstalledShim } from "../helpers/codex-shim-install-fixture";
+import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { CodexShimAutoRestoreResult } from "../../src/codex/shim";
+import { getDefaultConfig } from "../../src/config";
+import {
+  maybeAutoRestoreCodexShim,
+  skipsCodexShimAutoRestore,
+  type CodexShimAutoRestoreCliDeps,
+} from "../../src/cli/codex-shim-autorestore";
+import { autoRestoreCodexShim, CODEX_SHIM_STATE_MAX_BYTES, installCodexShim } from "../../src/codex/shim";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { repoPath } from "../helpers/repo-root";
+
+isolateCodexShimEnvironment();
+
+const SHIM_MARKER = "opencodex codex autostart shim";
+
+function cliDeps(
+  result: CodexShimAutoRestoreResult,
+  overrides: Partial<CodexShimAutoRestoreCliDeps> = {},
+): { deps: CodexShimAutoRestoreCliDeps; warnings: string[]; readConfigCalls: () => number } {
+  const warnings: string[] = [];
+  let configCalls = 0;
+  const deps: CodexShimAutoRestoreCliDeps = {
+    env: {},
+    warn: message => warnings.push(message),
+    restore: () => result,
+    readConfig: () => {
+      configCalls += 1;
+      return { config: getDefaultConfig(), source: "default", error: null };
+    },
+    ...overrides,
+  };
+  return { deps, warnings, readConfigCalls: () => configCalls };
+}
+
+describe("Codex shim CLI auto-restore policy", () => {
+  test("skips inspection, destructive, and explicit repair commands but keeps start and ensure eligible", () => {
+    expect(skipsCodexShimAutoRestore("uninstall", ["uninstall"])).toBe(true);
+    expect(skipsCodexShimAutoRestore("remove", ["remove"])).toBe(true);
+    for (const subcommand of ["install", "uninstall", "remove", "status"]) {
+      expect(skipsCodexShimAutoRestore("codex-shim", ["codex-shim", subcommand])).toBe(true);
+    }
+    expect(skipsCodexShimAutoRestore("codex-shim", ["codex-shim", "status"])).toBe(true);
+    for (const action of ["check", "future-action", "bad", undefined]) {
+      const args = ["system", "codex-cli-update", ...(action ? [action] : [])];
+      expect(skipsCodexShimAutoRestore("system", args)).toBe(true);
+    }
+    expect(skipsCodexShimAutoRestore("system", ["system", "update", "check"])).toBe(false);
+    // resolve is read-only inspection for embedding shells: a lookup made to populate a
+    // consent surface must not trigger a shim repair side effect first.
+    expect(skipsCodexShimAutoRestore("resolve", ["resolve"])).toBe(true);
+    expect(skipsCodexShimAutoRestore("resolve", ["resolve", "--json"])).toBe(true);
+    for (const command of ["status", "doctor"]) {
+      expect(skipsCodexShimAutoRestore(command, [command])).toBe(true);
+      const { deps, warnings, readConfigCalls } = cliDeps({ status: "healthy" }, {
+        restore: () => { throw new Error("inspection must not restore"); },
+      });
+      maybeAutoRestoreCodexShim(command, [command], deps);
+      expect(warnings).toEqual([]);
+      expect(readConfigCalls()).toBe(0);
+    }
+    expect(skipsCodexShimAutoRestore("start", ["start"])).toBe(false);
+    expect(skipsCodexShimAutoRestore("ensure", ["ensure"])).toBe(false);
+  });
+
+  test("restore failure -> warning only, command succeeds", () => {
+    const { deps, warnings } = cliDeps({ status: "healthy" }, {
+      restore: () => { throw new Error("permission denied"); },
+    });
+
+    expect(maybeAutoRestoreCodexShim("ensure", ["ensure"], deps)).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("continuing without it");
+    expect(warnings[0]).toContain("ocx codex-shim install");
+  });
+
+  test("successful automatic repair warns exactly once", () => {
+    const { deps, warnings } = cliDeps({ status: "restored", message: "restored shim" });
+    maybeAutoRestoreCodexShim("ensure", ["ensure"], deps);
+    expect(warnings).toEqual([expect.stringContaining("automatic repair after Codex update")]);
+  });
+
+  test("actionable mixed-sibling deferrals are logged while ordinary deferrals stay silent", () => {
+    const { deps, warnings } = cliDeps({
+      status: "deferred",
+      message: "tracked launcher siblings are in a mixed shim/replacement state",
+    });
+    maybeAutoRestoreCodexShim("ensure", ["ensure"], deps);
+    expect(warnings).toEqual([expect.stringContaining("mixed shim/replacement state")]);
+  });
+
+  test("healthy, not-installed, disabled, and deferred outcomes stay silent and lazy", () => {
+    for (const status of ["healthy", "not-installed", "disabled", "deferred"] as const) {
+      const { deps, warnings, readConfigCalls } = cliDeps({ status });
+      maybeAutoRestoreCodexShim("ensure", ["ensure"], deps);
+      expect(warnings).toEqual([]);
+      expect(readConfigCalls()).toBe(0);
+    }
+  });
+
+  test("opt-out config and environment are evaluated lazily only for a candidate", () => {
+    for (const [configValue, env] of [[false, {}], [true, { OPENCODEX_CODEX_SHIM_AUTO_RESTORE: "0" }]] as const) {
+      let enabledValue: boolean | undefined;
+      const { deps, warnings } = cliDeps({ status: "disabled" }, {
+        env,
+        restore: options => {
+          enabledValue = options.enabled();
+          return { status: enabledValue ? "deferred" : "disabled" };
+        },
+        readConfig: () => ({
+          config: { ...getDefaultConfig(), codexShimAutoRestore: configValue },
+          source: "file",
+          error: null,
+        }),
+      });
+      maybeAutoRestoreCodexShim("ensure", ["ensure"], deps);
+      expect(enabledValue).toBe(false);
+      expect(warnings).toEqual([]);
+    }
+  });
+
+  test("oversized shim state is bounded, skipped, and warned without loading config", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-shim-oversized-state-"));
+    const oldHome = process.env.OPENCODEX_HOME;
+    try {
+      process.env.OPENCODEX_HOME = home;
+      const statePath = join(home, "codex-shim.json");
+      writeFileSync(statePath, Buffer.alloc(CODEX_SHIM_STATE_MAX_BYTES + 1, 0x20));
+      const before = readFileSync(statePath);
+      const { deps, warnings, readConfigCalls } = cliDeps({ status: "healthy" }, {
+        restore: autoRestoreCodexShim,
+      });
+
+      maybeAutoRestoreCodexShim("ensure", ["ensure"], deps);
+
+      expect(warnings).toEqual([expect.stringContaining("exceeds the 1 MiB startup limit")]);
+      expect(readConfigCalls()).toBe(0);
+      expect(readFileSync(statePath)).toEqual(before);
+    } finally {
+      if (oldHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = oldHome;
+      removeTreeWithRetry(home);
+    }
+  });
+
+  test("a native package-manager upgrade leaves the private overlay intact during updater inspection", async () => {
+    if (process.platform === "win32") return;
+    const binDir = mkdtempSync(join(tmpdir(), "ocx-shim-update-inspection-bin-"));
+    const home = mkdtempSync(join(tmpdir(), "ocx-shim-update-inspection-home-"));
+    const wrapper = join(binDir, "codex");
+    const overlay = join(home, "bin", "codex");
+    const statePath = join(home, "codex-shim.json");
+    const replacement = "#!/bin/sh\necho externally updated codex\n";
+    const oldPath = process.env.PATH;
+    const oldHome = process.env.OPENCODEX_HOME;
+    try {
+      process.env.PATH = binDir;
+      process.env.OPENCODEX_HOME = home;
+      writeFileSync(wrapper, "#!/bin/sh\necho original codex\n", "utf8");
+      chmodSync(wrapper, 0o755);
+      expect(installCodexShim().installed).toBe(true);
+      writeFileSync(wrapper, replacement, "utf8");
+      chmodSync(wrapper, 0o755);
+
+      const beforeWrapper = readFileSync(wrapper);
+      const beforeOverlay = readFileSync(overlay);
+      const beforeState = readFileSync(statePath);
+
+      const result = spawnSync(process.execPath, [
+        repoPath("src", "cli", "index.ts"),
+        "system", "codex-cli-update", "check", "--json",
+      ], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: binDir, OPENCODEX_HOME: home },
+      });
+
+      expect(result.status).toBe(0);
+      expect(() => JSON.parse(result.stdout)).not.toThrow();
+      expect(result.stderr).not.toContain("automatic repair after Codex update");
+      expect(readFileSync(wrapper)).toEqual(beforeWrapper);
+      expect(readFileSync(overlay)).toEqual(beforeOverlay);
+      expect(readFileSync(statePath)).toEqual(beforeState);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      if (oldHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = oldHome;
+      removeTreeWithRetry(binDir);
+      removeTreeWithRetry(home);
+    }
+  }, 20_000);
+
+  test("status and doctor preserve a missing overlay; start and ensure still repair it", () => {
+    if (process.platform === "win32") return;
+    withInstalledShim(({ wrappers, launchers, statePath }) => {
+      const nativeBefore = readFileSync(launchers[0]);
+      const stateBefore = readFileSync(statePath);
+      rmSync(wrappers[0]);
+      for (const command of ["status", "doctor"]) {
+        const { deps, warnings } = cliDeps({ status: "healthy" }, { restore: autoRestoreCodexShim });
+        maybeAutoRestoreCodexShim(command, [command], deps);
+        expect(warnings).toEqual([]);
+        expect(existsSync(wrappers[0])).toBe(false);
+        expect(readFileSync(statePath)).toEqual(stateBefore);
+      }
+      for (const command of ["start", "ensure"]) {
+        const { deps, warnings } = cliDeps({ status: "healthy" }, {
+          restore: options => autoRestoreCodexShim({ ...options, stabilitySleep: () => {} }),
+        });
+        maybeAutoRestoreCodexShim(command, [command], deps);
+        expect(warnings).toEqual([expect.stringContaining("automatic repair after Codex update")]);
+        expect(readFileSync(wrappers[0], "utf8")).toContain(SHIM_MARKER);
+        expect(readFileSync(launchers[0])).toEqual(nativeBefore);
+        rmSync(wrappers[0]);
+      }
+    });
+  }, 30_000);
+});

@@ -9,7 +9,7 @@
  *
  * Design of record: devlog/_fin/260802_client_toggle_api/031_wp3_writer_impl.md.
  */
-import type { ManagedContribution } from "../clients/config-export";
+import type { ManagedContribution } from "../clients/config-export/contracts";
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -20,18 +20,212 @@ function clone<T>(value: T): T {
   return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }
 
-/** Write `value` at `path`, creating intermediate objects. Returns a new document. */
+/**
+ * `[field=value]` addresses the ONE element of a sequence whose `field` equals
+ * `value`, and `[v2:field=value,field=value]` the one whose every named field
+ * matches. Raycast keeps its providers as a YAML list, so the element is the
+ * smallest thing we can own there; an index would move under us the moment
+ * the user reordered their own entries. Any other segment is a plain key.
+ *
+ * A conjunction exists because one field is not always the identity. ZCode
+ * keys a model rule in its provider store by the PAIR `(providerId, modelId)`,
+ * so a `[modelId=…]` selector alone would match another provider's rule for the
+ * same model and then replace it, in a file holding every provider the user
+ * has. Addressing an element by less than what identifies it is the same
+ * defect as addressing it by index.
+ *
+ * The single-criterion spelling keeps its original grammar, where the value may
+ * itself contain commas and equals signs. A conjunction uses an explicit v2
+ * marker, so no path already written into an ownership record on disk changes
+ * meaning. Once the marker is present the whole segment must be valid; falling
+ * back to a key or v1 selector would recreate the silent reselection hazard.
+ */
+const ARRAY_SELECTOR = /^\[([A-Za-z_][A-Za-z0-9_]*)=([^\]]+)\]$/u;
+const SELECTOR_FIELD = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+const SELECTOR_CONJUNCTION_PREFIX = "[v2:";
+
+/** One `field=value` equality a selector requires of the element it names. */
+export interface SelectorCriterion {
+  field: string;
+  value: string;
+}
+
+export type PathSegment =
+  | { kind: "key"; key: string }
+  | { kind: "select"; criteria: readonly SelectorCriterion[] };
+
+/** A reserved v2 selector marker was present, but its complete grammar was not. */
+export class InvalidSelectorError extends Error {
+  constructor() {
+    super("invalid versioned selector");
+    this.name = "InvalidSelectorError";
+  }
+}
+
+function validConjunctionCriteria(criteria: readonly SelectorCriterion[]): boolean {
+  return criteria.length >= 2 && criteria.every(criterion => (
+    SELECTOR_FIELD.test(criterion.field)
+    && criterion.value.length > 0
+    && !criterion.value.includes(",")
+    && !criterion.value.includes("]")
+  ));
+}
+
+/** Spell a multi-field selector without colliding with persisted v1 paths. */
+export function formatSelectorConjunction(criteria: readonly SelectorCriterion[]): string | null {
+  if (!validConjunctionCriteria(criteria)) return null;
+  return `${SELECTOR_CONJUNCTION_PREFIX}${criteria
+    .map(criterion => `${criterion.field}=${criterion.value}`)
+    .join(",")}]`;
+}
+
+export function parseSegment(raw: string): PathSegment {
+  if (raw.startsWith(SELECTOR_CONJUNCTION_PREFIX)) {
+    if (!raw.endsWith("]")) throw new InvalidSelectorError();
+    const parts = raw.slice(SELECTOR_CONJUNCTION_PREFIX.length, -1).split(",");
+    const criteria = parts.map(part => {
+      const equals = part.indexOf("=");
+      return equals < 0
+        ? { field: "", value: "" }
+        : { field: part.slice(0, equals), value: part.slice(equals + 1) };
+    });
+    if (!validConjunctionCriteria(criteria)) throw new InvalidSelectorError();
+    return {
+      kind: "select",
+      criteria,
+    };
+  }
+  const match = ARRAY_SELECTOR.exec(raw);
+  if (!match) return { kind: "key", key: raw };
+  return { kind: "select", criteria: [{ field: match[1]!, value: match[2]! }] };
+}
+
+/** The `field=value` list a selector segment spells, for messages and seeding. */
+export function selectorPairs(criteria: readonly SelectorCriterion[]): string {
+  return criteria.map(criterion => `${criterion.field}=${criterion.value}`).join(", ");
+}
+
+/**
+ * Thrown when a selector matches more than one element. Picking either one
+ * would silently rewrite an entry the user may have written; the writer maps
+ * this to an `unsafe` refusal instead.
+ */
+export class AmbiguousSelectorError extends Error {
+  constructor(criteria: readonly SelectorCriterion[]) {
+    super(`more than one entry has ${selectorPairs(criteria)}`);
+    this.name = "AmbiguousSelectorError";
+  }
+}
+
+/** The index of the element a selector names, -1 when none matches. */
+export function selectIndex(items: readonly unknown[], criteria: readonly SelectorCriterion[]): number {
+  const matches: number[] = [];
+  items.forEach((item, index) => {
+    if (isPlainRecord(item) && criteria.every(criterion => item[criterion.field] === criterion.value)) {
+      matches.push(index);
+    }
+  });
+  if (matches.length > 1) throw new AmbiguousSelectorError(criteria);
+  return matches[0] ?? -1;
+}
+
+function assertNever(segment: never): never {
+  throw new Error(`unknown path segment ${JSON.stringify(segment)}`);
+}
+
+/** The element a selector names, or `undefined` when none matches. */
+function selectElement(items: readonly unknown[], segment: PathSegment & { kind: "select" }): unknown {
+  return items[selectIndex(items, segment.criteria)];
+}
+
+/**
+ * Read `path` through the same segment grammar `setPath` writes through.
+ *
+ * It belongs here rather than beside the classifier because the grammar does: a
+ * reader that resolved a selector differently from the writer would report one
+ * element as ours and then rewrite another. `state` re-exports it for the
+ * callers that have always imported it from there.
+ */
+export function readPath(doc: unknown, path: readonly string[]): unknown {
+  let cursor: unknown = doc;
+  // Validate the complete persisted grammar before document shape can short-circuit
+  // the walk. Otherwise an absent early key can hide a malformed later selector,
+  // making an unreadable ownership record look absent and move the operation to a
+  // different file.
+  const segments = path.map(parseSegment);
+  for (const segment of segments) {
+    switch (segment.kind) {
+      case "key":
+        if (!isPlainRecord(cursor)) return undefined;
+        cursor = cursor[segment.key];
+        break;
+      case "select":
+        if (!Array.isArray(cursor)) return undefined;
+        cursor = selectElement(cursor, segment);
+        break;
+      default:
+        return assertNever(segment);
+    }
+    if (cursor === undefined) return undefined;
+  }
+  return cursor;
+}
+
+/**
+ * Write `value` at `path`, creating intermediate containers. Returns a new document.
+ *
+ * A `key` segment descends through a record, creating `{}` where the slot is
+ * absent or holds something else. A `select` segment descends through an
+ * array the same way, creating `[]`; a missing element is pushed, a matching
+ * one is replaced in place so the user's ordering survives.
+ */
 export function setPath(doc: unknown, path: readonly string[], value: unknown): unknown {
   if (path.length === 0) throw new Error("setPath needs a non-empty path");
-  const root: Record<string, unknown> = isPlainRecord(doc) ? clone(doc) : {};
-  let cursor = root;
-  for (const key of path.slice(0, -1)) {
-    const next = cursor[key];
-    if (!isPlainRecord(next)) cursor[key] = {};
-    cursor = cursor[key] as Record<string, unknown>;
+  /*
+   * `parent[slot]` is the position the segment just consumed addresses. The
+   * root sits in a one-key holder so the first segment needs no special case:
+   * a document that is neither a record nor a sequence is replaced by `{}`
+   * exactly as before. A sequence root survives so a leading selector can
+   * address one of its entries (a DSH profile patch is a top-level list).
+   */
+  const holder: Record<string, unknown> = { root: isPlainRecord(doc) || Array.isArray(doc) ? clone(doc) : {} };
+  let parent: Record<string, unknown> | unknown[] = holder;
+  let slot: string | number = "root";
+  const read = (): unknown => (Array.isArray(parent) ? parent[slot as number] : parent[slot as string]);
+  const write = (next: unknown): void => {
+    if (Array.isArray(parent)) parent[slot as number] = next;
+    else parent[slot as string] = next;
+  };
+  for (const raw of path) {
+    const segment = parseSegment(raw);
+    switch (segment.kind) {
+      case "key": {
+        if (!isPlainRecord(read())) write({});
+        parent = read() as Record<string, unknown>;
+        slot = segment.key;
+        break;
+      }
+      case "select": {
+        if (!Array.isArray(read())) write([]);
+        const items = read() as unknown[];
+        const found = selectIndex(items, segment.criteria);
+        parent = items;
+        if (found >= 0) {
+          slot = found;
+        } else {
+          // Seed the element so the selector stays true for whatever a deeper
+          // segment writes into it; a last-position select replaces it whole.
+          slot = items.length;
+          items.push(Object.fromEntries(segment.criteria.map(criterion => [criterion.field, criterion.value])));
+        }
+        break;
+      }
+      default:
+        return assertNever(segment);
+    }
   }
-  cursor[path[path.length - 1]!] = clone(value);
-  return root;
+  write(clone(value));
+  return holder.root;
 }
 
 /**
@@ -52,29 +246,61 @@ export function deletePath(
   path: readonly string[],
   createdContainers: ReadonlySet<string> = new Set(),
 ): { doc: unknown; removed: boolean } {
-  if (!isPlainRecord(doc) || path.length === 0) return { doc, removed: false };
-  const root = clone(doc) as Record<string, unknown>;
-  const chain: Record<string, unknown>[] = [root];
-  let cursor: Record<string, unknown> = root;
-  for (const key of path.slice(0, -1)) {
-    const next = cursor[key];
-    if (!isPlainRecord(next)) return { doc: root, removed: false };
-    cursor = next;
-    chain.push(cursor);
+  if ((!isPlainRecord(doc) && !Array.isArray(doc)) || path.length === 0) return { doc, removed: false };
+  const root = clone(doc) as Record<string, unknown> | unknown[];
+  // `chain[i]` is the container segment `i` is resolved against; `slots[i]` is
+  // the key or index it resolved to, so the prune walk can delete by position.
+  const chain: (Record<string, unknown> | unknown[])[] = [root];
+  const slots: (string | number)[] = [];
+  for (let depth = 0; depth < path.length; depth += 1) {
+    const container = chain[depth]!;
+    const segment = parseSegment(path[depth]!);
+    switch (segment.kind) {
+      case "key": {
+        if (Array.isArray(container) || !(segment.key in container)) return { doc: root, removed: false };
+        slots.push(segment.key);
+        chain.push(container[segment.key] as Record<string, unknown> | unknown[]);
+        break;
+      }
+      case "select": {
+        if (!Array.isArray(container)) return { doc: root, removed: false };
+        const found = selectIndex(container, segment.criteria);
+        if (found < 0) return { doc: root, removed: false };
+        slots.push(found);
+        chain.push(container[found] as Record<string, unknown> | unknown[]);
+        break;
+      }
+      default:
+        return assertNever(segment);
+    }
+    // Only the leaf may be a scalar; walking into one means the path is absent.
+    if (depth < path.length - 1) {
+      const next = chain[depth + 1];
+      if (!isPlainRecord(next) && !Array.isArray(next)) return { doc: root, removed: false };
+    }
   }
-  const leaf = path[path.length - 1]!;
-  if (!(leaf in cursor)) return { doc: root, removed: false };
-  delete cursor[leaf];
+  const remove = (container: Record<string, unknown> | unknown[], slot: string | number): void => {
+    if (Array.isArray(container)) container.splice(slot as number, 1);
+    else delete container[slot as string];
+  };
+  remove(chain[path.length - 1]!, slots[path.length - 1]!);
   /*
    * Walk back up, pruning only containers this deletion emptied AND that we
    * created. The root is never pruned.
    */
-  for (let index = chain.length - 1; index >= 1; index -= 1) {
+  for (let index = path.length - 1; index >= 1; index -= 1) {
     const container = chain[index]!;
-    if (Object.keys(container).length > 0) break;
+    // An element we pushed for a selector is empty once only the fields that seeded it remain.
+    const segment = parseSegment(path[index - 1]!);
+    const empty = Array.isArray(container)
+      ? container.length === 0
+      : segment.kind === "select"
+        ? Object.keys(container).length === segment.criteria.length && selectIndex([container], segment.criteria) === 0
+        : Object.keys(container).length === 0;
+    if (!empty) break;
     const containerPath = path.slice(0, index).join("\u0000");
     if (!createdContainers.has(containerPath)) break;
-    delete chain[index - 1]![path[index - 1]!];
+    remove(chain[index - 1]!, slots[index - 1]!);
   }
   return { doc: root, removed: true };
 }
@@ -121,9 +347,31 @@ export function createdContainerPaths(
   for (const fragment of contribution.fragments) {
     let cursor: unknown = doc;
     for (let depth = 0; depth < fragment.path.length - 1; depth += 1) {
-      const key = fragment.path[depth]!;
-      const next = isPlainRecord(cursor) ? cursor[key] : undefined;
-      if (!isPlainRecord(next)) {
+      const segment = parseSegment(fragment.path[depth]!);
+      let next: unknown;
+      switch (segment.kind) {
+        case "key": {
+          /*
+           * The container this key must hold is whatever the NEXT segment
+           * descends into: an array when that is a selector, a record
+           * otherwise. Either one is ours to create when absent.
+           */
+          const nextSegment = parseSegment(fragment.path[depth + 1]!);
+          next = isPlainRecord(cursor) ? cursor[segment.key] : undefined;
+          if (nextSegment.kind === "select" ? !Array.isArray(next) : !isPlainRecord(next)) next = undefined;
+          break;
+        }
+        case "select": {
+          // A selector that matches nothing means setPath will push the element.
+          next = Array.isArray(cursor)
+            ? cursor[selectIndex(cursor, segment.criteria)]
+            : undefined;
+          break;
+        }
+        default:
+          return assertNever(segment);
+      }
+      if (next === undefined) {
         created.add(fragment.path.slice(0, depth + 1).join("\u0000"));
         cursor = undefined;
         continue;

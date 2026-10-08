@@ -13,6 +13,7 @@ export const IconBoxes = (p: P) => (<svg {...S(p)}><path d="M12 2 4 6v6l8 4 8-4V
 export const IconBot = (p: P) => (<svg {...S(p)}><rect x="4" y="8" width="16" height="11" rx="3"/><path d="M12 8V4M8 2h8"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>);
 export const IconList = (p: P) => (<svg {...S(p)}><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>);
 export const IconMenu = (p: P) => (<svg {...S(p)}><path d="M4 6h16M4 12h16M4 18h16"/></svg>);
+export const IconPanelLeft = (p: P) => (<svg {...S(p)}><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>);
 export const IconTerminal = (p: P) => (<svg {...S(p)}><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>);
 export const IconActivity = (p: P) => (<svg {...S(p)}><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>);
 export const IconHardDrive = (p: P) => (<svg {...S(p)}><path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/><path d="M6 16h.01M10 16h.01"/></svg>);
@@ -20,10 +21,13 @@ export const IconHardDrive = (p: P) => (<svg {...S(p)}><path d="M22 12H2"/><path
 export const IconCheck = (p: P) => (<svg {...S(p)}><path d="m20 6-11 11-5-5"/></svg>);
 export const IconX = (p: P) => (<svg {...S(p)}><path d="M18 6 6 18M6 6l12 12"/></svg>);
 export const IconPlus = (p: P) => (<svg {...S(p)}><path d="M12 5v14M5 12h14"/></svg>);
+export const IconMinus = (p: P) => (<svg {...S(p)}><path d="M5 12h14"/></svg>);
 export const IconRefresh = (p: P) => (<svg {...S(p)}><path d="M21 12a9 9 0 0 1-9 9 9.8 9.8 0 0 1-6.7-2.7L3 16M3 21v-5h5M3 12a9 9 0 0 1 9-9 9.8 9.8 0 0 1 6.7 2.7L21 8M21 3v5h-5"/></svg>);
 export const IconPause = (p: P) => (<svg {...S(p)}><path d="M8 5v14M16 5v14"/></svg>);
 export const IconPlay = (p: P) => (<svg {...S(p)}><path d="m7 4 13 8-13 8Z"/></svg>);
 export const IconTrash = (p: P) => (<svg {...S(p)}><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>);
+export const IconEyeOff = (p: P) => (<svg {...S(p)}><path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 4.2A10.8 10.8 0 0 1 12 4c5 0 9 4 10 8a12.7 12.7 0 0 1-2 4.1M6.6 6.6A12.4 12.4 0 0 0 2 12c1 4 5 8 10 8 1.5 0 2.9-.4 4.1-1"/></svg>);
+export const IconPencil = (p: P) => (<svg {...S(p)}><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>);
 export const IconAlert = (p: P) => (<svg {...S(p)}><path d="M10.3 3.7 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>);
 export const IconInfo = (p: P) => (<svg {...S(p)}><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>);
 export const IconSearch = (p: P) => (<svg {...S(p)}><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>);
@@ -35,6 +39,33 @@ export const IconGithub = (p: P) => (<svg {...S(p)}><path d="M9 19c-5 1.5-5-2.5-
 export const IconPower = (p: P) => (<svg {...S(p)}><path d="M18.4 5.6a9 9 0 1 1-12.8 0"/><path d="M12 2v10"/></svg>);
 export const IconExternal = (p: P) => (<svg {...S(p)}><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>);
 export const IconKey = (p: P) => (<svg {...S(p)}><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.6-9.6M16 7l3 3M14 9l2 2"/></svg>);
+
+/**
+ * The Codex mark — a terminal prompt (`>` and an underscore) inside a ring.
+ *
+ * Path data is copied verbatim from the mark the Codex CLI renders on its own
+ * login-success page,
+ * openai/codex `codex-rs/login/src/assets/success.html` (`svg.codex-mark`), so the
+ * geometry traces to a source rather than to a redraw. That mark is already
+ * stroked on `currentColor` with round caps, which is exactly this file's
+ * convention; only its viewBox differs. It keeps the source's `0 0 32 32` box and
+ * `2.484` stroke instead of being rescaled — at 24 units that stroke would be
+ * 1.863, within a hair of the `2` its neighbours use, so it sits at the same
+ * visual weight while staying byte-identical to the original. That is also why it
+ * does not go through `S()`, which hardcodes the 24-unit box and a stroke of 2.
+ */
+export const IconCodex = (p: P) => (
+  <svg
+    viewBox="0 0 32 32"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={2.484}
+    strokeLinecap="round"
+    {...p}
+  >
+    <path d="M22.356 19.797H17.17M9.662 12.29l1.979 3.576a.511.511 0 0 1-.005.504l-1.974 3.409M30.758 16c0 8.15-6.607 14.758-14.758 14.758-8.15 0-14.758-6.607-14.758-14.758C1.242 7.85 7.85 1.242 16 1.242c8.15 0 14.758 6.608 14.758 14.758Z" />
+  </svg>
+);
 
 export const IconLock = (p: P) => (<svg {...S(p)}><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>);
 export const IconTicket = (p: P) => (<svg {...S(p)}><path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2"/><path d="M13 17v2"/><path d="M13 11v2"/></svg>);
@@ -65,3 +96,6 @@ export const IconGrip = (p: P) => (
 );
 export const IconStar = (p: P) => (<svg {...S(p)}><path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>);
 export const IconFilter = (p: P) => (<svg {...S(p)}><path d="M4 5h16l-6 7v5l-4 2v-7L4 5z"/></svg>);
+
+/** Claude sunburst, using the same currentColor stroke as the navigation marks. */
+export const IconClaude = (p: P) => (<svg {...S(p)}><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M5.6 18.4 18.4 5.6M8.5 3.7l7 16.6M3.7 8.5l16.6 7M3.7 15.5l16.6-7M8.5 20.3l7-16.6"/></svg>);

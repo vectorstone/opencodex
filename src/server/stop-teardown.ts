@@ -1,0 +1,125 @@
+import type { CodexNativeRestoreResult } from "../codex/inject";
+import { siblingOfLivePort, siblingSkipMessage } from "../codex/sibling-start";
+import { deferralMatchesReceipt } from "../config/pending-teardown";
+import { isDesktopSupervised } from "../lib/system-restart-contract";
+import type { ManagementPrincipal } from "./management-auth";
+
+/**
+ * Shared-teardown decision and execution for `POST /api/stop` (#3008).
+ *
+ * Lives outside the route handler because the handler schedules `process.exit` 200ms
+ * after it answers, which makes it uncallable from a test. The part worth testing is
+ * exactly this: whether the deferral is honoured, whether the restores actually run, and
+ * whether the response says what happened.
+ */
+
+export type GrokStripResult = { ok: boolean; changed: boolean; message: string };
+
+export type StopTeardownIo = {
+  /** Does the nonce this request carries name a readable obligation on disk? */
+  ownsReceipt?: (nonce: string | null) => boolean;
+  restoreNativeCodex?: () => Promise<CodexNativeRestoreResult>;
+  stripGrok?: () => GrokStripResult;
+};
+
+export type StopTeardownBody = {
+  success: boolean;
+  message: string;
+  /** `not-owned`: a sibling instance, whose shared client routing belongs to the live owner. */
+  sharedTeardown: "deferred" | "performed" | "not-owned";
+};
+
+/**
+ * A deferral is honoured only when the caller proves it owns the obligation.
+ *
+ * The query flag names an intention; the receipt is the obligation. Without the second
+ * half any authenticated caller could ask the proxy to skip teardown and then exit,
+ * leaving native Codex and the Grok fence pointed at a proxy that no longer exists.
+ *
+ * "A receipt exists" is not that proof either: it would let any caller ride on another
+ * stop's outstanding obligation and get a deferral it never owns. The request has to name
+ * the receipt's nonce, which only the process that wrote it (and anything that can read
+ * the 0700 config directory, which is already the trust boundary for the admin token)
+ * can know.
+ */
+export function deferralHonored(url: URL, ownsReceipt: (nonce: string | null) => boolean): boolean {
+  if (url.searchParams.get("deferSharedTeardown") !== "1") return false;
+  return ownsReceipt(url.searchParams.get("teardownNonce"));
+}
+
+export type StopRefusalBody = { success: false; code: string; message: string };
+
+/**
+ * The dashboard's Stop, refused while the desktop app supervises this process.
+ *
+ * The app starts its runtime again after any exit it did not ask for
+ * (`desktop/src-tauri/src/supervisor.rs`), and a dashboard Stop is not the app asking: the proxy
+ * would restore native Codex and exit, and the app would start it again seconds later and reload
+ * the dashboard. Like the service-manager refusals it is refused before anything changes, and it
+ * names what does stop the proxy: the app's tray Stop proxy, or Quit. Only a dashboard session is
+ * refused. `ocx stop`, which the tray's Stop, Quit and an update's drain all run, authenticates
+ * with the admin token and is unaffected. Read only on this route, never on the request path.
+ */
+export function desktopSupervisedStopRefusal(
+  principal: ManagementPrincipal | null | undefined,
+  supervised: () => boolean = isDesktopSupervised,
+): StopRefusalBody | null {
+  if (principal !== "gui-session" || !supervised()) return null;
+  return {
+    success: false,
+    code: "desktop_supervised",
+    message: "The OpenCodex desktop app runs this proxy and starts it again after it exits, so the dashboard does not stop it. Use Stop proxy in the app's tray menu, or quit the app. Nothing was changed.",
+  };
+}
+
+/** Run (or skip) the shared teardown and describe the outcome truthfully. */
+export async function performStopTeardown(url: URL, io: StopTeardownIo = {}): Promise<StopTeardownBody> {
+  // Before the deferral check: a sibling owns no shared teardown to perform OR to hand over.
+  // Restoring here would replay the live owner's journal and strip its Grok fence.
+  if (siblingOfLivePort() !== null) {
+    return { success: true, message: `Proxy stopping. ${siblingSkipMessage()}`, sharedTeardown: "not-owned" };
+  }
+  const ownsReceipt = io.ownsReceipt ?? deferralMatchesReceipt;
+  if (deferralHonored(url, ownsReceipt)) {
+    // Not "native Codex restored": nothing was restored here, and claiming otherwise
+    // would be a success message the operator cannot verify.
+    return {
+      success: true,
+      message: "Proxy stopping; shared teardown deferred to the stopping client.",
+      sharedTeardown: "deferred",
+    };
+  }
+  const restore = io.restoreNativeCodex
+    ? await io.restoreNativeCodex()
+    : await (await import("../codex/inject")).restoreNativeCodexAsync();
+  const grok = io.stripGrok
+    ? io.stripGrok()
+    : (await import("../grok/inject")).stripGrokConfig();
+  // Success means BOTH halves came down. Deciding it from the native restore alone and
+  // appending the Grok text let a caller read `success: true` while the fence still
+  // pointed at a proxy that was exiting — the teardown reported done with half of it
+  // undone (#3008).
+  const grokNote = grok.ok ? "" : ` Grok config cleanup failed: ${grok.message}`;
+  if (restore.success && grok.ok) {
+    // A degraded restore is a success — routing is out and the client is no longer aimed at
+    // a port that is about to disappear — but it left a provider table behind on purpose.
+    // Reporting a bare "restored" would put the caller in exactly the position #4812
+    // describes: a config they did not expect and no idea why it is there.
+    const retained = restore.retainedCodexProviderTable
+      ? ` ${(await import("../codex/inject/restore")).describeRetainedCodexProviderTable(restore.retainedCodexProviderTable)}`
+      : "";
+    return { success: true, message: `Proxy stopping, native Codex restored.${retained}`, sharedTeardown: "performed" };
+  }
+  if (restore.success) {
+    return {
+      success: false,
+      message: `Proxy stopping, native Codex restored, but the Grok fence was not removed:${grokNote} Run \`ocx restore\`.`,
+      sharedTeardown: "performed",
+    };
+  }
+  return {
+    success: false,
+    message: `Proxy stopping, but native Codex restore failed: ${restore.message}. Run \`ocx restore\`.${grokNote}`,
+    sharedTeardown: "performed",
+  };
+}

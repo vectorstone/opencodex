@@ -37,6 +37,14 @@ function errorHtml(message: string): string {
 
 export type CallbackResult = { code: string; state: string };
 
+/** Close every response so pooled sockets cannot send the next login to a retired flow. */
+function closingResponse(body: string, status: number, contentType = "text/html"): Response {
+  return new Response(body, {
+    status,
+    headers: { "Content-Type": contentType, "Connection": "close" },
+  });
+}
+
 /**
  * The redirect URI advertised to providers must stay `localhost` (it is what the OAuth
  * apps have registered), but Windows commonly resolves `localhost` to `::1` first while
@@ -177,7 +185,7 @@ export abstract class OAuthCallbackFlow {
   #handleCallback(req: Request, expectedState: string): Response {
     const url = new URL(req.url);
     if (url.pathname !== this.callbackPath) {
-      return new Response("Not Found", { status: 404 });
+      return closingResponse("Not Found", 404, "text/plain");
     }
 
     const code = url.searchParams.get("code");
@@ -214,10 +222,7 @@ export abstract class OAuthCallbackFlow {
       });
     }
 
-    return new Response(ok ? SUCCESS_HTML : errorHtml(errMessage), {
-      status: ok ? 200 : consumeFlow ? 500 : 400,
-      headers: { "Content-Type": "text/html" },
-    });
+    return closingResponse(ok ? SUCCESS_HTML : errorHtml(errMessage), ok ? 200 : consumeFlow ? 500 : 400);
   }
 
   #waitForCallback(expectedState: string): Promise<CallbackResult> {
@@ -247,9 +252,10 @@ export abstract class OAuthCallbackFlow {
                 if (!parsed.code) return null;
                 // Kind-aware state enforcement: url/query-shaped input is an authorization
                 // RESPONSE and must carry a matching state — missing state is rejected, not
-                // downgraded to raw. Only a syntactically raw code (same PKCE session) is
-                // exempt, so the CLI/GUI paste fallback still works.
-                if (parsed.kind !== "raw" && expectedState && parsed.state !== expectedState) return null;
+                // downgraded to raw. A raw paste with an explicit code#state suffix is
+                // state-bearing too. Only a syntactically raw code WITHOUT a state suffix
+                // (same PKCE session) is exempt, so the CLI/GUI paste fallback still works.
+                if ((parsed.kind !== "raw" || parsed.state !== undefined) && expectedState && parsed.state !== expectedState) return null;
                 return { code: parsed.code, state: parsed.state ?? expectedState };
               })
               .catch((): CallbackResult | null => null),
@@ -276,10 +282,30 @@ export function parseCallbackInput(input: string): { kind: "url" | "query" | "ra
 
   try {
     const url = new URL(value);
+    // Also read the fragment. No provider configured here returns one — every
+    // OAuthCallbackFlow asks for response_type=code without response_mode, so
+    // the parameters land in the query — but a full URL whose parameters sit in
+    // the hash parses as a valid URL with no code, and reading only the query
+    // rejects it as "no authorization code found in input". This is the one
+    // place a fragment-returning provider would land, and the raw branch below
+    // already understands `code#state`.
+    //
+    // The query wins as a WHOLE when it carries the response, and the two
+    // fields are never mixed across collections. Reading `code` and `state`
+    // independently would accept `?state=<expected>#code=<other>` — one
+    // response assembled from two sources — which is exactly the confusion a
+    // state check exists to prevent. An authorization response arrives in one
+    // place; treat it that way.
+    //
+    // Only `code` and `state` are read — never a token. This repo does not
+    // implement the implicit grant and a paste field must not become the place
+    // it appears.
+    const fragment = new URLSearchParams(url.hash.replace(/^#/, ""));
+    const source = url.searchParams.has("code") ? url.searchParams : fragment;
     return {
       kind: "url",
-      code: url.searchParams.get("code") ?? undefined,
-      state: url.searchParams.get("state") ?? undefined,
+      code: source.get("code") ?? undefined,
+      state: source.get("state") ?? undefined,
     };
   } catch {
     // Not a URL - check for query string format

@@ -1,6 +1,6 @@
 ---
 title: Adaptateurs
-description: Les sept adaptateurs de fournisseurs — leurs cibles, la construction des requêtes et leurs particularités.
+description: Les adaptateurs de fournisseurs — leurs cibles, la construction des requêtes et leurs particularités.
 ---
 
 Un **adaptateur** traduit les échanges entre le modèle interne de requête/réponse d’opencodex et le protocole d’un fournisseur. Chaque adaptateur implémente l’interface `ProviderAdapter` (`src/adapters/base.ts`) :
@@ -22,7 +22,7 @@ interface ProviderAdapter {
 
 ## `openai-chat`
 
-**Cibles :** l’API **Chat Completions** d’OpenAI (`POST {baseUrl}/chat/completions` ; un suffixe `/chat/completions` ou `/` est d’abord retiré de `baseUrl`) et tous les fournisseurs compatibles — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (local et cloud), entre autres.
+**Cibles :** l’API **Chat Completions** d’OpenAI (`POST {baseUrl}/chat/completions` ; un suffixe `/chat/completions` ou `/` est d’abord retiré de `baseUrl`) et tous les fournisseurs compatibles — xAI, Kimi, DeepSeek, GLM, Groq, OpenRouter, Ollama (local), entre autres.
 **Authentification :** `key` (Bearer).
 
 - Convertit les messages internes en rôles OpenAI ; mappe les outils vers `{type:"function", function:{…}}` et `tool_choice` (`auto`/`none`/`required` ou une fonction nommée).
@@ -30,7 +30,51 @@ interface ProviderAdapter {
 - **Réécrit le prompt d’identité GPT-5 de Codex** sous une forme indépendante du modèle afin que les modèles routés ne prétendent pas être OpenAI.
 - **Limite `reasoning_effort`** au sous-ensemble annoncé par le modèle lorsque le niveau exact n’est pas disponible ; `xhigh` et `max` restent des libellés distincts, sauf si un fournisseur configure explicitement un alias. L’adaptateur **omet entièrement ce champ** pour les identifiants figurant dans `provider.noReasoningModels`.
 - Diffuse `delta.content` (texte), `delta.reasoning_content` (raisonnement) et `delta.tool_calls[]`, et recueille `usage`.
-- ClinePass utilise le format de passerelle vérifié en conditions réelles `reasoning: { enabled: true, effort: "low" }` (ou `{ enabled: false }` lorsque le raisonnement est désactivé). Sa documentation publique d’API ne précise pas encore cette forme de requête. L’adaptateur limite les autres niveaux demandés au niveau `low` vérifié, accepte les deltas de raisonnement provenant de `delta.reasoning_content` ou de `delta.reasoning`, demande les données d’utilisation en flux avec `stream_options.include_usage` et lit ces données dans les enveloppes de réponse hors flux.
+- ClinePass utilise le format de passerelle vérifié en conditions réelles `reasoning: { enabled: true, effort }` (ou `{ enabled: false }` lorsque le raisonnement est désactivé). Sa documentation publique d’API ne précise pas encore cette forme de requête. L’adaptateur préserve les niveaux `low`, `medium`, `high`, `xhigh` et `max` demandés, accepte les deltas de raisonnement provenant de `delta.reasoning_content` ou de `delta.reasoning`, demande les données d’utilisation en flux avec `stream_options.include_usage` et lit ces données dans les enveloppes de réponse hors flux.
+
+## `ollama-native`
+
+**Cibles :** l’**API Chat** native d’Ollama (`POST /api/chat`) plutôt que sa surface compatible
+OpenAI. Le fournisseur intégré `ollama-cloud` est sélectionné sur cet adaptateur par le registre ;
+il peut aussi être configuré sur un fournisseur Ollama personnalisé ou auto-hébergé distinct avec
+`adapter: "ollama-native"`.
+**Authentification :** `key` (Bearer) pour les cibles cloud/personnalisées ; aucun identifiant
+n’est envoyé aux cibles de boucle locale ou en `authMode: "local"`.
+
+- **La sélection par le registre est déterminante.** La ligne intégrée `ollama-cloud` conserve
+  l’URL de base `https://ollama.com/v1` pour la découverte en direct via `/v1/models`, tandis que
+  l’inférence est normalisée vers `POST https://ollama.com/api/chat`. Un champ `adapter` configuré
+  est écarté pour cette ligne de fournisseur. L’Ollama local intégré reste sur `openai-chat` ;
+  choisir `ollama-native` pour un point de terminaison local ou auto-hébergé est une décision
+  explicite de configuration de fournisseur, détectée par hôte afin qu’une destination non-Ollama
+  ne soit jamais réécrite silencieusement.
+- **Métadonnées des modèles :** `/v1/models` ne porte aucune métadonnée par modèle ; pour Ollama
+  Cloud canonique, le fournisseur enrichit chaque identifiant découvert via un `POST /api/show`
+  *borné* (256 KiB par réponse, 8 s par requête, concurrence 4, 48 requêtes, échéance de 12 s pour
+  toute la phase) afin d’obtenir la véritable fenêtre de contexte et la capacité de vision. La
+  requête show est de même origine et ne suit jamais une redirection ; un échec dégrade ce seul
+  modèle sans jamais faire échouer la découverte.
+- **Diffusion :** le NDJSON natif d’Ollama. Les deltas de texte et de `message.thinking` sont
+  transmis dès leur arrivée ; un tour ne se termine que sur un enregistrement terminal
+  `done: true`, et un `done: false` bufferisé ou un terminal manquant supprime entièrement le
+  texte partiel et les appels d’outils.
+- **Raisonnement :** cartographie le champ natif `think` d’Ollama (`low`/`medium`/`high`/`max`,
+  plus les booléens), limité à l’échelle annoncée du modèle, et respecte la sémantique de la
+  sentinelle `__omit__` configurée en amont.
+- **Images :** envoyées nativement dans le tableau `images` du message lorsque le modèle prend en
+  charge la vision ; la vidéo est refusée plutôt que mal envoyée, et les URL d’images distantes ne
+  sont pas récupérées.
+- **Outils :** déclarés dans la forme native d’Ollama ; les appels d’outils diffusés sont des
+  enregistrements entiers avec des `arguments` objet, et le rejeu des résultats d’outils est
+  apparié strictement par identifiant d’appel et nom d’outil. `tool_choice: "none"` et `auto`
+  se comportent normalement ; **`required` ou un choix nommé exact échoue fermement**, car
+  `/api/chat` d’Ollama n’a aucun champ `tool_choice` pour l’imposer.
+- **La sortie structurée est refusée sur Ollama Cloud canonique.** Ollama documente actuellement
+  la sortie structurée comme non prise en charge sur son Cloud, et Cloud n’applique pas le champ
+  `format` ; OpenCodex fait donc échouer cette requête plutôt que de renvoyer une prose libre en
+  réponse à une demande structurée par schéma. Les points de terminaison `ollama-native` locaux et
+  personnalisés conservent le mappage natif `format` d’Ollama (`json_object` → `"json"`,
+  `json_schema` → l’objet de schéma).
 
 ## `openai-responses`
 
@@ -51,6 +95,7 @@ Avec l’authentification `key`, [`retryOn429`](/fr/reference/configuration/) s�
 
 - Convertit les messages en blocs de contenu Anthropic (texte, image base64, `tool_use`, `thinking`).
 - **Calcul du raisonnement étendu :** Anthropic exige `max_tokens > thinking.budget_tokens`. L’adaptateur associe l’effort de raisonnement à un budget (minimal 1024 … max 32000), calcule ensuite une valeur sûre de `max_tokens` avec une marge pour la sortie et **supprime `temperature`/`top_p`** lorsque le raisonnement est activé, car Anthropic les interdit dans ce cas.
+- **Affichage du raisonnement adaptatif :** les modèles à raisonnement adaptatif (Opus 4.7+, Sonnet 5, Fable) reçoivent `thinking.display: "summarized"`, de sorte qu’une longue réflexion arrive aux clients Chat et Responses sous forme de deltas de raisonnement au lieu de minutes de heartbeats. Une requête qui masque le résumé (`reasoning.summary: "none"`) conserve la valeur par défaut du fournisseur.
 - **Sortie structurée :** les requêtes Responses `text.format` et Chat Completions `response_format` dont le type est `type: "json_schema"` deviennent `output_config.format` dans Anthropic. Le format est fusionné avec une configuration de sortie de raisonnement adaptatif existante, tout en préservant un `output_config.effort` compatible. Les requêtes Anthropic Messages routées conservent ce même format lors de la traduction OAuth stockée. L’adaptateur reproduit le sous-ensemble de JSON Schema pris en charge par le SDK TypeScript d’Anthropic : les contraintes non prises en charge sont déplacées dans `description` à titre d’instructions pour le modèle, `oneOf` devient `anyOf` et les schémas d’objet reçoivent `additionalProperties: false`. Une racine `$ref` conserve le `$defs` adjacent afin que la référence locale reste résoluble. Les champs d’enveloppe OpenAI tels que le `name` du schéma, la `description` de l’enveloppe et `strict` ne font pas partie du protocole Anthropic. Le mode objet JSON sans schéma n’a pas d’équivalent Anthropic et n’est pas traduit.
 - Envoie toujours `anthropic-version: 2023-06-01`. Diffuse `content_block_delta` (`text_delta`, `thinking_delta`, le compatible `reasoning_delta`, `input_json_delta`). Le décodeur SSE conserve l’état des événements d’un fragment reçu à l’autre et accepte un événement terminal `message_stop` sans saut de ligne final.
 - Pour les tours Responses routés vers Anthropic avec des outils clients, une garde terminale bornée détecte le cas hautement probable où l’utilisateur a demandé une action, mais où Claude termine en affirmant l’avoir exécutée sans appeler d’outil. Elle effectue au plus une continuation interne ; les réponses normales, les demandes de précision, les tours qui utilisent un outil et les réponses incomplètes au niveau du transport ne sont pas relancés automatiquement.
@@ -69,10 +114,19 @@ Avec l’authentification `key`, [`retryOn429`](/fr/reference/configuration/) s�
 **Cibles :** le service Amazon CodeWhisperer Streaming `GenerateAssistantResponse` utilisé par Kiro (`https://runtime.{region}.kiro.dev/`).
 **Authentification :** jeton d’accès OAuth Kiro en Bearer, accompagné des métadonnées region/profile issues de l’identifiant Kiro.
 
+Après l’admission d’une requête, le proxy lit en arrière-plan la liste des modèles du compte sur le
+service de gestion régional. Les modèles observés complètent la liste fournie ; une réponse vide ou
+inconnue conserve la dernière liste valide. Cette liste guide seulement la préférence entre comptes
+admissibles : un identifiant de modèle inconnu est toujours transmis. Les limites d’entrée signalées
+informent la fenêtre de contexte, avec la limite fournie comme repli si les preuves sont partielles.
+Les comptes inactifs n’ont pas encore nécessairement de liste observée.
+
 - Construit le `conversationState` de Kiro, mappe les outils Codex et leurs résultats, puis envoie les blocs d’image pris en charge par le protocole Kiro.
 - Décode `application/vnd.amazon.eventstream`, reconstruit les événements de texte, de raisonnement et d’outil, détecte les données JSON d’outil tronquées et estime l’utilisation, car le service en amont ne renvoie aucun nombre de jetons.
-- Utilise à l’identique le `baseUrl` configuré lorsqu’il est personnalisé. Une URL canonique `runtime.{region}.kiro.dev` suit la région d’API de l’identifiant importé ; seule cette forme canonique peut faire l’objet d’un unique repli borné vers `q.{region}.amazonaws.com` après un échec de point de terminaison, de signature, de DNS ou de connexion.
-- Gère la récupération après réinitialisation de connexion lorsqu’un rejeu est sûr, cet unique repli de point de terminaison admissible, une actualisation OAuth suivie d’un rejeu après une réponse HTTP 401, ainsi qu’une récupération bornée pour les réponses Kiro 429 transitoires. Un délai de récupération partagé et une seule sonde après ce délai empêchent les requêtes concurrentes d’épuiser des budgets de nouvelle tentative indépendants ; les dépassements fermes de quota et les erreurs de service ordinaires ne sont pas rejoués.
+  Les jetons restent estimés, mais les crédits de `meteringEvent` sont mesurés dans `providerCredits` : la dernière valeur d'une réponse est retenue, puis les envois physiques facturés séparément sont additionnés. Aucun crédit n'est déduit des jetons.
+- Utilise à l’identique le `baseUrl` configuré lorsqu’il est personnalisé. Une URL canonique `runtime.{region}.kiro.dev` suit la région d’API de l’identifiant importé ; seule cette forme canonique peut faire l’objet d’un unique repli borné vers `q.{region}.amazonaws.com` après un échec de point de terminaison, de signature, de DNS ou de connexion, ou une réponse HTTP 502/503/504 reçue avant toute sortie.
+- Gère la récupération après réinitialisation de connexion lorsqu’un rejeu est sûr, cet unique repli de point de terminaison admissible, une actualisation OAuth suivie d’un rejeu après une réponse HTTP 401, ainsi qu’une récupération bornée pour les réponses Kiro 429 transitoires. Un délai de récupération partagé et une seule sonde après ce délai empêchent les requêtes concurrentes d’épuiser des budgets de nouvelle tentative indépendants ; un quota épuisé n’est pas réessayé sur le même compte, et les autres erreurs de service ne sont pas rejouées. Tous les envois Kiro utilisent la sortie réseau configurée ; un délai d’en-tête dépassé renvoie 504, l’annulation du client arrête la requête et les erreurs HTTP 5xx finales affichent un texte public fixe.
+- Avec deux comptes enregistrés, un refus de débit refroidit brièvement le compte concerné. Un refus mensuel confirmé (HTTP 400 ou 429) l’exclut jusqu’à la réinitialisation observée ou l’expiration des données ; une suspension confirmée (HTTP 403) le met temporairement en quarantaine, mais un 403 ordinaire ne déclenche pas de rotation. La rotation après refus reste active lorsque la préférence proactive est désactivée. Le choix d’un autre compte avant le premier envoi exige une préférence proactive, où le réglage du fournisseur prime sur le réglage global. Un tour terminé par le même compte efface un ancien verdict d’épuisement.
 - Son analyseur hors flux consomme le même flux d’événements pour la boucle de recherche Web.
 
 ### Sémantique d’achèvement
@@ -81,13 +135,18 @@ Le texte de l’assistant Kiro ne comporte pas, à lui seul, de phase fiable ind
 
 `END_TURN`, `STOP_SEQUENCE` ou l’absence de motif d’arrêt peuvent emprunter le chemin de compatibilité. Les autres motifs explicites ont déjà interrompu l’inférence en amont ; l’adaptateur les signale donc au lieu de consommer une nouvelle requête au modèle. Une limite de jetons de sortie est présentée comme une sortie incomplète que le client peut poursuivre, tandis qu’un épuisement de la fenêtre de contexte devient une erreur de longueur de contexte non renouvelable plutôt qu’une sortie tronquée. Les arrêts dus au filtrage et aux garde-fous sont présentés comme des sorties filtrées incomplètes. Un arrêt `TOOL_USE` sans appel d’outil réel est signalé comme une contradiction, et non comme une progression.
 
-Lorsqu’un outil client ordinaire est disponible, opencodex ajoute un outil privé `codex_kiro_final_answer` à la requête en amont. Le texte de progression est diffusé comme commentaire et ne peut pas clore le tour. L’adaptateur consomme l’appel privé, émet sa réponse comme texte final et n’expose jamais cet outil privé à Codex ou Claude Code. Le motif d’arrêt n’arrivant qu’à la fin du flux, le texte de l’assistant est retenu pendant un tour avec outils jusqu’au début d’un véritable appel d’outil ou jusqu’à la fin du flux. Il est alors libéré comme commentaire, sauf si l’outil privé a fourni la réponse finale. Lorsque le service auxiliaire de recherche Web est actif, les commentaires libérés continuent d’être diffusés avant l’événement terminal ; seuls les événements nécessaires pour déterminer si le modèle a demandé une recherche synthétique restent en mémoire tampon.
+Lorsqu’un outil client ordinaire est disponible, opencodex ajoute un outil privé `codex_kiro_final_answer` à la requête en amont. Le texte de progression est diffusé comme commentaire et ne peut pas clore le tour. L’adaptateur consomme l’appel privé, émet sa réponse comme texte final et n’expose jamais cet outil privé à Codex ou Claude Code. Le motif d’arrêt n’arrivant qu’à la fin du flux, le texte de l’assistant est retenu pendant un tour avec outils jusqu’au début d’un véritable appel d’outil ou jusqu’à la fin du flux. Il est alors libéré comme commentaire, sauf si l’outil privé a fourni la réponse finale. Lorsque le service auxiliaire de recherche Web est actif, les commentaires libérés continuent d’être diffusés avant l’événement terminal ; seuls les événements nécessaires pour déterminer si le modèle a demandé une recherche synthétique restent en mémoire tampon. Lorsque le modèle ne peut pas continuer sans une décision, une information ou une clarification que seul l’utilisateur peut fournir, le contrat lui demande de transmettre cette question via l’outil d’achèvement et de s’arrêter ; un tel tour arrive lui aussi comme `final_answer` avec le tour clos, et non comme un commentaire.
 
 Si Kiro s’arrête sans appeler l’outil d’achèvement, l’adaptateur effectue une continuation. Les nouvelles tentatives ne contenant que du raisonnement conservent le tour utilisateur/résultat d’outil valide d’origine au lieu de fabriquer un message assistant vide ; la progression visible est rejouée avec une instruction non vide appartenant à l’adaptateur. Avant le transport, la conversation générée est contrôlée afin de vérifier l’alternance des rôles, l’absence de tours structurels vides et la correspondance des identifiants d’utilisation et de résultat d’outil. Une sortie d’outil vide reçoit un texte de remplacement neutre et non vide. La nouvelle tentative ne peut pas se répéter récursivement : si elle est vide ou ne contient que du raisonnement, elle est renvoyée comme incomplète mais renouvelable ; un véritable appel d’outil client maintient le tour ouvert. Une réponse de l’outil d’achèvement est toujours émise comme `final_answer`, même si elle répète exactement un commentaire antérieur, car l’exactitude de la phase prime sur la déduplication esthétique. Les requêtes sans outil conservent le comportement normal d’achèvement textuel.
 
 ### Effort de raisonnement
 
-`gpt-5.6-sol` et `claude-opus-5` prennent en charge nativement un niveau d’effort vérifié, mais chaque famille de modèles nomme différemment le champ de la requête. La valeur sélectionnée `low`, `medium`, `high`, `xhigh` ou `max` est envoyée dans `additionalModelRequestFields.reasoning.effort` pour `gpt-5.6-sol`, et dans `additionalModelRequestFields.output_config.effort` pour `claude-opus-5`. Les autres modèles Kiro utilisent actuellement un raisonnement émulé : opencodex convertit le niveau choisi en instructions de réflexion bornées dans le contenu utilisateur, car leur champ d’effort natif n’a pas été vérifié. La présence d’un contrôle d’effort annoncé sur ces modèles ne prouve donc pas la prise en charge native du raisonnement en amont.
+Les modèles GPT-5.6 utilisent `additionalModelRequestFields.reasoning.effort`, et `claude-opus-5`
+utilise `additionalModelRequestFields.output_config.effort`. Pour `gpt-5.6-luna` et `gpt-5.6-terra`,
+seuls `low`, `medium`, `high` et `max` empruntent le chemin natif vérifié. Leur niveau `xhigh`
+conserve les instructions de réflexion bornées existantes, car ce niveau natif n’a pas été vérifié.
+`gpt-5.6-sol` et `claude-opus-5` conservent leurs niveaux natifs existants : `low`, `medium`, `high`,
+`xhigh` et `max`. Les autres modèles Kiro utilisent une émulation ; un réglage d’effort ne prouve pas une prise en charge native.
 
 ## `cursor`
 
@@ -100,12 +159,24 @@ Si Kiro s’arrête sans appeler l’outil d’achèvement, l’adaptateur effec
 - Envoie les niveaux ordinaires de `cursor/grok-4.5` avec les identifiants de protocole exacts issus de la découverte en direct de Cursor (`cursor-grok-4.5-low`, `-medium` ou `-high`). `cursor/grok-4.5-fast` reste sélectionnable, mais le modèle canonique `grok-4.5` est envoyé avec des paramètres distincts `effort` et `fast=true`.
 - L’exécution locale native de commandes sur le système de fichiers, le shell ou le réseau par Cursor est refusée par défaut. Les intégrations explicites `mcpServers` et `desktopExecutor` disposent d’activations distinctes ; `nativeLocalExec: "on"` active l’exécuteur intégré plus large et contourne la sémantique d’approbation et de bac à sable de Codex. L’ancien réglage `unsafeAllowNativeLocalExec: true` reste équivalent uniquement lorsque `nativeLocalExec` n’est pas défini.
 
+## `devin`
+
+**Cible :** `exa.api_server_pb.ApiServerService/GetChatMessage` de Cognition, en streaming Connect sur `server.codeium.com`.
+**Authentification :** clé d'API Devin/Cognition issue de `provider.apiKey` ou de l'en-tête authorization transmis. La connexion tente d'abord d'importer l'identifiant que le Devin CLI installé détient déjà : `devin auth login` achève la connexion PKCE propre au CLI et écrit un `devin-session-token` dans son `credentials.toml`, le même identifiant que `SeatManagementService.RegisterUser` délivre pour une connexion navigateur. Sans identifiant CLI exploitable, la connexion revient à l'authentification Auth0 dans le navigateur, puis échange le jeton collé via `RegisterUser` contre une clé durable. `devin-cli` ne subsiste que comme alias déprécié : `ocx login devin-cli` est toujours routé vers `devin`, et une configuration enregistrée sous l'ancien id est réécrite au démarrage.
+
+- Utilise `runTurn` plutôt que le chemin fetch/parse ordinaire. Les requêtes et les événements serveur passent par le cadrage protobuf manuel de `devin/cloud-direct/wire.ts`.
+- Les modèles sont découverts par compte avec `GetCascadeModelConfigs` ; ceux qui ne figurent pas dans l'offre disparaissent de la liste au lieu d'échouer au moment de la requête.
+- Cognition impose une limite de longueur sur les descriptions d'outils et une liste de phrases interdites. L'adaptateur réécrit les formulations connues et tronque les descriptions trop longues.
+- Les clés ne se renouvellent pas. Relancez `ocx login devin` lorsqu'une clé expire ou est révoquée.
+- Seul l'identifiant est local quand l'import CLI est utilisé ; le tour part vers Cognition dans les deux cas. Un ancien build livrait sous l'id `devin-cli` un second adaptateur qui exécutait le tour comme une session Agent Client Protocol contre un processus enfant local `devin acp`. Il a été retiré : une configuration qui nomme encore cet adaptateur est réécrite vers `devin` au démarrage, y compris une ligne au nom personnalisé comme `"devin-acp"`.
+
 ## `azure-openai` (alias : `azure`)
 
 **Cibles :** **Azure OpenAI**. Encapsule `openai-responses` (et utilise donc également `passthrough: true`).
 **Authentification :** `key` au moyen de l’en-tête `api-key` (et non Bearer).
 
 - Délègue la construction de la requête au relais Responses, vérifie que `baseUrl` ne contient aucun espace réservé de modèle non résolu et remplace `Authorization` par `api-key`. L’URL configurée cible directement l’API Responses v1 d’Azure ; l’adaptateur n’ajoute donc pas `api-version`.
+- Partage la récupération Responses pour l’état de raisonnement produit par un autre fournisseur : après un `400 invalid_encrypted_content`, il renvoie la requête une seule fois sans cet état (contenu chiffré et identifiant `rs_…` de l’élément de raisonnement).
 
 ## Utilitaires d’image (`image.ts`)
 

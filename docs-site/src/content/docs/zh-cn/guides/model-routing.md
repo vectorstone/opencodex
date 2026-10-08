@@ -72,12 +72,22 @@ transport；这些凭证路径互不 fallback。
   仍保留在目录中，但会改为 `visibility: "hide"`。它**不会**拒绝对该模型的直接请求。
 - 提供商的非空 `selectedModels` 是另一层目录 allowlist。实时发现和直接路由仍然有效；它只会缩小
   目录和 `/v1/models` 输出的模型范围。
+- 当 `modelDiscovery.newModelPolicy` 为 `"off"` 时，首次成功的实时发现建立基准，后续新增
+  模型会加入 `disabledModels`。此策略会在通过 `/v1/models`、仪表盘、客户端配置导出或
+  Codex 目录同步（包括服务启动）发布新模型之前生效。手动启用的模型在后续刷新和导出中仍保持
+  启用。新安装默认使用 `"off"`，已有安装在主动更改前保持 `"on"`。使用
+  `ocx models new-policy off` 设置全局策略，添加 `--provider <name>` 覆盖单个提供商的设置；
+  使用 `ocx models new-arrivals [--json]` 查看新增模型。失败或降级的发现不会改变基准。
+  非空 `selectedModels` 已经限定了提供商的模型列表，因此此策略不会再自动禁用模型。
 - `provider.disabled: true` 会把该提供商排除在目录发现之外。显式 `provider/model` 请求会失败，
   `defaultModel` / `models[]` 扫描也会跳过它。
 - `providerContextCaps` 为各提供商设置 Codex 可见的上下文上限。`contextCapValue` 是仪表盘的默认值，
-  默认为 350,000；但只有 `providerContextCaps` 中列出了提供商时才会生效。仅当勾选“应用到所有已路由的
-  提供方”时，修改仪表盘值才会重新指向所有已启用提供商；否则每个提供商保留自己的上限。上限只能降低
-  已知上下文，不会把它调高，也不会改变上游模型的实际限制。
+  默认为 350,000；仅设置这个值不会应用上限，提供商必须出现在 `providerContextCaps` 中才会生效。
+  勾选“应用到所有已路由的提供方”后，修改仪表盘值只会更新已开启的上限；未勾选时，各提供商保留自己的上限。
+  普通的已知窗口只能缩小；支持长窗口的原生模型可以扩展到该模型支持的上限，但不会改变上游模型的实际限制。
+  关闭上限后，选择值保存在 `providerContextCapValues` 中，重新加载后仍保留；再次开启时恢复该选择值。
+  关闭期间不会把保存的值作为限制应用。不带 `value` 的 `{ "setAll": true }` 会按当前全局值开启所有
+  已配置提供商的上限，并替换它们保存的选择值。
 
 ```json
 {

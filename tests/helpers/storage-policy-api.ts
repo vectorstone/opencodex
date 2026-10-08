@@ -5,7 +5,7 @@
  */
 import { managementFetch as fetch } from "./management-auth";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../../src/config";
@@ -23,6 +23,8 @@ import {
 } from "../../src/storage/policy-job";
 import { stopStorageCleanupScheduler } from "../../src/storage/policy-scheduler";
 import { drainStorageWorkers } from "../../src/storage/worker-lifecycle";
+import { removeTreeWithRetry } from "./remove-tree";
+import { INTERNAL_DEADLINE_MS } from "./test-budget";
 
 export function baseConfig(): OcxConfig {
   return {
@@ -57,7 +59,9 @@ export function seedArchived(codexHome: string): void {
 export async function waitForJobIdle(
   serverUrl: URL,
   startedAt: number,
-  timeoutMs = 15_000,
+  // Polls a live server for a worker-backed job to settle; the worker's OS-thread join is
+  // the slow half on Windows. Named so every caller inherits the same bound.
+  timeoutMs = INTERNAL_DEADLINE_MS,
 ): Promise<{
   enabled: boolean;
   lastRun?: { removed: number };
@@ -134,7 +138,7 @@ export async function installPolicyApiHarness(prefix: string): Promise<PolicyApi
     if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousHome;
     isolatedCodexHome?.restore();
-    if (testDir) rmSync(testDir, { recursive: true, force: true });
+    if (testDir) removeTreeWithRetry(testDir);
     throw error;
   }
 }
@@ -151,7 +155,7 @@ export async function uninstallPolicyApiHarness(h: PolicyApiHarness): Promise<vo
     if (h.previousHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = h.previousHome;
     h.isolatedCodexHome.restore();
-    if (h.testDir) rmSync(h.testDir, { recursive: true, force: true });
+    if (h.testDir) removeTreeWithRetry(h.testDir);
   }
 }
 

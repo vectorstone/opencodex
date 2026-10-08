@@ -3,6 +3,12 @@ export interface OcxTool {
   description: string;
   parameters: Record<string, unknown>;
   strict?: boolean;
+  /**
+   * Anthropic `tools[*].allowed_callers`: which callers may invoke this tool. Carried rather
+   * than diagnosed, because rebuilding the declaration without it hands the model a tool the
+   * caller had restricted and returns a normal response (#5210).
+   */
+  allowedCallers?: string[];
   /** MCP namespace (e.g. "mcp__context7") for tools flattened out of a Responses "namespace" tool. */
   namespace?: string;
   /** Freeform/custom tool (e.g. apply_patch): the model's call must be relayed as a custom_tool_call. */
@@ -13,7 +19,7 @@ export interface OcxTool {
   loadedFromToolSearch?: boolean;
   /** Cursor-only synthetic exact-match edit tool; never inferred from the wire name. */
   cursorStructuredEdit?: true;
-  /** Synthetic web_search tool: the model's call is executed by the gpt-5.4-mini sidecar, not relayed to Codex. */
+  /** Synthetic web_search tool: the model's call is executed by the gpt-5.6-luna sidecar, not relayed to Codex. */
   webSearch?: boolean;
   /** Synthetic image_gen tool: the model's call is executed by the xAI image bridge sidecar, not relayed to Codex. */
   imageGeneration?: boolean;
@@ -31,9 +37,213 @@ export function namespacedToolName(namespace: string | undefined, name: string):
   return namespace ? `${namespace}__${name}` : name;
 }
 
+/**
+ * Whether a declaration actually narrows who may call the tool.
+ *
+ * `["direct"]` is the state every unrestricted tool is already in, so treating it as a
+ * restriction would refuse ordinary traffic. Mirrors the `caller_mode` predicate in
+ * src/claude/compatibility.ts, which draws the same line.
+ */
+export function toolRestrictsCallers(tool: Pick<OcxTool, "allowedCallers">): boolean {
+  const callers = tool.allowedCallers;
+  if (callers === undefined) return false;
+  return !(callers.length === 1 && callers[0] === "direct");
+}
+
+/**
+ * Dotted alias of a namespaced tool's wire name. Some routed providers (observed: muse-spark
+ * via opencode-go) echo a namespaced tool call as "<namespace>.<name>" instead of the flattened
+ * "<namespace>__<name>" form. It names the same tool identity+�u���T never a new grant"��y��y� so the
+ * undeclared-tool guard and the tool bridge maps accept it wherever the wire name is accepted
+ * (mirroring the second entry of `toolChoiceAliases`). See #3402.
+ */
+export function dottedToolName(namespace: string | undefined, name: string): string {
+  return namespace ? `${namespace}.${name}` : name;
+}
+
+/**
+ * Codex unified-exec name normalization.
+ *
+ * Codex's code-mode shell tool is declared as `exec` (a freeform custom tool whose own
+ * description mentions the nested `await tools.exec_command(...)` helper). Some routed providers
+ * echo that helper name as the tool-call name, emitting `exec_command`, `write_stdin`,
+ * `apply_patch`, `view_image`, or one of the goal helpers (`create_goal`, `get_goal`,
+ * `update_goal`, #5495) instead of the declared `exec`. Accept these nested helper names only
+ * when the request catalog actually declares `exec` and does not itself declare the emitted name
+ * (an MCP server may legitimately advertise one under its own namespace). The helper list itself
+ * is closed; the one other admission through `exec` is a direct `mcp__<server>__<tool>` call,
+ * which `isCodeModeMcpDirectName` recognizes.
+ */
+const LEGACY_SHELL_BRIDGE_TOOL_NAMES = ["exec_command", "shell_command"] as const;
+const CODE_MODE_HELPER_TOOL_NAMES = [
+  ...LEGACY_SHELL_BRIDGE_TOOL_NAMES,
+  "write_stdin",
+  "apply_patch",
+  "view_image",
+  "create_goal",
+  "get_goal",
+  "update_goal",
+] as const;
+
+/**
+ * The one declared name that turns nested-helper normalization on. Declaring it is not just a
+ * name: it also decides whether an emitted helper name is accepted as that shell tool, so callers
+ * that build declared-name sets must add it only for a genuine bare declaration.
+ */
+export const CODE_MODE_EXEC_TOOL_NAME = "exec";
+
+/**
+ * The nested-helper spellings, as a membership view of the same list.
+ *
+ * A code-mode catalog never DECLARES any of them — they exist only as `tools.<helper>(...)` inside
+ * `exec` — so a recorded call under one of these names can only have come from a provider echoing
+ * the helper, which is what makes the set usable as a bounded recovery vocabulary for stored
+ * history (#5095). Kept beside the tuple it is built from so the two can never drift; this is a
+ * different question from `NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES` below, which also covers `exec`
+ * itself because declaring THAT name is what turns normalization on.
+ */
+export const CODE_MODE_HELPER_WIRE_NAMES: ReadonlySet<string> = new Set<string>(
+  CODE_MODE_HELPER_TOOL_NAMES,
+);
+
+/**
+ * A flattened MCP wire name (`mcp__<server>__<tool>`) emitted as a direct tool call.
+ *
+ * Codex code mode reaches the host's nested tools through `tools.<name>(...)` inside `exec`,
+ * so none of them are declared; routed models (observed: Kimi K3, GLM 5.3) occasionally skip the
+ * wrapper and call the flattened name directly. Under a code-mode catalog the call is compiled
+ * into the equivalent `tools.<name>(...)` exec body instead of failing closed — capability-
+ * equivalent, since the model could have written that JavaScript itself. Server and tool must
+ * both be non-empty so a bare `mcp__` prefix never qualifies.
+ */
+export function isCodeModeMcpDirectName(name: string): boolean {
+  if (!name.startsWith("mcp__")) return false;
+  const rest = name.slice("mcp__".length);
+  const separator = rest.indexOf("__");
+  return separator > 0 && separator + "__".length < rest.length;
+}
+
+/**
+ * Spellings that may never be MANUFACTURED as a bare alias for a namespaced tool.
+ *
+ * A bare alias is an ordinary compatibility affordance -- providers echo a namespaced tool
+ * without its prefix, and restoring the identity needs the bare spelling registered. For these
+ * names it is also an authorization decision, because a declared-name set is what
+ * `normalizeDeclaredToolName` and `declaresCodeModeExec` read: bare `exec` turns nested-helper
+ * normalization on for a catalog that never declared the shell, bare `exec_command` or
+ * `shell_command` turns it off for one that did, and the rest are accepted as declared calls the
+ * caller only ever authorized under a namespace.
+ *
+ * This is a property of the SPELLING, not of the namespace that declared it and not of the reason
+ * the alias was being added. It lives here, beside the names it protects, because every site that
+ * builds a declared-name set has to apply the same list -- the two that kept their own copies each
+ * drifted, once to a single namespace and once to a single name.
+ *
+ * A genuine namespace-free declaration is NOT covered: that is the caller declaring the tool, not
+ * a namespace being discarded to synthesize a bare name.
+ */
+export const NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES: ReadonlySet<string> = new Set<string>([
+  CODE_MODE_EXEC_TOOL_NAME,
+  ...CODE_MODE_HELPER_TOOL_NAMES,
+]);
+
+/**
+ * Normalizes provider-emitted tool names against declared tool catalogs.
+ *
+ * Rewrites invented `default.<name>` prefixes back to a declared bare tool when that bare tool
+ * is declared and neither `default.<name>` nor `default__<name>` was explicitly declared (#4176).
+ * The same wrapper may surround an already-flattened namespace identity; accept that exact
+ * declared suffix without treating its child name as a bare declaration.
+ * Also normalizes nested helper names (`exec_command`, `shell_command`, `write_stdin`,
+ * `apply_patch`, `view_image`, `create_goal`, `get_goal`, `update_goal`) and direct
+ * `mcp__<server>__<tool>` calls to `exec` when code-mode `exec` is declared in the
+ * request catalog. MCP recovery additionally requires explicit custom-tool provenance;
+ * a structured function named `exec` is not a JavaScript executor.
+ *
+ * @param name - The tool name emitted on the wire by the provider.
+ * @param declared - All wire tool names declared in the request catalog, including aliases.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ *                       When omitted, falls back to `declared`.
+ * @param declaredCustom - Custom wire identities from the caller's catalog, never bare aliases
+ *                         manufactured from foreign namespaces.
+ * @returns The normalized tool name to expose downstream.
+ */
+export function normalizeDeclaredToolName(
+  name: string,
+  declared: ReadonlySet<string> | undefined,
+  declaredBare?: ReadonlySet<string>,
+  declaredCustom?: ReadonlySet<string>,
+): string {
+  if (!declared) return name;
+  if (declared.has(name)) return name;
+  let candidate = name;
+  if (name.startsWith("default.")) {
+    const bare = name.slice("default.".length);
+    const bareDeclared = declaredBare ?? declared;
+    if (
+      bare.length > 0
+      && (
+        bareDeclared.has(bare)
+        // Muse can wrap the complete `namespace__tool` identity in `default.`. Requiring the
+        // exact flattened identity to be declared preserves the #4176 provenance boundary:
+        // `default.tool` still cannot borrow a namespaced tool's manufactured bare alias.
+        || (bare.includes("__") && declared.has(bare))
+      )
+      && !declared.has("default." + bare)
+      && !declared.has("default__" + bare)
+    ) {
+      candidate = bare;
+    } else if (
+      // Code mode never declares bare helper names; a provider that invents `default.`
+      // for one still means the nested helper. The same wrapper can surround a direct MCP
+      // name, but only a custom exec declaration authorizes that recovery.
+      bare.length > 0
+      && declared.has(CODE_MODE_EXEC_TOOL_NAME)
+      && ((CODE_MODE_HELPER_TOOL_NAMES as readonly string[]).includes(bare)
+        || (declaredCustom?.has(CODE_MODE_EXEC_TOOL_NAME) && isCodeModeMcpDirectName(bare)))
+      && !declared.has("default." + bare)
+      && !declared.has("default__" + bare)
+    ) {
+      candidate = bare;
+    }
+  }
+  if (!declared.has(CODE_MODE_EXEC_TOOL_NAME)) return candidate;
+  if (declared.has(candidate)) return candidate;
+  if (candidate === "apply_patch") return CODE_MODE_EXEC_TOOL_NAME;
+  // When the catalog explicitly declares any legacy shell bridge name, the environment
+  // genuinely exposes that tool — turn normalization off so a call is never mis-routed
+  // to `exec`.
+  if ((LEGACY_SHELL_BRIDGE_TOOL_NAMES as readonly string[]).some(legacy => declared.has(legacy))) {
+    return candidate;
+  }
+  if ((CODE_MODE_HELPER_TOOL_NAMES as readonly string[]).includes(candidate)) {
+    return CODE_MODE_EXEC_TOOL_NAME;
+  }
+  // A direct `mcp__<server>__<tool>` call names a nested host tool the code-mode catalog
+  // never declares; `compileCodeModeHelperInput` turns it into the `tools.<name>(...)`
+  // exec body the model could have written itself.
+  return declaredCustom?.has(CODE_MODE_EXEC_TOOL_NAME) && isCodeModeMcpDirectName(candidate)
+    ? CODE_MODE_EXEC_TOOL_NAME
+    : candidate;
+}
+
+/**
+ * True when a declared catalog is the genuine Codex code-mode shape.
+ *
+ * `exec` is a name, not a guarantee. A catalog that lists `exec` NEXT TO a bare
+ * `exec_command` or `shell_command` is the flat-bridge shape: there `exec` may be an
+ * ordinary caller-defined tool, and nested `tools.*` helpers are not what it runs.
+ * `normalizeDeclaredToolName` already refuses to reinterpret helper names in that shape,
+ * and anything inferring code mode from the bare name owes the same check.
+ */
+export function declaresCodeModeExec(declared: ReadonlySet<string> | undefined): boolean {
+  if (!declared || !declared.has(CODE_MODE_EXEC_TOOL_NAME)) return false;
+  return !(LEGACY_SHELL_BRIDGE_TOOL_NAMES as readonly string[]).some(legacy => declared.has(legacy));
+}
+
 export function toolChoiceAliases(tool: Pick<OcxTool, "namespace" | "name">): string[] {
   const wireName = namespacedToolName(tool.namespace, tool.name);
-  return tool.namespace ? [wireName, `${tool.namespace}.${tool.name}`] : [wireName];
+  return tool.namespace ? [wireName, dottedToolName(tool.namespace, tool.name)] : [wireName];
 }
 
 function sameToolIdentity(
@@ -41,6 +251,74 @@ function sameToolIdentity(
   right: Pick<OcxTool, "namespace" | "name">,
 ): boolean {
   return left.namespace === right.namespace && left.name === right.name;
+}
+
+type ToolIdentity = Readonly<Pick<OcxTool, "namespace" | "name">>;
+
+function snapshotToolIdentity(tool: Pick<OcxTool, "namespace" | "name">): ToolIdentity {
+  return Object.freeze({
+    name: tool.name,
+    ...(tool.namespace === undefined ? {} : { namespace: tool.namespace }),
+  });
+}
+
+function buildToolChoiceCatalog(
+  tools: readonly ToolIdentity[],
+): {
+  candidatesByName: ReadonlyMap<string, readonly ToolIdentity[]>;
+  sourceCandidatesByName: ReadonlyMap<string, readonly ToolIdentity[]>;
+  identitiesByTool: WeakMap<object, ToolIdentity>;
+} {
+  const index = new Map<string, ToolIdentity[]>();
+  const sourceIndex = new Map<string, ToolIdentity[]>();
+  const identities = new Map<string, Set<string>>();
+  const identitiesByTool = new WeakMap<object, ToolIdentity>();
+  for (const tool of tools) {
+    const snapshot = snapshotToolIdentity(tool);
+    identitiesByTool.set(tool, snapshot);
+    const identity = JSON.stringify([snapshot.namespace ?? null, snapshot.name]);
+    for (const selector of [...toolChoiceAliases(snapshot), snapshot.name]) {
+      const candidates = index.get(selector);
+      if (!candidates) {
+        index.set(selector, [snapshot]);
+        sourceIndex.set(selector, [tool]);
+        identities.set(selector, new Set([identity]));
+      } else if (!identities.get(selector)!.has(identity)) {
+        candidates.push(snapshot);
+        sourceIndex.get(selector)!.push(tool);
+        identities.get(selector)!.add(identity);
+      }
+    }
+  }
+  return { candidatesByName: index, sourceCandidatesByName: sourceIndex, identitiesByTool };
+}
+
+/** Compile one immutable view of a request's tool catalog for repeated policy checks. */
+export function createToolChoiceResolver(tools: readonly ToolIdentity[] | undefined) {
+  const compiled = tools ? buildToolChoiceCatalog(tools) : undefined;
+  const candidatesByName = compiled?.candidatesByName;
+  const snapshotFor = (tool: ToolIdentity): ToolIdentity | undefined => {
+    const snapshot = compiled?.identitiesByTool.get(tool);
+    return snapshot && sameToolIdentity(snapshot, tool) ? snapshot : undefined;
+  };
+  return {
+    candidates(name: string): ToolIdentity[] {
+      return (candidatesByName?.get(name) ?? []).map(candidate => ({ ...candidate }));
+    },
+    candidateCount(name: string): number {
+      return candidatesByName?.get(name)?.length ?? 0;
+    },
+    allows(tool: ToolIdentity, allowedTools: ReadonlySet<string>): boolean {
+      if (!candidatesByName) return toolChoiceAliases(tool).some(name => allowedTools.has(name));
+      const snapshot = snapshotFor(tool);
+      return snapshot ? toolAllowedByChoiceFromIndex(snapshot, allowedTools, candidatesByName) : false;
+    },
+    selects(tool: ToolIdentity, name: string): boolean {
+      const snapshot = snapshotFor(tool);
+      const candidates = candidatesByName?.get(name);
+      return !!snapshot && candidates?.length === 1 && sameToolIdentity(candidates[0], snapshot);
+    },
+  };
 }
 
 /**
@@ -53,12 +331,7 @@ export function toolChoiceCandidates(
   name: string,
 ): Pick<OcxTool, "namespace" | "name">[] {
   if (!tools) return [];
-  const candidates: Pick<OcxTool, "namespace" | "name">[] = [];
-  for (const tool of tools) {
-    if (tool.name !== name && !toolChoiceAliases(tool).includes(name)) continue;
-    if (!candidates.some(candidate => sameToolIdentity(candidate, tool))) candidates.push(tool);
-  }
-  return candidates;
+  return [...(buildToolChoiceCatalog(tools).sourceCandidatesByName.get(name) ?? [])];
 }
 
 /**
@@ -72,10 +345,22 @@ export function toolAllowedByChoice(
   tools?: readonly Pick<OcxTool, "namespace" | "name">[],
 ): boolean {
   if (!tools) return toolChoiceAliases(tool).some(name => allowedTools.has(name));
+  return toolAllowedByChoiceFromIndex(
+    snapshotToolIdentity(tool),
+    allowedTools,
+    buildToolChoiceCatalog(tools).candidatesByName,
+  );
+}
+
+function toolAllowedByChoiceFromIndex(
+  tool: ToolIdentity,
+  allowedTools: ReadonlySet<string>,
+  candidatesByName: ReadonlyMap<string, readonly ToolIdentity[]>,
+): boolean {
   for (const name of [...toolChoiceAliases(tool), tool.name]) {
     if (!allowedTools.has(name)) continue;
-    const candidates = toolChoiceCandidates(tools, name);
-    if (candidates.length === 1 && sameToolIdentity(candidates[0], tool)) return true;
+    const candidates = candidatesByName.get(name);
+    if (candidates?.length === 1 && sameToolIdentity(candidates[0], tool)) return true;
   }
   return false;
 }
@@ -123,9 +408,10 @@ export function toolChoiceToolPredicate(
   if (choice === "none") return () => false;
   if (isAllowedToolChoice(choice)) {
     const allowed = new Set(choice.allowedTools);
-    return tool => toolAllowedByChoice(tool, allowed, tools);
+    const resolver = createToolChoiceResolver(tools);
+    return tool => resolver.allows(tool, allowed);
   }
   if (!tools) return tool => toolChoiceAliases(tool).includes(choice.name);
-  const candidates = toolChoiceCandidates(tools, choice.name);
-  return tool => candidates.length === 1 && sameToolIdentity(candidates[0], tool);
+  const resolver = createToolChoiceResolver(tools);
+  return tool => resolver.selects(tool, choice.name);
 }

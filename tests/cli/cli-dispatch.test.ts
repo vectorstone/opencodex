@@ -1,0 +1,1363 @@
+import { describe, expect, spyOn, test } from "bun:test";
+import { CLI_COMMANDS } from "../../src/cli/registry";
+import { DISPATCH_ALIASES, DISPATCH_COMMANDS, dispatchCommand, resolveDispatchCommand, decideBusyPreferredPort, decideStartExitTeardown, decideStartWithLiveOwner, selectDefaultGuiUrl, startupLeftCodexNativeLine } from "../../src/cli/dispatch";
+import {
+  honorSiblingMarker,
+  markSiblingStart,
+  parseSiblingMarker,
+  resetSiblingStartForTests,
+  SIBLING_HANDOFF_NONCE_ENV,
+  SIBLING_OF_PORT_ENV,
+  siblingOfLivePort,
+  siblingStopFoundOwner,
+  withoutSiblingMarker,
+  withSiblingMarker,
+} from "../../src/codex/sibling-start";
+import { consumeSiblingHandoff, issueSiblingHandoff } from "../../src/codex/sibling-handoff";
+import { removeRuntimePort, writeRuntimePort } from "../../src/config/process-state";
+import { createLocalAttestationSecret } from "../../src/lib/local-management-attestation";
+import type { CliDispatchDeps } from "../../src/cli/dispatch";
+import type { OcxConfig } from "../../src/types";
+import { runGuiCommand } from "../../src/cli/gui";
+import { isCodexAccountLoginName } from "../../src/cli/account-auth";
+import { listOAuthProviders } from "../../src/oauth";
+import { isKeyLoginProvider } from "../../src/oauth/key-providers";
+import { loginUsageMessage } from "../../src/oauth/login-cli";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getConfigDir } from "../../src/config";
+import { getAccountSet, removeCredential, saveCredential } from "../../src/oauth/store";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { repoPath } from "../helpers/repo-root";
+import type { OcxConfig } from "../../src/types";
+
+/** Minimal fake deps. dispatchCommand only touches deps for real command
+ * runners, which these tests never invoke, so an empty object is enough. */
+const fakeDeps = {} as unknown as CliDispatchDeps;
+
+describe("CLI dispatch command coverage", () => {
+  test("every non-hidden registry command is dispatchable", () => {
+    const aliasResolved = new Set([...DISPATCH_COMMANDS, ...DISPATCH_ALIASES.keys()]);
+    const missing = CLI_COMMANDS.filter(entry => {
+      if (entry.hidden) return false;
+      // A visible command counts as dispatchable when it is a direct runner
+      // key or an alias that resolves to one (setup/eject/remove/model).
+      return !aliasResolved.has(entry.name);
+    }).map(entry => entry.name);
+    expect(missing).toEqual([]);
+  });
+
+  test("every dispatch alias resolves to a dispatchable command", () => {
+    for (const [alias, target] of DISPATCH_ALIASES) {
+      expect(DISPATCH_COMMANDS).toContain(target);
+      expect(alias).not.toBe(target);
+    }
+  });
+});
+
+describe("CLI dispatch aliases", () => {
+  test("canonical alias pairs resolve to their command", () => {
+    expect(DISPATCH_ALIASES.get("setup")).toBe("init");
+    expect(DISPATCH_ALIASES.get("eject")).toBe("restore");
+    expect(DISPATCH_ALIASES.get("remove")).toBe("uninstall");
+    expect(DISPATCH_ALIASES.get("model")).toBe("models");
+  });
+
+  test("resolveDispatchCommand maps each alias to its canonical runner key", () => {
+    // The same resolver dispatchCommand uses for runner selection, exercised
+    // at the resolution level so a regression in the lookup is caught.
+    expect(resolveDispatchCommand("setup")).toBe("init");
+    expect(resolveDispatchCommand("eject")).toBe("restore");
+    expect(resolveDispatchCommand("remove")).toBe("uninstall");
+    expect(resolveDispatchCommand("model")).toBe("models");
+    // Canonical names resolve to themselves; unknown names resolve undefined.
+    expect(resolveDispatchCommand("init")).toBe("init");
+    expect(resolveDispatchCommand("definitely-not-a-command")).toBeUndefined();
+    expect(resolveDispatchCommand(undefined)).toBeUndefined();
+  });
+
+  test("resolveDispatchCommand rejects inherited Object property names", () => {
+    // commandRunners is a normal object; inherited names (__proto__,
+    // constructor, toString) must not resolve as valid commands.
+    expect(resolveDispatchCommand("__proto__")).toBeUndefined();
+    expect(resolveDispatchCommand("constructor")).toBeUndefined();
+    expect(resolveDispatchCommand("toString")).toBeUndefined();
+  });
+});
+
+describe("dispatchCommand exit codes", () => {
+  test("uninstall aliases reject arguments without calling teardown", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    let teardowns = 0;
+    try {
+      for (const command of ["uninstall", "remove"]) {
+        for (const trailing of [["--dry-run"], ["extra"], ["--token=synthetic-private-value"]]) {
+          const args = [command, ...trailing];
+          expect(await dispatchCommand({ kind: "command", command, args }, {
+            ...fakeDeps, args, command, handleUninstall: async () => { teardowns++; },
+          })).toBe(2);
+        }
+      }
+      expect(teardowns).toBe(0);
+      expect(JSON.stringify(error.mock.calls)).not.toContain("synthetic-private-value");
+    } finally { error.mockRestore(); }
+  });
+
+  test("Aside sync refuses a marker-only configured-port listener before sending credentials", async () => {
+    const { refreshAsideProfilesThroughServer } = await import("../../src/cli/aside-profiles");
+    const requests: Array<{ input: string; headers: Headers }> = [];
+    const directRequests: string[] = [];
+    const http = spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      requests.push({ input: String(input), headers: new Headers(init?.headers) });
+      return new Response(JSON.stringify({ service: "opencodex", status: "ok" }), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      await expect(refreshAsideProfilesThroughServer({
+        findLiveProxy: async () => ({ pid: null, port: 10100, hostname: "127.0.0.1", source: "config" }),
+        directLocalFetch: async input => {
+          directRequests.push(String(input));
+          throw new Error("marker-only listener must not be contacted");
+        },
+      })).rejects.toMatchObject({ status: 503 });
+      expect(requests).toEqual([]);
+      expect(directRequests).toEqual([]);
+    } finally {
+      http.mockRestore();
+    }
+  });
+
+  test("invalid client state refuses sync before local proxy discovery", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-dispatch-client-invalid-"));
+    const previous = process.env.OPENCODEX_HOME;
+    let discoveries = 0;
+    try {
+      process.env.OPENCODEX_HOME = home;
+      writeFileSync(join(home, "config.json"), JSON.stringify({
+        port: 10100,
+        providers: {},
+        defaultProvider: "openai",
+        runtimeRole: "client",
+        client: { apiKeyId: "half-present" },
+      }), "utf8");
+      const args = ["sync"];
+      const deps = {
+        ...fakeDeps,
+        args,
+        findLiveProxy: async () => { discoveries += 1; return null; },
+      };
+      expect(await dispatchCommand({ kind: "command", command: "sync", args }, deps)).toBe(1);
+      expect(discoveries).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      removeTreeWithRetry(home);
+    }
+  });
+
+  test("sync refreshes already-owned OpenCode and Kilo after publishing the Codex catalog", async () => {
+    const syncModule = await import("../../src/codex/sync");
+    const catalogModule = await import("../../src/integrations/catalog-refresh");
+    const asideModule = await import("../../src/cli/aside-profiles");
+    const order: string[] = [];
+    const sync = spyOn(syncModule, "syncModelsToCodex").mockImplementation(async () => {
+      order.push("catalog");
+      return { status: "applied", ok: true, added: 0, catalogPath: null, catalogExists: false,
+        catalogWritten: false, cacheSynced: false, message: "fixture" };
+    });
+    const refresh = spyOn(catalogModule, "refreshOwnedCatalogIntegrations").mockImplementation(async () => {
+      order.push("refresh");
+      return [];
+    });
+    const aside = spyOn(asideModule, "refreshAsideProfilesThroughServer").mockResolvedValue([]);
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const args = ["sync"];
+      const code = await dispatchCommand({ kind: "command", command: "sync", args }, {
+        ...fakeDeps, args, loadConfig: () => ({ port: 10100, defaultProvider: "mock", providers: {} }) as OcxConfig,
+        findLiveProxy: async () => ({ pid: null, port: 10100, hostname: "127.0.0.1", source: "config" }),
+      });
+      expect(code).toBe(0);
+      expect(order).toEqual(["catalog", "refresh"]);
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(refresh.mock.calls[0]![1]).toEqual(["mcode", "pi", "raycast", "omo", "cline", "droid", "opencode", "kilo"]);
+    } finally {
+      sync.mockRestore(); refresh.mockRestore(); aside.mockRestore(); log.mockRestore();
+    }
+  });
+
+  test.each(["applied", "catalog-only", "refused"] as const)(
+    "sync with no live proxy reports Aside unavailability after Codex %s without local fallback", async status => {
+      const home = mkdtempSync(join(tmpdir(), "ocx-dispatch-aside-offline-"));
+      const previous = { OPENCODEX_HOME: process.env.OPENCODEX_HOME, CODEX_HOME: process.env.CODEX_HOME };
+      const syncModule = await import("../../src/codex/sync");
+      const catalogModule = await import("../../src/integrations/catalog-refresh");
+      const livenessModule = await import("../../src/server/proxy-liveness");
+      const warnings: string[] = [];
+      const logs: string[] = [];
+      const sync = spyOn(syncModule, "syncModelsToCodex").mockResolvedValue({
+        status, ok: status !== "refused", added: 0, catalogPath: null, catalogExists: false,
+        catalogWritten: false, cacheSynced: false, message: "fixture Codex sync result",
+      });
+      // The real Aside helper/runtime client must run. Fence the independent local
+      // writer and unscoped discovery so this regression cannot reach user files
+      // or a developer's real proxy if either dispatch boundary regresses.
+      const localRefresh = spyOn(catalogModule, "refreshOwnedCatalogIntegrations").mockResolvedValue([]);
+      // A globally discoverable proxy must not override the injected null result.
+      const unscopedDiscovery = spyOn(livenessModule, "findLiveProxy").mockResolvedValue({
+        pid: null, port: 65534, hostname: "127.0.0.1", source: "config",
+      });
+      const http = spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected runtime HTTP request"));
+      const warn = spyOn(console, "warn").mockImplementation((...args) => { warnings.push(args.map(String).join(" ")); });
+      const log = spyOn(console, "log").mockImplementation((...args) => { logs.push(args.map(String).join(" ")); });
+      const error = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        process.env.OPENCODEX_HOME = home;
+        process.env.CODEX_HOME = join(home, "codex");
+        mkdirSync(process.env.CODEX_HOME);
+        const config = {
+          port: 10100, providers: {}, defaultProvider: "openai",
+          asideProfileSync: { allProfiles: true, profiles: {} },
+        } as OcxConfig;
+        const configPath = join(home, "config.json");
+        const before = JSON.stringify(config);
+        writeFileSync(configPath, before);
+        let discoveries = 0;
+        const args = ["sync"];
+        const deps = {
+          ...fakeDeps, args, loadConfig: () => config,
+          findLiveProxy: async () => { discoveries += 1; return null; },
+        };
+        const code = await dispatchCommand({ kind: "command", command: "sync", args }, deps);
+        // An Aside warning does not change a successful Codex sync's exit code.
+        expect(code).toBe(status === "refused" ? 1 : 0);
+        expect(discoveries).toBe(1);
+        expect(sync).toHaveBeenCalledTimes(1);
+        expect(unscopedDiscovery).not.toHaveBeenCalled();
+        expect(http).not.toHaveBeenCalled();
+        expect(localRefresh).not.toHaveBeenCalled();
+        if (status === "refused") {
+          expect(warnings).toEqual([]);
+        } else {
+          expect(warnings).toHaveLength(1);
+          expect(warnings[0]).toContain("Aside profiles were not refreshed:");
+          expect(warnings[0]).toContain("Proxy is not running");
+          expect(warnings[0]).toContain("ocx start");
+        }
+        expect(logs.join("\n")).not.toContain("integration refreshed");
+        expect(readFileSync(configPath, "utf8")).toBe(before);
+        expect(readdirSync(home).sort()).toEqual(["codex", "config.json"]);
+        expect(readdirSync(join(home, "codex"))).toEqual([]);
+      } finally {
+        sync.mockRestore(); localRefresh.mockRestore(); unscopedDiscovery.mockRestore(); http.mockRestore();
+        warn.mockRestore(); log.mockRestore(); error.mockRestore();
+        for (const [key, value] of Object.entries(previous)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        removeTreeWithRetry(home);
+      }
+    },
+  );
+
+  test("returns 0 for help forms", async () => {
+    expect(await dispatchCommand({ kind: "help", command: "help", args: ["help"] }, fakeDeps)).toBe(0);
+    expect(await dispatchCommand({ kind: "help", command: "--help", args: ["--help"] }, fakeDeps)).toBe(0);
+    expect(await dispatchCommand({ kind: "help", command: "-h", args: ["-h"] }, fakeDeps)).toBe(0);
+    expect(await dispatchCommand({ kind: "command", command: undefined, args: [] }, fakeDeps)).toBe(0);
+  });
+
+  test("returns 1 for an unknown command", async () => {
+    const head = { kind: "command" as const, command: "definitely-not-a-command", args: ["definitely-not-a-command"] };
+    expect(await dispatchCommand(head, fakeDeps)).toBe(1);
+  });
+
+  test("returns 1 for inherited Object property names", async () => {
+    for (const name of ["__proto__", "constructor", "toString"]) {
+      const head = { kind: "command" as const, command: name, args: [name] };
+      expect(await dispatchCommand(head, fakeDeps), `${name} must be unknown`).toBe(1);
+    }
+  });
+
+  test("forwards service arguments and preserves handler exit codes", async () => {
+    const previousExitCode = process.exitCode;
+    try {
+      process.exitCode = 7;
+      const successCalls: string[][] = [];
+      const successDeps = {
+        ...fakeDeps,
+        args: ["service", "install", "--scheduler"],
+        serviceCommand: async (...args: string[]) => {
+          successCalls.push(args);
+        },
+      };
+
+      expect(await dispatchCommand(
+        { kind: "command", command: "service", args: successDeps.args },
+        successDeps,
+      )).toBe(0);
+      expect(successCalls).toEqual([["install", "--scheduler"]]);
+
+      for (const expected of [1, 2]) {
+        const calls: string[][] = [];
+        const deps = {
+          ...fakeDeps,
+          args: ["service", "install", "--scheduler"],
+          serviceCommand: async (...args: string[]) => {
+            calls.push(args);
+            process.exitCode = expected;
+          },
+        };
+
+        expect(await dispatchCommand(
+          { kind: "command", command: "service", args: deps.args },
+          deps,
+        )).toBe(expected);
+        expect(calls).toEqual([["install", "--scheduler"]]);
+      }
+    } finally {
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+});
+
+/**
+ * `ocx health` probed once. A proxy that has only just bound can miss a single
+ * probe while its event loop is still settling startup work, so health run
+ * seconds after a service restart reported "Proxy not healthy" and exited 1 for
+ * a proxy that was in fact serving. The stop paths already retry this exact race
+ * under SERVICE_STOP_LIVENESS (#764); health did not.
+ */
+describe("health retries a just-started proxy", () => {
+  test("passes a retry budget to findLiveProxy", async () => {
+    const seen: (number | undefined)[] = [];
+    const deps = {
+      ...fakeDeps,
+      args: ["health"],
+      findLiveProxy: async (io?: { attempts?: number }) => {
+        seen.push(io?.attempts);
+        return { pid: 4242, port: 10100 } as never;
+      },
+    } as unknown as CliDispatchDeps;
+
+    expect(await dispatchCommand({ kind: "command", command: "health", args: deps.args }, deps)).toBe(0);
+    // More than one: a single attempt is the defect. The exact number is the
+    // stop path's, and is asserted rather than inferred so a silent drop back to
+    // one probe fails here.
+    expect(seen).toEqual([3]);
+  });
+
+  test("still reports an absent proxy as unhealthy", async () => {
+    const deps = {
+      ...fakeDeps,
+      args: ["health"],
+      findLiveProxy: async () => null,
+    } as unknown as CliDispatchDeps;
+
+    expect(await dispatchCommand({ kind: "command", command: "health", args: deps.args }, deps)).toBe(1);
+  });
+});
+
+/**
+ * `handleStart` skipped the configured-port probe whenever the pid file and the
+ * runtime-port record were both absent. That absence proves nothing: a
+ * fallback-port sibling overwrites both records when it starts and removes them
+ * when it stops, so `start` shadowed a healthy configured-port proxy with an
+ * ephemeral-port copy and re-pointed client config at the copy.
+ *
+ * Source-level because the executable path binds real ports and spawns a real
+ * child; this pins the one option that decides the behavior, next to the
+ * `handleEnsure` call site that already had it right.
+ */
+describe("start probes the configured port before shadowing it (source-level)", () => {
+  const cliSource = readFileSync(repoPath("src/cli/index.ts"), "utf8");
+
+  test("every findProxyOwnerBeforeJournalRecovery call site asks for the probe", () => {
+    const calls = cliSource.match(/findProxyOwnerBeforeJournalRecovery\s*\(([^)]*)\)/g) ?? [];
+    // The declaration plus both call sites (handleStart, handleEnsure).
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    const invocations = calls.filter(call => !call.includes("options:"));
+    expect(invocations.length).toBe(2);
+    for (const call of invocations) {
+      expect(call).toContain("probeConfiguredPort: true");
+    }
+  });
+
+  /**
+   * The #3106 guard refused start whenever ANY live proxy existed, ignoring an explicit
+   * `--port` that differs from the live proxy's port. That is not the shadow the guard
+   * targets (a bare `start` landing on an ephemeral port); it broke starting a second
+   * instance on another port, and every spawned-launcher test on a machine running a
+   * real proxy timed out its startup wait. The decision is a pure function so the whole
+   * matrix runs at runtime here; the source oracle below only pins that handleStart
+   * actually routes through it.
+   */
+  test("the live-owner decision matrix", () => {
+    // Bare start: the #3106 shadow — still refused.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: undefined, ocxService: undefined }))
+      .toBe("refuse");
+    // Explicit port equal to the live proxy's: same conflict — still refused.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 10100, ocxService: undefined }))
+      .toBe("refuse");
+    // Explicit DIFFERENT port, interactive: the sibling request this fix restores.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 65301, ocxService: undefined }))
+      .toBe("sibling");
+    // Service wrapper keeps its exact stay-out semantics on both port shapes.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 10100, ocxService: "1" }))
+      .toBe("service-stay-out");
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 8080, ocxService: "1" }))
+      .toBe("service-stay-out");
+    // Only the exact "1" sentinel is service context — "0"/"false" cannot reach stay-out.
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: 8080, ocxService: "0" }))
+      .toBe("sibling");
+    expect(decideStartWithLiveOwner({ livePort: 10100, requestedPort: undefined, ocxService: "false" }))
+      .toBe("refuse");
+  });
+
+  test("a restart replacement awaits only its own draining parent", () => {
+    // The live proxy is the exact pid that spawned this start as its replacement: wait, do not refuse.
+    expect(decideStartWithLiveOwner({ livePort: 10100, livePid: 4242, restartParentPid: 4242, requestedPort: 10100, ocxService: undefined }))
+      .toBe("await-parent");
+    expect(decideStartWithLiveOwner({ livePort: 10100, livePid: 4242, restartParentPid: 4242, requestedPort: undefined, ocxService: undefined }))
+      .toBe("await-parent");
+    // Any other live owner keeps the ordinary table.
+    expect(decideStartWithLiveOwner({ livePort: 10100, livePid: 4243, restartParentPid: 4242, requestedPort: 10100, ocxService: undefined }))
+      .toBe("refuse");
+    expect(decideStartWithLiveOwner({ livePort: 10100, livePid: null, restartParentPid: 4242, requestedPort: 10100, ocxService: undefined }))
+      .toBe("refuse");
+    expect(decideStartWithLiveOwner({ livePort: 10100, livePid: 4243, restartParentPid: 4242, requestedPort: 10198, ocxService: undefined }))
+      .toBe("sibling");
+    expect(decideStartWithLiveOwner({ livePort: 10100, livePid: 4242, restartParentPid: null, requestedPort: 10100, ocxService: undefined }))
+      .toBe("refuse");
+    expect(decideStartWithLiveOwner({ livePort: 10100, livePid: 4243, restartParentPid: 4242, requestedPort: 10100, ocxService: "1" }))
+      .toBe("service-stay-out");
+  });
+
+  test("handleStart waits out its restart parent and refuses it on both paths after the wait", () => {
+    const start = cliSource.slice(cliSource.indexOf("async function handleStart("));
+    expect(start).toContain("takeRestartHandoffMarkers(process.env)");
+    expect(start).toContain("await probeOwnerPastRestartParent(() => findProxyOwnerBeforeJournalRecovery({ probeConfiguredPort: true, deferPidCleanup: supervisedServiceChild }), restartParent)");
+    expect(start.match(/decision === "refuse" \|\| decision === "await-parent"/g)?.length).toBe(2);
+    expect(start).toContain("livePid: fencedLive.pid, restartParentPid: restartParent.restartParentPid,");
+  });
+
+  test("handleStart routes its live-owner branch through the shared decision", () => {
+    expect(cliSource).toContain("decideStartWithLiveOwner({");
+    // No leftover inline refusal that could bypass the tested decision.
+    expect(cliSource).not.toContain("explicitSiblingPort");
+  });
+
+  test("a sibling start carries its flag into every chooseListenPort call", () => {
+    // The sibling instance must not persist its explicit port into config.port: the
+    // configured-port proxy still owns this home, and `ocx service` bakes config.port.
+    // Both call sites (initial pick and the EADDRINUSE re-pick) have to pass the flag,
+    // or the re-pick path silently regains the old behavior.
+    const calls = cliSource.match(/await chooseListenPort(([^)]*))/g) ?? [];
+    expect(calls.length).toBe(2);
+    for (const call of calls) {
+      expect(call).toContain("sibling: siblingStart");
+    }
+    expect(cliSource).toContain("siblingStart = true;");
+  });
+
+  test("the probe option still gates on an explicit true", () => {
+    // A truthy-but-not-true default would silently probe for callers that pass
+    // nothing, which is a different behavior than the one asserted above.
+    expect(cliSource).toContain("options.probeConfiguredPort === true");
+  });
+});
+
+/**
+ * #5004. The pre-bind owner check is not the last chance to notice a live proxy: when it
+ * answers "nothing is there" — a stale record, a probe that lost a race, a Windows loopback
+ * family split — the start walked on to `chooseListenPort`, found the port busy, and hopped.
+ * The hopped instance takes over this home's pid/runtime records and re-points Codex at
+ * itself, so the reporter was left with two proxies and an editor talking to the wrong one.
+ *
+ * The decision is a pure function so the matrix runs here at runtime; the source oracle
+ * below pins that `chooseListenPort` asks the port before it walks away from it.
+ */
+describe("a busy preferred port never becomes a second proxy (#5004)", () => {
+  // INV-START-01 (structure/overview.md).
+  const cliSource = readFileSync(repoPath("src/cli/index.ts"), "utf8");
+
+  test("the busy-preferred-port decision matrix", () => {
+    // The exact reported shape: preferred 58285 held by a live proxy, ephemeral 62254 free.
+    const reported = { preferredPort: 58285, selectedPort: 62254, hardPin: false, ocxService: undefined };
+
+    expect(decideBusyPreferredPort({ ...reported, holderIsOpencodex: true })).toBe("refuse-live-proxy");
+    // An unidentified holder stops the start too: hopping re-points Codex either way, and a
+    // silent probe is not proof that the port is free for the taking.
+    expect(decideBusyPreferredPort({ ...reported, holderIsOpencodex: false })).toBe("refuse-unidentified-holder");
+    // The service wrapper keeps the stay-out contract decideStartWithLiveOwner gives it.
+    expect(decideBusyPreferredPort({ ...reported, holderIsOpencodex: true, ocxService: "1" })).toBe("service-stay-out");
+    // Only the exact "1" sentinel is service context.
+    expect(decideBusyPreferredPort({ ...reported, holderIsOpencodex: true, ocxService: "0" })).toBe("refuse-live-proxy");
+    expect(decideBusyPreferredPort({ ...reported, holderIsOpencodex: false, ocxService: "1" })).toBe("refuse-unidentified-holder");
+    // No hop happened — the preferred port was obtained.
+    expect(decideBusyPreferredPort({ ...reported, selectedPort: 58285, holderIsOpencodex: true })).toBe("hop");
+    // `port: 0` asks the OS for a port; nothing was taken from anybody.
+    expect(decideBusyPreferredPort({ ...reported, preferredPort: 0, holderIsOpencodex: false })).toBe("hop");
+    // An explicit `--port` is the user's own instruction and never reaches the fallback:
+    // findAvailablePort throws PortUnavailableError for a hard pin instead of hopping.
+    expect(decideBusyPreferredPort({ ...reported, hardPin: true, holderIsOpencodex: true })).toBe("hop");
+  });
+
+  test("chooseListenPort asks who holds the port before it accepts a different one", () => {
+    const at = cliSource.indexOf("async function chooseListenPort(");
+    expect(at).toBeGreaterThan(-1);
+    const end = cliSource.indexOf("async function findProxyOwnerBeforeJournalRecovery(");
+    expect(end).toBeGreaterThan(at);
+    const fn = cliSource.slice(at, end);
+
+    const probeAt = fn.indexOf("await probePortOwner(");
+    const decisionAt = fn.indexOf("decideBusyPreferredPort({");
+    const hopLogAt = fn.indexOf("is busy; starting opencodex on");
+    expect(probeAt).toBeGreaterThan(-1);
+    expect(decisionAt).toBeGreaterThan(probeAt);
+    // The hop message is downstream of the decision, so no path can print it without one.
+    expect(hopLogAt).toBeGreaterThan(decisionAt);
+    // One 750ms probe is what produced the duplicate; the guard spends the larger budget.
+    expect(fn).toContain("START_OWNERSHIP_LIVENESS");
+
+    // Both refusals preserve the exit code through the caller's lease-cleanup boundary.
+    expect(fn).toMatch(/decision === "refuse-live-proxy"[\s\S]{0,400}?StartCommandExit\(1\)/);
+    expect(fn).toContain("Use 'ocx stop' first.");
+    expect(fn).toMatch(/decision === "refuse-unidentified-holder"[\s\S]{0,700}?StartCommandExit\(1\)/);
+    // The wrapper receives an explicit stay-out signal for a served port.
+    expect(fn).toMatch(/decision === "service-stay-out"[\s\S]{0,500}?StartCommandExit\(serviceStayOutExitCode\(\)\)/);
+  });
+
+  test("the pre-bind owner probe spends the same budget before it deletes state", () => {
+    const at = cliSource.indexOf("async function findProxyOwnerBeforeJournalRecovery(");
+    expect(at).toBeGreaterThan(-1);
+    const fn = cliSource.slice(at, at + 1400);
+    expect(fn).toContain("await findLiveProxy(START_OWNERSHIP_LIVENESS)");
+    // A negative answer here removes this home's pid record. That is the other half of why
+    // one unanswered probe must not be enough.
+    expect(fn).toContain("if (!options.deferPidCleanup) removePidIfValueIs(pidSnapshot)");
+  });
+});
+
+/**
+ * A sibling (`ocx start --port <other>` beside a live proxy) shares CODEX_HOME, ~/.claude, ~/.grok
+ * and the launchd domain with the live owner. It used to re-point Codex at itself on startup, and
+ * `openai_base_url` kept naming its port after it was killed. The exit-teardown decision is pure so
+ * its matrix runs here; the source oracle pins that handleStart and handleStop route through the
+ * mark. The end-to-end proof that shared bytes survive is in cli-start-journal-order.test.ts.
+ */
+describe("a sibling start leaves shared client routing to the live owner", () => {
+  const cliSource = readFileSync(repoPath("src/cli/index.ts"), "utf8");
+  const slice = (from: string, to: string): string => {
+    const at = cliSource.indexOf(from);
+    const end = cliSource.indexOf(to, at);
+    expect(at).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(at);
+    return cliSource.slice(at, end);
+  };
+
+  test("the exit-teardown matrix", () => {
+    const none = { revertSystemEnv: false, restoreNativeCodex: false, stripGrokConfig: false };
+    const all = { revertSystemEnv: true, restoreNativeCodex: true, stripGrokConfig: true };
+    // A sibling owns nothing it could tear down, under any launcher.
+    expect(decideStartExitTeardown({ sibling: true, recycling: false, ocxService: undefined })).toEqual(none);
+    expect(decideStartExitTeardown({ sibling: true, recycling: false, ocxService: "1" })).toEqual(none);
+    // A drain-and-restart keeps everything for the replacement (#563).
+    expect(decideStartExitTeardown({ sibling: false, recycling: true, ocxService: undefined })).toEqual(none);
+    // Service context keeps routing and the fence; only the env comes down.
+    expect(decideStartExitTeardown({ sibling: false, recycling: false, ocxService: "1" }))
+      .toEqual({ revertSystemEnv: true, restoreNativeCodex: false, stripGrokConfig: false });
+    // Only the exact "1" sentinel is service context.
+    expect(decideStartExitTeardown({ sibling: false, recycling: false, ocxService: "0" })).toEqual(all);
+    expect(decideStartExitTeardown({ sibling: false, recycling: false, ocxService: undefined })).toEqual(all);
+  });
+
+  test("the startup line names both ports for a sibling and keeps the other two sentences", () => {
+    try {
+      markSiblingStart(10100);
+      expect(startupLeftCodexNativeLine("sibling", 10199))
+        .toBe("   Client routing stays on the proxy at port 10100; this instance serves direct requests on port 10199 only.");
+    } finally {
+      resetSiblingStartForTests();
+    }
+    expect(startupLeftCodexNativeLine("desired_disabled")).toBe("   Codex integration OFF; startup left Codex native.");
+    expect(startupLeftCodexNativeLine("hub-gated")).toContain("Startup left Codex native.");
+  });
+
+  test("handleStart marks the sibling on both detection paths before the server binds", () => {
+    const start = slice("async function handleStart(", "function detachedStartEnvironment(");
+    const bindAt = start.indexOf("serverModule.startServer(");
+    expect(bindAt).toBeGreaterThan(-1);
+    for (const mark of ["siblingStart = true;\n    markSiblingStart(owner.live.port);", "siblingStart = true;\n          markSiblingStart(fencedLive.port);"]) {
+      expect(start.indexOf(mark)).toBeGreaterThan(-1);
+      expect(start.indexOf(mark)).toBeLessThan(bindAt);
+    }
+    // The old comment described the defect as intended behavior.
+    expect(start).not.toContain("re-points this home's Codex config");
+    expect(start).toContain("...siblingRuntimeField(),");
+    expect(start).toContain("if (!siblingStart) await maybeShowUpdatePrompt();");
+    expect(start).toContain("if (!siblingStart) reportShellHookFailure(reconcileShellHook(systemEnv.injected));");
+    expect(start).toContain("if (!siblingStart && !currentExternalCodexModelProvider() && !shouldInjectApiAuthHeader(config)");
+    expect(start).toContain("startupLeftCodexNativeLine(localClientSkipReason(config), server.port ?? port)");
+  });
+
+  test("the exit cleanup routes every shared teardown through the decision", () => {
+    const cleanup = slice("const syncCleanup = () => {", "let shuttingDown = false;");
+    expect(cleanup).toContain("decideStartExitTeardown({ sibling: siblingStart, recycling: isRecyclingForExit(), ocxService: process.env.OCX_SERVICE })");
+    expect(cleanup).toContain("if (teardown.revertSystemEnv) {");
+    expect(cleanup).toContain("if (teardown.restoreNativeCodex && !currentExternalCodexModelProvider()) {");
+    expect(cleanup).toContain("if (teardown.stripGrokConfig && serviceEnvironmentOwnedHere()) {");
+    expect(cleanup).not.toContain("preserveRouting");
+  });
+
+  test("ocx stop of a sibling claims no receipt and restores nothing", () => {
+    const stop = slice("async function handleStopUnlocked(", "async function handleUninstall(");
+    const readAt = stop.indexOf("const siblingOfPort = readRuntimePort()?.siblingOfPort;");
+    expect(readAt).toBeGreaterThan(-1);
+    // Read before the first stop can remove the record.
+    expect(readAt).toBeLessThan(stop.indexOf("stopServiceIfInstalledDetailed()"));
+    expect(stop).toContain("if (teardownNonce || stoppingSibling) return;");
+    expect(stop).toContain("const restoreBlocked = ownershipBlocked || inheritedBlocks || nativeRestoreHandledByProxy || stoppingSibling;");
+    expect(stop).toContain('if (nativeRestoreHandledByProxy && !stoppingSibling) record.sharedTeardown = "performed-by-proxy";');
+    // The system env was never the sibling's to set, so its stop does not roll it back either.
+    expect(stop).toContain("if (!stoppingSibling) { try { revertSystemEnv(); } catch { /* best-effort */ } }");
+    expect(stop).not.toMatch(/\n {2}try \{ revertSystemEnv\(\); \}/);
+    // A sibling never runs under a service manager, so an installed one is the live owner's. Asking
+    // it failed the ownership check from the sibling's home: exit 1, and after a hard kill the
+    // stale sibling records were never purged.
+    expect(stop).toContain(': stoppingSibling ? "absent" : stopServiceIfInstalledDetailed();');
+    // The only other caller is the guarded desktop step, which reaches the manager only when it
+    // provably owns the approved pid; a sibling's pid never is.
+    expect(stop.split("stopServiceIfInstalledDetailed()").length - 1).toBe(2);
+  });
+
+  test("ocx stop of a hard-killed sibling never stops the live owner discovery falls back to", () => {
+    // Behavior: the recorded sibling on 10199 is gone, and discovery answered with the owner.
+    expect(siblingStopFoundOwner(10100, { port: 10100, source: "config" })).toBe(true);
+    expect(siblingStopFoundOwner(10100, { port: 10100, source: "runtime" })).toBe(true);
+    // A configured-port answer is never the sibling's own record, whatever port it names.
+    expect(siblingStopFoundOwner(10100, { port: 10150, source: "config" })).toBe(true);
+    // The sibling itself still answering through its record is stopped normally.
+    expect(siblingStopFoundOwner(10100, { port: 10199, source: "runtime" })).toBe(false);
+    // Nothing answering, or not a sibling record at all: the ordinary stop paths decide.
+    expect(siblingStopFoundOwner(10100, null)).toBe(false);
+    expect(siblingStopFoundOwner(undefined, { port: 10100, source: "config" })).toBe(false);
+
+    // Wiring: the orphan path asks before it may stop anything it found, and reports success.
+    const stop = slice("async function handleStopUnlocked(", "async function handleUninstall(");
+    const findAt = stop.indexOf("const live = await findLiveProxy({ acceptPackageTreeFenced: true });");
+    const askAt = stop.indexOf("if (siblingStopFoundOwner(siblingOfPort, live)) {");
+    const attestAt = stop.indexOf('} else if (live?.pid && (await proveLiveProxyOwnedByHome(live)) !== "proven") {');
+    expect(findAt).toBeGreaterThan(-1);
+    expect(askAt).toBeGreaterThan(findAt);
+    expect(askAt).toBeLessThan(attestAt);
+    expect(attestAt).toBeLessThan(stop.indexOf("} else if (live?.pid) {"));
+    const branch = stop.slice(askAt, attestAt);
+    expect(branch).toContain('record.proxy = "not-running";');
+    expect(branch).toContain("was left running.");
+    expect(branch).not.toContain("stopFailed = true");
+    expect(branch).not.toContain("stopWithDeferral");
+  });
+
+  test("a sibling's replacement start inherits the mark through the env, and nothing else does", () => {
+    expect(SIBLING_OF_PORT_ENV).toBe("OCX_SIBLING_OF_PORT");
+    expect(SIBLING_HANDOFF_NONCE_ENV).toBe("OCX_SIBLING_HANDOFF_NONCE");
+    for (const [raw, port] of [["10100", 10100], [" 1 ", 1], ["65535", 65535]] as const) {
+      expect(parseSiblingMarker(raw)).toBe(port);
+    }
+    for (const raw of [undefined, "", "0", "65536", "-1", "10100.5", "1e4", "abc", "10100abc", "123456"]) {
+      expect(parseSiblingMarker(raw), String(raw)).toBeNull();
+    }
+    try {
+      // Unmarked: a replacement env carries no marker, and a stale inherited one is dropped.
+      expect(withSiblingMarker({ PATH: "/bin", OCX_SIBLING_OF_PORT: "9", OCX_SIBLING_HANDOFF_NONCE: "stale" })).toEqual({ PATH: "/bin" });
+      // The leaf marks only after the supplied one-use verifier accepts both fields.
+      const env: Record<string, string | undefined> = { PATH: "/bin", OCX_SIBLING_OF_PORT: "10100", OCX_SIBLING_HANDOFF_NONCE: "one-use" };
+      expect(honorSiblingMarker(env, (port, nonce) => port === 10100 && nonce === "one-use")).toBe(10100);
+      expect(siblingOfLivePort()).toBe(10100);
+      expect(env).toEqual({ PATH: "/bin" });
+      // Marked: the replacement env names the owner; an ordinary-owner child env never does.
+      const source = { PATH: "/bin", OCX_SERVICE: "1" };
+      expect(withSiblingMarker(source, () => "one-use")).toEqual({ PATH: "/bin", OCX_SERVICE: "1", OCX_SIBLING_OF_PORT: "10100", OCX_SIBLING_HANDOFF_NONCE: "one-use" });
+      expect(source).toEqual({ PATH: "/bin", OCX_SERVICE: "1" });
+      expect(withoutSiblingMarker({ PATH: "/bin", OCX_SIBLING_OF_PORT: "10100", OCX_SIBLING_HANDOFF_NONCE: "stale" })).toEqual({ PATH: "/bin" });
+    } finally {
+      resetSiblingStartForTests();
+    }
+    // A malformed marker marks nothing and is still consumed.
+    const bad: Record<string, string | undefined> = { OCX_SIBLING_OF_PORT: "0" };
+    expect(honorSiblingMarker(bad, () => true)).toBeNull();
+    expect(siblingOfLivePort()).toBeNull();
+    expect(bad).toEqual({});
+    const forged: Record<string, string | undefined> = { OCX_SIBLING_OF_PORT: "10100" };
+    expect(honorSiblingMarker(forged, consumeSiblingHandoff)).toBeNull();
+    expect(forged).toEqual({});
+
+    // Wiring: handleStart honors it before the first probe; both replacement spawns hand it on;
+    // the ordinary-owner detached starts strip it.
+    const start = slice("async function handleStart(", "function detachedStartEnvironment(");
+    const honorAt = start.indexOf("let siblingStart = honorSiblingMarker(process.env, consumeSiblingHandoff) !== null;");
+    expect(honorAt).toBeGreaterThan(-1);
+    expect(honorAt).toBeLessThan(start.indexOf("findProxyOwnerBeforeJournalRecovery("));
+    const owner = slice("async function findProxyOwnerBeforeJournalRecovery(", "async function handleStart(");
+    expect(owner).not.toContain("reconcileJournal(");
+    expect(start.indexOf("markCrossHomeSibling()")).toBeGreaterThan(-1);
+    expect(start.indexOf("markCrossHomeSibling()")).toBeLessThan(start.indexOf("reconcileStartupJournal()"));
+    const detached = slice("function detachedStartEnvironment(", "async function handleEnsure(");
+    expect(detached).toContain("const env: NodeJS.ProcessEnv = withoutSiblingMarker(process.env);");
+    expect(detached).toContain("delete env.OCX_SERVICE;");
+    expect(detached).toContain("delete env[SERVICE_MANAGED_ENV];");
+    expect(detached).toContain("delete env[WINDOWS_WRAPPER_PROTOCOL_ENV];");
+    expect(cliSource).toContain("env: withProcessRuntimeProvenance(withoutSiblingMarker(process.env)),");
+    // Every other detached `ocx start` is an ordinary owner too: the client auto-starts and the
+    // updater's restart. A stray marker would mark them before any probe.
+    const opencodeStartEnv = "env: withProcessRuntimeProvenance(opencodeProxyStartEnv(withoutSiblingMarker(process.env)) as NodeJS.ProcessEnv),";
+    for (const [path, env] of [
+      ["src/cli/claude.ts", 'env: withProcessRuntimeProvenance(withoutSiblingMarker({ ...process.env, OCX_SERVICE: "1" })),'],
+      ["src/cli/opencode.ts", opencodeStartEnv],
+      ["src/cli/minimax.ts", opencodeStartEnv],
+      ["src/update/job.ts", "const env: NodeJS.ProcessEnv = withoutSiblingMarker(process.env);"],
+      ["src/update/index.ts", "const env = mutation.controlEnvironment(withoutSiblingMarker(process.env));"],
+    ] as const) {
+      expect(readFileSync(repoPath(path), "utf8"), path).toContain(env);
+    }
+    // The package launcher's own post-update restart cannot import the helper; it deletes inline.
+    expect(readFileSync(repoPath("bin/ocx.mjs"), "utf8")).toContain("delete env.OCX_SIBLING_OF_PORT;");
+    expect(readFileSync(repoPath("bin/ocx.mjs"), "utf8")).toContain("delete env.OCX_SIBLING_HANDOFF_NONCE;");
+    expect(readFileSync(repoPath("src/server/management/system-restart.ts"), "utf8"))
+      .toContain("const sourceEnv: NodeJS.ProcessEnv = withSiblingMarker(process.env, issueSiblingHandoff);");
+    const runtime = readFileSync(repoPath("src/client/runtime.ts"), "utf8");
+    const prepareAt = runtime.indexOf("withSiblingMarker(standaloneRecycleEnv(process.env, disconnectedTokenFingerprint), issueSiblingHandoff)");
+    expect(prepareAt).toBeGreaterThan(-1);
+    expect(prepareAt).toBeLessThan(runtime.indexOf("  cleanup();", prepareAt));
+  });
+
+  test("a sibling handoff is bound to its live runtime and home, then consumed once", () => {
+    const priorHome = process.env.OPENCODEX_HOME;
+    const home = mkdtempSync(join(tmpdir(), "ocx-sibling-handoff-"));
+    const otherHome = mkdtempSync(join(tmpdir(), "ocx-other-handoff-"));
+    try {
+      process.env.OPENCODEX_HOME = home;
+      markSiblingStart(10100);
+      expect(() => withSiblingMarker({ OPENCODEX_HOME: home }, issueSiblingHandoff)).toThrow();
+      writeRuntimePort({ pid: process.pid, port: 10199, siblingOfPort: 10100,
+        attestationSecret: createLocalAttestationSecret() });
+      const issued = withSiblingMarker({ OPENCODEX_HOME: home }, issueSiblingHandoff);
+      resetSiblingStartForTests();
+      process.env.OPENCODEX_HOME = otherHome;
+      expect(honorSiblingMarker({ ...issued }, consumeSiblingHandoff)).toBeNull();
+      process.env.OPENCODEX_HOME = home;
+      expect(honorSiblingMarker({ ...issued }, consumeSiblingHandoff)).toBe(10100);
+      resetSiblingStartForTests();
+      expect(honorSiblingMarker({ ...issued }, consumeSiblingHandoff)).toBeNull();
+    } finally {
+      resetSiblingStartForTests();
+      process.env.OPENCODEX_HOME = home;
+      removeRuntimePort(process.pid);
+      if (priorHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = priorHome;
+      removeTreeWithRetry(home);
+      removeTreeWithRetry(otherHome);
+    }
+  });
+
+  test("a sibling client runtime can hand off without a server attestation secret", () => {
+    const priorHome = process.env.OPENCODEX_HOME;
+    const home = mkdtempSync(join(tmpdir(), "ocx-client-sibling-handoff-"));
+    try {
+      process.env.OPENCODEX_HOME = home;
+      writeRuntimePort({ pid: process.pid, port: 10199, siblingOfPort: 10100 });
+      markSiblingStart(10100);
+      const issued = withSiblingMarker({ OPENCODEX_HOME: home }, issueSiblingHandoff);
+      resetSiblingStartForTests();
+      expect(honorSiblingMarker({ ...issued }, consumeSiblingHandoff)).toBe(10100);
+    } finally {
+      resetSiblingStartForTests();
+      process.env.OPENCODEX_HOME = home;
+      removeRuntimePort(process.pid);
+      if (priorHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = priorHome;
+      removeTreeWithRetry(home);
+    }
+  });
+});
+
+describe("logout parses argv before touching the credential store", () => {
+  /**
+   * `ocx logout --json` used to lowercase `--json`, pass it to removeCredential as a provider
+   * name, print "Logged out of --json." and exit 0. A caller that can only see the exit code
+   * got a success for an operation that removed nothing.
+   *
+   * The severity is not "a wasted call". `normalizeAuthStore` copies every top-level key it
+   * finds, so a hand-edited, legacy, or corrupted auth.json carrying a `--json` key would lose
+   * that key's active account -- and the key itself if it was the last account. These
+   * assertions therefore compare the store FILE before and after, which proves the store was
+   * never reached rather than trusting a stubbed function.
+   *
+   * Safe against the developer's real store: `tests/preload.ts` sandboxes HOME and
+   * OPENCODEX_HOME for every invocation, wrapped or bare, so this writes to a temp home.
+   */
+  const authPath = (): string => join(getConfigDir(), "auth.json");
+  const snapshot = (): string | null => existsSync(authPath()) ? readFileSync(authPath(), "utf8") : null;
+
+  /**
+   * Seed a real credential before every case, because otherwise these assertions are vacuous:
+   * the sandbox home starts with no `auth.json`, so `before` and `after` would both be null and
+   * a comparison between them would pass even if the command HAD written to the store. Found by
+   * probing the sandbox rather than by reading the test -- the file genuinely does not exist at
+   * `<tmp>/.opencodex/auth.json` when the suite starts.
+   *
+   * With a credential present the file exists, so "byte-identical before and after" is a claim
+   * with content: any write, including the destructive `--json`-as-provider-name path, changes it.
+   */
+  const seed = async (): Promise<string> => {
+    await saveCredential("claude", { access: "seed-access", refresh: "seed-refresh", expires: Date.now() + 600_000 });
+    const contents = snapshot();
+    expect(contents, "seeded auth.json must exist or the non-mutation assertions are vacuous").not.toBeNull();
+    return contents!;
+  };
+
+  const runLogout = async (args: string[]): Promise<{ code: number; out: string[]; err: string[]; before: string | null; after: string | null }> => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const log = console.log;
+    const error = console.error;
+    console.log = (...v: unknown[]) => out.push(v.join(" "));
+    console.error = (...v: unknown[]) => err.push(v.join(" "));
+    const before = snapshot();
+    try {
+      const argv = ["logout", ...args];
+      const code = await dispatchCommand(
+        { kind: "command", command: "logout", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+      return { code, out, err, before, after: snapshot() };
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("a flag is never read as a provider name and leaves the store byte-identical", async () => {
+    await seed();
+    const result = await runLogout(["--json"]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+    expect(result.out.join("")).not.toContain("Logged out");
+  });
+
+  test("an omitted provider is a usage error, not a no-op success", async () => {
+    await seed();
+    const result = await runLogout([]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+  });
+
+  test("an unknown option is rejected and the store is untouched", async () => {
+    await seed();
+    const result = await runLogout(["claude", "--wat"]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+  });
+
+  test("extra positionals are a usage error", async () => {
+    await seed();
+    const result = await runLogout(["claude", "gemini"]);
+    expect(result.code).toBe(2);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+  });
+
+  test("a provider with no stored credential is not-found, not usage", async () => {
+    // 4 rather than 2: the call was well-formed, the thing simply is not there. Collapsing
+    // those two into one code is what made the account family unscriptable (#2698).
+    await seed();
+    const result = await runLogout(["gemini", "--json"]);
+    expect(result.code).toBe(4);
+    expect(result.before).not.toBeNull();
+    expect(result.after).toEqual(result.before);
+    expect(JSON.parse(result.out.join("\n"))).toMatchObject({ ok: false, removed: false, reason: "not_found" });
+  });
+
+  test("a stored provider is removed and reported in both modes", async () => {
+    await seed();
+    expect(getAccountSet("claude")).not.toBeNull();
+
+    const human = await runLogout(["claude"]);
+    expect(human.code).toBe(0);
+    expect(human.out.join("")).toContain("Logged out of claude.");
+    expect(getAccountSet("claude")).toBeNull();
+
+    // Order-independent, and idempotent: a second logout is now a clean not-found.
+    await seed();
+    const json = await runLogout(["--json", "claude"]);
+    expect(json.code).toBe(0);
+    expect(JSON.parse(json.out.join("\n"))).toMatchObject({ ok: true, provider: "claude", removed: true });
+    expect(getAccountSet("claude")).toBeNull();
+  });
+});
+
+describe("logout reports only what it actually did", () => {
+  /**
+   * Two defects an adversarial audit found in the first version of the argv fix, both
+   * reproduced before being fixed.
+   *
+   * The first was the same bug one dash shorter: the parser treated only `--*` as options, so
+   * `ocx logout -j` used `-j` as the provider name. With a `-j` key in the store -- which
+   * `normalizeAuthStore` happily preserves -- that deleted a credential and exited 0.
+   *
+   * The second was a non-atomic read-then-remove. `getAccountSet` followed by
+   * `removeCredential` leaves a window where a concurrent logout removes the same account and
+   * both callers report a removal. `removeCredential` now returns its disposition from inside
+   * the serialized mutation, so only the caller that actually removed something says so.
+   */
+  const authPath = (): string => join(getConfigDir(), "auth.json");
+  const snapshot = (): string | null => existsSync(authPath()) ? readFileSync(authPath(), "utf8") : null;
+
+  const run = async (args: string[]): Promise<{ code: number; out: string[] }> => {
+    const out: string[] = [];
+    const log = console.log;
+    const error = console.error;
+    console.log = (...v: unknown[]) => out.push(v.join(" "));
+    console.error = (...v: unknown[]) => out.push(v.join(" "));
+    const argv = ["logout", ...args];
+    try {
+      const code = await dispatchCommand(
+        { kind: "command", command: "logout", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+      return { code, out };
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("a short flag is an option, not a provider, and its sentinel credential survives", async () => {
+    // The sentinel is the point: a store key named exactly like the malformed token. Seeding
+    // only a well-named provider cannot detect this class of bug, because removing `-j` would
+    // leave the rest of the file byte-identical.
+    await saveCredential("-j", { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+    expect(getAccountSet("-j")).not.toBeNull();
+
+    const result = await run(["-j"]);
+    expect(result.code).toBe(2);
+    expect(getAccountSet("-j"), "a flag must never reach the store as a provider name").not.toBeNull();
+    expect(result.out.join("")).not.toContain("Logged out");
+  });
+
+  test("a --json=... spelling is rejected rather than treated as a provider", async () => {
+    await saveCredential("--json=true", { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+    const result = await run(["--json=true"]);
+    expect(result.code).toBe(2);
+    expect(getAccountSet("--json=true")).not.toBeNull();
+  });
+
+  test("the malformed-token sentinel survives a --json invocation", async () => {
+    await saveCredential("--json", { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+    const before = snapshot();
+    const result = await run(["--json"]);
+    expect(result.code).toBe(2);
+    expect(getAccountSet("--json"), "the store must not be reached at all").not.toBeNull();
+    expect(snapshot()).toEqual(before);
+  });
+
+  test("concurrent logouts: exactly one reports the removal", async () => {
+    await saveCredential("gemini", { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+    const [first, second] = await Promise.all([run(["gemini"]), run(["gemini"])]);
+    // One removal (0) and one not-found (4). Two zeroes would mean a caller claimed credit for
+    // a mutation it did not perform, which is what the preflight allowed.
+    expect([first.code, second.code].sort()).toEqual([0, 4]);
+    expect(getAccountSet("gemini")).toBeNull();
+  });
+
+  test("removeCredential returns its disposition from inside the mutation", async () => {
+    await saveCredential("claude", { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+    expect(await removeCredential("claude")).toBe("removed");
+    expect(await removeCredential("claude")).toBe("not-found");
+    expect(await removeCredential("never-stored")).toBe("not-found");
+  });
+});
+
+describe("logout rejects anything that is not a possible provider id", () => {
+  /**
+   * Third round on the same defect, which is why the fix stopped naming spellings.
+   *
+   * `--json` was rejected, then `-j` was not; `-j` was rejected, then `—json` with a Unicode
+   * em dash was not. Each patch enumerated one more variant of "looks like a flag" while the
+   * store kept accepting anything that did not match that enumeration. The rule is now stated
+   * positively via `isValidProviderName`: start and end alphanumeric, internal `._-` allowed.
+   * Everything that cannot be a provider id is refused before the store is opened.
+   *
+   * Real providers contain dashes -- `github-copilot`, `google-antigravity` -- so a blanket
+   * dash ban would have been wrong; this is why the check is a shape rule, not a character ban.
+   */
+  const run = async (arg: string): Promise<number> => {
+    const argv = ["logout", arg];
+    const log = console.log;
+    const error = console.error;
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      return await dispatchCommand(
+        { kind: "command", command: "logout", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("Unicode dash tokens never reach the store", async () => {
+    // Em dash and minus sign. Both survived the ASCII-only guard and deleted sentinels.
+    for (const token of ["\u2014json", "\u2212json", "\u2013j"]) {
+      await saveCredential(token, { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+      expect(await run(token), `${JSON.stringify(token)} must be rejected`).toBe(2);
+      expect(getAccountSet(token), `${JSON.stringify(token)} sentinel must survive`).not.toBeNull();
+    }
+  });
+
+  test("reserved and malformed names are refused before any store access", async () => {
+    // `__proto__` is asserted without a sentinel: seeding it is impossible, because
+    // `saveCredential("__proto__")` corrupts the store object itself -- which is precisely why
+    // the validator reserves it. Trying to seed it threw inside the store, and that failure is
+    // the argument for rejecting the name at the CLI boundary.
+    expect(await run("__proto__")).toBe(2);
+    for (const token of ["policy", "-lead", "trail-", ".dot"]) {
+      await saveCredential(token, { access: "sentinel", refresh: "r", expires: Date.now() + 600_000 });
+      expect(await run(token), `${token} must be rejected`).toBe(2);
+      expect(getAccountSet(token), `${token} sentinel must survive`).not.toBeNull();
+    }
+  });
+
+  test("providers that legitimately contain dashes still work", async () => {
+    // The guard must not overshoot: these are real provider ids from listOAuthProviders().
+    for (const provider of ["github-copilot", "google-antigravity", "command-code"]) {
+      await saveCredential(provider, { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+      expect(await run(provider), `${provider} must be accepted`).toBe(0);
+      expect(getAccountSet(provider)).toBeNull();
+    }
+  });
+
+  test("an uppercase provider is normalised, not rejected", async () => {
+    await saveCredential("github-copilot", { access: "a", refresh: "r", expires: Date.now() + 600_000 });
+    expect(await run("GITHUB-COPILOT")).toBe(0);
+    expect(getAccountSet("github-copilot")).toBeNull();
+  });
+});
+
+describe("doctor refuses --json rather than printing prose as success", () => {
+  const runDoctor = async (flag: string): Promise<number> => {
+    const argv = ["doctor", flag];
+    const log = console.log;
+    const error = console.error;
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      return await dispatchCommand(
+        { kind: "command", command: "doctor", args: argv },
+        { ...fakeDeps, args: argv } as unknown as CliDispatchDeps,
+      );
+    } finally {
+      console.log = log;
+      console.error = error;
+    }
+  };
+
+  test("exact --json, --json=true, and Unicode dashes all exit 2", async () => {
+    for (const flag of ["--json", "--json=true", "\u2014json"]) {
+      expect(await runDoctor(flag), `${JSON.stringify(flag)} must be refused`).toBe(2);
+    }
+  });
+});
+
+describe("codex-shim status argument validation", () => {
+  test.each(["--json", "--json=true", "--nope", "unexpected"])("rejects %s with stderr-only usage and exit 2", async extra => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const logSpy = spyOn(console, "log").mockImplementation(value => { out.push(String(value)); });
+    const errorSpy = spyOn(console, "error").mockImplementation(value => { err.push(String(value)); });
+    try {
+      const args = ["codex-shim", "status", extra];
+      expect(await dispatchCommand(
+        { kind: "command", command: "codex-shim", args }, { ...fakeDeps, args },
+      )).toBe(2);
+      expect(out).toEqual([]);
+      expect(err).toContain("Usage: ocx codex-shim status");
+      expect(err[0]).toBe(extra.startsWith("--json")
+        ? "ocx codex-shim status does not support --json; use ocx status --json (codexShim)."
+        : "ocx codex-shim status does not accept arguments or options.");
+      expect(err.join("\n")).not.toContain(extra === "unexpected" ? extra : "Codex autostart shim:");
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("bare status still prints the local diagnosis and exits 0", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-shim-status-"));
+    const previous = process.env.OPENCODEX_HOME;
+    const out: string[] = [];
+    const logSpy = spyOn(console, "log").mockImplementation(value => { out.push(String(value)); });
+    try {
+      process.env.OPENCODEX_HOME = home;
+      const args = ["codex-shim", "status"];
+      expect(await dispatchCommand(
+        { kind: "command", command: "codex-shim", args }, { ...fakeDeps, args },
+      )).toBe(0);
+      expect(out).toEqual(["Codex autostart shim is not installed."]);
+    } finally {
+      logSpy.mockRestore();
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      removeTreeWithRetry(home);
+    }
+  });
+});
+
+describe("GUI command delegation", () => {
+  const config = {
+    port: 10100,
+    runtimeRole: "hub" as const,
+    hub: { managementPublicOrigin: "https://hub.example.test" },
+    corsAllowOrigins: ["https://dashboard.example.test"],
+    providers: {},
+    defaultProvider: "openai",
+  };
+
+  test("opens the hub management ingress on its literal IPv4 loopback bind", () => {
+    const hubConfig = {
+      port: 10100,
+      hostname: "100.76.170.81",
+      runtimeRole: "hub" as const,
+      hub: {
+        managementPublicOrigin: "https://hub.example.test",
+        managementIngress: { enabled: true as const, port: 10102 },
+      },
+    } as Pick<OcxConfig, "port" | "hostname" | "runtimeRole" | "hub">;
+    const live = { hostname: "100.76.170.81", port: 10100 };
+
+    expect(selectDefaultGuiUrl(hubConfig, live, hostname => hostname ?? "127.0.0.1"))
+      .toBe("http://127.0.0.1:10102");
+
+    const withoutIngress = { ...hubConfig, hub: { managementPublicOrigin: "https://hub.example.test" } };
+    expect(selectDefaultGuiUrl(withoutIngress, live, hostname => hostname ?? "127.0.0.1"))
+      .toBe("http://100.76.170.81:10100");
+  });
+
+  test("keeps the default open behavior and requires an explicit pairing origin", async () => {
+    let opens = 0;
+    const deps = {
+      loadConfig: () => config,
+      openDefaultGui: async () => { opens += 1; return 0; },
+    };
+    expect(await runGuiCommand([], deps)).toBe(0);
+    expect(opens).toBe(1);
+    expect(await runGuiCommand(["pair"], deps)).toBe(1);
+    expect(await runGuiCommand(["pair", "--origin", "https://dashboard.example.test", "extra"], deps)).toBe(1);
+  });
+
+  test("prints a created grant once and maps remote API refusal to exit 1 without echoing response data", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const logSpy = spyOn(console, "log").mockImplementation(value => { stdout.push(String(value)); });
+    const errorSpy = spyOn(console, "error").mockImplementation(value => { stderr.push(String(value)); });
+    try {
+      const base = {
+        loadConfig: () => config,
+        openDefaultGui: async () => 0,
+        findLiveProxy: async () => ({ pid: 4242, port: 10100, source: "runtime" as const }),
+      };
+      const grant = `ocx_pair_${"C".repeat(43)}`;
+      expect(await runGuiCommand(["pair", "--origin", "https://dashboard.example.test", "--json"], {
+        ...base,
+        requestPairingGrant: async () => ({
+          kind: "created",
+          grant,
+          browserOrigin: "https://dashboard.example.test",
+          serverOrigin: "https://hub.example.test",
+          expiresAt: 1_800_000_300_000,
+        }),
+      })).toBe(0);
+      expect(stdout.join(" ").split(grant)).toHaveLength(2);
+
+      stdout.length = 0;
+      expect(await runGuiCommand(["pair", "--origin", "https://dashboard.example.test"], {
+        ...base,
+        requestPairingGrant: async () => ({ kind: "unavailable", reason: "rejected" }),
+      })).toBe(1);
+      expect(`${stdout.join(" ")} ${stderr.join(" ")}`).not.toContain("remote-response-secret");
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("login routes the Codex account names instead of printing the provider wall", () => {
+  /**
+   * `ocx login codex` used to fall through to handleLogin, which knows only the public
+   * OAuth and API-key providers, and answered with a ~90-name usage list that never
+   * contains the word the user typed. The Codex pool is reachable (`ocx account login
+   * codex`), so the dead end was vocabulary, not capability.
+   *
+   * The observable proof that the routing happened is the account path's own precondition:
+   * that flow runs inside the proxy, so with no live proxy it reports "Proxy is not
+   * running" and exits 1. handleLogin would have printed "Usage: ocx login <provider>"
+   * and killed the process with process.exit(1) instead, which is also why these cases
+   * cannot simply assert on a non-Codex name here.
+   */
+  const runLogin = async (args: string[]): Promise<{ code: number; err: string }> => {
+    const err: string[] = [];
+    const errorSpy = spyOn(console, "error").mockImplementation((...v: unknown[]) => { err.push(v.join(" ")); });
+    try {
+      const argv = ["login", ...args];
+      const code = await dispatchCommand(
+        { kind: "command", command: "login", args: argv },
+        { ...fakeDeps, args: argv, findLiveProxy: async () => null } as unknown as CliDispatchDeps,
+      );
+      return { code, err: err.join("\n") };
+    } finally {
+      errorSpy.mockRestore();
+    }
+  };
+
+  test("every Codex spelling reaches the account-pool login", async () => {
+    for (const name of ["codex", "chatgpt", "openai", "CODEX", " codex "]) {
+      const result = await runLogin([name]);
+      expect(result.code, `${name} must route to the account login`).toBe(1);
+      expect(result.err).toContain("Proxy is not running. Start the intended proxy with: ocx start. No request was sent.");
+      expect(result.err).not.toContain("Usage: ocx login <provider>");
+    }
+  });
+
+  test("account-login flags ride into the request body, not just past the parser", async () => {
+    // An earlier version of this case asserted the 503 path with --reauth/--id attached and
+    // called that "flags survive". It could not fail: dropping the flags at the dispatch seam
+    // leaves an empty leftover list, so rejectArgs stays quiet and the liveness probe prints
+    // the same message. The only falsifiable proof is the request the flags are supposed to
+    // reach, so this one answers the probe with a live proxy and reads the POST body.
+    const calls: { url: string; method?: string; body?: string }[] = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), method: init?.method, body: typeof init?.body === "string" ? init.body : undefined });
+      return new Response(JSON.stringify({ flowId: "flow-1", url: "https://example.invalid/auth" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch);
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const argv = ["login", "codex", "--reauth", "--id", "acct-1", "--no-wait", "--json"];
+      const code = await dispatchCommand(
+        { kind: "command", command: "login", args: argv },
+        {
+          ...fakeDeps,
+          args: argv,
+          findLiveProxy: async () => ({ hostname: "127.0.0.1", port: 65500 }),
+        } as unknown as CliDispatchDeps,
+      );
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.url).toContain("/api/codex-auth/login");
+      expect(calls[0]?.method).toBe("POST");
+      expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ id: "acct-1", reauth: true });
+    } finally {
+      logSpy.mockRestore();
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test("an unsupported flag is still rejected as a usage error", async () => {
+    const result = await runLogin(["codex", "--nope"]);
+    expect(result.code).toBe(2);
+    expect(result.err).toContain("Unexpected arguments or repeated options");
+    expect(result.err).toContain("ocx account login");
+  });
+
+  test("a name that is not a Codex spelling still gets the provider wall, not the account path", async () => {
+    // Closes the other half of the routing claim: the predicate is the gate, so a regression
+    // that sent every 'ocx login' through the account command would print "Proxy is not
+    // running" here instead of the wall. handleLogin ends in process.exit, which a test
+    // cannot survive, so the exit is spied and turned into a throw.
+    const err: string[] = [];
+    const errorSpy = spyOn(console, "error").mockImplementation((...v: unknown[]) => { err.push(v.join(" ")); });
+    const exitSpy = spyOn(process, "exit").mockImplementation(((exitCode?: number) => {
+      throw new Error(`process.exit:${exitCode}`);
+    }) as never);
+    try {
+      const argv = ["login", "definitely-not-a-provider"];
+      await expect(dispatchCommand(
+        { kind: "command", command: "login", args: argv },
+        { ...fakeDeps, args: argv, findLiveProxy: async () => null } as unknown as CliDispatchDeps,
+      )).rejects.toThrow("process.exit:1");
+      const printed = err.join("\n");
+      expect(printed).toContain("Usage: ocx login <provider>");
+      expect(printed).toContain("ocx login codex");
+      expect(printed).toContain("openai-apikey");
+      expect(printed).not.toContain("Proxy is not running");
+    } finally {
+      exitSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("the provider wall names the Codex route without joining the public OAuth surface", () => {
+    const usage = loginUsageMessage();
+    expect(usage).toContain("ocx login codex");
+    // The wall is what the production path prints (asserted above through console.error);
+    // this reads the same source so a wording regression names the field that changed.
+    expect(usage).toContain("openai-apikey");
+    // Routing must not re-open the generic OAuth path for the pool credential:
+    // tests/oauth/oauth-public-surface.test.ts owns that exclusion.
+    expect(listOAuthProviders()).not.toContain("chatgpt");
+    expect(listOAuthProviders()).not.toContain("codex");
+    // The other table the routing silently shadows: if a key-login provider ever took one of
+    // these ids, 'ocx login <that id>' would become unreachable with no other failing test.
+    for (const name of ["openai", "codex", "chatgpt"]) expect(isKeyLoginProvider(name)).toBe(false);
+    expect(isKeyLoginProvider("openai-apikey")).toBe(true);
+    expect(isCodexAccountLoginName("codex")).toBe(true);
+    expect(isCodexAccountLoginName("xai")).toBe(false);
+  });
+
+  test("the registry entry keeps documenting the Codex route", () => {
+    // help.ts and registry.ts carry the only discoverability text a user sees before typing;
+    // the existing help/registry suites only require that an 'ocx login' line exists at all.
+    const details = (CLI_COMMANDS.find(entry => entry.name === "login")?.details ?? []).join(" ");
+    expect(details).toContain("ocx login codex");
+    expect(details).toContain("openai-apikey");
+  });
+});
+
+
+describe("CLI usage recovery contracts", () => {
+  test.each([["--wat"], ["--wat", "--json"], ["--json", "--json"], ["extra"]].map(args => [args]))(
+    "health rejects %j before liveness discovery", async healthArgs => {
+      const err = spyOn(console, "error").mockImplementation(() => {});
+      const out = spyOn(console, "log").mockImplementation(() => {});
+      let probes = 0;
+      const args = ["health", ...healthArgs];
+      const deps = { ...fakeDeps, args, findLiveProxy: async () => { probes++; return null; } } as CliDispatchDeps;
+      try {
+        expect(await dispatchCommand({ kind: "command", command: "health", args }, deps)).toBe(2);
+        expect(probes).toBe(0);
+        expect(out.mock.calls).toEqual([]);
+        expect(err.mock.calls.flat().join(" ")).toBe("Usage: ocx health [--json]\nSee: ocx help health");
+      } finally { err.mockRestore(); out.mockRestore(); }
+    },
+  );
+  test.each([["integration"], ["integration", "unknown"]].map(args => [args]))(
+    "integration %j names all families and the help command", async args => {
+      const err = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect(await dispatchCommand({ kind: "command", command: "integration", args }, { ...fakeDeps, args })).toBe(2);
+        expect(err.mock.calls.flat().join(" ")).toBe("Usage: ocx integration <claude|grok|client|native> <subcommand>\nSee: ocx help integration");
+      } finally { err.mockRestore(); }
+    },
+  );
+});

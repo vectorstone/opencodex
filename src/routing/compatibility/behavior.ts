@@ -1,3 +1,4 @@
+import { modelRecordValue } from "../../reasoning-effort";
 import { modelInList } from "../../types";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
 import { PROVIDER_REGISTRY } from "../../providers/registry";
@@ -13,6 +14,7 @@ export function upstreamProtocolForAdapter(adapter: string): string {
     case "openai-chat":
     case "command-code":
     case "cursor":
+    case "devin":
     case "azure":
     case "azure-openai":
     case "kiro":
@@ -51,8 +53,45 @@ function includesModel(list: string[] | undefined, modelId: string): boolean {
   return modelInList(list, modelId);
 }
 
+/**
+ * Per-model override lookup for the nine family-aware report rows.
+ *
+ * Delegates to modelRecordValue so the report reads these maps the way the
+ * runtime does -- own properties only, then the pre-colon family, then a
+ * case-folded key. A bare index disagreed on all three: it missed the
+ * `gpt-oss` entry ollama-cloud's `gpt-oss:120b` actually resolves, missed a
+ * differently-cased key, and walked the prototype chain, so a routed model id
+ * of `constructor`/`toString` yielded an Object.prototype function. That last
+ * one made buildBehaviorFingerprintV1 throw ("unsupported value type
+ * function"); the caller catches it (`src/routing/compatibility/subject.ts:125`)
+ * and returns no route, so the subject is silently dropped -- and the linker
+ * contract says implementations do not throw.
+ *
+ * Not every override map belongs here. `modelPreferHostedTools` and
+ * `modelOpenRouterRouting` are exact-own at runtime and go through
+ * `exactOwnValue` below; widening those to the family would be this same bug
+ * with the sign flipped.
+ */
 function modelValue<T>(map: Record<string, T> | undefined, modelId: string): T | undefined {
-  return map?.[modelId];
+  return modelRecordValue(map, modelId);
+}
+
+/**
+ * Exact, own-property lookup for the two maps the runtime resolves that way.
+ *
+ * `modelPreferHostedTools` and `modelOpenRouterRouting` are deliberately exact: the
+ * adapter reads the first through `hasOwnProperty`
+ * (`src/adapters/openai-responses.ts:1001`) and the second through `Object.hasOwn`
+ * (`src/providers/openrouter-routing.ts:89`), and the type documents the first as
+ * "Exact-model hosted tools" (`src/types.ts:1584`). Sending them through
+ * `modelRecordValue` would make the report say a `gpt-oss` entry applies to
+ * `gpt-oss:120b` when the adapter will never apply it -- the same divergence this
+ * file exists to remove, pointed the other way. A bare index is not the answer
+ * either: it walks the prototype chain, which is the bug `modelValue` just fixed.
+ * Neither existing primitive is right for these two, so this is the third one.
+ */
+function exactOwnValue<T>(map: Record<string, T> | undefined, modelId: string): T | undefined {
+  return map !== undefined && Object.hasOwn(map, modelId) ? map[modelId] : undefined;
 }
 
 const CREDENTIAL_HEADER = /(authorization|api[-_]?key|token|secret|credential|cookie)/i;
@@ -69,7 +108,7 @@ function nonCredentialHeaderDigest(
 }
 
 function effectiveOpenRouterRouting(effective: OcxProviderConfig, modelId: string) {
-  return effective.modelOpenRouterRouting?.[modelId] ?? effective.openRouterRouting;
+  return exactOwnValue(effective.modelOpenRouterRouting, modelId) ?? effective.openRouterRouting;
 }
 
 /**
@@ -109,6 +148,7 @@ export function resolveProductionBehaviorValues(
     "wire.adapter": behaviorRow("provider_config", adapter),
     "wire.upstreamProtocol": behaviorRow("provider_config", upstreamProtocol),
     "wire.responsesPath": behaviorRow("provider_config", effective.responsesPath ?? null),
+    "wire.chatCompletionsPath": behaviorRow("provider_config", effective.chatCompletionsPath ?? null),
     "wire.commandCodeVersion": behaviorRow("provider_config", effective.commandCodeVersion ?? null),
     "wire.modelSuffixMode": behaviorRow(
       "provider_config",
@@ -160,6 +200,12 @@ export function resolveProductionBehaviorValues(
         : reasoningEfforts.length > 0 || Boolean(registryEntry?.reasoningEfforts),
     ),
     "reasoning.efforts": behaviorRow("provider_config", reasoningEfforts),
+    // Whether the configured ladder above is what the WIRE uses, or only what the catalog
+    // advertises. An adapter shipping its own per-model table (command-code) otherwise wins for
+    // models it knows, and it also repairs a refused rung by replaying without the effort. Two
+    // routes that disagree about this send different bytes and recover differently, so they are
+    // not the same compatibility subject and must not share evidence.
+    "reasoning.effortsAuthoritative": behaviorRow("provider_config", effective.modelReasoningEffortsAuthoritative === true),
     "reasoning.defaultEffort": behaviorRow("provider_config", defaultReasoningEffort),
     "reasoning.effortMap": behaviorRow("provider_config", reasoningEffortMap),
     "reasoning.wireFormat": behaviorRow("provider_config", effective.reasoningWireFormat ?? null),
@@ -169,6 +215,9 @@ export function resolveProductionBehaviorValues(
     }),
     "reasoning.replayMode": behaviorRow("provider_config", {
       preserveResponses: effective.preserveResponsesReasoningContent === true,
+      // Dropping replayed reasoning items changes the continuation body, so two routes that
+      // disagree about it are not the same compatibility subject and must not share evidence.
+      dropResponses: effective.dropResponsesReasoningItems === true,
       preserveContent: includesModel(effective.preserveReasoningContentModels, modelId),
       placeholder: includesModel(effective.requiresReasoningPlaceholderModels, modelId),
     }),
@@ -184,12 +233,13 @@ export function resolveProductionBehaviorValues(
       effective.parallelToolCalls ?? (upstreamProtocol === "openai-chat"),
     ),
     "tools.hostedPreference": behaviorRow("provider_config", {
-      tools: modelValue(effective.modelPreferHostedTools, modelId) ?? [],
+      tools: exactOwnValue(effective.modelPreferHostedTools, modelId) ?? [],
     }),
     "tools.builtinNameEscaping": behaviorRow("provider_config", effective.escapeBuiltinToolNames === true),
     "cache.forwarding": behaviorRow("provider_config", effective.promptCacheKey === true),
     "cache.retention": behaviorRow("global_config", config.cacheRetention ?? "short"),
     "anthropic.eofPolicy": behaviorRow("provider_config", effective.anthropicEofTolerance === true ? "tolerant" : "strict"),
+    "openai-chat.eofPolicy": behaviorRow("provider_config", effective.openaiChatEofTolerance === true ? "tolerant" : "strict"),
     "google.mode": behaviorRow("provider_config", effective.googleMode ?? null),
     "google.projectFingerprint": behaviorRow(
       "provider_config",

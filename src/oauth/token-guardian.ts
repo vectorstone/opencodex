@@ -14,7 +14,7 @@
 import { loadConfig } from "../config";
 import type { OcxConfig, OcxTokenGuardianConfig } from "../types";
 import { listAccounts } from "./store";
-import { getValidAccessTokenForAccount, listOAuthProviders, OAuthLoginRequiredError, resolveRefreshPolicy } from "./index";
+import { getValidAccessTokenForAccount, listOAuthProviders, OAuthAccountPausedError, OAuthLoginRequiredError, resolveRefreshPolicy } from "./index";
 import {
   getValidCodexToken,
   listCodexAccountIds,
@@ -52,7 +52,7 @@ const DEFAULTS = {
   failureBackoffBaseSeconds: 300,
   failureBackoffMaxSeconds: 3600,
   codexWarmupMaxAgeSeconds: 691_200, // 8d — matches Codex managed-auth last_refresh cadence.
-  codexWarmupModel: "gpt-5.4-mini",
+  codexWarmupModel: "gpt-5.6-luna",
 };
 
 interface BackoffEntry {
@@ -141,11 +141,12 @@ export async function guardianSweep(nowMs: number = Date.now()): Promise<Guardia
   const tasks: Array<() => Promise<void>> = [];
 
   // A) OAuth providers — every account in each provider's set (multiauth keep-alive),
-  // skipping accounts already marked needsReauth (terminal; only a re-login fixes them).
+  // skipping accounts already marked needsReauth (terminal; only a re-login fixes them) or
+  // paused by the operator (manual exclusion from all automatic account use).
   for (const provider of listOAuthProviders()) {
     if (resolveRefreshPolicy(provider, config) !== "proactive") continue;
     for (const account of listAccounts(provider)) {
-      if (account.needsReauth) continue;
+      if (account.needsReauth || account.paused) continue;
       if (account.credential.expires > nowMs + horizonMs) continue;
       const key = `oauth:${provider}:${account.id}`;
       if (inBackoff(key, nowMs)) { result.skippedBackoff.push(key); continue; }
@@ -155,6 +156,9 @@ export async function guardianSweep(nowMs: number = Date.now()): Promise<Guardia
           backoff.delete(key);
           result.refreshed.push(key);
         } catch (err) {
+          // The account may have been paused after this task was queued. It is no longer an
+          // automatic refresh failure and must not acquire retry backoff.
+          if (err instanceof OAuthAccountPausedError) return;
           // Terminal grant failures surface as OAuthLoginRequiredError (account marked
           // needsReauth by the resolver) — back off at the ceiling; transient errors backoff exponentially.
           const permanent = err instanceof OAuthLoginRequiredError;
@@ -211,21 +215,30 @@ export async function guardianSweep(nowMs: number = Date.now()): Promise<Guardia
       if (!cred) continue;
       const needsRefresh = cred.expiresAt <= nowMs + horizonMs;
       const needsWarmup = opts.codexWarmupEnabled
+        && !record.codexValidationPending
         && (record.lastCodexValidatedAt === undefined || nowMs - record.lastCodexValidatedAt > opts.codexWarmupMaxAgeSeconds * 1000);
       if (!needsRefresh && !needsWarmup) continue;
       const key = `codex:${id}`;
       if (inBackoff(key, nowMs)) { result.skippedBackoff.push(key); continue; }
+      // The generation this sweep is acting on. A successful refresh commits a new one, and a
+      // failure that follows belongs to THAT credential, so the fence has to move with it.
+      let observedGeneration = record.generation;
       tasks.push(async () => {
+        let warmupGeneration: number | undefined;
         try {
           const token = await getValidCodexToken(id);
+          observedGeneration = token.generation;
           if (needsRefresh) result.refreshed.push(key);
-          if (needsWarmup) {
+          const current = readCodexAccountRecord(id);
+          if (needsWarmup && current?.credential && current.deletedAt == null
+            && !current.codexValidationPending && current.generation === token.generation) {
+            warmupGeneration = token.generation;
             await warmCodexAccount({
               accessToken: token.accessToken,
               chatgptAccountId: token.chatgptAccountId,
               model: opts.codexWarmupModel,
             });
-            markCodexAccountValidated(id, Date.now());
+            markCodexAccountValidated(id, Date.now(), token.generation);
             result.warmed.push(key);
           }
           backoff.delete(key);
@@ -235,11 +248,28 @@ export async function guardianSweep(nowMs: number = Date.now()): Promise<Guardia
             result.skippedBackoff.push(key);
             return;
           }
-          const permanent = err instanceof TokenRefreshError && (err.reason === "revoked" || err.reason === "expired");
-          if (needsWarmup && !(err instanceof TokenRefreshError)) {
-            markCodexAccountValidationFailed(id, codexWarmupFailureReason(err));
+          const terminal = err instanceof TokenRefreshError && (err.reason === "revoked" || err.reason === "expired")
+            ? err
+            : undefined;
+          if (terminal) {
+            // A revoked or expired refresh grant is the strongest terminal evidence there is, and
+            // it used to be the one class that never reached the record: the persisted-verdict
+            // branch below requires `needsWarmup`, which is false in the default configuration,
+            // and additionally excluded every TokenRefreshError. The verdict landed only in the
+            // in-memory backoff map, which no health surface reads and no restart survives, so the
+            // account kept its login-time "ok" while every request with it 401'd (#4120).
+            markCodexAccountValidationFailed(id, `refresh_${terminal.reason}`, {
+              expectedGeneration: observedGeneration,
+              terminal: true,
+            });
+          } else if (warmupGeneration !== undefined && !(err instanceof TokenRefreshError)) {
+            // warmupGeneration is set only once the warmup actually started against a record
+            // still at the token's generation, so it is a tighter fence than the pre-sweep read.
+            markCodexAccountValidationFailed(id, codexWarmupFailureReason(err), {
+              expectedGeneration: warmupGeneration,
+            });
           }
-          recordFailure(key, nowMs, opts.backoffBaseSeconds, opts.backoffMaxSeconds, permanent, writerGeneration);
+          recordFailure(key, nowMs, opts.backoffBaseSeconds, opts.backoffMaxSeconds, terminal !== undefined, writerGeneration);
           result.failed.push(key);
         }
       });

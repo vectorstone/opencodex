@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type ComboItem,
+  type ProviderQuotaStates,
+  comboQuotaState,
   comboPublicModelId,
   emptyDraft,
   intersectComboEfforts,
@@ -11,28 +13,45 @@ import { useT } from "../i18n/shared";
 import { Notice } from "../ui";
 import type { ModelOption, ProviderOption } from "./combo-workspace-types";
 import { ComboCapabilities, EffortSelect, StrategySeg, TargetEditor } from "./combo-workspace-controls";
-import { clampedNumberInput } from "./combo-workspace-utils";
+import { ComboJevDecisionSection } from "./combo-workspace-jev-decision";
+import { COMBO_STRATEGY_HINT_KEYS, COMBO_TARGETS_HINT_KEYS } from "../combo-workspace-data";
+import { clampedNumberInput, comboDraftErrorText } from "./combo-workspace-utils";
+import type { JevDecisionRow } from "../jev-decision-service";
+
+/** Stable default so an omitted combo list does not change identity every render. */
+const NO_COMBOS: readonly ComboItem[] = [];
 
 export function AddComboModal({
+  apiBase,
+  combos = NO_COMBOS,
   existingIds,
   existingAliases,
   providerMap,
+  providerQuotaStates,
   providers,
   models,
+  initialDraft,
   onClose,
   onSubmit,
 }: {
+  apiBase?: string;
+  /** Existing combos; a JEV decision model may not name the new combo or any JEV combo. */
+  combos?: readonly ComboItem[];
   existingIds: string[];
   existingAliases: string[];
-  providerMap: Readonly<Record<string, { disabled?: boolean }>>;
+  providerMap: Readonly<Record<string, JevDecisionRow>>;
+  providerQuotaStates: ProviderQuotaStates;
   providers: ProviderOption[];
   models: ModelOption[];
+  initialDraft?: ComboItem;
   onClose: () => void;
   onSubmit: (item: ComboItem) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const t = useT();
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const [draft, setDraft] = useState<ComboItem>(() => emptyDraft());
+  const [draft, setDraft] = useState<ComboItem>(() => initialDraft
+    ? { ...initialDraft, targets: initialDraft.targets.map(target => ({ ...target })) }
+    : emptyDraft());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const effortMap = useMemo(() => {
@@ -43,8 +62,14 @@ export function AddComboModal({
     return map;
   }, [models]);
   const allowedEfforts = useMemo(
-    () => intersectComboEfforts(draft.targets, effortMap),
-    [draft.targets, effortMap],
+    () => intersectComboEfforts(draft.targets, effortMap, draft.reasoningEffortMode ?? "strict"),
+    [draft.targets, effortMap, draft.reasoningEffortMode],
+  );
+  const allTargetsExhausted = comboQuotaState(draft.targets, providerQuotaStates, providerMap) === "exhausted";
+  const isJevPreset = initialDraft?.strategy === "jev";
+  const jevCollision = isJevPreset && (
+    existingIds.includes(draft.id.trim())
+    || (!!draft.alias?.trim() && existingAliases.includes(draft.alias.trim()))
   );
 
   useEffect(() => {
@@ -65,11 +90,12 @@ export function AddComboModal({
     const code = validateComboDraft(draft, {
       existingIds,
       existingAliases,
+      combos,
       isCreate: true,
       providers: providerMap,
     });
     if (code) {
-      setError(t(`cws.err.${code}`));
+      setError(comboDraftErrorText(t, code, draft, providerMap));
       return;
     }
     setBusy(true);
@@ -91,6 +117,7 @@ export function AddComboModal({
     <dialog
       ref={dialogRef}
       className="modal-overlay"
+      data-combo-preset={isJevPreset ? "jev-auto" : undefined}
       aria-labelledby="cwi-add-title"
       onCancel={handleCancel}
     >
@@ -102,8 +129,16 @@ export function AddComboModal({
             <IconX width={16} height={16} />
           </button>
         </div>
-        <p className="muted" style={{ marginTop: 0, maxWidth: "62ch", overflowWrap: "anywhere" }}>{t("cws.addSubtitle")}</p>
+        <p className="muted" style={{ marginTop: 0, maxWidth: "62ch", overflowWrap: "anywhere" }}>
+          {isJevPreset ? t("cws.jev.setupHint") : t("cws.addSubtitle")}
+        </p>
         {error && <Notice tone="err">{error}</Notice>}
+        {jevCollision && <Notice tone="err">{t("cws.jev.exists")}</Notice>}
+        {allTargetsExhausted && (
+          <div className="cwi-quota-banner" role="status" aria-live="polite">
+            {t("cws.quota.allExhausted")}
+          </div>
+        )}
         <div className="cwi-modal-form">
           <div className="cwi-field">
             <label htmlFor="cwi-new-id">{t("cws.field.id")}</label>
@@ -153,9 +188,24 @@ export function AddComboModal({
               onChange={(strategy) => setDraft((d) => ({ ...d, strategy }))}
             />
             <p className="muted" style={{ fontSize: 12, margin: "8px 0 0" }}>
-              {draft.strategy === "failover" ? t("cws.strategy.failoverHint") : t("cws.strategy.roundRobinHint")}
+              {t(COMBO_STRATEGY_HINT_KEYS[draft.strategy])}
             </p>
           </div>
+          {draft.strategy === "jev" && (
+            <ComboJevDecisionSection
+              idPrefix="cwi-new"
+              apiBase={apiBase}
+              combo={draft}
+              combos={combos}
+              providers={providers}
+              models={models}
+              decisionProvider={draft.decisionProvider ?? null}
+              decisionModel={draft.decisionModel ?? null}
+              decisionTimeoutMs={draft.decisionTimeoutMs ?? null}
+              disabled={busy}
+              onChange={(patch) => setDraft((d) => ({ ...d, ...patch }))}
+            />
+          )}
           <div className="cwi-field">
             <label htmlFor="cwi-new-effort">{t("cws.field.defaultEffort")}</label>
             <EffortSelect
@@ -198,23 +248,25 @@ export function AddComboModal({
               strategy={draft.strategy}
               providers={providers}
               models={models}
+              providerQuotaStates={providerQuotaStates}
               onChange={(targets) => setDraft((d) => ({ ...d, targets }))}
             />
             <p className="muted" style={{ fontSize: 12, margin: "8px 0 0" }}>
-              {draft.strategy === "failover" ? t("cws.targets.failoverHint") : t("cws.targets.roundRobinHint")}
+              {t(COMBO_TARGETS_HINT_KEYS[draft.strategy])}
             </p>
           </div>
           <ComboCapabilities
             targets={draft.targets}
             models={models}
             imageInput={draft.imageInput ?? "auto"}
+            reasoningEffortMode={draft.reasoningEffortMode ?? "strict"}
             disabled={busy}
             onChange={(patch) => setDraft((d) => ({ ...d, ...patch }))}
           />
         </div>
         <div className="cwi-modal-actions">
           <button type="button" className="btn btn-ghost" onClick={requestClose} disabled={busy}>{t("common.cancel")}</button>
-          <button type="button" className="btn btn-primary" onClick={() => { void submit(); }} disabled={busy}>
+          <button type="button" className="btn btn-primary" onClick={() => { void submit(); }} disabled={busy || allTargetsExhausted || jevCollision}>
             {busy ? t("common.saving") : t("cws.create")}
           </button>
         </div>

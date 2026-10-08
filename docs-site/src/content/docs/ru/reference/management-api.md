@@ -79,13 +79,82 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET /api/grok` | Прочитать статус управляемой конфигурации Grok и кандидатные модели | 400 status read failure |
 | `PUT /api/grok/selection` | Сохранить список исключённых моделей Grok | 400 invalid or oversized selection |
 | `POST /api/grok/apply` | Применить сохранённую конфигурацию Grok через managed sync | 409 `grok_apply_busy`; 400/500 apply failure |
+| `GET /api/grok/reset-coupons?accountId=...` | Прочитать оставшиеся токены сброса биллинга Grok и окна их действия для активного или указанного аккаунта xAI | 400 отсутствует аккаунт; 401 без аутентификации; 502 ошибка upstream gRPC-Web |
+| `POST /api/grok/reset-coupons/consume` | Обменять подходящий купон сброса. Тело `{ accountId?, tokenId?, operationId? }`. Необязательный `operationId` (UUIDv4) делает обмен идемпотентным: повтор того же идентификатора воспроизводит сохраненный результат без повторного обмена. | 400 некорректные JSON/UUID; 401 без аутентификации; 409 `identity_mismatch`; 502 ошибка upstream; 503 емкость реестра |
+| `GET /api/anthropic/reset-grants?accountId=...` | Прочитать сбросы лимитов Claude для одного OAuth-аккаунта Anthropic: доступность, число оставшихся сбросов для каждого гранта, срок действия и сбрасываемые окна, а также неподтверждённую попытку, которую ещё можно повторить | 400 подходящий аккаунт не найден; 401 требуется повторный вход; 502 вышестоящий сервис недоступен |
+| `POST /api/anthropic/reset-grants/consume` | Использовать один сброс. Тело `{ accountId, grantId, operationId }`; `operationId` — UUIDv4, который передаётся вышестоящему сервису как идентификатор запроса, поэтому повтор с ним возобновляет ту же попытку. Требуется сессия дашборда. | 400 некорректное тело; 401 требуется повторный вход; 403 `session_required`; 409 `grant_not_usable`, `in_flight`, `unresolved_prior_operation`, `unknown_outcome_expired`, `operation_identity_mismatch`; 500 `journal_write_failed`; 502 `unknown_outcome`; 503 журнал занят, недоступен или заполнен |
 | `GET, PUT /api/claude-desktop` | Прочитать или сохранить routed/native-профиль Claude Desktop | 400 invalid or unavailable assignment |
 | `POST /api/claude-desktop/apply` | Записать сохранённый профиль в managed config Claude Desktop | 400/500 write failure |
 | `GET /api/claude-desktop/status` | Проверить согласованность saved-vs-applied profile и здоровье Desktop | 400 status read failure |
 | `GET, PUT /api/claude-code` | Прочитать или обновить настройки gateway, auth-mode, model-map, context, agent и sidecar для Claude Code | 400 invalid field or shape |
 
+Дашборд управляет обоими путями купонов из **Providers > xAI Grok > Accounts**: каждая
+строка вошедшего аккаунта несёт значок-билет с числом оставшихся купонов, а значок
+открывает диалог, который показывает окна действия и обменивает купон, ближайший
+к истечению срока. Диалог отправляет сгенерированный клиентом `operationId` и после
+таймаута прекращает отправку вместо повторной попытки, потому что обмен, запись
+журнала которого ещё открыта, выполнился бы снова. `ocx account grok-reset-coupons`
+остаётся эквивалентом в терминале.
+
+Сбросы лимитов Claude аналогично доступны в **Providers > Anthropic > Accounts**. В строке каждого вошедшего аккаунта значок-билет показывает число оставшихся сбросов, а диалог использует один сброс после дополнительного подтверждения. Сброс восстанавливает 5-часовой и недельный лимиты, не меняя день недельного сброса. Если ответ на запрос не приходит, диалог сохраняет `operationId` и в течение десяти минут предлагает повторить попытку с тем же идентификатором — так восстанавливает запрос и сам клиент Claude Code. До этого момента новая операция с тем же грантом отклоняется. Использовать сброс можно только через дашборд: одного токена администратора недостаточно — ответом будет `403 session_required`.
+
 О принципах model roster и поведении encrypted worker-task см.
 [Поверхность подагентов](/guides/sub-agent-surface/).
+
+### Журнал отката клиентских интеграций
+
+| Метод и путь | Назначение | Важные ошибки |
+| --- | --- | --- |
+| `GET /api/client-integrations/journal?client=...` | Получить операции отката, при необходимости только для одного клиента. Каждая запись содержит вычисленный сервером флаг `deletable`. | 400 неверный клиент |
+| `DELETE /api/client-integrations/journal?opId=...` | Исключить старую операцию отката и по возможности удалить её снимок. В успешном ответе `snapshotRemoved: false` означает, что очистка сохранена для повторной попытки обслуживания. | 400 нет `opId`; 404 операция отсутствует или уже исключена; 409 последняя операция клиента |
+
+## Предварительный просмотр изменения интеграции
+
+Предпросмотр показывает, что сделало бы изменение, не делая его. Эти маршруты ничего не пишут:
+ни снимка, ни записи о владении, ни строки журнала, ни блокировки, ни обслуживания, ни
+восстановления.
+
+| Метод и путь | Назначение | Основные ошибки |
+| --- | --- | --- |
+| `POST /api/client-integrations/preview` | Спланировать `apply`, `overwrite` или `disable` для одного клиента; тело `{ "clientId": "...", "operation": "..." }` | 400 неверный клиент или операция; 400 `invalid_aside_profile_path`; 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/restore/preview` | Спланировать отмену; тело `{ "opId": "...", "confirmDrift": false }` | 404 операция не найдена; 400 `invalid_aside_profile_path`; 409 `integration_preview_unavailable` |
+| `POST /api/client-integrations/aside/profiles/{profileId}/preview` | Спланировать изменение одного профиля Aside; для `restore` нужен `opId` | 400 неверное тело или профиль не указан; 404 профиль или операция не найдены; 409 `integration_preview_unavailable` |
+
+План содержит `version`, `clientId`, `operation`, `state`, `foreignEdit`, список `changes` из пар
+`kind` и `path`, непрозрачный `fingerprint`, `canApply` и `willChange`; `refusalReason` и
+`profileId` необязательны. Пути — это управляемые пути схемы либо фиксированные метки
+`$snapshot`, `$ownership` и `$journal`; позиция, определяемая во время работы, показывается как
+`*`. Ни значения конфигурации, ни расположение файлов, ни имя выбранного элемента не возвращаются.
+
+`canApply` истинно при `willChange` ложном означает, что операция завершится успешно и ничего не
+изменит в управляемом клиентском документе, например повторное применение уже применённого.
+
+Изменение профиля Aside в этом случае всё же кое-что сохраняет: подтверждение записывает настройку
+синхронизации профиля до того, как будет затронут хоть один клиентский документ. Поэтому отключение
+профиля, управляемый блок которого уже отсутствует, сохраняет настройку и оставляет документ и его
+историю нетронутыми.
+
+`integration_preview_unavailable` означает, что сейчас нет пригодного списка моделей: только что
+запущенный прокси — один такой случай, список, отброшенный из-за изменения конфигурации или кэша
+провайдеров, — другой. Чтение `GET /api/client-integrations` формирует его, когда обнаружение
+прошло успешно и конфигурацию удалось определить; это обычное решение, а не гарантия.
+
+## Подтверждение просмотренного изменения
+
+Маршруты изменения принимают `operation` и `planFingerprint` рядом с обычным телом. Отправляйте
+оба или ни одного: запрос только с одним отклоняется, как и запрос, `operation` которого не
+совпадает с запрошенным изменением. Привязка Aside относится к одному профилю, поскольку один
+отпечаток не может описать несколько независимо меняющихся файлов.
+
+Перед записью сервер планирует заново и возвращает `409 integration_preview_stale` с заново
+вычисленным `plan`, когда подтверждение больше не описывает происходящее. Примите решение
+заново по новому плану; запрос не повторяется автоматически.
+
+Отпечаток — это оптимистичная проверка, а не разрешение. Возможность изменения по-прежнему
+определяют аутентификация управляющего API и правила владения.
+
+Удаление добавляет отметку вместо перезаписи журнала. Сервер защищает последнюю операцию каждого
+клиента, чтобы сохранить текущую точку отмены.
 
 ### Combos
 
@@ -96,6 +165,21 @@ GUI-сессия в стиле loopback не выпускается.
 | `DELETE /api/combos?id=...` | Удалить одну combo и очистить её selection/cooldown state | 400 missing id; 404 unknown combo |
 
 О стратегиях целей, cooldown, alias и routing-failure см. [Combos](/guides/combos/).
+
+### Слои промпта Codex
+
+| Метод и путь | Назначение | Особые ошибки |
+| --- | --- | --- |
+| `GET /api/codex-prompt` | Прочитать снимок слоёв промпта: слои, базовые варианты, выбор и состояние drift | — |
+| `GET /api/codex-prompt/text` | Проверить текст промпта, видимый модели, через `codex debug prompt-input` | Fail-soft: недоступный probe деградирует до статуса в теле, а не HTTP-ошибки |
+| `PUT /api/codex-prompt/toggle` | Включить или выключить один переключаемый слой | 400 invalid body или unknown layer; 409 `stale_revision`, `layer_not_toggleable` |
+| `PUT /api/codex-prompt/custom` | Заменить набор пользовательских слоёв | 400 invalid body, `invalid_characters`, `body_too_large`, когда нормализованный UTF-8 слой превышает 65 536 байт, `composed_too_large` свыше 131 072 байт; 409 `stale_revision` |
+| `PUT /api/codex-prompt/base/select` | Выбрать базовый промпт по умолчанию или один сохранённый вариант | 400 invalid body, `unknown_layer` для id, не совпадающего ни с одним сохранённым вариантом; 409 `stale_revision`, `developer_instructions_not_owned`, когда текущий base внешний |
+| `PUT /api/codex-prompt/base` | Создать (`id` опущен или `id: null`), изменить или удалить (`delete: true`) один базовый вариант. Указанный `id` предназначен только для редактирования и должен ссылаться на сохранённый вариант. `body` нормализуется (табуляции раскрываются, CR/CRLF сворачиваются в LF) до измерения или сохранения | 400 invalid body, `unknown_layer` для id `default` или id, не совпадающего ни с одним сохранённым вариантом, `body_too_large`, когда нормализованное UTF-8 тело превышает 65 536 байт; 409 `stale_revision` |
+| `POST /api/codex-prompt/adopt` | Импортировать `developer_instructions` из `config.toml` как пользовательский слой | 400 invalid body, `invalid_characters`, `body_too_large`, `composed_too_large`; 409 `config_unreadable`, `nothing_to_adopt`, `adopt_unsupported_form`, `stale_revision` |
+| `POST /api/codex-prompt/repair` | Устранить drift между `config.toml` и принадлежащей projection | 400 invalid body; 409 `config_unreadable`, `nothing_to_repair`, `repair_unsupported`, `stale_revision` |
+
+О модели слоёв и ключах, которые записывает каждый слой, см. [Слои промпта Codex](/ru/guides/codex-prompt/).
 
 ### Конфигурация, startup, sync и updates
 
@@ -109,13 +193,18 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET, POST /api/windows-tray` | Прочитать состояние Windows tray или установить/запустить/остановить/удалить её | 400 unsupported platform/action; 500 operation failure |
 | `GET /api/diagnostics/project-config` | Прочитать кэшированные предупреждения project config | — |
 | `POST /api/sync` | Синхронизировать текущий каталог моделей в Codex | 500 failed sync |
-| `GET /api/update/check` | Проверить канал обновлений `latest` или `preview` | 400 invalid tag |
-| `POST /api/update/run` | Запустить update job, при желании с последующим restart | 400 invalid body; job-specific conflict/error status |
+| `GET /api/update/check` | Асинхронно проверить канал пакета `latest` или `preview` и при успехе обновить кеш | 400 invalid tag |
+| `POST /api/update/run` | Асинхронно проверить новую версию пакета, затем запустить задание обновления с возможным перезапуском | 400 invalid body; job-specific conflict/error status |
 | `GET /api/update/status` | Опрашивать update job по id | 404 unknown job |
 | `GET, PUT /api/sidecar-settings` | Прочитать или обновить model/backend-settings web-search и vision sidecar'ов | 400 invalid shape, backend or limit |
 | `GET, PUT /api/shadow-call-settings` | Прочитать или обновить настройки shadow-call interception | 400 invalid shape or value |
 
 ### Логи, usage и storage
+
+В журналах запросов поле `servedModel` сохраняется, когда вышестоящий сервис сообщает модель, которая ответила.
+Поле `wireModel` сохраняется, когда отправленная вышестоящему сервису модель отличается от модели, показанной клиенту.
+Если эти модели различаются, панель показывает `wire → served`, а подсказка сохраняет оба значения. Если вышестоящий
+сервис не сообщил модель ответа, она остаётся неизвестной и не выводится из запрошенной модели.
 
 | Метод и путь | Назначение | Особые ошибки |
 | --- | --- | --- |
@@ -125,7 +214,8 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET /api/debug/usage-logs` | Прочитать ограниченные usage-debug-записи | — |
 | `GET /api/debug/injection-logs` | Прочитать ограниченные guidance-injection debug-записи | — |
 | `GET /api/claude/inbound-debug` | Прочитать состояние и записи Claude inbound debug | — |
-| `GET /api/usage` | Сводка usage по диапазону и client surface | При сбое чтения storage вернёт summary с `error: "read_failed"` |
+| `GET /api/usage` | Сводка usage по диапазону и client surface | При сбое чтения storage вернёт 500 `{ "error": "read_failed" }` |
+| `GET /api/metrics` | Вернуть локальные для процесса текстовые метрики Prometheus: логические запросы, физические отправки, виды восстановления, длительность и TTFT. Метки запросов используют закрытые наборы, а метрики Kiro добавляют только ограниченные непрозрачные метки аккаунтов; идентификаторы запросов и учётных данных не экспортируются. Четыре метрики `opencodex_kiro_quota_{used_credits,limit_credits,used_percent,seconds_to_reset}` читают только кэш и используют не более 32 непрозрачных меток аккаунтов. При сборе сетевых запросов нет. | 404, если `metricsExport.enabled` не был true при запуске; требуется обычная management-аутентификация, data-plane credentials доступа не дают |
 | `GET /api/storage` | Просканировать использование storage Codex по bucket'ам | При ошибке scan вернёт payload с `error: "scan_failed"` |
 | `POST /api/storage/cleanup/preview` | Предпросмотр cleanup archived-session и возврат binding digest | 400 `invalid_json` or `invalid_percent` |
 | `POST /api/storage/cleanup` | Поместить preview'нутый архивный набор в quarantine или удалить его навсегда | 400 invalid input; 409 stale/busy/referenced state; 500 filesystem/database failure |
@@ -135,6 +225,14 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET, PUT /api/storage/cleanup-policy` | Прочитать или обновить расписанную cleanup-policy и job-state | 400 invalid policy |
 | `POST /api/storage/cleanup-policy/run` | Запустить manual cleanup-policy run | 409 `already_running`; 500 `cleanup_failed` |
 | `GET /api/storage/cleanup-policy/test-stream` | Тестовый policy-stream hook | 404 `not_found`, когда недоступен |
+
+Если строка превышает существующий лимит размера парсера, `GET /api/usage` и `GET /api/keys` сохраняют агрегаты читаемых строк и добавляют в ответ `usageIncomplete: true` и `usageIncompleteReason: "oversized_rows"`. Диагностика сохраняется в кеше и при инкрементальных добавлениях, в том числе для пустых результатов и отсутствующих совпадений; при перестроении она вычисляется заново. Идентификаторы провайдеров, моделей и API-ключей не сокращаются. Отсутствие флага не доказывает корректность всех строк. Это отдельный сигнал от `historyTruncated`, `entriesTruncated` и покрытия измерений токенов.
+
+Строки в `models`, `providers` и `days[].models` также содержат `cacheHitRate` — долю входных
+токенов, полученных из кэша промптов провайдера и ограниченную диапазоном `[0, 1]`. Значение равно
+`null`, а не `0`, если провайдер не передал телеметрию кэша или в строке нет входных токенов: отсутствие
+данных о кэше и фактическая доля попаданий 0 % — разные сведения, и диаграмма, отображающая их
+одинаково, вводит в заблуждение.
 
 :::caution
 Endpoint'ы storage cleanup могут перемещать или навсегда удалять архивные данные сессий. Всегда
@@ -150,10 +248,16 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | `GET /api/models` | Вернуть model-row'ы для дашборда и CLI | `catalog_busy`, когда сборка перегружена |
 | `GET /api/client-config?client=...` | Собрать read-only client config для любой поддерживаемой файловой интеграции | 400 unsupported client; 503 catalog unavailable |
 | `PUT /api/disabled-models` | Полностью заменить общий список disabled-models | 400 invalid JSON |
-| `PUT /api/model-visibility` | Атомарно изменить видимость на уровне провайдера или модели | 400 invalid provider, scope, target or body |
+| `PUT /api/model-visibility` | Атомарно изменить видимость на уровне провайдера или модели | 400 invalid provider, scope, target or body; 409 `initial_model_selection_pending` (Обновите список моделей и повторите попытку.) |
 | `GET, POST /api/custom-models` | Показать список custom-моделей или добавить одну | 400 invalid fields; 404 provider missing; 409 duplicate model |
 | `PUT, DELETE /api/custom-models/{id}` | Изменить или удалить одну custom-модель | 400 invalid id/fields; 404 not found; 409 duplicate model |
-| `GET, PUT /api/selected-models` | Прочитать allowlist'ы и availability провайдеров либо заменить один allowlist | 400 missing provider/body; 404 unknown provider |
+| `GET, PUT /api/selected-models` | Прочитать allowlist'ы и availability провайдеров либо заменить один allowlist | 400 missing provider/body; 404 unknown provider; PUT 409 `initial_model_selection_pending` |
+| `GET, PUT /api/model-presets` | Прочитать пресеты или выбрать режим preset/all/custom | 400 неверный режим или неподдерживаемый пресет; 404 неизвестный провайдер; PUT 409 `initial_model_selection_pending` |
+
+Ручная модель заменяет строку панели Models с тем же провайдером и идентификатором модели. Для OpenAI ручная строка сохраняет `openai/<model>` и поддерживает управление видимостью. При её удалении восстанавливается нативная строка без уточнения аккаунта. Нативные строки с указанием аккаунта остаются отдельными. Нативные маршруты и права аккаунта не меняются. Ненативная цель видимости OpenAI должна соответствовать настроенной ручной модели.
+
+
+Пока достоверный исходный список моделей не получен, корректные PUT-запросы к `/api/selected-models` и `/api/model-presets` возвращают HTTP 409 с кодом `initial_model_selection_pending`. Обновите список моделей, например через `GET /api/models`, и повторите запрос после успешного получения списка.
 
 ### OAuth-аккаунты, ключи провайдеров и ключи data plane
 
@@ -166,11 +270,13 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | `POST /api/oauth/login/cancel` | Отменить публичный OAuth-flow в progress | 400 unknown provider |
 | `GET /api/oauth/status` | Опрашивать OAuth-flow одного провайдера | 400 unknown provider |
 | `POST /api/oauth/logout` | Удалить сохранённый credential выбранного провайдера | 400 unknown provider; `oauth_mutation_busy` |
-| `GET, DELETE /api/oauth/accounts` | Показать список masked-аккаунтов или удалить один аккаунт | 400 invalid provider/id; 404 account missing; `oauth_mutation_busy` |
+| `GET, DELETE /api/oauth/accounts` | Показать список masked-аккаунтов или удалить один аккаунт Строки Kiro содержат `autoSelectable` и закрытый `skipReason` при исключении из автоматического выбора; единственный активный аккаунт всё ещё может отправлять запросы. Чтение квоты остаётся необязательным. | 400 invalid provider/id; 404 account missing; `oauth_mutation_busy` |
 | `PUT /api/oauth/accounts/active` | Выбрать активный OAuth-аккаунт | 400 invalid provider/account; `oauth_mutation_busy` |
-| `GET, PUT, PATCH /api/oauth/accounts/pool` | Прочитать или обновить policy Anthropic OAuth pool | 400 non-Anthropic provider or invalid policy |
+| `GET, PUT, PATCH /api/pool/settings` | Прочитать или обновить policy пула любого вида (codex, anthropic, generic); все три отвечают одинаковыми ключами, а поля, которые вид действительно применяет, перечислены в `supported` | 400 неизвестный provider, поле, которое вид не поддерживает, или недопустимое значение |
+| `GET, PUT, PATCH /api/oauth/accounts/pool` | Прежняя policy пула для Anthropic и обычных OAuth-провайдеров; заменена на `/api/pool/settings` и сохранена для существующих клиентов | 400 codex или api-key provider, либо недопустимая policy |
 | `POST /api/oauth/accounts/clear-cooldown` | Очистить runtime cooldown одного OAuth-аккаунта | 400 invalid provider/account |
 | `PUT /api/oauth/accounts/alias` | Задать или очистить alias OAuth-аккаунта | 400 invalid provider/account/alias |
+| `PUT /api/oauth/accounts/pause` | Приостановить/возобновить Anthropic или обычный OAuth-аккаунт. Body `{ provider, accountId, paused }`; при паузе активного аккаунта выбирается другой пригодный аккаунт, если он есть. | 400 неподдерживаемый provider или неверный body; 404 аккаунт не найден; `oauth_mutation_busy` |
 | `GET, POST, DELETE /api/providers/keys` | Показать список masked provider-key'ов, добавить/активировать один или удалить один | 400 invalid input; 404 provider/key missing |
 | `PUT /api/providers/keys/active` | Выбрать активный ключ провайдера | 400 invalid input; 404 provider/key missing |
 | `PUT /api/providers/keys/alias` | Задать или очистить alias provider-key'а | 400 invalid input; 404 provider/key missing |
@@ -178,6 +284,10 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 
 Ответы со списками credential'ов намеренно маскируются. OAuth access-token'ы и полные API-key'и
 провайдеров клиентам дашборда не возвращаются.
+
+#### Anthropic OAuth: `pause` / `resume`
+
+Команда CLI приостанавливает или возобновляет аккаунт Anthropic OAuth по id или уникальному alias: сначала точное совпадение, затем без учёта регистра. CLI и дашборд используют `PUT /api/oauth/accounts/pause` с `{ provider: "anthropic", accountId, paused }`. Поле `paused` сохраняется в аккаунте и возвращается через `GET /api/oauth/accounts`. Пауза действует и при отключённом проактивном пуле: аккаунт исключается из выбора, привязок сессий и кандидатов после 429. Если приостановлены все аккаунты, запросы получают 403 до возобновления одного из них. Уже отправленные запросы продолжаются; учётные данные и состояние здоровья сохраняются. Пауза переживает перезапуск и повторный вход, но удаляется вместе с аккаунтом. Индивидуальные пороги в эту операцию не входят.
 
 ### Провайдеры
 
@@ -192,6 +302,18 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | `GET, PUT /api/provider-context-caps` | Прочитать или обновить context cap глобально, для всех провайдеров или для одного провайдера | 400 invalid request; 404 unknown provider |
 | `GET /api/provider-presets` | Вернуть GUI-presets провайдеров, выведенные из runtime registry | — |
 
+Ответ API лимитов контекста содержит `caps` (активные лимиты) и `values` (последние выбранные
+значения, сохраняемые после отключения). Включение лимита провайдера без `value` восстанавливает
+его выбор, а при первом включении использует глобальное значение `contextCapValue`.
+Это относится и к OpenAI: переключатель не выбирает специальный режим 922k. Активный лимит
+ограничивает каждое нативное окно; модели с поддержкой длинного контекста могут расширять окно
+только до собственного поддерживаемого предела.
+`{ "value": 600000, "setAll": true }` меняет глобальное значение и только активные лимиты.
+Провайдеры с отключённым лимитом сохраняют свой выбор для последующего включения.
+`{ "setAll": true }` без `value` включает лимиты всех настроенных провайдеров с текущим глобальным
+значением и заменяет сохранённый выбор. Отключение сохраняет выбор даже после перезагрузки,
+но не применяет его как ограничение.
+
 `provider_has_dependent_combos` — это safety-барьер: сначала удалите или отредактируйте
 зависящие combo, и лишь потом удаляйте их провайдера.
 
@@ -201,7 +323,12 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | --- | --- | --- |
 | `GET /api/github/star` | Прочитать статус star для репозитория через пользовательскую `gh`-сессию | Фиксированные result-code'ы, зависящие от статуса |
 | `POST /api/github/star` | Поставить star репозиторию только из аутентифицированного человеческого действия | 403 `agent_consent_required` для agent-driven callers без dashboard-session evidence |
-| `GET /api/update/badge` | Прочитать дешёвое состояние update-badge в sidebar | — |
+| `GET /api/update/badge` | Прочитать кешированный значок пакета без обращения к реестру; отсутствие кеша, другой канал или возраст от 40 часов дают `unknown: true`. `surface=desktop&session=<id>` читает только указанную сессию настольного приложения. | 400 неверная surface; отсутствующая или истёкшая настольная сессия возвращает `unknown: true` |
+| `POST /api/update/desktop-snapshot` | Настольная оболочка публикует состояние отображения обновлятора Tauri через привязанный прокси-клиент | 403 при наличии заголовка `Origin` или без principal с исходным `admin-token`; 400 неверные поля; 413 при размере свыше 1 KiB |
+
+Настольный snapshot — временное состояние отображения, а не запрос на установку. Прокси хранит в памяти не более 32 сессий и удаляет сессию через 180 секунд после последнего heartbeat. Обычный браузер без surface=desktop продолжает читать значок обновления пакета.
+
+После запуска прокси проверяет подходящую установку пакета, если кеш отсутствует или старше 20 часов, а затем проверяет его свежесть каждый час. `OCX_DISABLE_UPDATE_CHECK=1` отключает только автоматические проверки. Явные запросы проверки и запуска продолжают работать.
 
 :::caution
 Management-аутентификация доказывает доступ к прокси, но не доказывает согласие тратить
@@ -215,7 +342,7 @@ Management-аутентификация доказывает доступ к п�
 | --- | --- | --- |
 | `GET /api/system/memory` | Вернуть скалярные метрики процесса, heap, stream, response-state, watchdog и active-turn | — |
 | `POST /api/system/restart` | Начать restart процесса с учётом drain, не снимая client injection | Возвращает 202; повторные вызовы сообщают о текущем drain |
-| `POST /api/stop` | Остановить службу, восстановить native Codex, убрать managed Grok injection и выполнить drain прокси | 409 service ownership conflict |
+| `POST /api/stop` | Остановить службу, восстановить native Codex, убрать managed Grok injection и выполнить drain прокси | 409 service ownership conflict; 409 `respawnable_service`, когда обёртка планировщика заданий Windows может перезапустить прокси, а вызывающая сторона — не `ocx stop` (ничего не изменяется); 409, когда установленный менеджер отказывается останавливаться; 409 `service_state_unknown`, когда состояние планировщика заданий не удаётся прочитать (ничего не изменяется; исправьте запрос и повторите) |
 
 ### Делегирование аутентификации Codex
 
@@ -232,19 +359,19 @@ picker изменилась. `catalogRefreshPending: true` в успешном �
 | --- | --- | --- |
 | `GET, POST, DELETE /api/codex-auth/accounts` | Показать/обновить список либо удалить аккаунты Codex. POST сохранён только как отключённый endpoint совместимости; успешный DELETE включает `catalogRefreshPending`. | POST всегда возвращает 403 `manual_import_disabled`; 400 при неверных данных DELETE |
 | `PUT /api/codex-auth/accounts/alias` | Задать или очистить alias аккаунта | 400 invalid account/alias |
-| `PUT /api/codex-auth/accounts/pause` | Поставить один аккаунт на паузу или снять её | 400 invalid account/state; 404 missing account |
+| `PUT /api/codex-auth/accounts/pause` | Вручную приостановить или возобновить аккаунт и существующие записи основного аккаунта и пула с той же идентичностью; возвращает `affectedAccountIds` | 400 неверный аккаунт/состояние; 404 аккаунт не найден; 503 данные идентичности основного аккаунта заняты или недоступны для чтения |
 | `PUT /api/codex-auth/accounts/pause-exhausted` | Поставить на паузу аккаунты с исчерпанной квотой | Сбои mutation-lock превращаются в 503 |
 | `POST /api/codex-auth/accounts/clear-cooldown` | Очистить runtime cooldown для одного аккаунта или для всех | 400 invalid id |
 | `GET, PUT /api/codex-auth/active` | Прочитать или выбрать активный аккаунт | 400 invalid or missing account; 409 paused/legacy-row conflict |
-| `PUT /api/codex-auth/auto-switch` | Задать порог квоты для автоматического переключения аккаунтов | 400 invalid threshold |
+| `PUT /api/codex-auth/auto-switch` | Задать глобальный порог через `{ threshold }` без `id` или переопределение аккаунта через `{ id, threshold }`; `id: '__main__'` выбирает аккаунт Codex Desktop. При указанном `id` значение `threshold: null` удаляет переопределение и восстанавливает наследование глобального порога | 400 invalid id/threshold; 404 missing account |
 | `PUT, PATCH /api/codex-auth/pool-strategy` | Обновить стратегию выбора в пуле аккаунтов Codex | 400 invalid strategy/config |
 | `PUT /api/codex-auth/failover` | Задать порог failover аккаунтов | 400 invalid threshold |
 | `GET /api/codex-auth/quota` | Прочитать кэшированное состояние квоты по аккаунтам | — |
 | `GET /api/codex-auth/reset-credits` | Проверить право аккаунта на reset credit | 400 missing account id; upstream status passthrough; 500 lookup failure |
-| `POST /api/codex-auth/reset-credits/consume` | Израсходовать доступный reset credit | 400 missing account id; upstream status passthrough; 503 `server_busy`; 500 consume failure |
+| `POST /api/codex-auth/reset-credits/consume` | Израсходовать доступный reset credit. Необязательный `operationId` (UUIDv4) делает списание идемпотентным: тот же id воспроизводит один сохранённый результат вместо расходования второго кредита. | 400 missing account id или некорректный `operationId`; 409 `identity_mismatch`, если id принадлежит другому аккаунту; upstream status passthrough; 503 `server_busy`, `capacity` или `unavailable`; 500 consume failure |
 | `POST /api/codex-auth/login` | Запустить login или reauthentication для Codex | 400 invalid request; conflict/busy login states |
 | `POST /api/codex-auth/login/code` | Отправить manual code для login-flow Codex | 400 invalid flow/code |
-| `POST /api/codex-auth/login/cancel` | Отменить login-flow Codex | — |
+| `POST /api/codex-auth/login/cancel` | Отменить только ожидающий вход Codex с `{ "flowId": "..." }` | 400 ID потока отсутствует, неизвестен или не ожидает завершения |
 | `GET /api/codex-auth/login-status` | Опрашивать flow или login-state аккаунта. Завершение нового аккаунта включает `catalogRefreshPending: true` только при необходимости восстановления. | Неизвестные flow'ы сообщаются как `expired`; отсутствие активного flow — как `idle` |
 
 Если config row нового аккаунта сохранён, но credential setup не завершён, OAuth `login-status`
@@ -271,3 +398,29 @@ fail closed, пока аккаунт отсутствует, а при повт�
 соответствующие команды `ocx`: они обращаются к тому же живому API и возвращают ненулевой код,
 если прокси недоступен или операция завершилась неудачей. Прямой HTTP полезнее всего там, где
 интеграции нужен точный контракт endpoint'ов, описанный выше.
+
+## Удалённые сессии и ротация ключей данных
+
+`POST /api/keys/rotate {id}` начинает десятиминутный overlap и один раз возвращает новый секрет. `POST /api/keys/rotate/commit {id,rotationId}` подтверждает, `DELETE /api/keys/rotate {id,rotationId}` отменяет. Требуется management auth; ключ данных не подходит. `POST /api/session/logout` требует текущую `gui-session`, совпадающий Origin и CSRF. Admin token получает 403 и не может создать consent session.
+
+## Порог использования аккаунта Anthropic
+
+`PUT /api/oauth/accounts/auto-switch`
+
+Только Anthropic OAuth. `{ provider: "anthropic", accountId, threshold }`: целое 0–100 или null для наследования; отсутствие поля — ошибка. Сохраняется при перезапуске и удаляется вместе с аккаунтом.
+
+DTO содержит `autoSwitchThresholdOverride` (целое/null), `autoSwitchThreshold` (порог пула) и `effectiveAutoSwitchThreshold`. 0 отключает только переключение по использованию; пауза и восстановление после 429 сохраняются.
+
+HTTP: 400 invalid/unsupported; 404 missing account; `oauth_mutation_busy` on lock contention.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

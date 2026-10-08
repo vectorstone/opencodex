@@ -29,6 +29,7 @@ interface CleanupResult {
   trashDir?: string;
   error?: string;
   message?: string;
+  skippedReferencedPaths?: string[];
 }
 
 interface TrashEntry {
@@ -74,6 +75,7 @@ interface CleanupPolicy {
       skipped?: string;
       deferred?: string;
       error?: string;
+      metadataPersistenceError?: "missing" | "invalid" | "conflict" | "write_failed";
       mode?: string;
       freedBytes?: number;
       removed?: number;
@@ -221,11 +223,12 @@ function ArchivedCleanupPanel({
         throw new Error(mapCleanupError(json.error, json.message, json.trashDir));
       }
       closeConfirm(true);
-      setStatus(
-        permanent
+      const complete = permanent
           ? t("storage.cleanup.donePermanent", { count: String(json.count), size: formatBytes(json.bytes, locale) })
-          : t("storage.cleanup.doneQuarantine", { count: String(json.count), size: formatBytes(json.bytes, locale) }),
-      );
+          : t("storage.cleanup.doneQuarantine", { count: String(json.count), size: formatBytes(json.bytes, locale) });
+      setStatus(json.skippedReferencedPaths?.length
+        ? `${complete} ${t("storage.cleanup.skippedReferenced", { count: String(json.skippedReferencedPaths.length) })}`
+        : complete);
       onDone();
     } catch (e) {
       // Keep the dialog open (except stale_preview) so the failure is visible.
@@ -888,6 +891,9 @@ function AutoCleanupPolicyPanel({
 
       if (outcome.skipped === "disabled") {
         setStatus(t("storage.policy.skippedDisabled"));
+      } else if (outcome.ok && outcome.metadataPersistenceError) {
+        setError(t("storage.policy.metadataSaveWarning"));
+        if (outcome.removed !== undefined) onDone();
       } else if (outcome.skipped === "under_threshold") {
         setStatus(t("storage.policy.skippedUnder"));
       } else if (outcome.skipped === "nothing_selected") {
@@ -1440,7 +1446,7 @@ export default function Storage({ apiBase }: { apiBase: string }) {
       ) : (
         <>
           {reportState.showError && <div className="alert alert-err" role="alert">{t("storage.error")}</div>}
-          {empty ? <EmptyState title={t("storage.empty")} /> : data && data.total.fileCount > 0 && <StorageWorkspace report={data} locale={locale} />}
+          {empty ? <EmptyState title={t("storage.empty")} /> : data && data.total.fileCount > 0 && <StorageWorkspace report={data} locale={locale} apiBase={apiBase} />}
         </>
       )}
 

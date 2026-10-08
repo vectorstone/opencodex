@@ -2,19 +2,150 @@
  * Retry guard for upstream fetches that die on stale pooled keep-alive sockets.
  *
  * chatgpt.com (Cloudflare) closes idle keep-alive connections server-side; Bun's fetch pool
- * reuses the half-closed socket and the request write fails with ECONNRESET before any
- * response bytes arrive. Retrying on a fresh connection is safe for our replayable
- * (string-body) upstream requests, because fetch() rejects only before response headers —
- * a caught error here means no response was ever received.
+ * reuses the half-closed socket and a request can fail before response headers arrive.
+ * A pre-header rejection does not prove that the origin did not process the request.
+ * Mechanically reusable bytes do not make a model POST idempotent: an ambiguous reset
+ * becomes a terminal, non-replayable response unless the operation is explicitly safe.
  *
  * Deliberately narrow: timeouts, aborts, ECONNREFUSED/DNS/TLS failures, and HTTP error
- * statuses (returned as Response, never thrown) are NOT retried. Mid-stream SSE resets are
- * out of scope — the response has already resolved by then.
+ * statuses (returned as Response, never thrown) are NOT retried. A reset after the response
+ * head is out of scope here, because the response has already resolved by then; the Responses
+ * transport asks the same question at that stage through the shared resend gate.
  *
  * MUST stay a leaf module: imports nothing from server.ts or adapters (kiro-retry imports
  * the shared abort helpers from here).
  */
 import { clearableDeadline } from "./abort";
+import { redactSecretString } from "./redact";
+
+/**
+ * Responses the origin may already be executing. RFC 9110 §9.2.2 forbids an intermediary
+ * from automatically repeating a non-idempotent request; when a post-send transport (the
+ * Codex WebSocket relay) settles a gateway status because the origin never acknowledged the
+ * turn, the request body must not be sent again by this process — not by the transient-5xx
+ * layer below, not by a pool account rotation, not by a combo hop. The status is returned
+ * to the caller so the user agent can apply its own retry policy, exactly as it does on the
+ * direct path. The WeakSet is the in-process marker; the structured error codes are the
+ * marker that survives body re-wrapping (combo failure consumption re-parses the JSON).
+ */
+const nonReplayableResponses = new WeakSet<Response>();
+
+export function markResponseNonReplayable(response: Response): void {
+  nonReplayableResponses.add(response);
+}
+
+export function isNonReplayableResponse(response: Response): boolean {
+  return nonReplayableResponses.has(response);
+}
+
+/**
+ * The narrower marker: responses this proxy synthesized as a replay refusal.
+ *
+ * {@link isNonReplayableResponse} answers "must not be sent again", which the WebSocket
+ * post-send verdicts share. This one answers "the upstream never said this", and that is the
+ * question a quota recorder or a `Retry-After` synthesizer has to ask. Both were written for
+ * a status that only ever arrived from a provider, so a synthetic 429 reads to them as a
+ * credential that rate-limited us and as a wait worth honouring -- one writes a cooldown
+ * against a credential that refused nothing, the other instructs the client to send the turn
+ * again. A marker rather than a body check, because it has to be answerable before the body
+ * is read and cannot be spoofed by an upstream that happens to echo the code.
+ */
+const replayRefusalResponses = new WeakSet<Response>();
+
+export function markReplayRefusalResponse(response: Response): void {
+  replayRefusalResponses.add(response);
+}
+
+export function isReplayRefusalResponse(response: Response): boolean {
+  return replayRefusalResponses.has(response);
+}
+
+/** Origin never produced a response event; the turn may still be executing. */
+export const UPSTREAM_NO_RESPONSE_CODE = "upstream_no_response";
+/** Transport closed after the send, before any response event. */
+export const UPSTREAM_CLOSED_BEFORE_RESPONSE_CODE = "upstream_closed_before_response";
+/**
+ * This proxy refused to replay a pre-header fetch rejection.
+ *
+ * Distinct from {@link UPSTREAM_CLOSED_BEFORE_RESPONSE_CODE}, which the Codex WebSocket
+ * transport settles as a 502 after the create frame was already sent. Both are ambiguous,
+ * but only this one is a refusal this process made before any response existed, so it
+ * follows the send-budget precedent and answers 429: the Codex client is configured with
+ * `retry_429: false` and `retry_5xx: true` over four attempts, so a 5xx here multiplies
+ * the duplicate send the refusal exists to prevent. See
+ * structure/transports/responses.md#ambiguous-connection-reset-replay-boundary.
+ */
+export const UPSTREAM_RESET_REPLAY_REFUSED_CODE = "upstream_reset_replay_refused";
+const NON_REPLAYABLE_UPSTREAM_CODES: ReadonlySet<string> = new Set([
+  UPSTREAM_NO_RESPONSE_CODE,
+  UPSTREAM_CLOSED_BEFORE_RESPONSE_CODE,
+  UPSTREAM_RESET_REPLAY_REFUSED_CODE,
+]);
+
+export function isNonReplayableUpstreamCode(code: unknown): boolean {
+  return typeof code === "string" && NON_REPLAYABLE_UPSTREAM_CODES.has(code);
+}
+
+/**
+ * True for the one non-replayable code this proxy owns end to end. The status it carries is
+ * a local decision, so a re-wrapping formatter must restate it rather than inherit the
+ * caller's upstream-shaped status.
+ */
+export function isReplayRefusalCode(code: unknown): boolean {
+  return code === UPSTREAM_RESET_REPLAY_REFUSED_CODE;
+}
+
+/** Client-facing status for {@link UPSTREAM_RESET_REPLAY_REFUSED_CODE}. */
+export const REPLAY_REFUSED_STATUS = 429;
+
+/**
+ * The header every surface attaches to a replay refusal, and its only accepted value.
+ *
+ * Dropping `Retry-After` is necessary and not sufficient. The Stainless-generated clients --
+ * `openai` and `anthropic` for both Python and Node, which is what most callers of this proxy
+ * actually are -- decide from a status table (408, 409, 429 and every 5xx) and compute their own
+ * backoff when no wait is named, so a 429 with no header is still resent. `x-should-retry` is
+ * the one signal each of them reads BEFORE that table, and `"false"` is the exact string they
+ * compare against.
+ */
+export const REPLAY_REFUSAL_NO_RETRY_HEADER = "x-should-retry";
+export const REPLAY_REFUSAL_NO_RETRY_VALUE = "false";
+
+/** Spreadable form for the surfaces that build their headers as an object literal. */
+export const REPLAY_REFUSAL_CLIENT_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  [REPLAY_REFUSAL_NO_RETRY_HEADER]: REPLAY_REFUSAL_NO_RETRY_VALUE,
+});
+
+/**
+ * Apply the one client-facing retry policy a refusal carries: no wait, and no automatic resend.
+ *
+ * Kept as a single function rather than two rules each surface repeats, because the two halves
+ * are only correct together -- a surface that removed the wait but not the suppression still
+ * hands a retrying client a turn it may already have run.
+ */
+export function applyReplayRefusalClientHeaders(headers: Headers): void {
+  headers.delete("retry-after");
+  headers.set(REPLAY_REFUSAL_NO_RETRY_HEADER, REPLAY_REFUSAL_NO_RETRY_VALUE);
+}
+
+/**
+ * Mark a response that re-wraps a refusal as the same refusal.
+ *
+ * The verdict has to be a property of the result the surfaces pass around, because the thing it
+ * would otherwise be read from is the status, and 429 is exactly what a refusal and a real rate
+ * limit have in common. Every formatter between the helper that made the refusal and the client
+ * builds a new Response, so each of them restates the verdict rather than dropping it.
+ */
+export function retainReplayRefusal<T extends Response>(response: T): T {
+  markResponseNonReplayable(response);
+  markReplayRefusalResponse(response);
+  return response;
+}
+
+/** Carry the verdict from a response onto the one that replaces it. */
+export function carryReplayRefusal<T extends Response>(source: Response, rewrapped: T): T {
+  return isReplayRefusalResponse(source) ? retainReplayRefusal(rewrapped) : rewrapped;
+}
 
 // 1 initial + 2 retries: the pool may hold more than one stale socket.
 const RESET_RETRY_MAX_ATTEMPTS = 3;
@@ -22,7 +153,63 @@ const RESET_RETRY_BASE_DELAY_MS = 150;
 const RESET_RETRY_MAX_DELAY_MS = 1_000;
 
 // Transient-5xx status retry layer (pre-stream only; devlog/_plan/260716_claudecode_hardening/010).
-const TRANSIENT_RETRY_MAX_ATTEMPTS = 3; // 1 initial + 2 retries
+/** Total sends one transient-retry helper call may make: 1 initial + 2 retries. */
+export const TRANSIENT_RETRY_MAX_ATTEMPTS = 3;
+
+/**
+ * Transient sends already spent by one LOGICAL request.
+ *
+ * A mutable holder rather than a counter local to one call frame, because the thing that has to
+ * share it spans frames: a combo parent runs a separate child turn per target, and a per-child
+ * counter is what let one logical request reach upstream three times per target (#4546).
+ */
+export interface TransientSendBudget {
+  used: number;
+}
+
+export function createTransientSendBudget(): TransientSendBudget {
+  return { used: 0 };
+}
+
+/**
+ * Refusal raised when a logical request has no send left (#4546, REQ-B04/B05).
+ *
+ * It is deliberately a distinct type rather than a generic `Error`: every call site that
+ * catches a helper rejection today launders it into HTTP 502 `upstream_error`, which would
+ * report a proxy-side budget decision as an upstream fault and hide the real 401/429 the
+ * request already had. Callers must recognise this and return the structured local error
+ * instead. It is a backstop, not the policy -- a call site that still holds a reusable
+ * upstream response is supposed to check the remainder BEFORE it cancels that body.
+ */
+export class SendBudgetExhaustedError extends Error {
+  readonly code = "request_send_budget_exhausted";
+  constructor(label?: string) {
+    super(label
+      ? `request send budget exhausted before dispatch (${label})`
+      : "request send budget exhausted before dispatch");
+    this.name = "SendBudgetExhaustedError";
+  }
+}
+
+/**
+ * Configuration refusal for an attempts value that is not a send count.
+ *
+ * `undefined` means "use the policy default" and `0` means "refuse". A negative, fractional,
+ * NaN or infinite value is a programming or configuration error, and silently substituting the
+ * default for it is how a broken budget turns back into three free sends.
+ */
+export class InvalidSendBudgetError extends Error {
+  constructor(value: unknown) {
+    super(`invalid upstream send budget: ${String(value)}`);
+    this.name = "InvalidSendBudgetError";
+  }
+}
+
+function normalizeSendAttempts(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < 0) throw new InvalidSendBudgetError(value);
+  return value;
+}
 const TRANSIENT_RETRY_BASE_DELAY_MS = 400;
 const TRANSIENT_RETRY_MAX_DELAY_MS = 5_000;
 // A failed attempt slower than this is the "slow 502" incident shape (191s observed on
@@ -44,7 +231,22 @@ export interface RetryBackoffOptions {
   baseDelayMs: number;
   maxDelayMs: number;
   headers?: Headers;
+  /**
+   * Treat a provider's `Retry-After` as the earliest legal send rather than something the
+   * local maximum may shorten. Opt-in per caller so the change lands on the transient path
+   * first instead of silently lengthening every adapter's backoff.
+   */
+  retryAfterIsLowerBound?: boolean;
+  /**
+   * The wait deadline a caller applies to an honoured `Retry-After`. The delay itself is
+   * never shortened: an instruction longer than the deadline is a reason to END with the
+   * upstream answer, not to send early. Kept for callers that still pass it.
+   */
+  retryAfterCeilingMs?: number;
 }
+
+/** One minute, matching the same-target 429 ceiling the key-failover path already uses. */
+export const RETRY_AFTER_CEILING_MS = 60_000;
 
 export function abortError(signal?: AbortSignal): unknown {
   return signal?.reason ?? new DOMException("The operation was aborted", "AbortError");
@@ -195,9 +397,20 @@ function retryAfterDelayMs(headers: Headers): number | undefined {
 
 export function retryBackoffDelayMs(attempt: number, opts: RetryBackoffOptions): number {
   const retryAfter = opts.headers ? retryAfterDelayMs(opts.headers) : undefined;
-  if (retryAfter !== undefined) return Math.min(retryAfter, opts.maxDelayMs);
   const exp = Math.min(opts.baseDelayMs * (2 ** attempt), opts.maxDelayMs);
-  return Math.floor(exp * (0.8 + Math.random() * 0.4));
+  const jittered = Math.floor(exp * (0.8 + Math.random() * 0.4));
+  if (retryAfter === undefined) return jittered;
+  if (opts.retryAfterIsLowerBound !== true) {
+    // Historical behaviour, still the default for every caller that has not opted in.
+    return Math.min(retryAfter, opts.maxDelayMs);
+  }
+  // A provider that names a wait is stating when it will serve again; sending earlier is a
+  // request we already know will be refused, and refusing it twice is the retry storm the
+  // header exists to prevent. The local maximum bounds our OWN exponential backoff and has no
+  // business shortening someone else's instruction, so the instruction is returned in full.
+  // Whether the request can afford to wait that long is the caller's deadline decision --
+  // fetchWithTransientRetry ends with the upstream answer rather than retrying early.
+  return Math.max(retryAfter, jittered);
 }
 
 export function cancelResponseBodyBestEffort(res: Response): void {
@@ -207,6 +420,43 @@ export function cancelResponseBodyBestEffort(res: Response): void {
   } catch {
     // Cancellation is cleanup only; retries must not wait for or fail because of it.
   }
+}
+
+/**
+ * Whether an answer to a spent operator replacement would invite yet another send.
+ *
+ * Once the one replacement a request may spend has gone out, the first send may already have run
+ * the turn, so nothing this exchange returns may cause a third send. Two parties would send again:
+ * the client, whose retry table covers 408, 409, 429 and every 5xx (the Codex client retries 5xx
+ * whatever the headers say; see {@link REPLAY_REFUSED_STATUS}), and this proxy, whose credential
+ * and quota recovery resends on 401 (token refresh, key and pool rotation) and on 402/429
+ * (account rotation). A client that follows a 307 or 308 sends the same POST body again, and a 413
+ * is answered as a context overflow the client compacts and resends, so those belong here too.
+ * {@link isTransientUpstreamStatus} is only the gateway subset of that set: 429 and 529 escaped
+ * it. These statuses settle as the refusal instead.
+ */
+function invitesResendAfterReplacement(status: number): boolean {
+  return status === 401 || status === 402 || status === 408 || status === 409 || status === 429
+    || status === 307 || status === 308 || status === 413 || status >= 500;
+}
+
+/**
+ * The answer a request keeps once its one operator replacement has gone out.
+ *
+ * A status that invites another send settles as the refusal. Any other answer keeps its real
+ * status: no client retries it, and the caller needs the evidence (a 400 names the request
+ * defect). The marker still stops this process from using it as a recovery trigger, such as the
+ * opaque-blob rebuild of a 400 or a combo hop on a context overflow, because each of those checks
+ * it before sending again.
+ */
+export function settleOperatorReplacement(response: Response): Response {
+  if (response.ok) return response;
+  if (invitesResendAfterReplacement(response.status)) {
+    cancelResponseBodyBestEffort(response);
+    return replayRefusalResponse();
+  }
+  markResponseNonReplayable(response);
+  return response;
 }
 
 export async function fetchWithAttemptDeadline(
@@ -226,6 +476,7 @@ export async function fetchWithAttemptDeadline(
     return await executor(url, {
       ...init,
       headers,
+      redirect: "manual",
       signal: attemptTimeout.signal,
     });
   } finally {
@@ -236,15 +487,56 @@ export async function fetchWithAttemptDeadline(
 }
 
 export interface ResetRetryOptions {
+  /**
+   * Opt in only when repeating this operation cannot duplicate upstream effects.
+   * This permits reset retries, not extra sends: attempts and onSendsConsumed still
+   * bound and count every physical send. A string body is not replay-safety proof.
+   */
+  replaySafe?: boolean;
   abortSignal?: AbortSignal;
   /** Short host/path label for the retry warn log (no secrets/query strings). */
   label?: string;
+  /** Total upstream sends allowed, including the first one. Not a per-layer retry count. */
   attempts?: number;
+  /**
+   * Reports how many upstream sends this call actually consumed, so a caller that spans
+   * several legs of one request (initial send, then a 429/account-recovery refetch) can
+   * keep them on ONE budget instead of handing each leg a fresh one.
+   *
+   * It lives on the RESET options, not on the transient ones, because every leg that falls
+   * back to reset-only retry -- the non-policy adapter initial send, and every
+   * `rebuildAndRefetch` recovery kind whose provider has no transient policy -- was not merely
+   * uncounted but UNCOUNTABLE: the callback existed on a type those call sites never reach.
+   */
+  onSendsConsumed?: (sends: number) => void;
+  /**
+   * Spend one operator-granted replacement for a pre-header reset this helper would otherwise
+   * refuse. Absent means no operator policy, which is the fail-closed answer.
+   *
+   * A callback rather than a count, and the difference is the whole point. A count handed to
+   * each leg of a request is a count each leg holds: a rotation leg, a refresh leg and a
+   * same-target 429 leg carry the same turn, so three numbers is three replacements of one
+   * possibly-executed inference. The callback draws on ONE allowance held by the logical
+   * request, which the post-header protocol gate draws on too.
+   *
+   * It never widens the send budget. A claimed replacement still has to fit inside
+   * `attempts`, exactly like every other send this leg makes.
+   */
+  claimAmbiguousResend?: () => boolean;
 }
 
 export interface TransientRetryOptions extends ResetRetryOptions {
   /** Test seam: per-attempt slow budget override (defaults to TRANSIENT_RETRY_SLOW_ATTEMPT_MS). */
   slowAttemptMs?: number;
+  /**
+   * How long this caller can wait on an honoured `Retry-After`, defaulting to
+   * {@link RETRY_AFTER_CEILING_MS}. It is a deadline, never a clamp: an instruction inside it
+   * is slept in full, and an instruction past it ends the call with the upstream answer and
+   * its `Retry-After` intact rather than sending early at a provider that already said it
+   * would refuse. A caller with a shorter budget than a minute says so and is not parked past
+   * it; a caller that can genuinely wait longer says so and is not cut short.
+   */
+  retryAfterCeilingMs?: number;
 }
 
 export type UpstreamSendRecovery = "connection-reset" | "transient-5xx";
@@ -305,36 +597,87 @@ export function applyUpstreamRecoveryInit<T extends RequestInit>(
 }
 
 /**
- * Run `doFetch`, retrying only connection-reset-shaped rejections (see
- * isConnectionResetError) with jittered backoff. The caller's thunk must be replay-safe
- * (string body); every retry is logged so persistent resets stay visible.
+ * The refusal this proxy returns for an ambiguous reset it will not replace. The WeakSet
+ * markers protect in-process recovery and the code survives JSON re-wrapping, so a combo or
+ * account-recovery layer downstream cannot read it as a replayable upstream fault. The raw
+ * exception is never exposed: it can carry credentials or request data.
+ */
+export function replayRefusalResponse(): Response {
+  const response = new Response(JSON.stringify({ error: {
+    type: "upstream_error",
+    code: UPSTREAM_RESET_REPLAY_REFUSED_CODE,
+    message: "The upstream exchange did not complete reliably. The request may already have been processed; automatic replay was stopped.",
+  } }), {
+    status: REPLAY_REFUSED_STATUS,
+    headers: { "content-type": "application/json", ...REPLAY_REFUSAL_CLIENT_HEADERS },
+  });
+  return retainReplayRefusal(response);
+}
+
+/**
+ * Run `doFetch` within one send budget. Connection-reset-shaped rejections are
+ * terminal by default; only an explicitly replay-safe operation receives reset retries
+ * with jittered backoff. HTTP responses retain the caller's existing retry policy.
  */
 export async function fetchWithResetRetry(
   doFetch: ReplayableFetch,
   opts: ResetRetryOptions = {},
   firstRecovery?: UpstreamSendRecovery,
 ): Promise<Response> {
-  const attempts = Math.max(1, opts.attempts ?? RESET_RETRY_MAX_ATTEMPTS);
+  const attempts = normalizeSendAttempts(opts.attempts, RESET_RETRY_MAX_ATTEMPTS);
+  // Zero is zero. The old Math.max(1, ...) floor meant an exhausted budget still bought one
+  // more send on every recovery leg, which is most of what made a bounded per-layer retry
+  // compose into an unbounded per-request count.
+  if (attempts === 0) throw new SendBudgetExhaustedError(opts.label);
   let lastError: unknown;
   let sawReset = false;
+  // True once this leg has spent the request's operator allowance. From that point the leg
+  // settles as the refusal or an unambiguous answer: a second send of a possibly-executed turn
+  // is already out, and handing the client anything it would retry compounds it.
+  let spentOperatorReplacement = false;
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (opts.abortSignal?.aborted) throw abortError(opts.abortSignal);
+    // Reported before the await, one physical send at a time: a send that rejects has still
+    // been made, and this helper leaves through four exits (return, reset give-up, non-reset
+    // rethrow, abort), so a per-send report is the only shape that is correct on all of them.
+    opts.onSendsConsumed?.(1);
     try {
-      return await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
+      const response = await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
+      return spentOperatorReplacement ? settleOperatorReplacement(response) : response;
     } catch (err) {
       if (opts.abortSignal?.aborted) throw err;
       if (!isConnectionResetError(err)) {
+        // Whatever ended the leg, an operator replacement already went out, so the first send
+        // may have run the turn. Settle it as the refusal instead of throwing into a caller
+        // whose transport-failure path answers with a client-retryable 502.
+        if (spentOperatorReplacement) return replayRefusalResponse();
         // A reset that already reached the origin is credential-visible
         // evidence: keep it attached so the terminal rejection cannot be
         // downgraded to the pre-connection neutral class (#914 review).
         if (sawReset) throw new UpstreamRetryEvidenceError([], err, true);
         throw err;
       }
-      if (attempt === attempts - 1) throw err;
+      if (opts.replaySafe === true) {
+        // Repeating this operation cannot duplicate anything, so an exhausted budget rethrows
+        // and the caller's own error path takes over.
+        if (attempt === attempts - 1) throw err;
+      } else {
+        // The stage table refuses an ambiguous pre-header reset. The only thing that overrides
+        // it is an operator allowance, and claiming it here is what keeps the grant single --
+        // the post-header protocol gate spends the same counter for the same logical request.
+        // Return evidence rather than throwing a generic transport error: outer catches
+        // otherwise turn it into a replayable 502 and a combo/account recovery resends it.
+        if (attempt + 1 >= attempts || opts.claimAmbiguousResend?.() !== true) {
+          return replayRefusalResponse();
+        }
+        spentOperatorReplacement = true;
+      }
       sawReset = true;
       lastError = err;
       console.warn(
-        `[upstream-retry] connection reset${opts.label ? ` (${opts.label})` : ""} — retrying (${attempt + 2}/${attempts})`,
+        `[upstream-retry] connection reset${opts.label ? ` (${opts.label})` : ""} — ${
+          spentOperatorReplacement ? "replacing" : "retrying"
+        } (${attempt + 2}/${attempts})`,
       );
       await sleepWithAbort(retryBackoffDelayMs(attempt, {
         baseDelayMs: RESET_RETRY_BASE_DELAY_MS,
@@ -346,47 +689,220 @@ export async function fetchWithResetRetry(
 }
 
 /**
- * fetchWithResetRetry plus a transient-5xx status retry layer, PRE-STREAM only: a
- * returned Response has by definition not been relayed to the client yet, so replaying
- * the (string-body) request is safe. The failed attempt's body is cancelled before the
+ * fetchWithResetRetry plus the caller-selected transient-5xx policy, PRE-STREAM only.
+ * A received HTTP error follows that policy; an ambiguous reset's non-replayable
+ * verdict always stops it. The failed attempt's body is cancelled before the
  * retry; every returned response (ok, non-transient, aborted, slow, exhausted) keeps
  * its body intact. Honors Retry-After via retryBackoffDelayMs.
  *
  * A failed attempt slower than the slow budget is returned as-is (slow-502 shape);
- * note `opts.attempts` is shared with the inner reset layer (no caller passes it today).
+ * `opts.attempts` is ONE total-send budget covering this layer and the inner reset layer
+ * together, so it bounds the real number of upstream requests rather than multiplying.
  */
 export async function fetchWithTransientRetry(
   doFetch: ReplayableFetch,
   opts: TransientRetryOptions = {},
 ): Promise<Response> {
-  const attempts = Math.max(1, opts.attempts ?? TRANSIENT_RETRY_MAX_ATTEMPTS);
+  const budget = normalizeSendAttempts(opts.attempts, TRANSIENT_RETRY_MAX_ATTEMPTS);
   const slowAttemptMs = opts.slowAttemptMs ?? TRANSIENT_RETRY_SLOW_ATTEMPT_MS;
   const transientStatuses: number[] = [];
+  // `attempts` is ONE total-send budget shared with the inner reset layer, not a per-layer
+  // count. Forwarding it into every `fetchWithResetRetry` made the two multiply: with
+  // `attempts: 3` the outer loop ran 3 transient rounds and each round independently retried
+  // 3 connection resets, so a single call could emit 9 upstream sends — and 10 could emit 100.
+  // That was harmless only because no caller passed `attempts`; the provider-level
+  // `transientRetryOn5xx` policy is the first one that does, and multiplying load against an
+  // already-failing provider is worse than not retrying at all.
+  let sent = 0;
+  const countedFetch: ReplayableFetch = (recovery) => {
+    // Incremented BEFORE the await so a rejected send still consumes budget; counting only
+    // successes would let a reset storm loop without bound.
+    sent += 1;
+    return doFetch(recovery);
+  };
+  // No floor. A spent budget hands the inner helper 0, which refuses rather than buying one
+  // more send -- the loop condition alone was never enough, because every later recovery leg
+  // called this helper again and the floor funded each of them.
+  const remaining = () => Math.max(0, budget - sent);
+  // The inner reset layer now has its own `onSendsConsumed`, and these are the same physical
+  // sends `countedFetch` already counts. Forwarding the reporter down the `remaining()` path
+  // would report each of them twice, which is how a four-send cap becomes a two-send cap. One
+  // send is counted once, by the outermost layer that owns the budget.
+  const innerResetOptions = (): ResetRetryOptions => ({
+    ...opts,
+    attempts: remaining(),
+    onSendsConsumed: undefined,
+  });
+  // Reported in `finally` rather than at each exit: this function returns from five places
+  // and throws from one, and a caller sharing the budget across request legs must be told the
+  // real count on every one of them.
+  try {
+  if (budget === 0) throw new SendBudgetExhaustedError(opts.label);
   let attemptStart = Date.now();
-  let res = await fetchWithResetRetry(doFetch, opts);
-  for (let attempt = 0; attempt < attempts - 1; attempt++) {
-    if (res.ok || !isTransientUpstreamStatus(res.status)) return res;
+  let res = await fetchWithResetRetry(countedFetch, innerResetOptions());
+  for (let attempt = 0; sent < budget; attempt++) {
+    // A non-replayable gateway status was settled after the request body had already left
+    // for the origin; retrying it here is the automatic resend the marker exists to forbid.
+    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) return res;
+    // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
+    // a response whose body we just cancelled.
     if (opts.abortSignal?.aborted) return res;
     if (Date.now() - attemptStart > slowAttemptMs) return res;
+    const instructedDelay = retryAfterDelayMs(res.headers);
+    // The deadline is the CALLER'S, not this module's default. Reading the constant directly
+    // broke it in both directions: a caller with a 30s budget slept the full 45s an upstream
+    // asked for, and a caller that could genuinely wait 120s was handed the error back for a
+    // 90s instruction it was willing to honour.
+    const waitDeadlineMs = opts.retryAfterCeilingMs ?? RETRY_AFTER_CEILING_MS;
+    if (instructedDelay !== undefined && instructedDelay > waitDeadlineMs) {
+      // Honouring the stated wait would park this request past the deadline it can commit
+      // to, and sleeping only up to the deadline is a send the provider already said it will
+      // refuse. End here instead: the caller receives the upstream answer with its
+      // Retry-After intact and applies its own policy, exactly as on the direct path.
+      return res;
+    }
     console.warn(
-      `[upstream-retry] transient ${res.status}${opts.label ? ` (${opts.label})` : ""} — retrying (${attempt + 2}/${attempts})`,
+      `[upstream-retry] transient ${res.status}${opts.label ? ` (${opts.label})` : ""} — retrying (${sent + 1}/${budget})`,
     );
     const delay = retryBackoffDelayMs(attempt, {
       baseDelayMs: TRANSIENT_RETRY_BASE_DELAY_MS,
       maxDelayMs: TRANSIENT_RETRY_MAX_DELAY_MS,
       headers: res.headers,
+      retryAfterIsLowerBound: true,
     });
     cancelResponseBodyBestEffort(res);
+    // Throws on abort (see sleepWithAbort): the rejection propagates, and the body we just
+    // cancelled belonged to a response we were discarding anyway.
     await sleepWithAbort(delay, opts.abortSignal);
     attemptStart = Date.now();
     transientStatuses.push(res.status);
     try {
-      res = await fetchWithResetRetry(doFetch, opts, "transient-5xx");
+      res = await fetchWithResetRetry(countedFetch, innerResetOptions(), "transient-5xx");
     } catch (err) {
       // Keep the prior 5xx evidence attached: the origin already responded, so
       // this rejection is not pre-connection and must not classify as neutral.
+      // A budget refusal is not upstream evidence of anything and must stay recognisable.
+      if (err instanceof SendBudgetExhaustedError) throw err;
       throw new UpstreamRetryEvidenceError(transientStatuses, err);
     }
   }
+  // Budget exhausted: the last response is returned with its body intact.
   return res;
+  } finally {
+    opts.onSendsConsumed?.(sent);
+  }
+}
+
+export type ProtocolSafeRefetch = (signal?: AbortSignal) => Promise<Response>;
+
+export interface ProtocolSafeRefetchOptions extends ResetRetryOptions {
+  /** The replacement must match the response contract already selected for the client. */
+  acceptResponse?: (response: Response) => boolean;
+  /**
+   * Spend the logical request's allowance, immediately before the replacement send.
+   *
+   * Asked here and not earlier so a failure this helper would refuse on its own terms -- a
+   * non-reset error, a cancelled caller, a spent send budget -- cannot drain the one
+   * replacement a later ambiguous reset was entitled to. False refuses the replacement.
+   */
+  authorize?: () => boolean;
+}
+
+/**
+ * Attempt ONE caller-authorized replacement of a stream that died after the response head.
+ *
+ * The caller owns the proof that nothing was observed -- it comes from protocol inspection,
+ * not from this module -- and owns the physical-send budget. What lives here is the part that
+ * is easy to get wrong: a replacement is only usable if it is a fresh, unlocked, unread body
+ * that matches the contract already promised to the client, and anything else has to be
+ * cancelled and the original failure preserved.
+ */
+export async function refetchAfterProtocolSafeReset(
+  doFetch: ProtocolSafeRefetch,
+  err: unknown,
+  opts: ProtocolSafeRefetchOptions = {},
+): Promise<Response | null> {
+  if (!isConnectionResetError(err) || opts.abortSignal?.aborted || opts.attempts === 0) return null;
+  const label = opts.label
+    ? " (" + redactSecretString(opts.label).replace(/[\r\n\u0000-\u001f\u007f]/g, "").slice(0, 128) + ")"
+    : "";
+  if (opts.authorize && !opts.authorize()) {
+    console.warn("[upstream-retry] post-header reset replacement refused" + label + "; preserving original stream error");
+    return null;
+  }
+  let replacement: Response;
+  try {
+    replacement = await doFetch(opts.abortSignal);
+  } catch {
+    console.warn("[upstream-retry] protocol-safe refetch failed" + label + "; preserving original stream error");
+    return null;
+  }
+  const body = replacement.body;
+  let accepted = !opts.abortSignal?.aborted && replacement.ok && body !== null
+    && !replacement.bodyUsed && !body.locked && !isNonReplayableResponse(replacement);
+  try { if (accepted && opts.acceptResponse) accepted = opts.acceptResponse(replacement); }
+  catch { accepted = false; }
+  if (!accepted || opts.abortSignal?.aborted || body?.locked) {
+    try { void body?.cancel().catch(() => {}); } catch { /* already locked or closed */ }
+    console.warn("[upstream-retry] protocol-safe refetch rejected" + label + "; preserving original stream error");
+    return null;
+  }
+  console.warn("[upstream-retry] pre-output stream reset" + label + "; using one replacement stream");
+  return replacement;
+}
+
+/**
+ * Wrap a streamed body so a reset that arrives before the downstream reader has consumed a single
+ * byte swaps in ONE replacement body.
+ *
+ * The zero-byte gate is the whole reason this wrapper exists: the caller observed nothing, which is
+ * the stage where a replacement may even be considered. Every other question -- whether the operator
+ * granted one, whether the request is replayable, whether the replacement is a fresh unlocked body
+ * that matches the contract already promised to the client -- belongs to
+ * {@link refetchAfterProtocolSafeReset}. Delegating rather than re-deciding is what keeps the chat
+ * lane from drifting away from the one the Responses stream already uses.
+ *
+ * Partial output is never masked: once a byte has reached the caller, the original failure stands.
+ */
+export function wrapWithZeroOutputRefetch(
+  body: ReadableStream<Uint8Array>,
+  doFetch: ProtocolSafeRefetch,
+  // `authorize` is optional on the shared options but required here: a zero-output replacement
+  // is always a post-header resend, so every caller must name the gate that weighs it.
+  opts: ProtocolSafeRefetchOptions & { authorize: () => boolean },
+): ReadableStream<Uint8Array> {
+  let reader = body.getReader();
+  let bytesRead = 0;
+  let retried = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      for (;;) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          bytesRead += value.byteLength;
+          controller.enqueue(value);
+          return;
+        } catch (err) {
+          if (!retried && bytesRead === 0 && !opts.abortSignal?.aborted) {
+            retried = true;
+            const replacement = await refetchAfterProtocolSafeReset(doFetch, err, { ...opts, authorize: opts.authorize });
+            if (replacement?.body) {
+              try { void reader.cancel().catch(() => {}); } catch { /* broken reader; the replacement won */ }
+              reader = replacement.body.getReader();
+              continue;
+            }
+          }
+          try { controller.error(err); } catch { /* already torn down */ }
+          return;
+        }
+      }
+    },
+    cancel(reason) {
+      try { void reader.cancel(reason).catch(() => {}); } catch { /* already torn down */ }
+    },
+  });
 }

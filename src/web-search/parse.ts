@@ -1,16 +1,18 @@
 import { sseFieldValue } from "../lib/sse-decoder";
+import {
+  appendSafeWebSearchSource,
+  safeWebSearchSources,
+  type SafeWebSearchSource,
+} from "./sources";
 
 /** A single web source backing the sidecar's answer. */
-export interface WebSearchSource {
-  url: string;
-  title?: string;
-}
+export type WebSearchSource = SafeWebSearchSource;
 
 /** The sidecar's synthesized answer plus its sources (empty `sources` is fine). */
 export interface WebSearchResult {
   text: string;
   sources: WebSearchSource[];
-  /** Set only when the stream surfaced an error AND produced no usable answer text. */
+  /** Set when the stream failed, including when partial text was decoded before failure. */
   error?: string;
 }
 
@@ -29,15 +31,20 @@ interface OutputItem {
   content?: OutputTextBlock[];
 }
 
-// ChatGPT's Codex backend does not accept `max_output_tokens` on sidecar requests. Bound the raw
-// streamed response here, before decoded text and authoritative/delta copies can accumulate.
+// Keep this compatibility export for non-Responses sidecar executors and bounded error bodies.
 export const MAX_SIDECAR_RESPONSE_BYTES = 64 * 1024;
+// Responses SSE can spend far more wire bytes on JSON framing than on useful model output. Keep a
+// larger finite wire ceiling while separately bounding the decoded text copies accumulated below.
+export const MAX_SIDECAR_STREAM_BYTES = MAX_SIDECAR_RESPONSE_BYTES * 16;
+export const MAX_SIDECAR_DECODED_CHARS = 64 * 1024;
 
 /** Push a `url_citation` annotation as a source, de-duplicated by URL. */
 function collectAnnotation(ann: AnnotationLike | undefined, sources: WebSearchSource[], seen: Set<string>): void {
   if (!ann || ann.type !== "url_citation" || typeof ann.url !== "string" || seen.has(ann.url)) return;
-  seen.add(ann.url);
-  sources.push({ url: ann.url, ...(ann.title ? { title: ann.title } : {}) });
+  if (appendSafeWebSearchSource(sources, {
+    url: ann.url,
+    ...(ann.title !== undefined ? { title: ann.title } : {}),
+  })) seen.add(ann.url);
 }
 
 /**
@@ -51,7 +58,11 @@ function collectAnnotation(ann: AnnotationLike | undefined, sources: WebSearchSo
  * (`### Sources:`, `**Sources**`), a title line whose URL sits on the FOLLOWING line, and trailing
  * URL punctuation (`;`, `,`, `)`, `]`, `.`). Prose that follows the source list is preserved.
  */
-const URL_RE = /https?:\/\/[^\s<>()\[\]]+/;
+const URL_RE = /https?:\/\/[^\s<>()\[\]]+/i;
+// Recognize URI-like candidates separately from the HTTP(S)-only acceptance boundary. A rejected
+// citation (for example `javascript:`) still belongs to the trailing Sources block and must not be
+// left behind as ordinary assistant text.
+const URI_LIKE_RE = /[a-z][a-z0-9+.-]*:[^\s<>()\[\]]+/i;
 // A "Sources:" / "Source:" header, allowing markdown prefixes (#, *, -, >) and bold/italic wrappers.
 const SOURCES_WORD_RE = /^sources?/i;
 
@@ -113,14 +124,14 @@ function cleanTitle(prefix: string): string {
   return title;
 }
 
-function extractTrailingSources(text: string): { text: string; sources: WebSearchSource[] } {
+function extractTrailingSources(text: string): { text: string; sources: WebSearchSource[]; stripped: boolean } {
   const lines = text.split("\n");
   // Find the LAST line that is a "Sources:" header (markdown prefixes allowed).
   let headerIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (isSourcesHeader(lines[i])) { headerIdx = i; break; }
   }
-  if (headerIdx === -1) return { text, sources: [] };
+  if (headerIdx === -1) return { text, sources: [], stripped: false };
   const sources: WebSearchSource[] = [];
   const seen = new Set<string>();
   // Track the last line index actually consumed as part of the source list so trailing prose after
@@ -128,14 +139,16 @@ function extractTrailingSources(text: string): { text: string; sources: WebSearc
   let lastConsumed = headerIdx;
   // A title line whose URL is expected on a following line (multiline entry).
   let pendingTitle: string | null = null;
+  let consumedSourceLine = false;
   for (let i = headerIdx + 1; i < lines.length; i++) {
     const raw = lines[i].trim();
     if (raw === "") {
       // Blank line between header and first entry is fine; a blank AFTER entries ends the list.
-      if (sources.length > 0 || pendingTitle !== null) break;
+      if (consumedSourceLine || pendingTitle !== null) break;
       continue;
     }
-    const m = raw.match(URL_RE);
+    const httpMatch = raw.match(URL_RE);
+    const m = httpMatch ?? raw.match(URI_LIKE_RE);
     if (!m) {
       // A list-ish line with no URL may be a title whose URL is on the next line. Only treat it as a
       // pending title when it looks like a list item; otherwise it's prose → stop.
@@ -144,23 +157,27 @@ function extractTrailingSources(text: string): { text: string; sources: WebSearc
       }
       break;
     }
+    // A non-HTTP URI embedded in prose is not sufficient to classify the line as a citation.
+    // Accept it as a consumed source line only when it is a list item or the whole line starts with
+    // the URI candidate, matching the existing bare-URL grammar.
+    if (!httpMatch && !/^[-*>\d.)]/.test(raw) && m.index !== 0) break;
     const url = cleanUrl(m[0]);
     if (!url) { break; }
+    consumedSourceLine = true;
     lastConsumed = i;
     // Title: text before the URL on this line, else a buffered title from a preceding line.
     const inlinePrefix = raw.slice(0, m.index);
     const title = cleanTitle(inlinePrefix) || (pendingTitle ? cleanTitle(pendingTitle) : "");
     pendingTitle = null;
     if (seen.has(url)) continue;
-    seen.add(url);
-    sources.push(title ? { url, title } : { url });
+    if (appendSafeWebSearchSource(sources, title ? { url, title } : { url })) seen.add(url);
   }
-  if (sources.length === 0) return { text, sources: [] };
+  if (!consumedSourceLine) return { text, sources: [], stripped: false };
   // Keep text before the header AND any prose after the consumed source lines.
   const before = lines.slice(0, headerIdx).join("\n").replace(/\s+$/, "");
   const after = lines.slice(lastConsumed + 1).join("\n").replace(/^\s+/, "");
   const body = after ? (before ? `${before}\n\n${after}` : after) : before;
-  return { text: body, sources };
+  return { text: body, sources, stripped: true };
 }
 
 /** Pull final text + url_citation sources from a completed Responses `output[]` array. */
@@ -179,7 +196,7 @@ function fromOutputArray(output: OutputItem[], seen: Set<string>): WebSearchResu
   return { text, sources };
 }
 
-function cancelReaderWithoutWaiting(
+export function cancelReaderWithoutWaiting(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   reason: string,
 ): void {
@@ -194,10 +211,11 @@ function cancelReaderWithoutWaiting(
  * `response.output_text.done` text; falls back to accumulated `response.output_text.delta`. Sources are
  * collected from EVERY shape they arrive in — `response.output_text.annotation.added` events (the
  * streaming path, which earlier testing missed → empty citations), `done`-block `annotations[]`, and
- * the final output[]. `response.failed`/`error` events surface as `error` when no answer text was produced.
+ * the final output[]. A terminal failure, a safety bound, or EOF before a terminal event surfaces as
+ * `error` even when partial answer text was decoded.
  */
 export async function parseSidecarSSE(response: Response): Promise<WebSearchResult> {
-  if (!response.body) return { text: "", sources: [] };
+  if (!response.body) return { text: "", sources: [], error: "sidecar stream returned no response body" };
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -210,10 +228,37 @@ export async function parseSidecarSSE(response: Response): Promise<WebSearchResu
     final: WebSearchResult | null;
     streamSources: WebSearchSource[];
     error: string | null;
-  } = { deltaText: "", doneText: "", final: null, streamSources: [], error: null };
+    decodedChars: number;
+    terminalEvent: boolean;
+    limitReached: boolean;
+  } = {
+    deltaText: "",
+    doneText: "",
+    final: null,
+    streamSources: [],
+    error: null,
+    decodedChars: 0,
+    terminalEvent: false,
+    limitReached: false,
+  };
+
+  const acceptDecodedChars = (count: number): boolean => {
+    if (count > MAX_SIDECAR_DECODED_CHARS - acc.decodedChars) {
+      acc.error = "sidecar response decoded text limit reached";
+      acc.limitReached = true;
+      return false;
+    }
+    acc.decodedChars += count;
+    return true;
+  };
 
   const handle = (payload: string): void => {
-    if (!payload || payload === "[DONE]") return;
+    if (!payload) return;
+    if (payload === "[DONE]") {
+      acc.terminalEvent = true;
+      return;
+    }
+    if (acc.limitReached) return;
     // Neither warning below copies the frame's content. An upstream SSE payload can carry model
     // output or credential material, and a malformed frame is exactly the case where the content
     // is least trustworthy. Length plus a classification separates the two failure modes in a log
@@ -233,19 +278,27 @@ export async function parseSidecarSSE(response: Response): Promise<WebSearchResu
     const data = parsed as Record<string, unknown>;
     const type = data.type as string | undefined;
     if (type === "response.output_text.delta" && typeof data.delta === "string") {
-      acc.deltaText += data.delta;
+      if (acceptDecodedChars(data.delta.length)) acc.deltaText += data.delta;
     } else if (type === "response.output_text.done" && typeof data.text === "string") {
       // The `done` event carries the full, authoritative text for one content part.
-      acc.doneText += data.text;
+      if (acceptDecodedChars(data.text.length)) acc.doneText += data.text;
     } else if (type === "response.completed" || type === "response.done") {
+      acc.terminalEvent = true;
       const resp = data.response as { output?: OutputItem[] } | undefined;
-      if (resp?.output) acc.final = fromOutputArray(resp.output, seen);
+      if (resp?.output) {
+        const final = fromOutputArray(resp.output, seen);
+        if (acceptDecodedChars(final.text.length)) acc.final = final;
+      }
     } else if (type === "response.failed" || type === "response.incomplete" || type === "error") {
+      acc.terminalEvent = true;
       const resp = data.response as { error?: { message?: string } } | undefined;
       const msg = resp?.error?.message
         ?? (data.error as { message?: string } | undefined)?.message
         ?? (typeof data.message === "string" ? data.message : undefined);
-      if (msg) acc.error = msg;
+      acc.error = msg ?? `sidecar stream ended with ${type}`;
+    } else if (type?.includes("reasoning") && typeof data.delta === "string") {
+      // Reasoning is not returned, but it is still decoded payload retained transiently by JSON.parse.
+      acceptDecodedChars(data.delta.length);
     }
     // Citations stream as a dedicated `response.output_text.annotation.added` event (singular
     // `annotation`); capture it regardless of the exact event name so they aren't lost.
@@ -256,7 +309,7 @@ export async function parseSidecarSSE(response: Response): Promise<WebSearchResu
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const remaining = MAX_SIDECAR_RESPONSE_BYTES - responseBytes;
+      const remaining = MAX_SIDECAR_STREAM_BYTES - responseBytes;
       const accepted = value.byteLength <= remaining ? value : value.subarray(0, remaining);
       responseBytes += accepted.byteLength;
       buffer += decoder.decode(accepted, { stream: true });
@@ -266,11 +319,24 @@ export async function parseSidecarSSE(response: Response): Promise<WebSearchResu
         const data = sseFieldValue(line, "data");
         if (data !== null) handle(data.trim());
       }
-      if (responseBytes >= MAX_SIDECAR_RESPONSE_BYTES) {
+      if (acc.limitReached) {
+        cancelReaderWithoutWaiting(reader, "sidecar response decoded text limit reached");
+        buffer = "";
+        break;
+      }
+      if (acc.terminalEvent) {
+        cancelReaderWithoutWaiting(reader, "sidecar terminal event received");
+        buffer = "";
+        break;
+      }
+      if (responseBytes >= MAX_SIDECAR_STREAM_BYTES) {
         // Preserve complete events accepted up to the cap, but discard any unterminated line and
         // TextDecoder carry. Do not let a rejecting/hung cancel turn bounded partial output into
         // an error or keep this parser waiting on upstream teardown.
         cancelReaderWithoutWaiting(reader, "sidecar response byte limit reached");
+        acc.error = "sidecar response byte limit reached before terminal event";
+        acc.limitReached = true;
+        buffer = "";
         break;
       }
     }
@@ -283,22 +349,20 @@ export async function parseSidecarSSE(response: Response): Promise<WebSearchResu
     || acc.doneText.trim() && acc.doneText
     || acc.deltaText;
   // Merge sources from the final output[] and the streaming annotation events.
-  const sources = [...(acc.final?.sources ?? [])];
-  const seenMerge = new Set(sources.map(s => s.url));
+  const sources = safeWebSearchSources(acc.final?.sources ?? []);
   for (const s of acc.streamSources) {
-    if (!seenMerge.has(s.url)) { seenMerge.add(s.url); sources.push(s); }
+    appendSafeWebSearchSource(sources, s);
   }
   // Hosted web_search usually omits url_citation annotations and lists sources in a trailing
   // `Sources:` markdown block instead. Pull those out (and strip the block from the answer so the
   // tool_result renderer doesn't print sources twice). Annotation titles win; text-block titles
   // only fill a gap. URL-deduped against annotation sources.
-  const { text: body, sources: textSources } = extractTrailingSources(typeof text === "string" ? text : "");
+  const { text: body, sources: textSources, stripped } = extractTrailingSources(typeof text === "string" ? text : "");
   for (const s of textSources) {
-    if (seenMerge.has(s.url)) continue;
-    seenMerge.add(s.url);
-    sources.push(s);
+    appendSafeWebSearchSource(sources, s);
   }
-  const finalText = textSources.length > 0 ? body : (typeof text === "string" ? text : "");
-  if (!finalText.trim() && acc.error) return { text: "", sources, error: acc.error };
+  const finalText = stripped ? body : (typeof text === "string" ? text : "");
+  const error = acc.error ?? (!acc.terminalEvent ? "sidecar stream ended before terminal event" : null);
+  if (error) return { text: finalText, sources, error };
   return { text: finalText, sources };
 }

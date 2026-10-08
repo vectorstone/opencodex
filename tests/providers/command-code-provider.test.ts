@@ -1,0 +1,1363 @@
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { saveCredential, getAccountSet, setActiveAccount } from "../../src/oauth/store";
+import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-failover";
+import { createRequestExecutionBudget, CODEX_TEXT_GUARDED_BUDGET_POLICY } from "../../src/lib/request-execution-budget";
+import { handleResponses } from "../../src/server/responses";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { budgetOwner } from "../helpers/send-budget-owner";
+import type { OcxConfig } from "../../src/types";
+import { commandCodeSessionId, createCommandCodeAdapter } from "../../src/adapters/command-code";
+import { projectContextCache } from "../../src/adapters/command-code-project-context";
+import { loginCommandCode, parseCommandCodeCallback, shouldImportLocalCommandCodeAuth } from "../../src/oauth/command-code";
+import { buildModelsRequest, OAUTH_PROVIDERS, submitManualLoginCode } from "../../src/oauth";
+import { clearManualCodeSlot, loginState, waitForManualLoginCode } from "../../src/oauth/login-flow-state";
+import {
+  commandCodeReasoningEfforts,
+  PROFILE_PAGE_MAX_BYTES,
+  refreshCommandCodeReasoningEfforts,
+  resetCommandCodeReasoningEffortsForTest,
+} from "../../src/providers/command-code-efforts";
+import { PROVIDER_REGISTRY } from "../../src/providers/registry";
+import type { OcxParsedRequest, OcxProviderConfig } from "../../src/types";
+import { createTestTranslatorBudget } from "../helpers/translator-budget";
+
+const provider: OcxProviderConfig = {
+  adapter: "command-code",
+  baseUrl: "https://api.commandcode.ai",
+  authMode: "oauth",
+  apiKey: "secret-command-key",
+  defaultMaxOutputTokens: 64_000,
+};
+
+function parsed(modelId = "deepseek/deepseek-v4-flash"): OcxParsedRequest {
+  return {
+    modelId,
+    stream: true,
+    context: {
+      systemPrompt: ["system"],
+      messages: [{ role: "user", content: "hello", timestamp: 1 }],
+      tools: [{ name: "lookup", description: "lookup", parameters: { type: "object" } }],
+    },
+    options: { reasoning: "high", maxOutputTokens: 100 },
+  };
+}
+
+async function builtRequest(...args: Parameters<ReturnType<typeof createCommandCodeAdapter>["buildRequest"]>) {
+  return createCommandCodeAdapter(provider).buildRequest(...args);
+}
+
+afterEach(() => resetCommandCodeReasoningEffortsForTest());
+
+describe("Command Code provider", () => {
+  test("empty-completion OAuth continuation counts initial sends and keeps its prepaid hop charged", async () => {
+    const previousHome = process.env.OPENCODEX_HOME;
+    const fixtureHome = mkdtempSync(join(tmpdir(), "ocx-command-hop-"));
+    process.env.OPENCODEX_HOME = fixtureHome;
+    const originalFetch = globalThis.fetch;
+    clearGenericFailoverHealth();
+    try {
+      for (let index = 0; index < 4; index++) await saveCredential("command-code", {
+        access: `synthetic-command-${index}`, refresh: `synthetic-refresh-${index}`,
+        expires: Date.now() + 3_600_000, accountId: `fixture-${index}`, source: "oauth",
+      }, { addAccount: true });
+      await setActiveAccount("command-code", getAccountSet("command-code")!.accounts[0]!.id);
+      // Every physical inference send, including the initial and continuation, shares this cap.
+      const budget = createRequestExecutionBudget({ ...CODEX_TEXT_GUARDED_BUDGET_POLICY,
+        maxTotalModelSends: 3, baseSendAllowance: 3, finalRecoveryAllowance: 0 });
+      const authorizations: string[] = [];
+      globalThis.fetch = (async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url !== "https://api.commandcode.ai/alpha/generate") throw new Error(`Unexpected fixture request: ${url}`);
+        authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+        if (authorizations.length === 1) return new Response('{"type":"finish","finishReason":"stop"}\n');
+        return Response.json({ error: { message: "rate limited" } }, { status: 429 });
+      }) as typeof fetch;
+      const cfg = { defaultProvider: "command-code", emptyCompletionRetry: true, providers: {
+        "command-code": { adapter: "command-code", baseUrl: "https://api.commandcode.ai", authMode: "oauth",
+          models: ["deepseek/deepseek-v4-flash"] },
+      } } as OcxConfig;
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "command-code/deepseek/deepseek-v4-flash", input: "hello", stream: false }),
+      }), cfg, { model: "", provider: "" }, { sendBudget: budget });
+      await response.text();
+      expect(authorizations).toEqual(["Bearer synthetic-command-0", "Bearer synthetic-command-0", "Bearer synthetic-command-1"]);
+      expect(budget.used).toBe(3);
+      expect(getAccountSet("command-code")!.activeAccountId).toBe(getAccountSet("command-code")!.accounts[1]!.id);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearGenericFailoverHealth();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      removeTreeWithRetry(fixtureHome);
+    }
+  }, 20_000);
+
+  test("registry and OAuth surfaces stay in parity", () => {
+    const registry = PROVIDER_REGISTRY.find(row => row.id === "command-code");
+    expect(registry).toMatchObject({
+      adapter: "command-code",
+      authKind: "oauth",
+      defaultModel: "deepseek/deepseek-v4-flash",
+      liveModels: true,
+      modelDiscovery: {
+        url: "https://api.commandcode.ai/provider/v1/models",
+        maxResponseBytes: 262_144,
+        maxModels: 256,
+      },
+    });
+    expect(registry?.models).toBeUndefined();
+    expect(registry?.modelReasoningEfforts).toMatchObject({
+      "deepseek/deepseek-v4-flash": ["low", "medium", "high", "xhigh", "max"],
+      "zai-org/GLM-5.2": ["high", "max"],
+    });
+    expect(OAUTH_PROVIDERS["command-code"]?.providerConfig).toMatchObject({
+      adapter: "command-code",
+      baseUrl: "https://api.commandcode.ai",
+      authMode: "oauth",
+    });
+  });
+
+  test("API-key preset shares the official reasoning-facts table with the OAuth entry", () => {
+    const oauth = PROVIDER_REGISTRY.find(row => row.id === "command-code");
+    const apiKey = PROVIDER_REGISTRY.find(row => row.id === "commandcode");
+    expect(apiKey).toMatchObject({
+      adapter: "openai-chat",
+      authKind: "key",
+      baseUrl: "https://api.commandcode.ai/provider/v1",
+      liveModels: true,
+    });
+    // Without this the API-key preset never advertises a reasoning picker, and the
+    // router's known-ids decode source misses the native slash ids — the Codex-facing
+    // slug `commandcode/deepseek-deepseek-v4-pro` is then sent upstream verbatim and
+    // rejected with `unsupported_model`.
+    expect(apiKey?.modelReasoningEfforts).toEqual(oauth?.modelReasoningEfforts);
+    expect(apiKey?.modelReasoningEfforts).toMatchObject({
+      "zai-org/GLM-5": ["high", "max"],
+      "zai-org/GLM-5.1": ["high", "max"],
+      "zai-org/GLM-5.2-Fast": ["high", "max"],
+      "zai-org/GLM-5.3": ["low", "medium", "high", "xhigh", "max"],
+    });
+  });
+
+  /*
+   * #2883. `z-ai/glm-5.3-flash` is a live-discovered route whose id shares
+   * neither the vendor prefix nor the model of `zai-org/GLM-5.3`, so no
+   * `modelRecordValue` relaxation reaches it — only an explicit row does. Both
+   * presets must carry it, because the picker is empty on whichever one the
+   * user configured, and the two entries are separately constructed.
+   */
+  test("the live GLM-5.3-Flash route carries its own effort ladder on both presets", () => {
+    const oauth = PROVIDER_REGISTRY.find(row => row.id === "command-code");
+    const apiKey = PROVIDER_REGISTRY.find(row => row.id === "commandcode");
+    for (const [label, entry] of [["oauth", oauth], ["api-key", apiKey]] as const) {
+      expect(entry?.modelReasoningEfforts?.["z-ai/glm-5.3-flash"], `${label} preset ladder`)
+        .toEqual(["low", "medium", "high", "xhigh", "max"]);
+    }
+    // Distinct rows for distinct upstream models: GLM-5.3 and GLM-5.3-Flash happen to
+    // share a ladder today, but neither may be derived from the other.
+    expect(commandCodeReasoningEfforts("z-ai/glm-5.3-flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(commandCodeReasoningEfforts("zai-org/GLM-5.3")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // The reported id arrives lowercase from live discovery; a caller may still fold case.
+    expect(commandCodeReasoningEfforts("Z-AI/GLM-5.3-Flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // Nothing widened into a substring match: a sibling that upstream does not list
+    // must stay unknown rather than inheriting the Flash ladder.
+    expect(commandCodeReasoningEfforts("z-ai/glm-5.3-flash-vision")).toBeUndefined();
+  });
+
+  /*
+   * deepseek/deepseek-v4.1-flash and Qwen/Qwen3.8-Flash are live routes that had
+   * no row in the official table, so `supportedCommandCodeEffort` dropped the
+   * field — a client's `max` reached /alpha/generate as no reasoning parameter
+   * at all. The two presets are constructed separately and must each carry the
+   * rows; the request assertions pin that the effort survives construction.
+   */
+  test("the live v4.1-flash and Qwen3.8-Flash routes forward their own ladder", async () => {
+    const oauth = PROVIDER_REGISTRY.find(row => row.id === "command-code");
+    const apiKey = PROVIDER_REGISTRY.find(row => row.id === "commandcode");
+    for (const [label, entry] of [["oauth", oauth], ["api-key", apiKey]] as const) {
+      expect(entry?.modelReasoningEfforts?.["deepseek/deepseek-v4.1-flash"], `${label} preset ladder`)
+        .toEqual(["low", "medium", "high", "xhigh", "max"]);
+      expect(entry?.modelReasoningEfforts?.["Qwen/Qwen3.8-Flash"], `${label} preset ladder`)
+        .toEqual(["low", "medium", "high", "xhigh", "max"]);
+    }
+    expect(commandCodeReasoningEfforts("deepseek/deepseek-v4.1-flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(commandCodeReasoningEfforts("Qwen/Qwen3.8-Flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // The live-discovered id may arrive in any case; the lookup folds it.
+    expect(commandCodeReasoningEfforts("qwen/qwen3.8-flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+
+    const deepseekMax = await builtRequest({
+      ...parsed("deepseek/deepseek-v4.1-flash"),
+      options: { reasoning: "max", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(deepseekMax.body).params.reasoning_effort).toBe("max");
+    const qwenXhigh = await builtRequest({
+      ...parsed("Qwen/Qwen3.8-Flash"),
+      options: { reasoning: "xhigh", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(qwenXhigh.body).params.reasoning_effort).toBe("xhigh");
+  });
+
+  test("OAuth and API-key presets share only verified image capabilities", () => {
+    const oauth = PROVIDER_REGISTRY.find(row => row.id === "command-code");
+    const apiKey = PROVIDER_REGISTRY.find(row => row.id === "commandcode");
+    const verifiedImageModels = [
+      "deepseek/deepseek-v4-flash-vision-exp",
+      "gpt-5.6-luna",
+      "gpt-5.6-sol",
+      "MiniMaxAI/MiniMax-M3",
+      "moonshotai/Kimi-K3",
+      "meta/muse-spark-1.3",
+      "meta/muse-spark-1.3-contributor",
+      "meta/muse-spark-1.2",
+      "meta/muse-spark-1.2-contributor",
+      "xai/grok-4.6",
+      "xai/grok-4.7",
+    ];
+    const verifiedTextOnlyModels = [
+      "deepseek/deepseek-v4-flash",
+      "zai-org/GLM-5.2",
+      "zai-org/GLM-5.3",
+    ];
+
+    expect(apiKey?.modelInputModalities).toEqual(oauth?.modelInputModalities);
+    for (const preset of [oauth, apiKey]) {
+      for (const id of verifiedImageModels) {
+        expect(preset?.modelInputModalities?.[id]).toEqual(["text", "image"]);
+      }
+      for (const id of verifiedTextOnlyModels) {
+        expect(preset?.modelInputModalities?.[id]).toBeUndefined();
+      }
+    }
+  });
+
+  test("validates callback shape and state without exposing the key", () => {
+    const secret = "super-secret-callback-key";
+    const parsedCallback = parseCommandCodeCallback({ apiKey: secret, state: "state", userId: "u", userName: "name", keyName: "cli" }, "state");
+    expect(parsedCallback).toMatchObject({ userId: "u" });
+    let thrown = "";
+    try {
+      parseCommandCodeCallback({ apiKey: secret, state: "wrong", userId: "u", userName: "name", keyName: "cli" }, "state");
+    } catch (error) { thrown = String(error); }
+    expect(thrown).toContain("state mismatch");
+    expect(thrown).not.toContain(secret);
+  });
+
+  test("rejects an already-aborted login before it creates a callback server", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled before login"));
+    await expect(loginCommandCode({ signal: controller.signal }, { importLocal: "off" })).rejects.toThrow("cancelled before login");
+  });
+
+  test("accepts a manually pasted API key when the browser callback cannot reach the loopback server", async () => {
+    const controller = new AbortController();
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const href = String(input);
+      calls.push(href);
+      if (href.includes("whoami")) return new Response(JSON.stringify({ ok: true, user: { id: "u-1", userName: "tester" } }), { status: 200 });
+      throw new Error(`unexpected fetch: ${href}`);
+    }) as typeof globalThis.fetch;
+    try {
+      const credentials = await loginCommandCode({
+        onAuth: () => {},
+        onProgress: () => {},
+        onManualCodeInput: async () => "sk-pasted-key",
+        signal: controller.signal,
+      }, { importLocal: "off" });
+      expect(credentials).toMatchObject({ access: "sk-pasted-key", source: "oauth", accountId: "u-1" });
+      expect(calls.some(href => href.includes("whoami"))).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("rejects a pasted API key whose whoami identity is incomplete", async () => {
+    const controller = new AbortController();
+    const originalFetch = globalThis.fetch;
+    let whoamiCalls = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const href = String(input);
+      if (href.includes("whoami")) {
+        whoamiCalls += 1;
+        return new Response(JSON.stringify({ ok: true, user: { id: "", userName: "" } }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${href}`);
+    }) as typeof globalThis.fetch;
+    try {
+      // With an incomplete identity, the manual loop keeps re-prompting; abort to stop it.
+      const login = loginCommandCode({
+        onAuth: () => {},
+        onProgress: () => {},
+        onManualCodeInput: async () => "sk-incomplete-key",
+        signal: controller.signal,
+      }, { importLocal: "off" });
+      controller.abort(new Error("cancelled"));
+      await expect(login).rejects.toThrow("cancelled");
+      expect(whoamiCalls).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("callback JSON pasted through the shared submit path: wrong state re-prompts, hashes survive", async () => {
+    const controller = new AbortController();
+    const originalFetch = globalThis.fetch;
+    const whoamiKeys: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const href = String(input);
+      if (href.includes("whoami")) {
+        whoamiKeys.push(new Headers(init?.headers).get("authorization") ?? "");
+        return new Response(JSON.stringify({ ok: true, user: { id: "u-1", userName: "alice#1" } }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${href}`);
+    }) as typeof globalThis.fetch;
+    loginState.set("command-code", { done: false });
+    const prompts: string[] = [];
+    let settled: Promise<void> = Promise.resolve();
+    const promptCount = async (count: number) => {
+      for (let i = 0; prompts.length < count && i < 400; i++) await Bun.sleep(5);
+      expect(prompts.length).toBeGreaterThanOrEqual(count);
+    };
+    const callback = (state: string) => JSON.stringify({
+      apiKey: "sk-key#segment",
+      state,
+      userId: "u-1",
+      userName: "alice#1",
+      keyName: "cli",
+    });
+    try {
+      const login = loginCommandCode({
+        onAuth: () => {},
+        onProgress: () => {},
+        onManualCodeInput: state => {
+          prompts.push(state);
+          return waitForManualLoginCode("command-code", controller.signal, state);
+        },
+        signal: controller.signal,
+      }, { importLocal: "off" });
+      // Observe the login from the start so an early assertion failure cannot leave its
+      // rejection unhandled once finally aborts it.
+      settled = login.then(() => undefined, () => undefined);
+      await promptCount(1);
+      const state = prompts[0]!;
+
+      // The shared gate lets Command Code JSON through; the provider parser owns the state check.
+      expect(submitManualLoginCode("command-code", callback(`${state}-other`))).toEqual({ ok: true });
+      await promptCount(2);
+      expect(whoamiKeys).toHaveLength(0);
+
+      // A "#" inside a JSON field must not be read as a code#state suffix.
+      expect(submitManualLoginCode("command-code", callback(state))).toEqual({ ok: true });
+      expect(await login).toMatchObject({ access: "sk-key#segment", accountId: "u-1", source: "oauth" });
+      expect(whoamiKeys).toEqual(["Bearer sk-key#segment"]);
+    } finally {
+      controller.abort(new Error("test complete"));
+      await settled;
+      globalThis.fetch = originalFetch;
+      loginState.delete("command-code");
+      clearManualCodeSlot("command-code");
+    }
+  });
+
+  test("the direct prompt rejects a raw key whose #state suffix does not match", async () => {
+    const controller = new AbortController();
+    const originalFetch = globalThis.fetch;
+    let whoamiCalls = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const href = String(input);
+      if (href.includes("whoami")) {
+        whoamiCalls += 1;
+        return new Response(JSON.stringify({ ok: true, user: { id: "u-1", userName: "tester" } }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${href}`);
+    }) as typeof globalThis.fetch;
+    let prompts = 0;
+    try {
+      const login = loginCommandCode({
+        onAuth: () => {},
+        onProgress: () => {},
+        onManualCodeInput: async state => {
+          prompts += 1;
+          if (prompts === 1) return `sk-direct#${state}-other`;
+          controller.abort(new Error("cancelled after re-prompt"));
+          return undefined;
+        },
+        signal: controller.signal,
+      }, { importLocal: "off" });
+      await expect(login).rejects.toThrow("cancelled after re-prompt");
+      expect(prompts).toBe(2);
+      expect(whoamiCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("uses live account discovery and only imports local CLI auth for the first account", () => {
+    const request = buildModelsRequest(provider, "secret-command-key", "command-code");
+    expect(request).toEqual({
+      url: "https://api.commandcode.ai/provider/v1/models",
+      headers: { Authorization: "Bearer secret-command-key" },
+    });
+    expect(shouldImportLocalCommandCodeAuth()).toBe(true);
+    expect(shouldImportLocalCommandCodeAuth({ importLocal: "off" })).toBe(false);
+  });
+
+  test("builds the proprietary generate request with an officially supported effort and bearer auth", async () => {
+    const built = await builtRequest(parsed());
+    const body = JSON.parse(built.body);
+    expect(built.url).toBe("https://api.commandcode.ai/alpha/generate");
+    expect(built.headers.Authorization).toBe("Bearer secret-command-key");
+    expect(body.params).toMatchObject({ model: "deepseek/deepseek-v4-flash", reasoning_effort: "high", max_tokens: 100, stream: true });
+    expect(body.params.tools[0]).toMatchObject({ name: "lookup" });
+    expect(built.body).not.toContain("secret-command-key");
+  });
+
+  test("passes every canonical Command Code id through unchanged", async () => {
+    const built = await builtRequest(parsed("xai/grok-4.5"));
+    expect(JSON.parse(built.body).params.model).toBe("xai/grok-4.5");
+  });
+
+  test("carries tool-result images in a follow-up user message instead of dropping them", async () => {
+    const image = "data:image/png;base64,AAAA";
+    const built = await builtRequest({
+      ...parsed(),
+      context: {
+        ...parsed().context,
+        messages: [{
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_1", name: "view_image", arguments: {} }],
+          timestamp: 1,
+        }, {
+          role: "toolResult",
+          toolCallId: "call_1",
+          toolName: "view_image",
+          content: [{ type: "text", text: "screenshot:" }, { type: "image", imageUrl: image }],
+          isError: false,
+          timestamp: 2,
+        }],
+      },
+    });
+    const body = JSON.parse(built.body);
+    expect(body.params.messages).toEqual([
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_1", toolName: "view_image", input: {} }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "call_1", toolName: "view_image", output: { type: "text", value: "screenshot:[image]" } }] },
+      { role: "user", content: [{ type: "image", image, mediaType: "image/png" }] },
+    ]);
+  });
+
+  test("synthesizes an error result for every assistant tool call that never received a result", async () => {
+    const built = await builtRequest({
+      ...parsed(),
+      context: {
+        ...parsed().context,
+        messages: [
+          { role: "user", content: "run tools", timestamp: 1 },
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "call_1", name: "lookup", arguments: { q: "a" } },
+              { type: "toolCall", id: "call_2", name: "lookup", arguments: { q: "b" } },
+            ],
+            timestamp: 2,
+          },
+          { role: "toolResult", toolCallId: "call_1", toolName: "lookup", content: "one", isError: false, timestamp: 3 },
+          { role: "user", content: "continue", timestamp: 4 },
+        ],
+      },
+    });
+    const body = JSON.parse(built.body);
+    const wire = body.params.messages;
+    expect(wire[0]).toEqual({ role: "user", content: [{ type: "text", text: "run tools" }] });
+    expect(wire[1]).toMatchObject({ role: "assistant", content: [{ type: "tool-call", toolCallId: "call_1" }, { type: "tool-call", toolCallId: "call_2" }] });
+    expect(wire[2]).toMatchObject({ role: "tool", content: [{ type: "tool-result", toolCallId: "call_1", output: { type: "text", value: "one" } }] });
+    // call_2 never received a result: the adapter must close it with an explicit error result
+    // BEFORE the next user message, or the upstream rejects the unpaired call (#1383).
+    expect(wire[3]).toMatchObject({
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "call_2", toolName: "lookup", output: { type: "error-text" } }],
+    });
+    expect(wire[4]).toEqual({ role: "user", content: [{ type: "text", text: "continue" }] });
+  });
+
+  test("keeps tool results contiguous before buffered image carriers", async () => {
+    const image = "data:image/png;base64,AAAA";
+    const built = await builtRequest({
+      ...parsed(),
+      context: {
+        ...parsed().context,
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "call_1", name: "view_image", arguments: {} },
+              { type: "toolCall", id: "call_2", name: "lookup", arguments: { q: "b" } },
+            ],
+            timestamp: 1,
+          },
+          { role: "toolResult", toolCallId: "call_1", toolName: "view_image", content: [{ type: "text", text: "shot" }, { type: "image", imageUrl: image }], isError: false, timestamp: 2 },
+          { role: "toolResult", toolCallId: "call_2", toolName: "lookup", content: "two", isError: false, timestamp: 3 },
+        ],
+      },
+    });
+    const body = JSON.parse(built.body);
+    const wire = body.params.messages;
+    // Both tool results must precede the user image carrier so the assistant turn's tool
+    // results stay contiguous on the wire (#1383 / CodeRabbit adjacency finding).
+    expect(wire[1]).toMatchObject({ role: "tool", content: [{ type: "tool-result", toolCallId: "call_1" }] });
+    expect(wire[2]).toMatchObject({ role: "tool", content: [{ type: "tool-result", toolCallId: "call_2" }] });
+    expect(wire[3]).toEqual({ role: "user", content: [{ type: "image", image, mediaType: "image/png" }] });
+  });
+
+  test("degrades an orphan tool result without a declared call to a text carrier", async () => {
+    const built = await builtRequest({
+      ...parsed(),
+      context: {
+        ...parsed().context,
+        messages: [
+          { role: "user", content: "go", timestamp: 1 },
+          { role: "toolResult", toolCallId: "call_orphan", toolName: "lookup", content: "outcome", isError: false, timestamp: 2 },
+        ],
+      },
+    });
+    const body = JSON.parse(built.body);
+    const wire = body.params.messages;
+    // The upstream rejects a standalone `tool` message whose call was never declared by an
+    // assistant turn; the outcome must ride a user text carrier instead (#1383).
+    expect(wire[1]).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: expect.stringContaining("[tool result without adjacent tool call: lookup (call_orphan)]") }],
+    });
+  });
+
+  test.each(["", "before\n"])("preserves standalone orphan data and HTTPS images with text %j", async (text) => {
+    const image = "data:image/png;base64,QUJDRA==";
+    const remote = "https://example.com/screenshot.JPEG?size=2#preview";
+    const built = await builtRequest({
+      ...parsed(),
+      context: {
+        ...parsed().context,
+        messages: [{
+          role: "toolResult", toolCallId: "call_orphan", toolName: "view_image",
+          content: [
+            { type: "text", text },
+            { type: "image", imageUrl: image },
+            { type: "text", text: "" },
+            { type: "image", imageUrl: remote },
+            { type: "text", text },
+          ],
+          isError: false, timestamp: 1,
+        }],
+      },
+    });
+    const wire = JSON.parse(built.body).params.messages;
+    expect(wire).toEqual([{
+      role: "user",
+      content: [
+        { type: "text", text: `[tool result without adjacent tool call: view_image (call_orphan)]\n${text}[image][image]${text}` },
+        { type: "image", image, mediaType: "image/png" },
+        { type: "image", image: remote, mediaType: "image/jpeg" },
+      ],
+    }]);
+    expect(wire[0].content[0].text).not.toContain("QUJDRA==");
+    expect(wire[0].content[0].text).not.toContain(remote);
+  });
+
+  test.each(["duplicate", "user barrier"])("preserves orphan images after a %s without repairing the pairing", async (scenario) => {
+    const image = "data:image/png;base64,QUJDRA==";
+    const remote = "https://example.com/late.webp";
+    const request = parsed();
+    request.context.messages = [{
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_1", name: "view_image", arguments: {} }],
+      timestamp: 1,
+    }];
+    if (scenario === "duplicate") {
+      request.context.messages.push({
+        role: "toolResult", toolCallId: "call_1", toolName: "view_image",
+        content: [{ type: "text", text: "first" }, { type: "image", imageUrl: image }],
+        isError: false, timestamp: 2,
+      });
+    } else {
+      request.context.messages.push({ role: "user", content: "continue", timestamp: 2 });
+    }
+    request.context.messages.push({
+      role: "toolResult", toolCallId: "call_1", toolName: "view_image",
+      content: [{ type: "text", text: "late:" }, { type: "image", imageUrl: remote }],
+      isError: false, timestamp: 3,
+    });
+    const built = await builtRequest(request);
+    const wire = JSON.parse(built.body).params.messages;
+    expect(wire).toEqual([
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "call_1", toolName: "view_image", input: {} }] },
+      { role: "tool", content: [{
+        type: "tool-result", toolCallId: "call_1", toolName: "view_image",
+        output: scenario === "duplicate"
+          ? { type: "text", value: "first[image]" }
+          : { type: "error-text", value: "[ocx] no tool result was recorded for this tool call; execution status unknown." },
+      }] },
+      scenario === "duplicate"
+        ? { role: "user", content: [{ type: "image", image, mediaType: "image/png" }] }
+        : { role: "user", content: [{ type: "text", text: "continue" }] },
+      { role: "user", content: [
+        { type: "text", text: "[tool result without adjacent tool call: view_image (call_1)]\nlate:[image]" },
+        { type: "image", image: remote, mediaType: "image/webp" },
+      ] },
+    ]);
+  });
+
+  test("closes outstanding calls before buffered and unmatched orphan image carriers", async () => {
+    const image = "data:image/png;base64,QUJDRA==";
+    const remote = "https://example.com/orphan.jpg";
+    const built = await builtRequest({
+      ...parsed(),
+      context: {
+        ...parsed().context,
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              { type: "toolCall", id: "call_1", name: "view_image", arguments: {} },
+              { type: "toolCall", id: "call_2", name: "lookup", arguments: {} },
+            ],
+            timestamp: 1,
+          },
+          {
+            role: "toolResult", toolCallId: "call_1", toolName: "view_image",
+            content: [{ type: "image", imageUrl: image }], isError: false, timestamp: 2,
+          },
+          {
+            role: "toolResult", toolCallId: "call_orphan", toolName: "view_image",
+            content: [{ type: "text", text: "unmatched:" }, { type: "image", imageUrl: remote }],
+            isError: true, timestamp: 3,
+          },
+        ],
+      },
+    });
+    expect(JSON.parse(built.body).params.messages).toEqual([
+      { role: "assistant", content: [
+        { type: "tool-call", toolCallId: "call_1", toolName: "view_image", input: {} },
+        { type: "tool-call", toolCallId: "call_2", toolName: "lookup", input: {} },
+      ] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "call_1", toolName: "view_image", output: { type: "text", value: "[image]" } }] },
+      { role: "tool", content: [{
+        type: "tool-result", toolCallId: "call_2", toolName: "lookup",
+        output: { type: "error-text", value: "[ocx] no tool result was recorded for this tool call; execution status unknown." },
+      }] },
+      { role: "user", content: [{ type: "image", image, mediaType: "image/png" }] },
+      { role: "user", content: [
+        { type: "text", text: "[tool result without adjacent tool call: view_image (call_orphan)]\nunmatched:[image]" },
+        { type: "image", image: remote, mediaType: "image/jpeg" },
+      ] },
+    ]);
+  });
+
+  test.each(["", " outcome\n"])("preserves exact image-free orphan text %j for strings and arrays", async (text) => {
+    for (const content of [text, [{ type: "text" as const, text }, { type: "text" as const, text: "" }]]) {
+      const built = await builtRequest({
+        ...parsed(),
+        context: {
+          ...parsed().context,
+          messages: [{ role: "toolResult", toolCallId: "call_orphan", toolName: "lookup", content, isError: false, timestamp: 1 }],
+        },
+      });
+      expect(JSON.parse(built.body).params.messages).toEqual([{
+        role: "user",
+        content: [{ type: "text", text: `[tool result without adjacent tool call: lookup (call_orphan)]\n${text}` }],
+      }]);
+    }
+  });
+
+  test("keeps the generate config to bounded workspace and git metadata", async () => {
+    const built = await builtRequest(parsed());
+    const body = JSON.parse(built.body);
+    expect(body.config).toHaveProperty("isGitRepo");
+    expect(body.config).toHaveProperty("currentBranch");
+    expect(body.config).toHaveProperty("mainBranch");
+    expect(body.config).toHaveProperty("gitStatus");
+    expect(body.config).toHaveProperty("recentCommits");
+    expect(Array.isArray(body.config.recentCommits)).toBe(true);
+    expect(body.config.recentCommits.length).toBeLessThanOrEqual(8);
+    expect(body.config.recentCommits.every((entry: string) => entry.length <= 512)).toBe(true);
+    expect(body.config.gitStatus.length).toBeLessThanOrEqual(2048);
+    expect(body.config.structure).toBeInstanceOf(Array);
+    expect(typeof body.config.workingDir).toBe("string");
+    expect(built.headers["x-project-slug"]?.length ?? 0).toBeLessThanOrEqual(64);
+    // This test runs inside a git worktree, so the real (non-fallback) metadata path
+    // must populate the repo/branch instead of returning the empty fallback.
+    expect(body.config.isGitRepo).toBe(true);
+    expect(body.config.currentBranch).not.toBe("");
+  });
+
+  test("does not advertise an unverified effort for models absent from the official table", async () => {
+    const built = await builtRequest(parsed("unknown/unmeasured-model"));
+    expect(JSON.parse(built.body).params).not.toHaveProperty("reasoning_effort");
+  });
+
+  test("advertises reasoning efforts for muse spark and rejects ultra at the wire", async () => {
+    // Muse Spark: CLI prints "has no adjustable reasoning effort", but upstream
+    // /alpha/generate accepts low..max (verified 2026-08-13: contributor
+    // variant all 200, ultra 400). The proxy previously stripped the field;
+    // this covers the actual forwarding behavior.
+    expect(commandCodeReasoningEfforts("meta/muse-spark-1.2-contributor")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    // The 2026-09-23 contributor profile lists four rungs, but /alpha/generate accepts max (200).
+    expect(commandCodeReasoningEfforts("meta/muse-spark-1.3-contributor")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    expect(commandCodeReasoningEfforts("meta/muse-spark-1.3")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    expect(commandCodeReasoningEfforts("meta/muse-spark-1.2")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    expect(commandCodeReasoningEfforts("meta/muse-spark-1.1")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    // Case-insensitive lookup (keyFor lowercases).
+    expect(commandCodeReasoningEfforts("Meta/Muse-Spark-1.2-Contributor")).toEqual(
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    for (const effort of ["low", "medium", "high", "max"] as const) {
+      const withEffort = await builtRequest({
+        ...parsed("meta/muse-spark-1.2-contributor"),
+        options: { reasoning: effort, maxOutputTokens: 100 },
+      });
+      expect(JSON.parse(withEffort.body).params.reasoning_effort).toBe(effort);
+    }
+    // xhigh is a distinct wire value for muse spark (upstream accepts it) and
+    // must not be collapsed to max — only deepseek/glm need that aliasing.
+    const xhigh = await builtRequest({
+      ...parsed("meta/muse-spark-1.2-contributor"),
+      options: { reasoning: "xhigh", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(xhigh.body).params.reasoning_effort).toBe("xhigh");
+    // ultra is not advertised for muse spark and upstream rejects it (400).
+    // The adapter must strip it before request construction.
+    const ultra = await builtRequest({
+      ...parsed("meta/muse-spark-1.2-contributor"),
+      options: { reasoning: "ultra", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(ultra.body).params).not.toHaveProperty("reasoning_effort");
+    // DeepSeek retains the ultra alias but forwards its accepted xhigh rung unchanged.
+    const deepseekUltra = await builtRequest({
+      ...parsed("deepseek/deepseek-v4-flash"),
+      options: { reasoning: "ultra", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(deepseekUltra.body).params.reasoning_effort).toBe("max");
+    const deepseekXhigh = await builtRequest({
+      ...parsed("deepseek/deepseek-v4-flash"),
+      options: { reasoning: "xhigh", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(deepseekXhigh.body).params.reasoning_effort).toBe("xhigh");
+  });
+
+  test("maps ultra to max, preserves xhigh, and honors legacy alias ids", async () => {
+    const ultra = await builtRequest({ ...parsed(), options: { reasoning: "ultra", maxOutputTokens: 100 } });
+    expect(JSON.parse(ultra.body).params.reasoning_effort).toBe("max");
+    const xhigh = await builtRequest({ ...parsed(), options: { reasoning: "xhigh", maxOutputTokens: 100 } });
+    expect(JSON.parse(xhigh.body).params.reasoning_effort).toBe("xhigh");
+    // Legacy compatibility id resolves to the canonical effort table before the lookup.
+    const legacy = await builtRequest({ ...parsed(), modelId: "deepseek-v4-flash" });
+    expect(JSON.parse(legacy.body).params.reasoning_effort).toBe("high");
+  });
+
+  test("treats prototype property names as literal model ids", async () => {
+    for (const modelId of ["__proto__", "constructor", "toString"]) {
+      const built = await builtRequest(parsed(modelId));
+      const params = JSON.parse(built.body).params;
+      expect(params.model).toBe(modelId);
+      expect(params).not.toHaveProperty("reasoning_effort");
+    }
+  });
+
+  test("filters tool declarations when tool_choice disables tools", async () => {
+    const built = await builtRequest({ ...parsed(), options: { toolChoice: "none" } });
+    expect(JSON.parse(built.body).params.tools).toEqual([]);
+  });
+
+  test("matches a forced namespaced tool choice by dot or unique bare alias", async () => {
+    const namespacedParsed = {
+      ...parsed(),
+      context: {
+        ...parsed().context,
+        tools: [{ name: "exec_command", namespace: "functions", description: "exec", parameters: { type: "object" } }],
+      },
+      options: { toolChoice: { name: "functions.exec_command" } },
+    };
+    const built = await builtRequest(namespacedParsed);
+    const tools = JSON.parse(built.body).params.tools;
+    expect(tools).toEqual([{ name: "functions__exec_command", description: "exec", input_schema: { type: "object" } }]);
+
+    const bareBuilt = await builtRequest({
+      ...namespacedParsed,
+      options: { toolChoice: { name: "exec_command" } },
+    });
+    expect(JSON.parse(bareBuilt.body).params.tools).toEqual(tools);
+  });
+
+  test.each(["fallback", "supplied", "prepaid"] as const)("refreshes stale effort metadata separately from inference executor (%s)", async mode => {
+    const supplied = mode !== "fallback";
+    const requests: Array<{ url: string; body?: string }> = [];
+    const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      requests.push({ url: href, body: typeof init?.body === "string" ? init.body : undefined });
+      if (href.includes("commandcode.ai/models/")) {
+        return new Response("Reasoning efforts high are supported; no other reasoning settings.");
+      }
+      return requests.filter(request => request.url.endsWith("/alpha/generate")).length === 1
+        ? new Response(JSON.stringify({ error: "unsupported reasoning_effort" }), { status: 400 })
+        : new Response("{}", { status: 200 });
+    }) as typeof globalThis.fetch;
+    const adapter = createCommandCodeAdapter({ ...provider, fetch } as OcxProviderConfig);
+    const request = await adapter.buildRequest({ ...parsed(), options: { reasoning: "max" } });
+    let suppliedCalls = 0;
+    const executor = (async (input, init) => {
+      expect(String(input).endsWith("/alpha/generate")).toBe(true);
+      suppliedCalls += 1;
+      return fetch(input, init);
+    }) as typeof globalThis.fetch;
+    const budget = createRequestExecutionBudget();
+    const { owner, dispose } = budgetOwner(budget);
+    try {
+      if (mode === "prepaid") {
+        budget.used = 3;
+        const hop = owner.reserveCredentialHop("auth-recovery", request.url, true);
+        if (!hop.allowed || !hop.permit) throw new Error("Expected final prepaid send");
+        owner.pendingHopPermit = hop.permit;
+      }
+      const scope = mode === "prepaid" ? owner.adapterDispatchBudget : budget;
+      const observed: number[] = [];
+      const response = await adapter.fetchResponse!(request, { ...(supplied ? { executor } : {}), sendBudget: scope,
+        onPhysicalSend: send => observed.push(send.ordinal) });
+      expect(suppliedCalls).toBe(supplied ? mode === "prepaid" ? 1 : 2 : 0);
+      expect(response.ok).toBe(mode !== "prepaid");
+      expect(budget.used).toBe(mode === "prepaid" ? 4 : 2);
+      expect(observed).toEqual(mode === "prepaid" ? [1] : [1, 2]);
+      const generated = requests.filter(request => request.url.endsWith("/alpha/generate"));
+      expect(generated).toHaveLength(mode === "prepaid" ? 1 : 2);
+      if (mode === "prepaid") expect(await response.text()).toContain("unsupported reasoning_effort");
+      else expect(JSON.parse(generated[1]!.body!).params).not.toHaveProperty("reasoning_effort");
+    } finally { dispose(); }
+    expect(commandCodeReasoningEfforts("deepseek/deepseek-v4-flash")).toEqual(["low", "medium", "high", "xhigh"]);
+  });
+
+  /*
+   * #5096: the shipped table is a default, not a ceiling configuration cannot reach past.
+   *
+   * The adapter used to read `commandCodeReasoningEfforts() ?? configuredReasoningEfforts()`,
+   * so a model WITH a row ignored `providers.command-code.modelReasoningEfforts` while a model
+   * WITHOUT one honoured it. The catalog never agreed with that: it advertises the picker from
+   * `configuredReasoningEfforts`, so an operator who widened a pinned row saw the wider ladder
+   * offered in Codex and then watched the adapter strip the rung on the way out.
+   *
+   * The seeded copy is the trap, and it is why the override is a declared flag rather than an
+   * inference. `providerConfigSeed` writes the whole shipped table into every materialized
+   * preset, and enrichment and routing both keep a persisted row over the current seed, so
+   * neither the presence of a row nor its difference from today's table proves a human wrote it.
+   * `modelReasoningEffortsAuthoritative` is never written by seeding, so its presence does.
+   */
+  test("an authoritative operator ladder reaches the wire", async () => {
+    // Shipped: deepseek/deepseek-v4-flash-fast is ["low", "high", "max"], so xhigh aliases to max.
+    expect(commandCodeReasoningEfforts("deepseek/deepseek-v4-flash-fast")).toEqual(["low", "high", "max"]);
+    const shipped = await builtRequest({
+      ...parsed("deepseek/deepseek-v4-flash-fast"),
+      options: { reasoning: "xhigh", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(shipped.body).params.reasoning_effort).toBe("max");
+
+    const widened = createCommandCodeAdapter({
+      ...provider,
+      modelReasoningEffortsAuthoritative: true,
+      modelReasoningEfforts: { "deepseek/deepseek-v4-flash-fast": ["low", "medium", "high", "xhigh", "max"] },
+    } as OcxProviderConfig);
+    const built = await widened.buildRequest({
+      ...parsed("deepseek/deepseek-v4-flash-fast"),
+      options: { reasoning: "xhigh", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(built.body).params.reasoning_effort).toBe("xhigh");
+
+    // Narrowing works in the same direction: an operator who removes a rung loses it.
+    const narrowed = createCommandCodeAdapter({
+      ...provider,
+      modelReasoningEffortsAuthoritative: true,
+      modelReasoningEfforts: { "deepseek/deepseek-v4-flash-fast": ["high"] },
+    } as OcxProviderConfig);
+    const stripped = await narrowed.buildRequest({
+      ...parsed("deepseek/deepseek-v4-flash-fast"),
+      options: { reasoning: "max", maxOutputTokens: 100 },
+    });
+    expect(JSON.parse(stripped.body).params).not.toHaveProperty("reasoning_effort");
+
+    // ultra is aliased to max only when the ladder does NOT advertise it, matching xhigh. An
+    // authoritative ladder offering ultra therefore sends ultra rather than quietly sending max.
+    const withUltra = createCommandCodeAdapter({
+      ...provider,
+      modelReasoningEffortsAuthoritative: true,
+      modelReasoningEfforts: { "deepseek/deepseek-v4-flash": ["high", "max", "ultra"] },
+    } as OcxProviderConfig);
+    const ultra = await withUltra.buildRequest({ ...parsed(), options: { reasoning: "ultra", maxOutputTokens: 100 } });
+    expect(JSON.parse(ultra.body).params.reasoning_effort).toBe("ultra");
+  });
+
+  // The flag is what makes this safe. A preset carries the seeded table, and a row written by an
+  // older release keeps its old value through enrichment and routing, so a value comparison would
+  // start reading a stale seed as operator intent the moment the shipped table is corrected.
+  // Without the flag, a configured row — seeded, stale, or hand-written — changes nothing.
+  test("a configured ladder is inert without the authoritative flag", async () => {
+    const entry = PROVIDER_REGISTRY.find(row => row.id === "command-code")!;
+    const cases = [
+      ["deepseek/deepseek-v4.1-flash", "xhigh"],
+      ["deepseek/deepseek-v4-flash", "ultra"],
+      ["google/gemini-3.7-flash", "max"],
+      ["zai-org/GLM-5.3", "low"],
+      ["meta/muse-spark-1.3", "xhigh"],
+    ] as const;
+    const seeded = createCommandCodeAdapter({
+      ...provider,
+      modelReasoningEfforts: { ...entry.modelReasoningEfforts },
+    } as OcxProviderConfig);
+    // A stale row: every shipped ladder widened, but nobody declared it authoritative.
+    const stale = createCommandCodeAdapter({
+      ...provider,
+      modelReasoningEfforts: Object.fromEntries(
+        Object.keys(entry.modelReasoningEfforts ?? {}).map(id => [id, ["low", "medium", "high", "xhigh", "max"]]),
+      ),
+    } as OcxProviderConfig);
+    for (const [modelId, reasoning] of cases) {
+      const options = { reasoning, maxOutputTokens: 100 };
+      const expected = JSON.parse((await builtRequest({ ...parsed(modelId), options })).body).params.reasoning_effort;
+      for (const [label, adapter] of [["seeded", seeded], ["stale", stale]] as const) {
+        const built = await adapter.buildRequest({ ...parsed(modelId), options });
+        expect(JSON.parse(built.body).params.reasoning_effort, `${label} ${modelId} @ ${reasoning}`).toEqual(expected);
+      }
+    }
+  });
+
+  test("an operator-authorized rung surfaces the upstream rejection instead of replaying without it", async () => {
+    const requests: string[] = [];
+    const fetch = (async (url: string | URL | Request) => {
+      requests.push(String(url));
+      if (String(url).includes("commandcode.ai/models/")) {
+        return new Response("Reasoning efforts high are supported; no other reasoning settings.");
+      }
+      return new Response(JSON.stringify({ error: "unsupported reasoning_effort" }), { status: 400 });
+    }) as typeof globalThis.fetch;
+    const adapter = createCommandCodeAdapter({
+      ...provider,
+      fetch,
+      modelReasoningEffortsAuthoritative: true,
+      modelReasoningEfforts: { "deepseek/deepseek-v4-flash": ["low", "medium", "high", "xhigh", "max"] },
+    } as OcxProviderConfig);
+    const request = await adapter.buildRequest({ ...parsed(), options: { reasoning: "xhigh", maxOutputTokens: 100 } });
+    expect(JSON.parse(request.body).params.reasoning_effort).toBe("xhigh");
+
+    const budget = createRequestExecutionBudget();
+    const { dispose } = budgetOwner(budget);
+    try {
+      const response = await adapter.fetchResponse!(request, { sendBudget: budget });
+      expect(response.status).toBe(400);
+      // One generate call and no profile fetch: the downgrade is skipped, not merely unsuccessful.
+      expect(requests.filter(url => url.endsWith("/alpha/generate"))).toHaveLength(1);
+      expect(requests.some(url => url.includes("commandcode.ai/models/"))).toBe(false);
+    } finally { dispose(); }
+  });
+
+  // Pin profile URLs independently of the payload parser.
+  test("resolves the #2647 effort profiles to their canonical public URLs", async () => {
+    const urls: string[] = [];
+    const fetch = (async (url: string | URL | Request) => {
+      urls.push(String(url));
+      return new Response("Reasoning efforts high are supported; no other reasoning settings.");
+    }) as typeof globalThis.fetch;
+
+    await refreshCommandCodeReasoningEfforts("gpt-5.6-luna", fetch);
+    await refreshCommandCodeReasoningEfforts("google/gemini-3.7-flash", fetch);
+    await refreshCommandCodeReasoningEfforts("deepseek/deepseek-v4-flash-vision-exp", fetch);
+
+    expect(urls).toEqual([
+      "https://commandcode.ai/models/gpt-5-6-luna",
+      "https://commandcode.ai/models/gemini-3-7-flash",
+      "https://commandcode.ai/models/deepseek-v4-flash-vision-exp",
+    ]);
+  });
+
+  test("refreshes the requested model from a trimmed captured React Router payload", async () => {
+    // Remapped from .tmp/cc-audit/B/qwen3-8-flash.html (2026-09-23):
+    // _id and _reasoningEfforts point into the serialized string/value table.
+    const values = [
+      { _1: 2, _3: 4, _5: 6 }, "id", "Qwen/Qwen3.8-Flash", "reasoningEfforts",
+      [7, 8, 9], "slug", "qwen3-8-flash", "low", "medium", "xhigh",
+      { _1: 11, _3: 12 }, "unrelated/model", [13], "max",
+    ];
+    const page = `<script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(values))});</script>`;
+    const fetch = (async () => new Response(page)) as typeof globalThis.fetch;
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", fetch))
+      .toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(commandCodeReasoningEfforts("Qwen/Qwen3.8-Flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    resetCommandCodeReasoningEffortsForTest();
+
+    // Incomplete and conflicting records never replace the static row.
+    values[4] = [7, 99];
+    const malformed = `<script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(values))});</script>`;
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", async () => new Response(malformed)))
+      .toBeUndefined();
+    expect(commandCodeReasoningEfforts("Qwen/Qwen3.8-Flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    values[4] = [7, 8, 9];
+    values.push({ _1: 2, _3: 12 }, [7, 8]);
+    const ambiguous = `<script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(values))});</script>`;
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", async () => new Response(ambiguous)))
+      .toBeUndefined();
+  });
+
+  test("a payload record with two keys decoding to one field name is rejected", async () => {
+    const values = [
+      { _1: 2, _3: 4, _5: 6 }, "id", "Qwen/Qwen3.8-Flash", "reasoningEfforts", [8, 9], "id", "Qwen/Qwen3.8-Flash", "unused", "low", "high",
+    ];
+    // _1 and _5 both decode to "id": the record is not one this parser understands.
+    const page = `<script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(values))});</script>`;
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", async () => new Response(page))).toBeUndefined();
+    expect(commandCodeReasoningEfforts("Qwen/Qwen3.8-Flash")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("reads a profile page larger than 256 KiB within the refresh bound", async () => {
+    const values = [{ _1: 2, _3: 4 }, "id", "Qwen/Qwen3.8-Flash", "reasoningEfforts", [5, 6], "low", "medium"];
+    const padding = "x".repeat(300 * 1024);
+    const page = `<html><!--${padding}--><script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(values))});</script></html>`;
+    expect(page.length).toBeGreaterThan(256 * 1024);
+    expect(page.length).toBeLessThan(PROFILE_PAGE_MAX_BYTES);
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", async () => new Response(page)))
+      .toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("later profile refreshes do not reintroduce a previously rejected effort", async () => {
+    const page = "Reasoning efforts low, medium, high, xhigh, max are supported; no mapping.";
+    const fetch = (async () => new Response(page)) as typeof globalThis.fetch;
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", fetch, "max"))
+      .toEqual(["low", "medium", "high", "xhigh"]);
+    expect(await refreshCommandCodeReasoningEfforts("qwen/qwen3.8-flash", fetch, "high"))
+      .toEqual(["low", "medium", "xhigh"]);
+    expect(commandCodeReasoningEfforts("Qwen/Qwen3.8-Flash")).toEqual(["low", "medium", "xhigh"]);
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", async () => new Response("unavailable", { status: 503 }), "xhigh"))
+      .toBeUndefined();
+    expect(commandCodeReasoningEfforts("Qwen/Qwen3.8-Flash")).toEqual(["low", "medium"]);
+    resetCommandCodeReasoningEffortsForTest();
+    expect(await refreshCommandCodeReasoningEfforts("Qwen/Qwen3.8-Flash", fetch))
+      .toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("effort rejections stay scoped to the destination that observed them", async () => {
+    const modelId = "deepseek/deepseek-v4-flash";
+    const alternate = "https://alternate.example/command-code";
+    const fetch = (async () => new Response("Reasoning efforts high, max are supported; no mapping.")) as typeof globalThis.fetch;
+    expect(await refreshCommandCodeReasoningEfforts(modelId, fetch, "max", provider.baseUrl)).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(commandCodeReasoningEfforts(modelId, alternate)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    const options = { reasoning: "max", maxOutputTokens: 100 };
+    const officialRequest = await createCommandCodeAdapter(provider).buildRequest({ ...parsed(modelId), options });
+    const alternateRequest = await createCommandCodeAdapter({ ...provider, baseUrl: alternate }).buildRequest({ ...parsed(modelId), options });
+    expect(JSON.parse(officialRequest.body).params).not.toHaveProperty("reasoning_effort");
+    expect(JSON.parse(alternateRequest.body).params.reasoning_effort).toBe("max");
+    expect(await refreshCommandCodeReasoningEfforts(modelId, fetch, "high", alternate)).toEqual(["low", "medium", "xhigh", "max"]);
+    expect(commandCodeReasoningEfforts(modelId, provider.baseUrl)).toEqual(["low", "medium", "high", "xhigh"]);
+  });
+
+  test("uses profile ladders plus measured corrections for newly cataloged models", async () => {
+    const cases: Array<[string, string[]]> = [
+      ["claude-fable-5-1", ["low", "medium", "high", "xhigh", "max"]],
+      ["claude-opus-5-5", ["low", "medium", "high", "xhigh", "max"]],
+      ["deepseek/deepseek-v4-flash-fast", ["low", "high", "max"]],
+      ["z-ai/glm-5.3-flashx", ["low", "high", "max"]],
+      ["Qwen/Qwen3.8-Omni-Flash", ["low", "medium", "xhigh"]],
+      ["Qwen/Qwen3.8-Max-0902", ["low", "medium", "xhigh"]],
+      ["stepfun/Step-5-Preview", ["low", "medium", "high"]],
+      ["tencent/hy4-preview", ["low", "medium", "high", "xhigh", "max"]],
+      ["google/gemini-3.8-flash", ["low", "medium", "high"]],
+      ["xai/grok-4.7", ["low", "medium", "high", "xhigh"]],
+    ];
+    for (const [id, ladder] of cases) expect(commandCodeReasoningEfforts(id)).toEqual(ladder);
+    const urls: string[] = [];
+    const fetch = (async (url: string | URL | Request) => {
+      urls.push(String(url));
+      return new Response("", { status: 404 });
+    }) as typeof globalThis.fetch;
+    await refreshCommandCodeReasoningEfforts("meta/muse-spark-1.3", fetch);
+    await refreshCommandCodeReasoningEfforts("meta/muse-spark-1.3-contributor", fetch);
+    expect(urls).toEqual([
+      "https://commandcode.ai/models/muse-spark-1-3",
+      "https://commandcode.ai/models/muse-spark-1-3-contributor",
+    ]);
+  });
+
+  test("omits effort when the caller did not choose one", async () => {
+    const built = await builtRequest({ ...parsed("claude-haiku-4-5"), options: { maxOutputTokens: 100 } });
+    expect(JSON.parse(built.body).params).not.toHaveProperty("reasoning_effort");
+  });
+
+  test("parses NDJSON text, reasoning, tools, usage, and finish", async () => {
+    const response = new Response([
+      JSON.stringify({ type: "reasoning-delta", text: "think" }),
+      JSON.stringify({ type: "text-delta", text: "hello" }),
+      JSON.stringify({ type: "tool-call", toolCallId: "call_1", toolName: "lookup", input: { q: "x" } }),
+      JSON.stringify({ type: "finish", rawFinishReason: "tool_use", totalUsage: { inputTokens: 10, outputTokens: 4, inputTokenDetails: { cacheReadTokens: 6, cacheWriteTokens: 2 } } }),
+    ].join("\n"));
+    const events = [];
+    for await (const event of createCommandCodeAdapter(provider).parseStream(response, createTestTranslatorBudget())) events.push(event);
+    expect(events).toEqual([
+      { type: "thinking_delta", thinking: "think" },
+      { type: "text_delta", text: "hello" },
+      { type: "tool_call_start", id: "call_1", name: "lookup" },
+      { type: "tool_call_delta", arguments: '{"q":"x"}' },
+      { type: "tool_call_end" },
+      { type: "done", usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14, cachedInputTokens: 6, cacheReadInputTokens: 6, cacheCreationInputTokens: 2 }, stopReason: "tool_use" },
+    ]);
+  });
+
+  test("yields an error event for upstream error events", async () => {
+    const response = new Response(JSON.stringify({ type: "error", error: { message: "upstream boom" } }));
+    const events = [];
+    for await (const event of createCommandCodeAdapter(provider).parseStream(response, createTestTranslatorBudget())) events.push(event);
+    expect(events).toEqual([
+      { type: "error", message: "upstream boom", status: 502 },
+      { type: "done", usage: undefined, stopReason: undefined },
+    ]);
+  });
+
+  test("classifies a missing-tool-result upstream error distinctly", async () => {
+    const response = new Response(JSON.stringify({
+      type: "error",
+      error: { message: "Provider stream error: Tool result is missing for tool call call_01_x." },
+    }));
+    const events = [];
+    for await (const event of createCommandCodeAdapter(provider).parseStream(response, createTestTranslatorBudget())) events.push(event);
+    expect(events).toEqual([
+      { type: "error", message: "Provider stream error: Tool result is missing for tool call call_01_x.", status: 502, errorType: "upstream_error", code: "missing_tool_result" },
+      { type: "done", usage: undefined, stopReason: undefined },
+    ]);
+  });
+
+  test("classifies the underscored missing-tool-result variant distinctly", async () => {
+    const response = new Response(JSON.stringify({
+      type: "error",
+      error: { message: "Provider stream error: tool_result is missing for call_02_y." },
+    }));
+    const events = [];
+    for await (const event of createCommandCodeAdapter(provider).parseStream(response, createTestTranslatorBudget())) events.push(event);
+    expect(events).toEqual([
+      { type: "error", message: "Provider stream error: tool_result is missing for call_02_y.", status: 502, errorType: "upstream_error", code: "missing_tool_result" },
+      { type: "done", usage: undefined, stopReason: undefined },
+    ]);
+  });
+
+  test("emits a fallback done when the stream ends without a finish event", async () => {
+    const response = new Response(JSON.stringify({ type: "text-delta", text: "partial" }));
+    const events = [];
+    for await (const event of createCommandCodeAdapter(provider).parseStream(response, createTestTranslatorBudget())) events.push(event);
+    expect(events).toEqual([
+      { type: "text_delta", text: "partial" },
+      { type: "done", usage: undefined, stopReason: undefined },
+    ]);
+  });
+
+  test("strips SSE data: framing if the gateway ever switches stream shapes", async () => {
+    const response = new Response([
+      "data: " + JSON.stringify({ type: "text-delta", text: "a" }),
+      "data: " + JSON.stringify({ type: "text-delta", text: "b" }),
+      "data: [DONE]",
+    ].join("\n"));
+    const events = [];
+    for await (const event of createCommandCodeAdapter(provider).parseStream(response, createTestTranslatorBudget())) events.push(event);
+    expect(events).toEqual([
+      { type: "text_delta", text: "a" },
+      { type: "text_delta", text: "b" },
+      { type: "done", usage: undefined, stopReason: undefined },
+    ]);
+  });
+
+  test("treats finish-step as a terminal event and emits only one done", async () => {
+    const response = new Response([
+      JSON.stringify({ type: "text-delta", text: "hi" }),
+      JSON.stringify({ type: "finish-step", finishReason: "stop", usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }),
+      JSON.stringify({ type: "finish", rawFinishReason: "stop", totalUsage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }),
+    ].join("\n"));
+    const events = [];
+    for await (const event of createCommandCodeAdapter(provider).parseStream(response, createTestTranslatorBudget())) events.push(event);
+    expect(events).toEqual([
+      { type: "text_delta", text: "hi" },
+      { type: "done", usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 }, stopReason: "stop" },
+    ]);
+  });
+
+  test("always requests streaming upstream so non-stream clients still get NDJSON", async () => {
+    const built = await builtRequest({ ...parsed(), stream: false });
+    expect(JSON.parse(built.body).params.stream).toBe(true);
+  });
+
+  test("derives an opaque stable session id from trusted conversation identity", async () => {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const identities = {
+      thread: "thread-secret-value",
+      replay: "replay-secret-value",
+      cache: "cache-secret-value",
+    };
+    const thread = {
+      ...parsed(),
+      _clientThreadId: `  ${identities.thread}  `,
+      _reasoningReplayScope: { clientThreadId: identities.replay },
+      options: { ...parsed().options, promptCacheKey: identities.cache },
+    };
+    const sameThread = {
+      ...thread,
+      _reasoningReplayScope: { clientThreadId: "different-replay" },
+      options: { ...thread.options, promptCacheKey: "different-cache" },
+    };
+    const replay = {
+      ...parsed(),
+      _reasoningReplayScope: { clientThreadId: identities.replay },
+      options: { ...parsed().options, promptCacheKey: identities.cache },
+    };
+    const sameReplay = { ...replay, options: { ...replay.options, promptCacheKey: "different-cache" } };
+    const cache = {
+      ...parsed(),
+      options: { ...parsed().options, promptCacheKey: ` ${identities.cache} ` },
+      _promptCacheKeyIsSharedCohort: false,
+    };
+    const sameCache = {
+      ...cache,
+      options: { ...cache.options, promptCacheKey: identities.cache },
+    };
+
+    const threadId = commandCodeSessionId(thread);
+    expect(threadId).toBe(commandCodeSessionId(sameThread));
+    expect(threadId).not.toBe(commandCodeSessionId({ ...thread, _clientThreadId: "different-thread" }));
+    expect(commandCodeSessionId(replay)).toBe(commandCodeSessionId(sameReplay));
+    expect(commandCodeSessionId(cache)).toBe(commandCodeSessionId(sameCache));
+    expect(commandCodeSessionId(replay)).not.toBe(commandCodeSessionId(cache));
+    expect(threadId).toMatch(uuid);
+    expect(commandCodeSessionId(replay)).toMatch(uuid);
+    expect(commandCodeSessionId(cache)).toMatch(uuid);
+    for (const raw of Object.values(identities)) expect(threadId).not.toContain(raw);
+
+    const built = await builtRequest(thread);
+    expect(built.headers["x-session-id"]).toBe(threadId);
+  });
+
+  test("whitespace thread and replay identities fall through to the next trusted identity at the wire", async () => {
+    const replay: OcxParsedRequest = {
+      ...parsed(),
+      _clientThreadId: " \t\n ",
+      _reasoningReplayScope: { clientThreadId: "  replay-after-blank-thread  " },
+      _promptCacheKeyIsSharedCohort: false,
+      options: { ...parsed().options, promptCacheKey: "distinct-cache-fallback" },
+    };
+    const cache: OcxParsedRequest = {
+      ...replay,
+      _reasoningReplayScope: { clientThreadId: " \t\n " },
+      options: { ...parsed().options, promptCacheKey: "  cache-after-blank-replay  " },
+    };
+    const cleanReplay: OcxParsedRequest = {
+      ...parsed(),
+      _reasoningReplayScope: { clientThreadId: "replay-after-blank-thread" },
+    };
+    const cleanCache: OcxParsedRequest = {
+      ...parsed(),
+      _promptCacheKeyIsSharedCohort: false,
+      options: { ...parsed().options, promptCacheKey: "cache-after-blank-replay" },
+    };
+    const cases: Array<[OcxParsedRequest, OcxParsedRequest]> = [[replay, cleanReplay], [cache, cleanCache]];
+    for (const [withWhitespace, clean] of cases) {
+      const built = await builtRequest(withWhitespace);
+      const expected = await builtRequest(clean);
+      expect(built.headers["x-session-id"]).toBe(expected.headers["x-session-id"]);
+      expect(commandCodeSessionId(withWhitespace)).toBe(built.headers["x-session-id"]);
+    }
+  });
+
+  test("whitespace-only trusted identities produce fresh session headers", async () => {
+    const blank: OcxParsedRequest = {
+      ...parsed(),
+      _clientThreadId: " \t ",
+      _reasoningReplayScope: { clientThreadId: "\n " },
+      _promptCacheKeyIsSharedCohort: false,
+      options: { ...parsed().options, promptCacheKey: " \t\n " },
+    };
+    const first = (await builtRequest(blank)).headers["x-session-id"];
+    const second = (await builtRequest(blank)).headers["x-session-id"];
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    expect(first).toMatch(uuid);
+    expect(second).toMatch(uuid);
+    expect(first).not.toBe(second);
+  });
+
+  test("the same literal in thread, replay and cache namespaces yields distinct stable session headers", async () => {
+    const literal = "same-identity-in-every-kind";
+    const requests: OcxParsedRequest[] = [
+      { ...parsed(), _clientThreadId: literal },
+      { ...parsed(), _reasoningReplayScope: { clientThreadId: literal } },
+      {
+        ...parsed(),
+        _promptCacheKeyIsSharedCohort: false,
+        options: { ...parsed().options, promptCacheKey: literal },
+      },
+    ];
+    const ids: string[] = [];
+    for (const request of requests) {
+      const id = (await builtRequest(request)).headers["x-session-id"]!;
+      expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/i);
+      expect(id).not.toContain(literal);
+      expect((await builtRequest(request)).headers["x-session-id"]).toBe(id);
+      expect(commandCodeSessionId(request)).toBe(id);
+      ids.push(id);
+    }
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  test("does not derive affinity from a shared cohort or prompt text", () => {
+    const shared = {
+      ...parsed(),
+      options: { ...parsed().options, promptCacheKey: "shared-cache-key" },
+      _promptCacheKeyIsSharedCohort: true,
+    };
+    expect(commandCodeSessionId(shared)).not.toBe(commandCodeSessionId(shared));
+    const unclassifiedCache = {
+      ...parsed(),
+      options: { ...parsed().options, promptCacheKey: "possibly-shared-cache-key" },
+    };
+    expect(commandCodeSessionId(unclassifiedCache)).not.toBe(commandCodeSessionId(unclassifiedCache));
+    expect(commandCodeSessionId(parsed())).not.toBe(commandCodeSessionId(parsed()));
+  });
+  test("buildRequest sends exact local context only when projectContext is on", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ocx-command-context-wire-"));
+    const cwdSpy = spyOn(process, "cwd").mockReturnValue(root);
+    try {
+      writeFileSync(join(root, "AGENTS.md"), "wire memory", "utf8");
+      mkdirSync(join(root, ".commandcode", "taste"), { recursive: true });
+      writeFileSync(join(root, ".commandcode", "taste", "taste.md"), "wire taste", "utf8");
+      const skillDir = join(root, ".commandcode", "skills", "wire-skill");
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, "SKILL.md"), "wire skill body", "utf8");
+      projectContextCache.clear();
+
+      for (const configured of [provider, { ...provider, projectContext: "off" as const }]) {
+        const body = JSON.parse((await createCommandCodeAdapter(configured).buildRequest(parsed())).body as string);
+        expect(body.memory).toBe("");
+        expect(body.taste).toBeNull();
+        expect(body.skills).toBeNull();
+        expect(projectContextCache.has(root)).toBe(false);
+      }
+
+      const body = JSON.parse((await createCommandCodeAdapter({ ...provider, projectContext: "on" }).buildRequest(parsed())).body as string);
+      expect(body.memory).toBe("wire memory");
+      expect(body.taste).toBe("wire taste");
+      expect(body.skills).toBe('<skills>\n  <skill name="wire-skill">wire skill body</skill>\n</skills>');
+    } finally {
+      cwdSpy.mockRestore();
+      projectContextCache.clear();
+      removeTreeWithRetry(root);
+    }
+  });
+});

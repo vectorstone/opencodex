@@ -1,12 +1,17 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { decodeJwtPayload, extractAccountId } from "../../oauth/chatgpt";
 import type { OcxConfig } from "../../types";
-import { readBoundedResponseBody } from "../../lib/bounded-body";
+import { boundedBodyDecodeFailure, readBoundedResponseBody } from "../../lib/bounded-body";
+import { isTransientUpstreamStatus, retryBackoffDelayMs, sleepWithAbort } from "../../lib/upstream-retry";
 import { isApiAuthRequired, isProxyAdmissionSecret } from "../auth-cors";
-import { structurallyValidFernetTokens } from "./encrypted-payload";
+import { MAX_AGENT_TASK_CIPHERTEXT_BYTES, MAX_AGENT_TASK_ENCRYPTED_PARTS, structurallyValidFernetTokens } from "./encrypted-payload";
 import {
+  cachedAgentTaskRecovery,
+  discardCachedAgentTaskRecovery,
   resetAgentTaskRecoveryCache,
-  resolveCachedAgentTaskRecovery,
+  resolveCachedAgentTaskRecoveryWithResult,
+  type AgentTaskRecoveryResolution,
+  type AgentTaskRecoveryResolutionFailureReason,
 } from "./agent-task-recovery-cache";
 
 /** Experimental opt-in normalization through ChatGPT's fixed Codex endpoint. */
@@ -22,21 +27,38 @@ const CODEX_ORIGINATORS = new Set([
   "Codex Desktop",
   "codex_app",
   "codex_work_desktop",
+  "codexless_agent",
 ]);
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_TOKEN_ISSUERS = new Set(["https://auth.openai.com", "https://auth.openai.com/"]);
 const OPENAI_TOKEN_AUDIENCE = "https://api.openai.com/v1";
-const MAX_CIPHERTEXT_BYTES = 2 * 1024 * 1024;
 const MAX_ASSIGNMENT_BYTES = 2 * 1024 * 1024;
 const MAX_RECOVERY_RESPONSE_BYTES = 4 * 1024 * 1024;
 const CACHE_SCOPE_KEY = randomBytes(32);
+// 1 initial send + up to 2 retries matches TRANSIENT_RETRY_MAX_ATTEMPTS; retries stay inside
+// the caller's deadline, admission scope, and shared flight (#3661).
+const MAX_RECOVERY_RETRIES = 2;
+const RECOVERY_RETRY_BASE_DELAY_MS = 500;
+const RECOVERY_RETRY_MAX_DELAY_MS = 2_000;
 
 export interface AgentTaskRecoveryOptions {
   enabled?: boolean;
   model?: string;
   timeoutMs?: number;
   cacheEntries?: number;
+  retries?: number;
 }
+
+export type AgentTaskRecoveryFailureReason =
+  | "unsupported_envelope"
+  | "admission_denied"
+  // recovery_unavailable includes capacity rejection, which does not imply an upstream attempt.
+  | AgentTaskRecoveryResolutionFailureReason
+  | "input_changed";
+
+export type AgentTaskRecoveryResult =
+  | { readonly recovered: true }
+  | { readonly recovered: false; readonly reason: AgentTaskRecoveryFailureReason };
 
 export function agentTaskRecoveryConfig(config: OcxConfig): AgentTaskRecoveryOptions | null {
   const raw = config.agentTaskRecovery;
@@ -52,22 +74,28 @@ export function agentTaskRecoveryConfig(config: OcxConfig): AgentTaskRecoveryOpt
     cacheEntries: Number.isFinite(raw.cacheEntries) && (raw.cacheEntries ?? 0) >= 1
       ? Math.min(512, Math.floor(raw.cacheEntries!))
       : 200,
+    retries: Number.isFinite(raw.retries) && (raw.retries ?? 0) >= 0
+      ? Math.min(MAX_RECOVERY_RETRIES, Math.floor(raw.retries!))
+      : 0,
   };
 }
 
 interface AgentEnvelope {
   itemIndex: number;
-  encryptedIndex: number;
+  encryptedStartIndex: number;
+  inputSnapshot: string;
   headerText: string;
-  messageType: "NEW_TASK";
-  taskName: string;
+  messageType: "NEW_TASK" | "MESSAGE" | "FOLLOWUP_TASK" | "FINAL_ANSWER";
+  taskName: string | null;
   sender: string;
-  ciphertext: string;
+  ciphertexts: readonly string[];
   author: string;
   recipient: string;
 }
 
-const ROUTING_HEADER = /(?:^|\n)Message Type\s*:\s*(NEW_TASK)\s*\nTask name\s*:\s*(\S+)\s*\nSender\s*:\s*(\S+)\s*\nPayload\s*:\s*(?:\n|$)/;
+const ROUTING_HEADER = /(?:^|\n)Message Type\s*:\s*(NEW_TASK|MESSAGE|FOLLOWUP_TASK)\s*\nTask name\s*:\s*(\S+)\s*\nSender\s*:\s*(\S+)\s*\nPayload\s*:\s*(?:\n|$)/;
+// FINAL_ANSWER omits the Task name line when the sender declares no recipient.
+const FINAL_ANSWER_HEADER = /(?:^|\n)Message Type\s*:\s*FINAL_ANSWER\s*\n(?:Task name\s*:\s*(\S+)\s*\n)?Sender\s*:\s*(\S+)\s*\nPayload\s*:\s*(?:\n|$)/;
 
 function findEnvelope(input: unknown): AgentEnvelope | null {
   if (!Array.isArray(input)) return null;
@@ -88,13 +116,12 @@ function findEnvelope(input: unknown): AgentEnvelope | null {
   if (!Array.isArray(content)) return null;
 
   let headerText: string | null = null;
-  let messageType: "NEW_TASK" | null = null;
+  let messageType: "NEW_TASK" | "MESSAGE" | "FOLLOWUP_TASK" | "FINAL_ANSWER" | null = null;
   let taskName: string | null = null;
   let sender: string | null = null;
-  let encryptedIndex = -1;
-  let ciphertext = "";
-  let encryptedPartCount = 0;
-  let ciphertextCount = 0;
+  let encryptedStartIndex = -1;
+  const ciphertexts: string[] = [];
+  let ciphertextBytes = 0;
 
   for (let index = 0; index < content.length; index += 1) {
     const part = content[index] as { type?: unknown; text?: unknown; encrypted_content?: unknown } | null;
@@ -104,61 +131,79 @@ function findEnvelope(input: unknown): AgentEnvelope | null {
       && typeof part.text === "string"
     ) {
       const match = ROUTING_HEADER.exec(part.text);
-      if (match) {
+      const finalMatch = match ? null : FINAL_ANSWER_HEADER.exec(part.text);
+      if (match || finalMatch) {
         if (headerText !== null) return null;
+        const m = match ?? finalMatch!;
         if (
-          part.text.slice(0, match.index).trim().length > 0
-          || part.text.slice(match.index + match[0].length).trim().length > 0
+          part.text.slice(0, m.index).trim().length > 0
+          || part.text.slice(m.index + m[0].length).trim().length > 0
         ) return null;
-        headerText = match[0].startsWith("\n") ? match[0].slice(1) : match[0];
-        messageType = "NEW_TASK";
-        taskName = match[2]!;
-        sender = match[3]!;
+        headerText = m[0].startsWith("\n") ? m[0].slice(1) : m[0];
+        if (match) {
+          messageType = match[1] as "NEW_TASK" | "MESSAGE" | "FOLLOWUP_TASK";
+          taskName = match[2]!;
+          sender = match[3]!;
+        } else {
+          messageType = "FINAL_ANSWER";
+          taskName = finalMatch![1] ?? null;
+          sender = finalMatch![2]!;
+        }
       }
     }
-    if (part.type !== "encrypted_content" || typeof part.encrypted_content !== "string") continue;
-    encryptedPartCount += 1;
-    for (const token of structurallyValidFernetTokens(part.encrypted_content)) {
-      ciphertextCount += 1;
-      encryptedIndex = index;
-      ciphertext = token;
-    }
+    if (part.type !== "encrypted_content") continue;
+    if (typeof part.encrypted_content !== "string") return null;
+    ciphertextBytes += Buffer.byteLength(part.encrypted_content);
+    if (ciphertexts.length >= MAX_AGENT_TASK_ENCRYPTED_PARTS || ciphertextBytes > MAX_AGENT_TASK_CIPHERTEXT_BYTES) return null;
+    const tokens = structurallyValidFernetTokens(part.encrypted_content);
+    if (tokens.length !== 1 || tokens[0] !== part.encrypted_content) return null;
+    if (encryptedStartIndex < 0) encryptedStartIndex = index;
+    if (index !== encryptedStartIndex + ciphertexts.length) return null;
+    ciphertexts.push(part.encrypted_content);
   }
 
   if (
     !headerText
     || !messageType
-    || !taskName
     || !sender
-    || encryptedIndex < 0
-    || encryptedPartCount !== 1
-    || ciphertextCount !== 1
-    || (content[encryptedIndex] as { encrypted_content?: unknown }).encrypted_content !== ciphertext
-    || Buffer.byteLength(ciphertext) > MAX_CIPHERTEXT_BYTES
+    || encryptedStartIndex < 0
+    || ciphertexts.length === 0
   ) return null;
 
   const itemRecord = item as { author?: unknown; recipient?: unknown };
   if (typeof itemRecord.author !== "string" || typeof itemRecord.recipient !== "string") return null;
-  if (itemRecord.author !== sender || itemRecord.recipient !== taskName) return null;
+  // A FINAL_ANSWER without a Task name line declares no recipient, so the structured
+  // recipient is only cross-checked when a task name is present; admission is the
+  // trust boundary either way.
+  if (
+    itemRecord.author !== sender
+    || (taskName !== null && itemRecord.recipient !== taskName)
+  ) return null;
 
   return {
     itemIndex,
-    encryptedIndex,
+    encryptedStartIndex,
+    inputSnapshot: JSON.stringify(item),
     headerText,
     messageType,
     taskName,
     sender,
-    ciphertext,
+    ciphertexts,
     author: itemRecord.author,
     recipient: itemRecord.recipient,
   };
 }
 
 function stripMatchingEnvelope(assignment: string, envelope: AgentEnvelope): string | null {
-  const match = ROUTING_HEADER.exec(assignment);
+  const header = envelope.messageType === "FINAL_ANSWER" ? FINAL_ANSWER_HEADER : ROUTING_HEADER;
+  const foreign = header === FINAL_ANSWER_HEADER ? ROUTING_HEADER : FINAL_ANSWER_HEADER;
+  if (foreign.test(assignment)) return null;
+  const match = header.exec(assignment);
   if (!match) return assignment;
   if (match.index !== 0) return null;
-  if (
+  if (envelope.messageType === "FINAL_ANSWER") {
+    if ((match[1] ?? null) !== envelope.taskName || match[2] !== envelope.sender) return null;
+  } else if (
     match[1] !== envelope.messageType
     || match[2] !== envelope.taskName
     || match[3] !== envelope.sender
@@ -181,14 +226,8 @@ function injectAssignment(input: unknown, envelope: AgentEnvelope, assignment: s
   if (!item || typeof item !== "object") return false;
   const content = (item as { content?: unknown }).content;
   if (!Array.isArray(content)) return false;
-  const part = content[envelope.encryptedIndex] as { type?: unknown; encrypted_content?: unknown } | undefined;
-  if (
-    !part
-    || part.type !== "encrypted_content"
-    || part.encrypted_content !== envelope.ciphertext
-  ) return false;
-
-  content[envelope.encryptedIndex] = { type: "input_text", text: assignment };
+  if (JSON.stringify(item) !== envelope.inputSnapshot) return false;
+  content.splice(envelope.encryptedStartIndex, envelope.ciphertexts.length, { type: "input_text", text: assignment });
   const message = item as Record<string, unknown>;
   message.type = "message";
   message.role = "user";
@@ -266,6 +305,45 @@ function recoveryAdmission(req: Request, config: OcxConfig): RecoveryAdmission |
   return { headers, cacheScope };
 }
 
+interface AdmittedRecovery {
+  envelope: AgentEnvelope;
+  admission: RecoveryAdmission;
+  cacheKey: string;
+}
+
+type RecoveryAdmissionResult =
+  | { admitted: true; recovery: AdmittedRecovery }
+  | { admitted: false; reason: "unsupported_envelope" | "admission_denied" };
+
+function admittedRecovery(
+  req: Request,
+  input: unknown,
+  config: OcxConfig,
+  parentThreadId?: string | null,
+): RecoveryAdmissionResult {
+  const envelope = findEnvelope(input);
+  if (!envelope) return { admitted: false, reason: "unsupported_envelope" };
+  const admission = recoveryAdmission(req, config);
+  if (!admission) return { admitted: false, reason: "admission_denied" };
+  // A JSON-encoded fixed-order tuple, not a delimiter-joined string: a field that carries the
+  // delimiter shifts every boundary after it, so two envelopes could hash to one entry and one
+  // recovery would replay for the other. A FINAL_ANSWER that omits its Task name line carries no
+  // addressing in the header, which leaves the structured recipient as the only field separating
+  // two such envelopes and makes the boundary the whole difference.
+  const cacheKey = createHash("sha256")
+    .update(JSON.stringify([
+      admission.cacheScope,
+      parentThreadId ?? "",
+      envelope.messageType,
+      envelope.taskName ?? "",
+      envelope.recipient,
+      envelope.sender,
+      envelope.ciphertexts,
+    ]))
+    .digest("hex");
+  return { admitted: true, recovery: { envelope, admission, cacheKey } };
+}
+
 function recoveryPayload(envelope: AgentEnvelope, model: string): string {
   return JSON.stringify({
     model,
@@ -291,7 +369,7 @@ function recoveryPayload(envelope: AgentEnvelope, model: string): string {
       recipient: envelope.recipient,
       content: [
         { type: "input_text", text: envelope.headerText },
-        { type: "encrypted_content", encrypted_content: envelope.ciphertext },
+        ...envelope.ciphertexts.map(encrypted_content => ({ type: "encrypted_content", encrypted_content })),
       ],
     }],
   });
@@ -380,20 +458,24 @@ function assignmentFromRecoverySse(raw: string, envelope: AgentEnvelope): string
     : null;
 }
 
-async function requestRecovery(
+interface RecoveryAttempt {
+  resolution: AgentTaskRecoveryResolution;
+  retryable: boolean;
+  retryHeaders?: Headers;
+}
+
+async function attemptRecovery(
   admission: RecoveryAdmission,
   envelope: AgentEnvelope,
   options: AgentTaskRecoveryOptions,
-  abortSignal?: AbortSignal,
-): Promise<string | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(new DOMException("Agent task recovery timed out", "TimeoutError")),
-    options.timeoutMs ?? 45_000,
-  );
-  const signal = abortSignal
-    ? AbortSignal.any([abortSignal, controller.signal])
-    : controller.signal;
+  signal: AbortSignal,
+  abortSignal: AbortSignal | undefined,
+  deadlineSignal: AbortSignal,
+): Promise<RecoveryAttempt> {
+  const terminal = (resolution: AgentTaskRecoveryResolution): RecoveryAttempt => ({
+    resolution,
+    retryable: false,
+  });
   try {
     const response = await fetch(RECOVERY_ENDPOINT, {
       method: "POST",
@@ -403,8 +485,15 @@ async function requestRecovery(
       redirect: "error",
     });
     if (!response.ok) {
-      try { await response.body?.cancel(); } catch { /* already closed */ }
-      return null;
+      // A rejected or never-settling cancellation must not extend the recovery deadline.
+      try { void response.body?.cancel().catch(() => undefined); } catch { /* already closed */ }
+      if (abortSignal?.aborted) return terminal({ recovered: false, reason: "recovery_aborted" });
+      if (deadlineSignal.aborted) return terminal({ recovered: false, reason: "recovery_timeout" });
+      return {
+        resolution: { recovered: false, reason: "recovery_http_rejected" },
+        retryable: isTransientUpstreamStatus(response.status),
+        retryHeaders: response.headers,
+      };
     }
     const body = await readBoundedResponseBody(response, {
       signal,
@@ -414,10 +503,68 @@ async function requestRecovery(
       inactivityTimeoutMs: options.timeoutMs ?? 45_000,
       firstByteTimeoutMs: options.timeoutMs ?? 45_000,
     });
-    if (body.truncated || body.oversized || body.timedOut || !body.displaySafe) return null;
-    return assignmentFromRecoverySse(body.text, envelope);
-  } catch {
-    return null;
+    if (abortSignal?.aborted) return terminal({ recovered: false, reason: "recovery_aborted" });
+    if (deadlineSignal.aborted || body.timedOut) return terminal({ recovered: false, reason: "recovery_timeout" });
+    if (body.truncated || body.oversized || !body.displaySafe) return terminal({ recovered: false, reason: "recovery_invalid_output" });
+    const assignment = assignmentFromRecoverySse(body.text, envelope);
+    return terminal(assignment === null
+      ? { recovered: false, reason: "recovery_invalid_output" }
+      : { recovered: true, assignment });
+  } catch (error) {
+    if (abortSignal?.aborted) return terminal({ recovered: false, reason: "recovery_aborted" });
+    const decodeFailure = boundedBodyDecodeFailure(error);
+    if (deadlineSignal.aborted || decodeFailure === "timeout") return terminal({ recovered: false, reason: "recovery_timeout" });
+    return decodeFailure === "invalid_utf8"
+      ? terminal({ recovered: false, reason: "recovery_invalid_output" })
+      : { resolution: { recovered: false, reason: "recovery_transport_error" }, retryable: true };
+  }
+}
+
+async function requestRecovery(
+  admission: RecoveryAdmission,
+  envelope: AgentEnvelope,
+  options: AgentTaskRecoveryOptions,
+  abortSignal?: AbortSignal,
+): Promise<AgentTaskRecoveryResolution> {
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 45_000;
+  const deadline = Date.now() + timeoutMs;
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException("Agent task recovery timed out", "TimeoutError")),
+    timeoutMs,
+  );
+  const signal = abortSignal
+    ? AbortSignal.any([abortSignal, controller.signal])
+    : controller.signal;
+  try {
+    // The configured bound is re-clamped here: callers may pass options that never went
+    // through agentTaskRecoveryConfig, and a larger value must not widen the outage window.
+    const retries = Number.isFinite(options.retries)
+      ? Math.max(0, Math.min(MAX_RECOVERY_RETRIES, Math.floor(options.retries!)))
+      : 0;
+    for (let attempt = 0; ; attempt += 1) {
+      const { resolution, retryable, retryHeaders } = await attemptRecovery(
+        admission, envelope, options, signal, abortSignal, controller.signal,
+      );
+      if (resolution.recovered || !retryable || attempt >= retries) return resolution;
+      // Retry-After is the provider's floor, not something our backoff cap may shorten.
+      // If honouring it would outlive the shared deadline, end with this failure rather
+      // than resend early into a refusal.
+      const delayMs = retryBackoffDelayMs(attempt, {
+        baseDelayMs: RECOVERY_RETRY_BASE_DELAY_MS,
+        maxDelayMs: RECOVERY_RETRY_MAX_DELAY_MS,
+        headers: retryHeaders,
+        retryAfterIsLowerBound: true,
+      });
+      if (delayMs >= deadline - Date.now()) return resolution;
+      try {
+        await sleepWithAbort(delayMs, signal);
+      } catch {
+        return abortSignal?.aborted
+          ? { recovered: false, reason: "recovery_aborted" }
+          : { recovered: false, reason: "recovery_timeout" };
+      }
+    }
   } finally {
     clearTimeout(timeout);
   }
@@ -430,36 +577,74 @@ export async function recoverEncryptedAgentTask(
   config: OcxConfig,
   context: { parentThreadId?: string | null; abortSignal?: AbortSignal } = {},
 ): Promise<boolean> {
-  const envelope = findEnvelope(input);
-  if (!envelope) return false;
+  return (await recoverEncryptedAgentTaskWithResult(req, input, options, config, context)).recovered;
+}
+
+/** Returns only bounded, caller-local diagnostics; no native error or payload content. */
+export async function recoverEncryptedAgentTaskWithResult(
+  req: Request,
+  input: unknown,
+  options: AgentTaskRecoveryOptions,
+  config: OcxConfig,
+  context: { parentThreadId?: string | null; abortSignal?: AbortSignal } = {},
+): Promise<AgentTaskRecoveryResult> {
   // Admission is deliberately checked before cache access. A cache hit must not
   // turn this process into a plaintext oracle for an unauthenticated caller.
-  const admission = recoveryAdmission(req, config);
-  if (!admission) return false;
-
-  const cacheKey = createHash("sha256")
-    .update(admission.cacheScope)
-    .update("\0")
-    .update(context.parentThreadId ?? "")
-    .update("\0")
-    .update(envelope.messageType)
-    .update("\0")
-    .update(envelope.taskName)
-    .update("\0")
-    .update(envelope.sender)
-    .update("\0")
-    .update(envelope.ciphertext)
-    .digest("hex");
-  const assignment = await resolveCachedAgentTaskRecovery(
+  const admitted = admittedRecovery(req, input, config, context.parentThreadId);
+  if (!admitted.admitted) return { recovered: false, reason: admitted.reason };
+  const { admission, cacheKey, envelope } = admitted.recovery;
+  const result = await resolveCachedAgentTaskRecoveryWithResult(
     cacheKey,
     options.cacheEntries ?? 200,
     signal => requestRecovery(admission, envelope, options, signal),
     context.abortSignal,
   );
-  if (!assignment || context.abortSignal?.aborted) return false;
-  return injectAssignment(input, envelope, assignment);
+  if (!result.recovered) {
+    return {
+      recovered: false,
+      reason: context.abortSignal?.aborted ? "caller_cancelled" : result.reason,
+    };
+  }
+  if (context.abortSignal?.aborted) {
+    discardCachedAgentTaskRecovery(cacheKey);
+    return { recovered: false, reason: "caller_cancelled" };
+  }
+  if (!injectAssignment(input, envelope, result.assignment)) {
+    discardCachedAgentTaskRecovery(cacheKey);
+    return { recovered: false, reason: "input_changed" };
+  }
+  return { recovered: true };
+}
+
+export function discardEncryptedAgentTaskRecovery(
+  req: Request,
+  input: unknown,
+  config: OcxConfig,
+  context: { parentThreadId?: string | null } = {},
+): void {
+  const admitted = admittedRecovery(req, input, config, context.parentThreadId);
+  if (admitted.admitted) discardCachedAgentTaskRecovery(admitted.recovery.cacheKey);
 }
 
 export function resetAgentTaskRecoveryState(): void {
   resetAgentTaskRecoveryCache();
+}
+
+/** Codex replays the original encrypted agent messages after tool calls. Reuse only an admitted cache hit. */
+export function restoreCachedEncryptedAgentTasks(
+  req: Request, input: unknown, config: OcxConfig,
+  context: { parentThreadId?: string | null } = {},
+): number {
+  if (!Array.isArray(input)) return 0;
+  let restored = 0;
+  for (const item of input) {
+    if (!item || typeof item !== "object" || item.type !== "agent_message") continue;
+    const single = [item];
+    // Revalidates caller credentials and the exact supported agent envelope before cache access.
+    const admitted = admittedRecovery(req, single, config, context.parentThreadId);
+    if (!admitted.admitted) continue;
+    const assignment = cachedAgentTaskRecovery(admitted.recovery.cacheKey);
+    if (assignment && injectAssignment(single, admitted.recovery.envelope, assignment)) restored += 1;
+  }
+  return restored;
 }

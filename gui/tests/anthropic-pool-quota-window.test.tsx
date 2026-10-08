@@ -1,0 +1,326 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Window } from "happy-dom";
+import { act } from "react";
+import type { Root } from "react-dom/client";
+import AnthropicAccountPoolSettings from "../src/components/provider-workspace/AnthropicAccountPoolSettings";
+import { LanguageProvider } from "../src/i18n/provider";
+
+let previousLanguage: unknown;
+
+const domGlobals = ["document", "window", "navigator", "fetch", "IS_REACT_ACT_ENVIRONMENT"] as const;
+let previousDomGlobals: Record<(typeof domGlobals)[number], unknown>;
+let testWindow: Window;
+let mountedRoots: Root[];
+
+async function flush(): Promise<void> {
+  await Promise.resolve();
+  await new Promise<void>((resolve) => testWindow.setTimeout(resolve, 0));
+  await Promise.resolve();
+}
+
+function setupDom(): void {
+  previousDomGlobals = Object.fromEntries(
+    domGlobals.map((key) => [key, Reflect.get(globalThis, key)]),
+  ) as typeof previousDomGlobals;
+  testWindow = new Window({ url: "http://localhost/" });
+  Object.defineProperty(testWindow.navigator, "language", { configurable: true, value: "en-US" });
+  Object.defineProperties(globalThis, {
+    document: { configurable: true, value: testWindow.document },
+    window: { configurable: true, value: testWindow },
+    navigator: { configurable: true, value: testWindow.navigator },
+  });
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  mountedRoots = [];
+}
+
+async function teardownDom(): Promise<void> {
+  for (const root of mountedRoots) {
+    await act(async () => {
+      root.unmount();
+    });
+  }
+  mountedRoots = [];
+  for (const key of domGlobals) {
+    Object.defineProperty(globalThis, key, { configurable: true, value: previousDomGlobals[key] });
+  }
+  await testWindow.happyDOM?.close?.();
+}
+
+type PoolPayload = {
+  enabled: boolean;
+  autoSwitchThreshold: number;
+  strategy: string;
+  stickyLimit: number;
+  quotaWindow: string;
+  nativeMessages?: boolean;
+};
+
+/**
+ * Stubs both pool endpoints and returns the recorded PUT bodies. The GET carries a
+ * `?provider=anthropic` query, so the URL match is a substring rather than a suffix.
+ */
+function stubPool(initial: PoolPayload): Record<string, unknown>[] {
+  const puts: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("/api/pool/settings") && init?.method === "PUT") {
+      const body = init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      puts.push(body);
+      return new Response(JSON.stringify({
+        strategy: body.strategy,
+        stickyLimit: body.stickyLimit,
+        quotaWindow: body.quotaWindow,
+      }), { status: 200 });
+    }
+    if (url.includes("/api/pool/settings")) {
+      return new Response(JSON.stringify(initial), { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${url} ${init?.method ?? "GET"}`);
+  }) as typeof fetch;
+  return puts;
+}
+
+async function mountPool(onThresholdChange?: (threshold: number) => void): Promise<HTMLElement> {
+  const host = testWindow.document.createElement("div");
+  testWindow.document.body.appendChild(host as never);
+  const { createRoot } = await import("react-dom/client");
+  await act(async () => {
+    const root = createRoot(host);
+    mountedRoots.push(root);
+    root.render(
+      <LanguageProvider>
+        <AnthropicAccountPoolSettings apiBase="http://proxy" accountCount={2} onThresholdChange={onThresholdChange} />
+      </LanguageProvider>,
+    );
+  });
+  await act(async () => { await flush(); });
+  return host as unknown as HTMLElement;
+}
+
+function windowTrigger(host: ParentNode): HTMLButtonElement {
+  const el = host.querySelector<HTMLButtonElement>("#anthropic-pool-quota-window");
+  if (!el) throw new Error("quota window select missing");
+  return el;
+}
+
+beforeEach(() => {
+  previousLanguage = (globalThis.navigator as { language?: unknown } | undefined)?.language;
+  Object.defineProperty(globalThis.navigator, "language", {
+    configurable: true,
+    value: "en-US",
+  });
+  setupDom();
+});
+
+afterEach(async () => {
+  await teardownDom();
+  Object.defineProperty(globalThis.navigator, "language", {
+    configurable: true,
+    value: previousLanguage,
+  });
+});
+
+describe("Anthropic account pool quota window", () => {
+  test("only confirmed pool defaults seed account override controls", async () => {
+    let fail = false;
+    globalThis.fetch = (async (_input, init) => init?.method === "PUT"
+      ? fail ? new Response(null, { status: 500 }) : Response.json({ enabled: false, autoSwitchThreshold: 73 })
+      : Response.json({ enabled: true, autoSwitchThreshold: 64, strategy: "quota", stickyLimit: 1, quotaWindow: "five-hour" })) as typeof fetch;
+    const values: number[] = [];
+    const host = await mountPool(value => { values.push(value); });
+    expect(values).toEqual([64]);
+    const toggle = host.querySelector('button[aria-pressed]') as HTMLButtonElement;
+    await act(async () => { toggle.click(); await flush(); });
+    expect(values).toEqual([64, 73]);
+    fail = true;
+    await act(async () => { toggle.click(); await flush(); });
+    expect(values).toEqual([64, 73]);
+  });
+
+  test("an unmounted settings card aborts its save without publishing the old server value", async () => {
+    let aborted = false;
+    globalThis.fetch = (async (_input, init) => {
+      if (init?.method !== "PUT") return Response.json({ enabled: true, autoSwitchThreshold: 64, strategy: "quota", stickyLimit: 1, quotaWindow: "five-hour" });
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("aborted"));
+        }, { once: true });
+      });
+    }) as typeof fetch;
+    const values: number[] = [];
+    const host = await mountPool(value => { values.push(value); });
+    const toggle = host.querySelector('button[aria-pressed]') as HTMLButtonElement;
+    await act(async () => { toggle.click(); await Promise.resolve(); });
+    const root = mountedRoots.pop();
+    await act(async () => { root?.unmount(); await Promise.resolve(); });
+    expect(aborted).toBe(true);
+    expect(values).toEqual([64]);
+  });
+
+  test("quota window selector renders for quota and fill-first strategies", async () => {
+    stubPool({
+      enabled: true,
+      autoSwitchThreshold: 80,
+      strategy: "quota",
+      stickyLimit: 1,
+      quotaWindow: "weekly",
+    });
+    const quotaHost = await mountPool();
+
+    expect(windowTrigger(quotaHost).disabled).toBe(false);
+
+    stubPool({
+      enabled: true,
+      autoSwitchThreshold: 80,
+      strategy: "fill-first",
+      stickyLimit: 1,
+      quotaWindow: "five-hour",
+    });
+    const fillHost = await mountPool();
+
+    expect(windowTrigger(fillHost).disabled).toBe(false);
+  });
+
+  test("quota window selector is disabled only for round-robin", async () => {
+    stubPool({
+      enabled: true,
+      autoSwitchThreshold: 80,
+      strategy: "round-robin",
+      stickyLimit: 1,
+      quotaWindow: "weekly",
+    });
+    const rrHost = await mountPool();
+
+    expect(windowTrigger(rrHost).disabled).toBe(true);
+
+    stubPool({
+      enabled: true,
+      autoSwitchThreshold: 0,
+      strategy: "fill-first",
+      stickyLimit: 1,
+      quotaWindow: "weekly",
+    });
+    const drainedHost = await mountPool();
+
+    // A 0 threshold disables PROACTIVE usage-based switching only. New-session selection and
+    // 429 recovery still consult the configured window, so disabling the selector here told
+    // the operator the setting was inert while it still governed two routing stages.
+    expect(windowTrigger(drainedHost).disabled).toBe(false);
+  });
+
+  test("threshold zero says healthy sessions stay put, not that quota routing stops", async () => {
+    stubPool({
+      enabled: true,
+      autoSwitchThreshold: 0,
+      strategy: "quota",
+      stickyLimit: 1,
+      quotaWindow: "weekly",
+    });
+    const host = await mountPool();
+
+    expect(host.textContent).toContain("Usage thresholds do not move an existing healthy session or a healthy active account");
+    // The stages that still run must be named, along with the window that still governs them.
+    expect(host.textContent).toContain("during refusal recovery, the account with the lowest usage (Weekly bar) is chosen");
+    // "429 recovery" is deliberately NOT named as a benefit of the enabled state any more:
+    // reactive failover stopped being something this toggle controls, so advertising it here
+    // would send an operator to the EXPERIMENTAL pool for something they already have
+    // unconditionally. Scoped to the description string -- the quota-window help text below
+    // legitimately mentions 429 when explaining which bar picks a replacement account.
+    expect(host.textContent).not.toContain("429 recovery");
+    expect(host.textContent).not.toContain("prefer usage under 0%");
+  });
+
+  test("quota window help text does not open the selector", async () => {
+    stubPool({
+      enabled: true,
+      autoSwitchThreshold: 80,
+      strategy: "quota",
+      stickyLimit: 1,
+      quotaWindow: "five-hour",
+    });
+    const host = await mountPool();
+    const field = windowTrigger(host).closest(".anthropic-pool-card__field");
+    const help = field?.querySelector<HTMLElement>(".card-sub");
+    if (!help) throw new Error("quota window help missing");
+
+    await act(async () => {
+      help.click();
+      await flush();
+    });
+
+    expect(testWindow.document.querySelector('[role="listbox"]')).toBeNull();
+  });
+
+  test("save sends quotaWindow in the PUT body", async () => {
+    const puts = stubPool({
+      enabled: true,
+      autoSwitchThreshold: 80,
+      strategy: "quota",
+      stickyLimit: 1,
+      quotaWindow: "five-hour",
+    });
+    const host = await mountPool();
+
+    await act(async () => {
+      windowTrigger(host).click();
+      await flush();
+    });
+    const option = testWindow.document.querySelector(
+      '[role="option"]:not([aria-selected="true"])',
+    ) as unknown as HTMLButtonElement | null;
+    if (!option) throw new Error("weekly option missing");
+    await act(async () => {
+      option.click();
+      await flush();
+    });
+
+    expect(puts).toHaveLength(1);
+    expect(puts[0]).toEqual({
+      provider: "anthropic",
+      enabled: true,
+      autoSwitchThreshold: 80,
+      strategy: "quota",
+      stickyLimit: 1,
+      quotaWindow: "weekly",
+      nativeMessages: true,
+    });
+  });
+
+  test("all pool controls retain a saved native opt-out", async () => {
+    const puts = stubPool({ enabled: true, autoSwitchThreshold: 80, strategy: "quota", stickyLimit: 1, quotaWindow: "five-hour", nativeMessages: false });
+    const host = await mountPool();
+    const choose = async (id: string, value: string) => {
+      await act(async () => { host.querySelector<HTMLButtonElement>(id)!.click(); await flush(); });
+      const option = Array.from(testWindow.document.querySelectorAll<HTMLButtonElement>('[role="option"]')).find(option => option.textContent === value)!;
+      expect(option).toBeDefined();
+      await act(async () => { option.click(); await flush(); });
+    };
+    // Drive the threshold's native input and blur handlers, then every other save path.
+    const threshold = host.querySelector<HTMLInputElement>('input[type="number"]')!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(testWindow.HTMLInputElement.prototype, "value")!.set!;
+      setter.call(threshold, "73");
+      threshold.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
+      threshold.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
+      await flush();
+    });
+    await act(async () => { threshold.dispatchEvent(new testWindow.FocusEvent("focusout", { bubbles: true }) as unknown as Event); await flush(); });
+    expect(puts.at(-1)).toMatchObject({ autoSwitchThreshold: 73, nativeMessages: false });
+    await choose("#anthropic-pool-quota-window", "Weekly bar");
+    await choose("#anthropic-pool-strategy", "Round-robin");
+    const increment = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(button => button.getAttribute("aria-label") === "Increase sticky limit")!;
+    expect(increment).toBeDefined();
+    await act(async () => { increment.click(); await flush(); });
+    const toggle = host.querySelector<HTMLButtonElement>('button[aria-pressed]')!;
+    await act(async () => { toggle.click(); await flush(); });
+    expect(puts).toHaveLength(5);
+    expect(puts.map(body => body.nativeMessages)).toEqual([false, false, false, false, false]);
+    expect(puts[0]).toMatchObject({ autoSwitchThreshold: 73 });
+    expect(puts[1]).toMatchObject({ quotaWindow: "weekly" });
+    expect(puts[2]).toMatchObject({ strategy: "round-robin" });
+    expect(puts[3]).toMatchObject({ stickyLimit: 2 });
+    expect(puts[4]).toMatchObject({ enabled: false });
+    expect(host.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked).toBe(false);
+  });
+});

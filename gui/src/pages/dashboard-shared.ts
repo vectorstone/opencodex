@@ -8,6 +8,7 @@ import {
 import { readJsonOrThrow } from "../fetch-json";
 import type { TKey } from "../i18n/shared";
 import type { StartupHealthStatus } from "../startup-health-ui";
+import { shadowSourceModelList } from "./shadow-call-source";
 
 export type DashboardSection = "overview" | "providers" | "models";
 
@@ -47,6 +48,11 @@ export interface ProviderInfo { name: string; adapter: string; baseUrl: string; 
 export interface ModelInfo { id: string; provider: string; namespaced: string; owned_by?: string; reasoningEfforts?: string[] }
 export interface SettingsData {
   codexAutoStart: boolean;
+  codexDesktopAuthless?: boolean;
+  codexClientCompaction?: boolean;
+  catalogRefreshPending?: boolean;
+  /** Whether a login may open a browser on the machine running the proxy. */
+  oauthOpenBrowser?: boolean;
   port: number;
   hostname: string;
   /** IANA zone of the machine running the proxy, used to render log timestamps (#725). */
@@ -60,9 +66,18 @@ export interface SettingsData {
   };
 }
 export type SidecarBackend = "openai" | "anthropic";
+/**
+ * Vision's union is wider than web-search's legacy pair but different from its
+ * executor set (web has xai/gemini/exa; vision's third arm is "routed" — the
+ * proxy's own router describing through any provider). Server provenance is
+ * authoritative; this type exists so a routed option row round-trips without
+ * being collapsed to a legacy backend.
+ */
+export type VisionBackend = SidecarBackend | "routed";
 export type VisionReasoning = "low" | "medium" | "high" | "xhigh" | "max";
 export interface SidecarSetting {
-  backend?: SidecarBackend;
+  // Shared by the web-search and vision cards; vision may carry "routed".
+  backend?: VisionBackend;
   model: string;
   reasoning?: VisionReasoning;
   streamRoutedModelOutput?: boolean;
@@ -70,19 +85,47 @@ export interface SidecarSetting {
   maxDescriptionsPerTurn?: number;
   timeoutMs?: number;
 }
-export interface VisionModelOption { value: string; label: string; backend: SidecarBackend; baseline?: boolean }
+export interface VisionModelOption { value: string; label: string; backend: VisionBackend; baseline?: boolean }
+export interface WebSearchModelOption {
+  value: string;
+  label: string;
+  backend: SidecarBackend;
+  model: string;
+  authSlot?: boolean;
+}
+export interface WebSearchPickerOption {
+  value: string;
+  label: string;
+  backend?: SidecarBackend;
+  model?: string;
+}
 export interface SidecarData {
   webSearch: SidecarSetting;
   vision: SidecarSetting;
+  /** The Codex-side write a sidecar PUT attempted, when the switch actually moved.
+   *  Absent on an older server; the client then shows nothing rather than guessing. */
+  codexWebSearch?: SidecarCodexApply;
   /** Server-computed eligible describers. Optional: an older server omits it and
    *  the client falls back to the legacy provider-name list rather than showing
    *  an empty picker. */
   visionModels?: VisionModelOption[];
+  /** Server-computed runnable web-search models (#2188). Same undefined-vs-[]
+   *  contract as visionModels: an older server omits the key and the client
+   *  falls back to the legacy list; a current server's [] means none. */
+  webSearchModels?: WebSearchModelOption[];
+}
+
+/** The Codex-config apply report a management write returns (same shape as the Desktop switches'). */
+export interface SidecarCodexApply {
+  applied?: boolean;
+  reason?: string;
+  retryable?: boolean;
+  detail?: string;
 }
 export interface SidecarPatch {
-  webSearch?: { backend?: SidecarBackend | null; model?: string; streamRoutedModelOutput?: boolean };
+  webSearch?: { backend?: SidecarBackend | null; model?: string; streamRoutedModelOutput?: boolean; enabled?: boolean };
   vision?: {
-    backend?: SidecarBackend | null;
+    backend?: VisionBackend | null;
     model?: string;
     reasoning?: VisionReasoning;
     enabled?: boolean;
@@ -91,12 +134,13 @@ export interface SidecarPatch {
   };
 }
 export interface ShadowCallData { enabled: boolean; model: string; sourceModels?: string[] }
-export interface UsageSummary30d { summary: { requests: number; totalTokens: number; coverageRatio: number } }
+export type UsageSummary30d = import("../usage-summary-resource").UsageReadMetadata & { summary: { requests: number; totalTokens: number; coverageRatio: number } };
 export type UpdateChannel = "latest" | "preview";
-export type Installer = "npm" | "bun" | "source";
+export type Installer = "bun" | "mise" | "npm" | "pnpm" | "source";
 export type UpdateJobStatus = "running" | "restarting" | "succeeded" | "failed";
 export interface SyncResult {
   ok: boolean;
+  status?: "applied" | "skipped" | "catalog-only" | "refused";
   added: number;
   catalogPath: string | null;
   catalogExists: boolean;
@@ -156,6 +200,8 @@ export function updateReasonLabel(reason: string | undefined, t: (key: TKey) => 
     case "source_checkout": return t("dash.updateReason.source_checkout");
     case "latest_unavailable": return t("dash.updateReason.latest_unavailable");
     case "already_latest": return t("dash.updateReason.already_latest");
+    case "externally_managed": return t("dash.updateReason.externally_managed");
+    case "external_ownership_invalid": return t("dash.updateReason.external_ownership_invalid");
     default: return t("dash.updateReason.unknown");
   }
 }
@@ -172,7 +218,7 @@ export function updateJobLabel(status: UpdateJobStatus, t: (key: TKey) => string
 export function mergeSidecarSetting(
   current: SidecarSetting,
   update?: {
-    backend?: SidecarBackend | null;
+    backend?: VisionBackend | null;
     model?: string;
     reasoning?: VisionReasoning;
     streamRoutedModelOutput?: boolean;
@@ -202,6 +248,41 @@ export function visionEnabledPatch(enabled: boolean): SidecarPatch {
   return { vision: { enabled } };
 }
 
+/**
+ * The web-search master switch, as the Dashboard's Off row sends it. Off is the operator saying
+ * "no native web search at all": OpenCodex stops intercepting it AND writes Codex's own
+ * `web_search` mode off, which is what lets an MCP search server be the only search path.
+ */
+export function webSearchEnabledPatch(enabled: boolean): SidecarPatch {
+  return { webSearch: { enabled } };
+}
+
+/**
+ * True when the last sidecar save asked for a Codex-config write and the write did not happen.
+ *
+ * The sidecar's own switch is stored either way — this is the client-side half that keeps an
+ * operator from reading a stored "Off" as a native `web_search` tool that is already gone. The
+ * ordinary "nothing moved" answer (`not_requested`) stays silent: it is not a failure.
+ */
+export function sidecarCodexWritePending(report: SidecarCodexApply | undefined): boolean {
+  return report?.applied === false && report.reason !== "not_requested";
+}
+
+/**
+ * Which Codex-config report the Dashboard keeps after a save.
+ *
+ * A save that did not move the web-search switch (`not_requested`) says nothing about the Codex
+ * file — a Vision save answers that way while the failed web-search write is still outstanding. So
+ * a pending report outlives it instead of being cleared by an answer that never described the
+ * file. An applied write and the model sync both replace it with a settled report.
+ */
+export function nextSidecarCodexApply(
+  previous: SidecarCodexApply | undefined,
+  report: SidecarCodexApply | undefined,
+): SidecarCodexApply | undefined {
+  return report?.reason === "not_requested" && sidecarCodexWritePending(previous) ? previous : report;
+}
+
 export function visionMaxDescriptionsPatch(maxDescriptionsPerTurn: number): SidecarPatch {
   return { vision: { maxDescriptionsPerTurn } };
 }
@@ -212,7 +293,7 @@ export function visionTimeoutPatch(timeoutMs: number): SidecarPatch {
 
 /**
  * Dashboard names for the runtime timeout contract in `src/vision/timeout-bounds.ts`.
- * Pinned by `tests/vision-sidecar-timeout-bounds.test.ts`.
+ * Pinned by `tests/gui/vision-sidecar-timeout-bounds.test.ts`.
  */
 export const VISION_TIMEOUT_MS_DEFAULT = DEFAULT_VISION_TIMEOUT_MS;
 export const VISION_TIMEOUT_MS_MAX = MAX_VISION_TIMEOUT_MS;
@@ -281,6 +362,47 @@ export function sidecarModelOptions(models: ModelInfo[]) {
 }
 
 /**
+ * Server list when present, else the legacy openai+anthropic list — the same
+ * undefined-vs-[] contract visionModelOptions documents. The persisted model is
+ * grandfathered into the list so the picker can DISPLAY a now-illegal setting;
+ * the server still rejects new writes of it.
+ */
+export function webSearchModelOptionsForPicker(
+  serverOptions: WebSearchModelOption[] | undefined,
+  models: ModelInfo[],
+  current: string | undefined,
+  currentBackend?: SidecarBackend,
+): WebSearchPickerOption[] {
+  if (serverOptions === undefined) {
+    const legacy: WebSearchPickerOption[] = sidecarModelOptions(models);
+    if (current && !legacy.some(option => option.value === current)) {
+      legacy.unshift({
+        value: current,
+        label: current,
+        ...(currentBackend ? { backend: currentBackend } : {}),
+        model: current,
+      });
+    }
+    return legacy;
+  }
+  const out: WebSearchPickerOption[] = serverOptions.map(option => ({
+    value: option.value,
+    label: option.label,
+    backend: option.backend,
+    model: option.model,
+  }));
+  if (current && !out.some(option => option.value === current)) {
+    out.unshift({
+      value: current,
+      label: current,
+      ...(currentBackend ? { backend: currentBackend } : {}),
+      model: current,
+    });
+  }
+  return out;
+}
+
+/**
  * Server list when present, else the legacy openai+anthropic list.
  *
  * `undefined` and `[]` mean different things and must not be collapsed. A server that
@@ -299,8 +421,8 @@ export function visionModelOptions(
   serverOptions: VisionModelOption[] | undefined,
   models: ModelInfo[],
   current: string | undefined,
-  currentBackend?: SidecarBackend,
-): Array<{ value: string; label: string; backend?: SidecarBackend }> {
+  currentBackend?: VisionBackend,
+): Array<{ value: string; label: string; backend?: VisionBackend }> {
   const options = serverOptions
     ? serverOptions.map(option => ({ value: option.value, label: option.label, backend: option.backend }))
     : sidecarModelOptions(models);
@@ -311,9 +433,28 @@ export function visionModelOptions(
 }
 
 /** Options for shadow-call replacement models use the proxy's canonical routing id. */
-export function shadowCallModelOptions(models: ModelInfo[], current: string | undefined) {
-  const out = [{ value: "", label: "—" }, ...models.map(model => ({ value: model.namespaced, label: model.namespaced }))];
-  if (current && !out.some(option => option.value === current)) out.push({ value: current, label: current });
+export function shadowCallModelOptions(models: ModelInfo[], current: string | undefined, sourceModels?: string[]) {
+  const sourcePrefixes = shadowSourceModelList(sourceModels);
+  const sourceIdentities = sourcePrefixes.flatMap(prefix => {
+    const source = models.find(model => model.namespaced.startsWith(prefix))
+      ?? models.find(model => model.id.startsWith(prefix));
+    return source ? [{ provider: source.provider, modelId: prefix }] : [];
+  });
+  const intersecting = models.filter(model => sourceIdentities.some(source =>
+    model.provider === source.provider && model.id.startsWith(source.modelId)));
+  const invalidSelectors = new Set([
+    ...sourcePrefixes.flatMap(prefix => [prefix, `openai/${prefix}`]),
+    ...intersecting.flatMap(model => [model.namespaced, `${model.provider}/${model.id}`]),
+  ]);
+  const out = [
+    { value: "", label: "—" },
+    ...models
+      .filter(model => !invalidSelectors.has(model.namespaced))
+      .map(model => ({ value: model.namespaced, label: model.namespaced })),
+  ];
+  if (current && !invalidSelectors.has(current) && !out.some(option => option.value === current)) {
+    out.push({ value: current, label: current });
+  }
   return out;
 }
 
@@ -321,13 +462,35 @@ export function sidecarBackendForModel(models: ModelInfo[], modelId: string): Si
   return models.find(model => model.id === modelId)?.provider === "anthropic" ? "anthropic" : "openai";
 }
 
-/** Server eligibility is authoritative; catalog inference only supports legacy picker entries. */
+/** Server provenance wins; catalog inference supports only legacy option rows. */
+export function webSearchSidecarSelectionForModel(
+  models: ModelInfo[],
+  options: WebSearchPickerOption[],
+  modelId: string,
+): { backend: SidecarBackend; model: string } {
+  const option = options.find(entry => entry.value === modelId);
+  return {
+    backend: option?.backend ?? sidecarBackendForModel(models, modelId),
+    model: option?.model ?? modelId,
+  };
+}
+
+/**
+ * Server eligibility is authoritative; catalog inference only supports legacy
+ * picker entries. A namespaced value ("provider/model") is the routed-backend
+ * option shape and must never collapse to a legacy backend — the openai
+ * executor would POST the namespaced string verbatim (the failure the file
+ * comment above warns about, in the other direction).
+ */
 export function visionSidecarBackendForModel(
   models: ModelInfo[],
-  options: Array<{ value: string; backend?: SidecarBackend }>,
+  options: Array<{ value: string; backend?: VisionBackend }>,
   modelId: string,
-): SidecarBackend {
-  return options.find(option => option.value === modelId)?.backend ?? sidecarBackendForModel(models, modelId);
+): VisionBackend {
+  const fromServer = options.find(option => option.value === modelId)?.backend;
+  if (fromServer) return fromServer;
+  if (modelId.includes("/")) return "routed";
+  return sidecarBackendForModel(models, modelId);
 }
 
 let lastInputWasKeyboard = false;

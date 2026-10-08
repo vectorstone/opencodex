@@ -1,0 +1,755 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  setUninstallServiceHooksForTests,
+  uninstallServiceIfInstalled,
+} from "../../src/service";
+import { pathToFileURL } from "node:url";
+import { repoRoot } from "../helpers/repo-root";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { removeOwnedConfigAfterDesktopCleanup, type UninstallClientStateDeps } from "../../src/cli/uninstall-client-state";
+import { cleanupOwnedIntegrationsBeforeUninstall } from "../../src/cli/uninstall-integrations";
+import { assertClientLifecycleHeld, withClientLifecycle, withClientLifecycleSync, type ClientLifecycleHeld } from "../../src/client/lifecycle-lock";
+import type { UninstallObservation } from "../../src/cli/uninstall-plan";
+import type { DesktopDisconnectReceipt } from "../../src/claude/desktop-remote-store";
+import type { ExportModel } from "../../src/clients/config-export";
+import { INTEGRATION_CLIENTS } from "../../src/integrations/registry";
+import { createIntegrationStateStore } from "../../src/integrations/store";
+import { applyIntegration, disableIntegrationCoordinated } from "../../src/integrations/writer";
+import type { OcxConfig } from "../../src/types";
+
+const root = pathToFileURL(repoRoot() + "/");
+
+async function readText(path: string): Promise<string> {
+  return await Bun.file(new URL(path, root)).text();
+}
+
+describe("full uninstall command", () => {
+  afterEach(() => setUninstallServiceHooksForTests(null));
+
+  test("CLI exposes a one-shot local state cleanup command", async () => {
+    const dispatch = await readText("src/cli/dispatch.ts");
+
+    expect(dispatch).toContain("uninstall: async");
+    const cli = await readText("src/cli/index.ts");
+    expect(cli).toContain("async function handleUninstall()");
+    expect(cli).toContain("uninstallServiceIfInstalled");
+    expect(cli).toContain("uninstallCodexShim");
+    expect(cli).toContain("restoreNativeCodex");
+    expect(cli).toContain("await removeOwnedConfigAfterDesktopCleanup(observed)");
+    expect(cli).not.toContain("removeOwnedConfigState(getConfigDir())");
+    expect(cli).not.toContain("rmSync(getConfigDir()");
+  });
+
+  test("CLI exposes explicit legacy history recovery command", async () => {
+    const dispatch = await readText("src/cli/dispatch.ts");
+    const cli = await readText("src/cli/index.ts");
+
+    expect(dispatch).toContain('"recover-history": async');
+    expect(cli).toContain("ocx recover-history --legacy-openai");
+    expect(cli).toContain("async function handleRecoverHistory()");
+    // The command still performs legacy recovery, but through the serialized
+    // history job rather than by calling the writer inline — the operation name
+    // is what keeps it distinct from a generic restore, which must not touch the
+    // backup manifest this one deliberately leaves alone.
+    expect(cli).toContain("recover-legacy-openai");
+    expect(cli).toContain("runCodexHistoryJob");
+  });
+
+  test("service cleanup has a quiet best-effort helper", async () => {
+    const service = await readText("src/service/orchestration.ts");
+
+    expect(service).toContain("export function uninstallServiceIfInstalled()");
+    expect(service).toContain("uninstallLaunchd");
+    expect(service).toContain("uninstallWindows");
+    expect(service).toContain("uninstallSystemd");
+  });
+
+  test("native service removal failure propagates without deleting install state", () => {
+    const calls: string[] = [];
+    let stateRemovals = 0;
+    setUninstallServiceHooksForTests({
+      platform: "win32",
+      assertEnvironment: () => {},
+      probeWindowsTask: () => ({ status: "present" }),
+      uninstallWindowsTask: () => { calls.push("scheduler"); },
+      nativeStatus: () => "started",
+      uninstallNative: () => {
+        calls.push("native");
+        throw new Error("native removal failed");
+      },
+      removeInstallState: () => { stateRemovals++; },
+    });
+
+    expect(() => uninstallServiceIfInstalled()).toThrow("native removal failed");
+    expect(calls).toEqual(["scheduler", "native"]);
+    expect(stateRemovals).toBe(0);
+  });
+
+  test("scheduler removal failure propagates without deleting install state", () => {
+    let stateRemovals = 0;
+    setUninstallServiceHooksForTests({
+      platform: "win32",
+      assertEnvironment: () => {},
+      probeWindowsTask: () => ({ status: "present" }),
+      uninstallWindowsTask: () => { throw new Error("scheduler removal failed"); },
+      nativeStatus: () => "nonexistent",
+      uninstallNative: () => {},
+      removeInstallState: () => { stateRemovals++; },
+    });
+
+    expect(() => uninstallServiceIfInstalled()).toThrow("scheduler removal failed");
+    expect(stateRemovals).toBe(0);
+  });
+
+  test("full uninstall kills the tracked proxy before deleting service assets", async () => {
+    const cli = await readText("src/cli/index.ts");
+    const uninstallBody = cli.slice(cli.indexOf("async function handleUninstall()"), cli.indexOf("type HealthCheck"));
+
+    expect(uninstallBody).toContain('runStep("service stopped"');
+    expect(uninstallBody).toContain('runStep("proxy stopped"');
+    expect(uninstallBody).toContain('runStep("service removed"');
+    expect(uninstallBody).toContain("await stopProxy(pid);");
+    expect(uninstallBody).toContain("uninstallServiceDetailed()");
+    expect(uninstallBody.indexOf('runStep("service stopped"')).toBeLessThan(uninstallBody.indexOf('runStep("proxy stopped"'));
+    expect(uninstallBody.indexOf('runStep("proxy stopped"')).toBeLessThan(uninstallBody.indexOf('runStep("service removed"'));
+    expect(uninstallBody.indexOf("await stopProxy(pid);")).toBeLessThan(uninstallBody.indexOf("uninstallServiceDetailed()"));
+  });
+
+  test("restore forwards the explicit provider-table removal flag and warns before mutation", async () => {
+    const dispatch = await readText("src/cli/dispatch.ts");
+    const restoreStart = dispatch.indexOf("restore: async deps => {");
+    const restoreBody = dispatch.slice(restoreStart, dispatch.indexOf('"recover-history": async', restoreStart));
+
+    expect(restoreBody).toContain('takeFlag(restoreArgs, "--remove-codex-provider-table")');
+    expect(restoreBody).toContain("conversations already tagged opencodex will stop opening");
+    expect(restoreBody).toContain("restoreNativeCodexAsync({ revalidateDesiredState: true, removeProviderTable })");
+  });
+});
+describe("uninstall gates shared teardown on a proven service stop", () => {
+  test("the authorization rule, exercised for every failure permutation", async () => {
+    const { sharedTeardownAuthorized } = await import("../../src/cli/uninstall-plan");
+    const base = {
+      serviceStop: "stopped" as const,
+      proxyProvenDown: true,
+      serviceRemoval: "removed" as const,
+      respawnWindowVerified: false,
+    };
+    expect(sharedTeardownAuthorized(base)).toBe(true);
+    expect(sharedTeardownAuthorized({ ...base, serviceStop: "absent" })).toBe(true);
+    expect(sharedTeardownAuthorized({ ...base, serviceRemoval: "absent" })).toBe(true);
+    // Removing the registration does not prove an already-running wrapper died; killing it
+    // is best-effort (#764), so the restart window has to be polled first.
+    expect(sharedTeardownAuthorized({ ...base, serviceStop: "stopped-respawnable" })).toBe(false);
+    expect(sharedTeardownAuthorized({ ...base, serviceStop: "stopped-respawnable", respawnWindowVerified: true })).toBe(true);
+    // A manager that refused to stop, or one we could not read, may still be running.
+    expect(sharedTeardownAuthorized({ ...base, serviceStop: "failed" })).toBe(false);
+    expect(sharedTeardownAuthorized({ ...base, serviceStop: "state-unknown" })).toBe(false);
+    // The step itself threw: we know nothing.
+    expect(sharedTeardownAuthorized({ ...base, serviceStop: null })).toBe(false);
+    // A proxy that could not be PROVEN down — a live orphan with no pid, or an endpoint
+    // that would not answer — blocks it. A findLiveProxy miss is not proof.
+    expect(sharedTeardownAuthorized({ ...base, proxyProvenDown: false })).toBe(false);
+    // A removal that failed used to look like absence on darwin and linux.
+    expect(sharedTeardownAuthorized({ ...base, serviceRemoval: "failed" })).toBe(false);
+    expect(sharedTeardownAuthorized({ ...base, serviceRemoval: null })).toBe(false);
+  });
+
+  test("a removal failure is distinguishable from nothing being installed", async () => {
+    const { setUninstallServiceHooksForTests, uninstallServiceDetailed } = await import("../../src/service");
+    // Windows is the platform whose hooks are injectable; the darwin/linux catch arms that
+    // returned the same false as absence are now typed outcomes rather than a boolean.
+    setUninstallServiceHooksForTests({
+      platform: "win32",
+      assertEnvironment: () => {},
+      probeWindowsTask: () => ({ status: "absent" }) as never,
+      uninstallWindowsTask: () => {},
+      nativeStatus: () => "nonexistent",
+      uninstallNative: () => {},
+      removeInstallState: () => {},
+    } as never);
+    expect(uninstallServiceDetailed()).toBe("absent");
+
+    const serviceSource = await readText("src/service/orchestration.ts");
+    // The darwin and linux arms return "failed", not the absence value.
+    expect(serviceSource).toContain('try { uninstallLaunchd(); removeServiceInstallState(); return "removed"; } catch { return "failed"; }');
+    expect(serviceSource).toContain('try { unlinkSync(unitPath()); removeServiceInstallState(); return "removed"; } catch { return "failed"; }');
+  });
+
+  test("a live orphan with no pid file blocks the teardown", async () => {
+    const cli = await readText("src/cli/index.ts");
+    const at = cli.indexOf("async function handleUninstall(");
+    const fn = cli.slice(at, at + 9000);
+    // A missing pid file is not proof that nothing is serving — the same discovery
+    // `ocx stop` performs. Without it, uninstall restored shared config under a live proxy.
+    expect(fn).toContain("const live = await findLiveProxy();");
+    expect(fn).toContain("observed.proxyProvenDown = await proxyEndpointProvenDown();");
+    expect(fn).toContain("no process id could be resolved for it");
+    // The orphan-with-no-pid branch THROWS, so `proxyProvenDown` stays false and the
+    // authorization rule refuses the shared teardown.
+    const orphanBranch = fn.slice(fn.indexOf("const live = await findLiveProxy();"), fn.indexOf("const live = await findLiveProxy();") + 600);
+    expect(orphanBranch).toContain("throw new Error(");
+    // A findLiveProxy miss is not proof either: it goes through the tri-state probe first.
+    expect(orphanBranch).toContain("could not be confirmed down either");
+  });
+
+  async function uninstallFn(): Promise<string> {
+    const cli = await readText("src/cli/index.ts");
+    const at = cli.indexOf("async function handleUninstall(");
+    expect(at).toBeGreaterThan(-1);
+    return cli.slice(at, at + 9000);
+  }
+
+  test("the detailed outcome is consumed, not the boolean collapse", async () => {
+    const fn = await uninstallFn();
+    // stopServiceIfInstalled returns false for "not installed", "refused to stop" and
+    // "state could not be read" alike, so this step reported "not installed" for a manager
+    // that might still be running (#3008).
+    expect(fn).toContain("stopServiceIfInstalledDetailed()");
+    expect(fn).not.toContain("stopServiceIfInstalled()");
+    expect(fn).toContain('if (outcome === "absent") return false;');
+    expect(fn).toContain('if (outcome === "failed")');
+    expect(fn).toContain('if (outcome === "state-unknown")');
+  });
+
+  test("shared teardown runs only when nothing that could still serve is unaccounted for", async () => {
+    const fn = await uninstallFn();
+    // The rule itself is exercised by calling it above; this pins the wiring.
+    expect(fn).toContain("if (sharedTeardownAuthorized(observed)) {");
+    // Every step that could leave something serving records what it observed, and the
+    // fields start pessimistic so a step that throws cannot look like a success.
+    expect(fn).toContain("serviceStop: null,");
+    expect(fn).toContain("proxyProvenDown: false,");
+    expect(fn).toContain("serviceRemoval: null,");
+    expect(fn).toContain("respawnWindowVerified: false,");
+    expect(fn).toContain("observed.serviceStop = outcome;");
+    expect(fn).toContain("observed.serviceRemoval = outcome;");
+    expect(fn).toContain('if (observed.serviceStop === "stopped-respawnable")');
+    expect(fn).toContain("observed.respawnWindowVerified = true;");
+    const gateAt = fn.indexOf("if (sharedTeardownAuthorized(observed)) {");
+    expect(gateAt).toBeLessThan(fn.indexOf("native Codex restored", gateAt));
+    const nativeRestoreStep = fn.slice(
+      fn.indexOf('runStep("native Codex restored"', gateAt),
+      fn.indexOf('runStep("Grok Build config restored"', gateAt),
+    );
+    // A partial config artifact with success=true discharged routing. Uninstall must report
+    // the retained table and continue, rather than adding this step to the failure list.
+    expect(nativeRestoreStep).toContain("if (!r.success) throw new Error(r.message);");
+    expect(nativeRestoreStep).toContain("if (r.retainedCodexProviderTable)");
+    expect(nativeRestoreStep).not.toContain('state === "partial"');
+    // The skip is a failure, not a silent pass: the command must exit nonzero and say what
+    // to run once the blocker is resolved.
+    expect(fn).toContain('failures.push("native Codex restored", "Grok Build config restored");');
+    expect(fn).toContain("Skipping shared teardown");
+    // Naming only `ocx restore` was wrong: it restores client routing but leaves the
+    // service removal and local cleanup this command had not reached.
+    expect(fn).toContain("rerun 'ocx uninstall'");
+    expect(fn).toContain("interim step");
+  });
+});
+  test("proof covers every distinct endpoint, not just the preferred one", async () => {
+    const { endpointsToProve, everyEndpointProvenDown, everyEndpointProvenDownAsync } = await import("../../src/cli/uninstall-plan");
+
+    // A stale runtime record pointing at a closed port, and the live proxy on the
+    // configured one. Probing only the runtime candidate reports "dead" for a port nobody
+    // is using and authorizes the teardown (#3008).
+    const endpoints = endpointsToProve({ port: 10999, hostname: "127.0.0.1" }, { port: 10100, hostname: "127.0.0.1" });
+    expect(endpoints).toEqual([
+      { hostname: "127.0.0.1", port: 10999 },
+      { hostname: "127.0.0.1", port: 10100 },
+    ]);
+    const closedRuntimeLiveConfig = (e: { port: number }) => (e.port === 10999 ? "dead" as const : "live" as const);
+    expect(everyEndpointProvenDown(endpoints, closedRuntimeLiveConfig)).toBe(false);
+    // A silent listener is not absence either.
+    expect(everyEndpointProvenDown(endpoints, e => (e.port === 10999 ? "dead" : "unknown"))).toBe(false);
+    // Both definitively dead is the only proof.
+    expect(everyEndpointProvenDown(endpoints, () => "dead")).toBe(true);
+
+    // Identical candidates collapse to one; a missing runtime record leaves the config one.
+    expect(endpointsToProve({ port: 10100, hostname: "127.0.0.1" }, { port: 10100 })).toHaveLength(1);
+    expect(endpointsToProve(null, { port: 10100 })).toEqual([{ hostname: "127.0.0.1", port: 10100 }]);
+    // No configured port still yields the default, so the set is never empty in practice.
+    expect(endpointsToProve(null, {})).toEqual([{ hostname: "127.0.0.1", port: 10100 }]);
+    // An empty set is not proof of anything.
+    expect(everyEndpointProvenDown([], () => "dead")).toBe(false);
+    expect(await everyEndpointProvenDownAsync(endpoints, async () => "dead")).toBe(true);
+    expect(await everyEndpointProvenDownAsync([], async () => "dead")).toBe(false);
+    // A nonsense runtime port is skipped rather than probed.
+    expect(endpointsToProve({ port: 0 }, { port: 10100 })).toEqual([{ hostname: "127.0.0.1", port: 10100 }]);
+  });
+
+  test("the respawn window is verified by evidence, not by a silent poll", async () => {
+    const cli = await readText("src/cli/index.ts");
+    const at = cli.indexOf("async function handleUninstall(");
+    const fn = cli.slice(at, at + 9000);
+    // proxyStillLiveAfterStop returns null on a timeout as well as on a genuinely dead
+    // endpoint, so a respawned-but-unresponsive proxy looked verified-down.
+    const windowStep = fn.slice(fn.indexOf('runStep("respawn window verified"'), fn.indexOf('runStep("respawn window verified"') + 900);
+    expect(windowStep).toContain("if (!await proxyEndpointProvenDown())");
+    expect(windowStep).toContain("could not be confirmed down either");
+    expect(windowStep.indexOf("if (!await proxyEndpointProvenDown())"))
+      .toBeLessThan(windowStep.indexOf("observed.respawnWindowVerified = true;"));
+    // And the proof itself asks every candidate.
+    expect(fn).toContain("endpointsToProve(readRuntimePort(), loadConfig())");
+    expect(fn).toContain("everyEndpointProvenDownAsync(endpoints, probeEndpointLiveness)");
+  });
+
+const safeTeardown: UninstallObservation = {
+  serviceStop: "stopped", serviceRemoval: "removed", proxyProvenDown: true, respawnWindowVerified: false,
+};
+const cleanupOwner = {
+  serverUrl: "https://hub.example", apiKeyId: "fixture-client", connectedAt: "2026-09-06T00:00:00.000Z",
+};
+const connectedFixture: ReturnType<UninstallClientStateDeps["readConnection"]> = {
+  kind: "connected",
+  value: {
+    ...cleanupOwner, managementUrl: "https://hub.example", managementTransport: "direct",
+    selectedClients: ["codex"], tokenEnv: "OPENCODEX_API_AUTH_TOKEN",
+    tokenFingerprint: "a".repeat(64), protocolVersion: 1,
+  },
+};
+function disconnectReceipt(phase: DesktopDisconnectReceipt["phase"], keepCatalog = false): DesktopDisconnectReceipt {
+  return { version: 1, owner: cleanupOwner, tokenFingerprint: "a".repeat(64), phase, keepCatalog };
+}
+
+function uninstallFixture() {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "ocx-uninstall-client-"));
+  const configDir = join(fixtureRoot, "config");
+  const lockPath = join(fixtureRoot, "runtime", "lifecycle.sqlite");
+  mkdirSync(join(configDir, "desktop-remote"), { recursive: true });
+  const sentinels = ["config.json", "service-api-token", "desktop-remote/state.json", "desktop-remote/baseline.json", "desktop-remote/disconnect.json"];
+  for (const [index, path] of sentinels.entries()) writeFileSync(join(configDir, path), `fixture-sentinel-${index}\n`, { mode: 0o600 });
+  const fixture: {
+    connection: ReturnType<UninstallClientStateDeps["readConnection"]>;
+    desktop: ReturnType<UninstallClientStateDeps["inspectDesktop"]>;
+    receipt: ReturnType<UninstallClientStateDeps["readReceipt"]>;
+    beforeFinalLock?: () => void;
+    beforeDisconnectLock?: () => void;
+    duringCleanup?: () => Promise<void>;
+    duringIntegrationCleanup?: () => Promise<void>;
+    duringRemove?: () => void;
+    finishCleanup: boolean;
+    lease?: ClientLifecycleHeld;
+    aclReapPending: boolean;
+    calls: { read: number; cleanup: number; integrations: number; remove: number; finalLock: number };
+    cleanupOptions: Array<Parameters<UninstallClientStateDeps["disconnect"]>[0]>;
+  } = {
+    connection: { kind: "disconnected" }, desktop: { kind: "absent" }, receipt: { kind: "absent" },
+    finishCleanup: true, aclReapPending: false,
+    calls: { read: 0, cleanup: 0, integrations: 0, remove: 0, finalLock: 0 }, cleanupOptions: [],
+  };
+  const deps: UninstallClientStateDeps = {
+    readConnection: () => { fixture.calls.read++; return fixture.connection; },
+    inspectDesktop: () => fixture.desktop,
+    readReceipt: () => fixture.receipt,
+    // This is a callable cleanup seam, with the same REAL SQLite L as the final
+    // removal. If uninstall incorrectly holds L over disconnect, this fails busy.
+    disconnect: async options => {
+      fixture.calls.cleanup++;
+      fixture.cleanupOptions.push(options);
+      fixture.beforeDisconnectLock?.();
+      await withClientLifecycle(async held => {
+        assertClientLifecycleHeld(held);
+        const actualOwner = fixture.connection.kind === "connected" ? fixture.connection.value
+          : fixture.receipt.kind === "valid" ? fixture.receipt.value.owner : undefined;
+        if (options?.expectedOwner && (!actualOwner
+          || actualOwner.apiKeyId !== options.expectedOwner.apiKeyId
+          || actualOwner.serverUrl !== options.expectedOwner.serverUrl
+          || actualOwner.connectedAt !== options.expectedOwner.connectedAt)) throw new Error("client_disconnect_expected_owner_changed");
+        await fixture.duringCleanup?.();
+        if (!fixture.finishCleanup) return;
+        fixture.connection = { kind: "disconnected" };
+        fixture.desktop = { kind: "absent" };
+        fixture.receipt = { kind: "valid", value: disconnectReceipt("complete", options?.keepCatalog) };
+      }, { lockPath });
+    },
+    withLifecycle: async work => {
+      fixture.calls.finalLock++;
+      fixture.beforeFinalLock?.();
+      return withClientLifecycle(async held => {
+        fixture.lease = held;
+        try { return await work(held); }
+        finally { fixture.lease = undefined; }
+      }, { lockPath });
+    },
+    cleanupIntegrations: async () => {
+      fixture.calls.integrations++;
+      await fixture.duringIntegrationCleanup?.();
+      return { attempted: 0, changed: 0 };
+    },
+    remove: () => {
+      // Real destructive work is confined to this fixture, never getConfigDir().
+      assertClientLifecycleHeld(fixture.lease!);
+      fixture.calls.remove++;
+      fixture.duringRemove?.();
+      rmSync(configDir, { recursive: true });
+      return { status: "removed", residualPaths: [] };
+    },
+    aclReapPending: () => fixture.aclReapPending,
+  };
+  const bytes = () => sentinels.map(path => readFileSync(join(configDir, path), "utf8"));
+  return { fixtureRoot, configDir, lockPath, fixture, deps, bytes };
+}
+
+async function withUninstallFixture(work: (f: ReturnType<typeof uninstallFixture>) => Promise<void>) {
+  const f = uninstallFixture();
+  try { await work(f); }
+  finally { rmSync(f.fixtureRoot, { recursive: true, force: true }); }
+}
+
+describe("uninstall client cleanup before owner-state deletion", () => {
+  test("teardown refusal occurs before even reading or cleaning client state", async () => {
+    await withUninstallFixture(async f => {
+      f.fixture.connection = connectedFixture;
+      const before = f.bytes();
+      await expect(removeOwnedConfigAfterDesktopCleanup({ ...safeTeardown, proxyProvenDown: false }, f.deps))
+        .rejects.toThrow("teardown is not proven");
+      expect(f.fixture.calls).toEqual({ read: 0, cleanup: 0, integrations: 0, remove: 0, finalLock: 0 });
+      expect(f.bytes()).toEqual(before);
+      expect(existsSync(f.lockPath)).toBe(false);
+    });
+  });
+
+  test.each(["invalid", "mismatched", "unsafe-desktop", "unsafe-receipt", "orphan-active", "orphan-pending", "orphan-restored", "foreign-desktop", "foreign-receipt"] as const)(
+    "%s refuses cleanup/removal and preserves config, token and journal bytes", async scenario => {
+      await withUninstallFixture(async f => {
+        const before = f.bytes();
+        if (scenario === "invalid" || scenario === "mismatched") f.fixture.connection = { kind: scenario, reason: "fixture" };
+        else if (scenario === "unsafe-desktop") f.fixture.desktop = { kind: "unsafe" };
+        else if (scenario === "unsafe-receipt") f.fixture.receipt = { kind: "unsafe" };
+        else if (scenario.startsWith("orphan-")) {
+          f.fixture.desktop = { kind: scenario === "orphan-active" ? "active" : scenario === "orphan-pending" ? "pending" : "restored", owner: cleanupOwner };
+        } else {
+          f.fixture.connection = connectedFixture;
+          const foreign = { ...cleanupOwner, apiKeyId: "different-client" };
+          if (scenario === "foreign-desktop") f.fixture.desktop = { kind: "active", owner: foreign };
+          else f.fixture.receipt = { kind: "valid", value: { ...disconnectReceipt("prepared"), owner: foreign } };
+        }
+        await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps)).rejects.toThrow("Client cleanup refused");
+        expect(f.fixture.calls.cleanup).toBe(0);
+        expect(f.fixture.calls.remove).toBe(0);
+        expect(f.bytes()).toEqual(before);
+      });
+    },
+  );
+
+  test("a cleanup exception propagates, preserves sentinels and releases L", async () => {
+    await withUninstallFixture(async f => {
+      f.fixture.connection = connectedFixture;
+      f.fixture.desktop = { kind: "active", owner: cleanupOwner };
+      f.fixture.duringCleanup = async () => { throw new Error("fixture cleanup failed"); };
+      const before = f.bytes();
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps)).rejects.toThrow("fixture cleanup failed");
+      expect(f.fixture.calls.cleanup).toBe(1);
+      expect(f.fixture.calls.remove).toBe(0);
+      expect(f.bytes()).toEqual(before);
+      withClientLifecycleSync(held => assertClientLifecycleHeld(held), { lockPath: f.lockPath });
+    });
+  });
+
+  test("a cleanup that returns while connected does not authorize removal", async () => {
+    await withUninstallFixture(async f => {
+      f.fixture.connection = connectedFixture;
+      f.fixture.finishCleanup = false;
+      const before = f.bytes();
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps)).rejects.toThrow("changed before removal");
+      expect(f.fixture.calls.cleanup).toBe(1);
+      expect(f.fixture.calls.remove).toBe(0);
+      expect(f.bytes()).toEqual(before);
+    });
+  });
+
+  test("a pending ACL reap under the config directory refuses removal instead of waiting", async () => {
+    await withUninstallFixture(async f => {
+      // The async ACL belt releases its caller on a stalled icacls.exe so startup and shutdown
+      // stay bounded. That release is not evidence the child let go of the directory, and on
+      // Windows removing a tree it still holds fails partway. Refusing is the honest answer:
+      // waiting here would let a stuck child hang `ocx uninstall`.
+      f.fixture.aclReapPending = true;
+      const before = f.bytes();
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .rejects.toThrow("ACL hardening still owns a path under the config directory");
+      expect(f.fixture.calls.remove).toBe(0);
+      expect(f.bytes()).toEqual(before);
+    });
+  });
+
+  test("an integration cleanup failure preserves OpenCodex recovery state and skips removal", async () => {
+    await withUninstallFixture(async f => {
+      const before = f.bytes();
+      f.fixture.duringIntegrationCleanup = async () => { throw new Error("fixture integration conflict"); };
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .rejects.toThrow("fixture integration conflict");
+      expect(f.fixture.calls.integrations).toBe(1);
+      expect(f.fixture.calls.remove).toBe(0);
+      expect(f.bytes()).toEqual(before);
+    });
+  });
+
+  test("a replacement connection before disconnect claims L survives uninstall", async () => {
+    await withUninstallFixture(async f => {
+      f.fixture.connection = connectedFixture;
+      const replacement = { ...connectedFixture.value, apiKeyId: "replacement-client" };
+      f.fixture.beforeDisconnectLock = () => withClientLifecycleSync(() => {
+        f.fixture.connection = { kind: "connected", value: replacement };
+        f.fixture.desktop = { kind: "active", owner: replacement };
+      }, { lockPath: f.lockPath });
+      const before = f.bytes();
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .rejects.toThrow("client_disconnect_expected_owner_changed");
+      expect(f.fixture.connection).toEqual({ kind: "connected", value: replacement });
+      expect(f.fixture.calls.remove).toBe(0);
+      expect(f.bytes()).toEqual(before);
+      expect(f.fixture.cleanupOptions[0]?.expectedOwner).toEqual(cleanupOwner);
+    });
+  });
+
+  test.each([false, true])("an interrupted disconnect resumes its frozen keepCatalog=%s choice", async keepCatalog => {
+    await withUninstallFixture(async f => {
+      f.fixture.receipt = { kind: "valid", value: disconnectReceipt("connection_cleared", keepCatalog) };
+      f.fixture.desktop = { kind: "pending", owner: cleanupOwner };
+      expect(await removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps)).toEqual({ status: "removed", residualPaths: [] });
+      expect(f.fixture.cleanupOptions).toEqual([{ keepCatalog, expectedOwner: cleanupOwner }]);
+      expect(f.fixture.calls.cleanup).toBe(1);
+      expect(f.fixture.calls.remove).toBe(1);
+      expect(f.fixture.receipt).toEqual({ kind: "valid", value: disconnectReceipt("complete", keepCatalog) });
+    });
+  });
+
+  test.each(["connected", "invalid", "mismatched", "desktop-pending", "unsafe-desktop", "unsafe-receipt", "pending-receipt"] as const)(
+    "the final L-held recheck refuses racing %s state", async scenario => {
+      await withUninstallFixture(async f => {
+        f.fixture.connection = connectedFixture;
+        const before = f.bytes();
+        f.fixture.beforeFinalLock = () => withClientLifecycleSync(held => {
+          assertClientLifecycleHeld(held);
+          if (scenario === "connected") f.fixture.connection = connectedFixture;
+          else if (scenario === "invalid" || scenario === "mismatched") f.fixture.connection = { kind: scenario, reason: "fixture race" };
+          else if (scenario === "desktop-pending") f.fixture.desktop = { kind: "pending", owner: cleanupOwner };
+          else if (scenario === "unsafe-desktop") f.fixture.desktop = { kind: "unsafe" };
+          else if (scenario === "unsafe-receipt") f.fixture.receipt = { kind: "unsafe" };
+          else f.fixture.receipt = { kind: "valid", value: disconnectReceipt("prepared") };
+        }, { lockPath: f.lockPath });
+        await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps)).rejects.toThrow("changed before removal");
+        expect(f.fixture.calls.cleanup).toBe(1);
+        expect(f.fixture.calls.remove).toBe(0);
+        expect(f.bytes()).toEqual(before);
+      });
+    },
+  );
+
+  test.each(["standalone", "connected"] as const)("an already-held real L refuses %s cleanup/removal", async mode => {
+    await withUninstallFixture(async f => {
+      if (mode === "connected") f.fixture.connection = connectedFixture;
+      const before = f.bytes();
+      await withClientLifecycle(async () => {
+        await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps)).rejects.toThrow("client_lifecycle_busy");
+        expect(f.fixture.calls.read).toBe(1); // preflight only
+        expect(f.fixture.calls.remove).toBe(0);
+        expect(f.bytes()).toEqual(before);
+      }, { lockPath: f.lockPath });
+    });
+  });
+
+  test.each(["standalone", "connected", "terminal"] as const)("%s removes exactly once under L and excludes connect/recovery until removal finishes", async mode => {
+    await withUninstallFixture(async f => {
+      if (mode === "connected") {
+        f.fixture.connection = connectedFixture;
+        f.fixture.desktop = { kind: "active", owner: cleanupOwner };
+      }
+      if (mode === "terminal") f.fixture.receipt = { kind: "valid", value: disconnectReceipt("complete", true) };
+      let contendersRan = 0;
+      let removingLease: ClientLifecycleHeld | undefined;
+      f.fixture.duringRemove = () => {
+        removingLease = f.fixture.lease;
+        assertClientLifecycleHeld(removingLease!);
+        for (const operation of ["connect", "recovery"]) {
+          expect(() => withClientLifecycleSync(() => {
+            contendersRan++;
+            writeFileSync(join(f.configDir, "service-api-token"), `fixture-${operation}`);
+          }, { lockPath: f.lockPath })).toThrow("client_lifecycle_busy");
+        }
+        expect(contendersRan).toBe(0);
+        expect(f.bytes()).toHaveLength(5);
+      };
+      expect(await removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps)).toEqual({ status: "removed", residualPaths: [] });
+      expect(f.fixture.calls.cleanup).toBe(mode === "connected" ? 1 : 0);
+      expect(f.fixture.calls.integrations).toBe(1);
+      expect(f.fixture.calls.remove).toBe(1);
+      expect(existsSync(f.configDir)).toBe(false);
+      expect(existsSync(f.lockPath)).toBe(true); // L is outside the directory being removed.
+      expect(() => assertClientLifecycleHeld(removingLease!)).toThrow("client_lifecycle_lease_invalid");
+      withClientLifecycleSync(held => assertClientLifecycleHeld(held), { lockPath: f.lockPath });
+    });
+  });
+});
+
+describe("uninstall restores recorded third-party integrations before deleting recovery state", () => {
+  const models: ExportModel[] = [
+    { namespaced: "fixture/model", provider: "fixture", id: "model", contextWindow: 128_000 },
+  ];
+  const config = {
+    port: 10100,
+    hostname: "127.0.0.1",
+    defaultProvider: "fixture",
+    providers: { fixture: { adapter: "openai-chat", baseUrl: "http://127.0.0.1/v1" } },
+  } as unknown as OcxConfig;
+
+  async function fixture() {
+    const root = mkdtempSync(join(tmpdir(), "ocx-uninstall-integrations-"));
+    const home = join(root, "home");
+    const configDir = join(root, "opencodex");
+    const lockPath = join(root, "runtime", "lifecycle.sqlite");
+    const env = {} as NodeJS.ProcessEnv;
+    mkdirSync(INTEGRATION_CLIENTS.pi.detectDir(env, home), { recursive: true });
+    mkdirSync(configDir, { recursive: true });
+    const clientConfig = INTEGRATION_CLIENTS.pi.configPath(env, home);
+    mkdirSync(dirname(clientConfig), { recursive: true });
+    writeFileSync(clientConfig, '{"userSetting":"keep"}\n');
+    const store = createIntegrationStateStore(join(configDir, "integrations"));
+    const input = { clientId: "pi" as const, models, config, port: config.port, env, home, store };
+    expect(applyIntegration(input).ok).toBe(true);
+    const deps: UninstallClientStateDeps = {
+      readConnection: () => ({ kind: "disconnected" }),
+      inspectDesktop: () => ({ kind: "absent" }),
+      readReceipt: () => ({ kind: "absent" }),
+      disconnect: async () => undefined,
+      withLifecycle: work => withClientLifecycle(work, { lockPath }),
+      cleanupIntegrations: () => cleanupOwnedIntegrationsBeforeUninstall({
+        createStore: () => store,
+        loadConfig: () => config,
+        loadModels: async () => models,
+        disable: value => disableIntegrationCoordinated(value),
+        env,
+        home,
+      }),
+      remove: () => {
+        rmSync(configDir, { recursive: true });
+        return { status: "removed", residualPaths: [] };
+      },
+      aclReapPending: () => false,
+    };
+    return { root, home, env, configDir, clientConfig, store, deps };
+  }
+
+  function addAsideProfiles(f: Awaited<ReturnType<typeof fixture>>) {
+    const asideRoot = join(f.home, ".aside");
+    const profiles = [0, 1].map(id => {
+      const detectDir = join(asideRoot, "u", String(id));
+      const configPath = join(detectDir, "models.json");
+      mkdirSync(detectDir, { recursive: true });
+      writeFileSync(configPath, '{"userSetting":"keep"}\n');
+      const store = id === 0 ? f.store
+        : createIntegrationStateStore(join(f.store.root, "aside-profiles", String(id)));
+      return { id, detectDir, configPath, store };
+    });
+    // The legacy owner is not the current profile; uninstall must use its recorded path.
+    writeFileSync(join(asideRoot, "accounts.json"), JSON.stringify({
+      currentAccountId: 1, accounts: profiles.map(({ id }) => ({ id })),
+    }));
+    for (const profile of profiles) {
+      expect(applyIntegration({ clientId: "aside", models, config, port: config.port,
+        env: f.env, home: f.home, store: profile.store,
+        resolvedPaths: { configPath: profile.configPath, detectDir: profile.detectDir },
+      }).ok).toBe(true);
+    }
+    return profiles;
+  }
+
+  test("restores the external file before removing the records that authorize restoration", async () => {
+    const f = await fixture();
+    try {
+      expect(await removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .toEqual({ status: "removed", residualPaths: [] });
+      expect(existsSync(f.configDir)).toBe(false);
+      const restored = JSON.parse(readFileSync(f.clientConfig, "utf8")) as Record<string, unknown>;
+      expect(restored.userSetting).toBe("keep");
+      expect((restored.providers as Record<string, unknown> | undefined)?.opencodex).toBeUndefined();
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a conflicting external edit retains both the file and recovery records", async () => {
+    const f = await fixture();
+    try {
+      const edited = JSON.parse(readFileSync(f.clientConfig, "utf8")) as {
+        providers: Record<string, Record<string, unknown>>;
+      };
+      edited.providers.opencodex!.baseUrl = "http://user-edited.invalid/v1";
+      writeFileSync(f.clientConfig, `${JSON.stringify(edited, null, 2)}\n`);
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .rejects.toThrow("integration cleanup refused for pi");
+      expect(existsSync(f.configDir)).toBe(true);
+      expect(f.store.readRecordsStrict().pi).toBeDefined();
+      expect(readFileSync(f.clientConfig, "utf8")).toContain("user-edited.invalid");
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  test("restores legacy and child Aside profiles before deleting all recovery stores", async () => {
+    const f = await fixture();
+    try {
+      const profiles = addAsideProfiles(f);
+      expect(await removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .toEqual({ status: "removed", residualPaths: [] });
+      expect(existsSync(f.configDir)).toBe(false);
+      for (const profile of profiles) {
+        expect(JSON.parse(readFileSync(profile.configPath, "utf8")))
+          .toEqual({ userSetting: "keep" });
+      }
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test("an unreadable Aside child record prevents every disable and config removal", async () => {
+    const f = await fixture();
+    try {
+      const profiles = addAsideProfiles(f);
+      const originals = profiles.map(profile => readFileSync(profile.configPath, "utf8"));
+      const childRecords = join(profiles[1]!.store.root, "records.json");
+      writeFileSync(childRecords, "invalid JSON");
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .rejects.toThrow("integration ownership is invalid for recovery");
+      expect(existsSync(f.configDir)).toBe(true);
+      expect(f.store.readRecordsStrict().pi).toBeDefined();
+      expect(profiles.map(profile => readFileSync(profile.configPath, "utf8"))).toEqual(originals);
+      expect(readFileSync(childRecords, "utf8")).toBe("invalid JSON");
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test("a conflicted Aside child retains recovery state without undoing earlier disables", async () => {
+    const f = await fixture();
+    try {
+      const profiles = addAsideProfiles(f);
+      const child = profiles[1]!;
+      const edited = JSON.parse(readFileSync(child.configPath, "utf8"));
+      edited.providers.opencodex.baseUrl = "http://user-edited.invalid/v1";
+      writeFileSync(child.configPath, `${JSON.stringify(edited)}\n`);
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .rejects.toThrow("integration cleanup refused for aside");
+      expect(existsSync(f.configDir)).toBe(true);
+      expect(child.store.readRecordsStrict().aside).toBeDefined();
+      expect(readFileSync(child.configPath, "utf8")).toContain("user-edited.invalid");
+      expect(f.store.readRecordsStrict().pi).toBeUndefined();
+      expect(f.store.readRecordsStrict().aside).toBeUndefined();
+      expect(JSON.parse(readFileSync(profiles[0]!.configPath, "utf8"))).toEqual({ userSetting: "keep" });
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  test("an unregistered owned Aside profile refuses cleanup rather than dropping its proof", async () => {
+    const f = await fixture();
+    try {
+      const profiles = addAsideProfiles(f);
+      writeFileSync(join(f.home, ".aside", "accounts.json"), JSON.stringify({
+        currentAccountId: 0, accounts: [{ id: 0 }],
+      }));
+      await expect(removeOwnedConfigAfterDesktopCleanup(safeTeardown, f.deps))
+        .rejects.toThrow("Aside profile ownership is missing or mismatched");
+      expect(existsSync(f.configDir)).toBe(true);
+      expect(f.store.readRecordsStrict().pi).toBeDefined();
+      expect(profiles[1]!.store.readRecordsStrict().aside).toBeDefined();
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+});

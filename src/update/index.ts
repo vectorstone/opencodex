@@ -1,16 +1,48 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { manualUpdateFailureGuidance } from "./update-failure-guidance.mjs";
+import { STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "./stop-contract.mjs";
+import { proxyIdentityAt } from "../server/proxy-liveness";
+import { probeProxyLiveness } from "./proxy-liveness-probe.mjs";
+import { decidePostStopUpdate } from "./stop-decision.mjs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { getConfigDir, loadConfig, readPid, readRuntimePort } from "../config";
+import { dirname, join, resolve } from "node:path";
+import { getConfigDir, loadConfig } from "../config";
+import { readPid, readRuntimePort, getRuntimePortPath } from "../config/process-state";
+import { pendingTeardownOutstanding } from "../config/pending-teardown";
+import type { ServiceOwnership } from "../service/state";
+import { planUpdateRuntimeHandling, planStoppedRuntimeRecovery, inspectPackageRuntimeLiveness } from "./runtime-ownership.mjs";
+import { unprivilegedOwnershipMutationEnvironment } from "../service/ownership-mutation-lease.mjs";
+import { withUpdateOwnershipLease, readUpdateRuntimeTarget } from "./ownership-transaction";
 import { npmInvocation } from "./npm-invocation.mjs";
+import { pnpmInvocation, pnpmInvocationForPath, resolvePnpmCommands } from "./pnpm-invocation.mjs";
+import {
+  detectInstallFromPath,
+  detectInstallOwnershipFromPath,
+} from "./install-detection.mjs";
+import type {
+  DetectedInstall,
+  InstallOwnership,
+  MiseInstallOwner,
+} from "./install-detection.d.mts";
+import {
+  pnpmOwnerInvocation,
+  readPnpmGlobalPackage,
+  resolvePnpmGlobalOwner,
+  runPnpmGlobalUpdate,
+} from "./pnpm-global-install.mjs";
+import type { PnpmGlobalOwner, PnpmGlobalOwnerResult } from "./pnpm-global-install.mjs";
+import { checkRegistryPackageIntegrity } from "./registry-integrity.mjs";
 import {
   npmCachePreflightFailureMessage,
   runNpmCachePreflight,
 } from "./npm-cache-preflight.mjs";
 import { handoffWindowsTrayForUpdate, planWindowsTrayUpdate } from "./tray-update-plan.mjs";
 import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
+import { withoutSiblingMarker } from "../codex/sibling-start";
+import { packageVersion } from "../lib/package-version";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
+import { PNPM_READ_CWD, withPnpmCommandCwd, pnpmReadEnvironment } from "./pnpm-read-policy.mjs";
 
 /**
  * A `codex-history-backup-*.json` surviving a stop means the native-history restore was
@@ -29,21 +61,129 @@ export function historyRestoreIncomplete(configDir = getConfigDir()): boolean {
 export const PKG = "@bitkyc08/opencodex";
 const HERE = dirname(fileURLToPath(import.meta.url)); // .../opencodex/src/update
 
-export type Installer = "bun" | "npm" | "source";
+export type Installer = DetectedInstall;
 export type Channel = "latest" | "preview";
+export type { InstallOwnership, MiseInstallOwner };
 
 /** Infer how opencodex is installed from the running module's path. */
 export function detectInstall(): Installer {
-  if (!HERE.includes("node_modules")) return "source"; // a git checkout, not a global install
-  return HERE.includes(".bun") ? "bun" : "npm";
+  return detectInstallFromPath(HERE, { exists: existsSync });
+}
+
+/** Resolve installer ownership and verified mise update guidance for this package. */
+export function detectInstallOwnership(): InstallOwnership {
+  return detectInstallOwnershipFromPath(HERE, { exists: existsSync });
+}
+
+export function miseUpdateCommand(
+  ownership: InstallOwnership = detectInstallOwnership(),
+): string | null {
+  return ownership.installer === "mise" && ownership.owner
+    ? `mise upgrade ${ownership.owner.tool}`
+    : null;
+}
+
+function packageRoot(): string {
+  return resolve(HERE, "..", "..");
+}
+
+function runningPnpmShimPath(invoked = process.argv[1]): string | undefined {
+  if (!invoked) return undefined;
+  const name = invoked.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase();
+  if (!new Set(["ocx", "opencodex", "ocx.cmd", "opencodex.cmd", "ocx.ps1", "opencodex.ps1"]).has(name ?? "")) {
+    return undefined;
+  }
+  return resolve(invoked);
+}
+
+function runPnpmCandidate(
+  commandPath: string,
+  args: readonly string[],
+  capture = false,
+  spawn: typeof spawnSync = spawnSync,
+): { status: number | null; stdout?: string | null; stderr?: string | null } {
+  const invocation = pnpmInvocationForPath(commandPath, args);
+  if (!invocation) return { status: 1 };
+  return spawn(invocation.file, invocation.args, {
+    stdio: capture ? "pipe" : "ignore",
+    encoding: "utf8",
+    timeout: 20_000,
+    windowsHide: true,
+    cwd: PNPM_READ_CWD,
+    env: pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(process.env)),
+    ...invocation.options,
+  });
+}
+
+/** Resolve the exact pnpm executable/group/bin that own this package. */
+export function resolveCurrentPnpmGlobalOwner(
+  invoked = process.argv[1],
+  deps: { commandPaths?: readonly string[]; spawn?: typeof spawnSync } = {},
+): PnpmGlobalOwnerResult {
+  const spawn = deps.spawn ?? spawnSync;
+  return resolvePnpmGlobalOwner({
+    packageName: PKG,
+    packagePath: packageRoot(),
+    commandPaths: deps.commandPaths ?? resolvePnpmCommands(),
+    runningShimPath: runningPnpmShimPath(invoked),
+    runPnpm: (commandPath, args, capture) => runPnpmCandidate(commandPath, args, capture, spawn),
+  });
+}
+
+function ownerPnpmTarget(
+  owner: PnpmGlobalOwner,
+  args: readonly string[],
+): { bin: string; args: string[]; options: { windowsVerbatimArguments?: boolean }; env: Record<string, string | undefined> } | null {
+  const invocation = pnpmOwnerInvocation(owner, args);
+  if (!invocation) return null;
+  return {
+    bin: invocation.file,
+    args: invocation.args,
+    options: invocation.options,
+    env: invocation.env,
+  };
+}
+
+export function runOwnedPnpm(
+  owner: PnpmGlobalOwner,
+  args: readonly string[],
+  capture: boolean,
+  stdio: "inherit" | "pipe" | "ignore" = capture ? "pipe" : "inherit",
+  spawn: typeof spawnSync = spawnSync,
+): { status: number | null; stdout?: string | null; stderr?: string | null } {
+  const target = ownerPnpmTarget(owner, args);
+  if (!target) return { status: 1 };
+  return withPnpmCommandCwd(args, cwd => spawn(target.bin, target.args, {
+    stdio,
+    encoding: "utf8",
+    timeout: 180_000,
+    windowsHide: true,
+    // Reads probe from the package dir; `add -g`/rollback children run from a neutral
+    // directory so a Windows cwd handle never pins open the package pnpm is replacing.
+    cwd,
+    env: pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(target.env)),
+    ...target.options,
+  }));
+}
+
+/** Re-read the owning group's active package and return its verified launcher. */
+export function resolvePnpmActiveLauncher(owner: PnpmGlobalOwner): string | null {
+  const active = readPnpmGlobalPackage(
+    PKG,
+    (args, capture = false) => runOwnedPnpm(owner, args, capture),
+    undefined,
+    {
+      owner,
+      expectedGlobalDir: owner.globalDir,
+      expectedGlobalRoot: owner.globalRoot,
+      globalBinDir: owner.globalBinDir,
+    },
+  );
+  return active.ok ? join(active.path, "bin", "ocx.mjs") : null;
 }
 
 export function currentVersion(): string {
-  try {
-    return (JSON.parse(readFileSync(join(HERE, "..", "..", "package.json"), "utf8")).version as string) ?? "?";
-  } catch {
-    return "?";
-  }
+  return packageVersion("?");
 }
 
 export function defaultUpdateTag(current: string): Channel {
@@ -57,14 +197,59 @@ export function updateTag(current: string): Channel {
   return defaultUpdateTag(current);
 }
 
-function npmSpawnTarget(args: readonly string[]): { bin: string; args: string[]; options: { windowsVerbatimArguments?: boolean } } | null {
+type SpawnTarget = {
+  bin: string;
+  args: string[];
+  options: { windowsVerbatimArguments?: boolean };
+  env?: Record<string, string | undefined>;
+};
+
+export type RegistrySpawnTarget = SpawnTarget;
+
+function npmSpawnTarget(args: readonly string[]): SpawnTarget | null {
   const invocation = npmInvocation(args);
   if (!invocation) return null;
   return { bin: invocation.file, args: invocation.args, options: invocation.options };
 }
 
-function updateSpawnTarget(bin: string, args: readonly string[]): { bin: string; args: string[]; options: { windowsVerbatimArguments?: boolean } } | null {
+function pnpmSpawnTarget(args: readonly string[], owner?: PnpmGlobalOwner): SpawnTarget | null {
+  if (owner) {
+    const invocation = pnpmOwnerInvocation(owner, args);
+    if (!invocation) return null;
+    return {
+      bin: invocation.file,
+      args: invocation.args,
+      options: invocation.options,
+      env: invocation.env,
+    };
+  }
+  const invocation = pnpmInvocation(args);
+  if (!invocation) return null;
+  return { bin: invocation.file, args: invocation.args, options: invocation.options };
+}
+
+export function registrySpawnTarget(
+  installer: Installer,
+  args: readonly string[],
+  owner?: PnpmGlobalOwner,
+): SpawnTarget | null {
+  // A pnpm command without an owner would silently fall back to the first PATH
+  // candidate. That is unsafe when multiple PNPM_HOME installations expose the
+  // same version, so registry queries use the same hard binding as mutation.
+  return installer === "pnpm"
+    ? owner ? pnpmSpawnTarget(args, owner) : null
+    : npmSpawnTarget(args);
+}
+
+function selectedPnpmOwner(owner?: PnpmGlobalOwner): PnpmGlobalOwner | undefined {
+  if (owner) return owner;
+  const result = resolveCurrentPnpmGlobalOwner();
+  return result.ok ? result.owner : undefined;
+}
+
+function updateSpawnTarget(bin: string, args: readonly string[]): SpawnTarget | null {
   if (bin === "npm") return npmSpawnTarget(args);
+  if (bin === "pnpm") return pnpmSpawnTarget(args);
   if (process.platform === "win32" && bin === "bun") {
     return { bin: process.execPath, args: [...args], options: {} };
   }
@@ -89,28 +274,53 @@ function logSpawnOutput(label: string, result: { stdout?: string | Buffer | null
   if (stderr) console.error(stderr.length > 4000 ? `${label}${stderr.slice(-4000)}` : stderr);
 }
 
-/** Latest published version from the registry (best-effort; null if npm isn't available). */
-export function latestVersion(tag: string): string | null {
-  const npm = npmSpawnTarget(["view", `${PKG}@${tag}`, "version"]);
-  if (!npm) return null;
-  const r = spawnSync(npm.bin, npm.args, {
+function shellQuote(value: string): string {
+  if (process.platform === "win32") return `"${value.replaceAll("\"", "\\\"")}"`;
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function launcherStartHint(launcher: string, port: number): string {
+  return `${shellQuote(process.execPath)} ${shellQuote(launcher)} start --port ${Math.trunc(port)}`;
+}
+
+/** Latest published version from the registry (best-effort; null if the manager isn't available). */
+export function latestVersion(
+  tag: string,
+  installer: Installer = detectInstall(),
+  owner?: PnpmGlobalOwner,
+  spawn: typeof spawnSync = spawnSync,
+): string | null {
+  const resolvedOwner = installer === "pnpm" ? selectedPnpmOwner(owner) : undefined;
+  if (installer === "pnpm" && !resolvedOwner) return null;
+  const manager = registrySpawnTarget(installer, ["view", `${PKG}@${tag}`, "version"], resolvedOwner);
+  if (!manager) return null;
+  const r = spawn(manager.bin, manager.args, {
     encoding: "utf8",
     timeout: 12000,
     windowsHide: true,
-    ...npm.options,
+    cwd: installer === "pnpm" ? PNPM_READ_CWD : undefined,
+    env: installer === "pnpm"
+      ? pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(manager.env ?? process.env))
+      : unprivilegedOwnershipMutationEnvironment(manager.env ?? process.env),
+    ...manager.options,
   });
-  return r.status === 0 ? (r.stdout.trim() || null) : null;
+  return r.status === 0 && typeof r.stdout === "string" ? (r.stdout.trim() || null) : null;
 }
 
 /** The global-install command opencodex would run to update on this channel. */
 export function updateCommand(installer: Installer, tag: Channel, resolvedVersion?: string | null): { bin: string; args: string[] } {
-  const bin = installer === "bun" ? "bun" : "npm";
+  if (installer === "mise") {
+    throw new Error("mise-owned installations must be upgraded through mise");
+  }
   // Immutable target: when the registry resolved a concrete version, install exactly
   // that version — the dist-tag can move between resolution and install (TOCTOU).
   const target = resolvedVersion || tag;
-  const args = installer === "bun"
-    ? ["add", "-g", `${PKG}@${target}`]
-    : ["install", "-g", `${PKG}@${target}`];
+  if (installer === "bun") return { bin: "bun", args: ["add", "-g", `${PKG}@${target}`] };
+  if (installer === "pnpm") {
+    return { bin: "pnpm", args: ["add", "-g", "--allow-build=bun", `${PKG}@${target}`] };
+  }
+  const bin = "npm";
+  const args = ["install", "-g", `${PKG}@${target}`];
   return { bin, args };
 }
 
@@ -132,39 +342,102 @@ export function updateCommandStr(installer: Installer, tag: Channel, resolvedVer
 export function checkUpdatePackageIntegrity(
   version: string | null,
   spawn: typeof spawnSync = spawnSync,
+  installer: Installer = detectInstall(),
+  owner?: PnpmGlobalOwner,
 ): { ok: true; integrity: string } | { ok: false; reason: string } | { ok: "skipped"; reason: string } {
-  if (!version) return { ok: "skipped", reason: "no resolved version (registry unavailable)" };
-  const npm = npmSpawnTarget(["view", `${PKG}@${version}`, "dist.integrity"]);
-  if (!npm) return { ok: "skipped", reason: "npm executable was not found on a trusted PATH entry" };
-  const r = spawn(
-    npm.bin,
-    npm.args,
-    { encoding: "utf8", timeout: 12000, windowsHide: true, ...npm.options },
-  );
-  // status !== 0 covers nonzero exits AND timeouts (status === null).
-  if (r.status !== 0) return { ok: "skipped", reason: `registry integrity query failed (status ${r.status ?? "timeout"})` };
-  const tokens = (r.stdout ?? "").replace(/["']/g, "").trim().split(/\s+/).filter(Boolean);
-  const match = tokens.find(token => /^sha512-[A-Za-z0-9+/=]+$/.test(token));
-  if (!match) return { ok: false, reason: `registry returned no sha512 integrity for ${PKG}@${version}` };
-  return { ok: true, integrity: match };
+  const resolvedOwner = installer === "pnpm" ? selectedPnpmOwner(owner) : undefined;
+  if (installer === "pnpm" && !resolvedOwner) {
+    return { ok: false, reason: "could not identify pnpm's owning global installation" };
+  }
+  const manager = registrySpawnTarget(installer, ["view", `${PKG}@${version}`, "dist.integrity"], resolvedOwner);
+  if (!manager) return { ok: "skipped", reason: `${installer} executable was not found on a trusted PATH entry` };
+  const result = checkRegistryPackageIntegrity(PKG, version, args => {
+    const target = registrySpawnTarget(installer, args, resolvedOwner);
+    if (!target) return { status: 1 };
+    return spawn(target.bin, target.args, {
+      encoding: "utf8",
+      timeout: 12000,
+      windowsHide: true,
+      cwd: installer === "pnpm" ? PNPM_READ_CWD : undefined,
+      env: installer === "pnpm"
+        ? pnpmReadEnvironment(unprivilegedOwnershipMutationEnvironment(target.env ?? process.env))
+        : unprivilegedOwnershipMutationEnvironment(target.env ?? process.env),
+      ...target.options,
+    });
+  });
+  return result;
 }
 
 /**
- * `ocx update` fallback for source checkouts and Bun global installs. npm global installs are updated
- * in the Node bin launcher before Bun starts, so Windows does not replace the running Bun binary.
+ * The recorded runtime owner, in the shape the shared update rule reads.
+ *
+ * Fails CLOSED. A resolution this process could not obtain is not evidence that nobody owns
+ * the runtime, and treating it as such is how an unreadable record reactivates the npm
+ * launcher over a takeover the user consented to.
+ */
+interface RuntimeOwnershipObservation {
+  readonly ownership: ServiceOwnership | null;
+  readonly ownershipUnknown: boolean;
+  readonly subjectToken: string;
+}
+
+async function resolvedRuntimeOwnership(): Promise<RuntimeOwnershipObservation> {
+  try {
+    const { resolveServiceOwnership } = await import("../service");
+    const resolution = resolveServiceOwnership();
+    if (resolution.kind === "owned") return {
+      ownership: resolution.ownership,
+      ownershipUnknown: false,
+      subjectToken: JSON.stringify(["owned", resolution.revision, resolution.ownership]),
+    };
+    if (resolution.kind === "none") return {
+      ownership: null,
+      ownershipUnknown: false,
+      subjectToken: JSON.stringify(["none", resolution.revision]),
+    };
+    return { ownership: null, ownershipUnknown: true, subjectToken: "unknown" };
+  } catch {
+    return { ownership: null, ownershipUnknown: true, subjectToken: "unknown" };
+  }
+}
+
+/**
+ * `ocx update` fallback for source checkouts and Bun global installs. npm and pnpm global installs
+ * are updated in the Node bin launcher before Bun starts, so Windows does not replace the running
+ * Bun binary.
  */
 export async function runUpdate(): Promise<void> {
-  const installer = detectInstall();
+  const ownership = detectInstallOwnership();
+  const installer = ownership.installer;
   const current = currentVersion();
   const tag = updateTag(current);
   console.log(`opencodex v${current} (installed via ${installer}, tag ${tag})`);
+
+  if (installer === "mise") {
+    const command = miseUpdateCommand(ownership);
+    if (command) {
+      console.error(`OpenCodex is externally managed by mise. Update it with: ${command}`);
+    } else {
+      console.error(
+        "OpenCodex appears to be managed by mise, but its ownership metadata is unreadable or inconsistent. Repair the mise installation metadata before updating.",
+      );
+    }
+    process.exitCode = 1;
+    return;
+  }
 
   if (installer === "source") {
     console.log("Running from a source checkout — update with:  git pull && bun install");
     return;
   }
 
-  const latest = latestVersion(tag);
+  const ownerResult = installer === "pnpm" ? resolveCurrentPnpmGlobalOwner() : undefined;
+  if (installer === "pnpm" && (!ownerResult || !ownerResult.ok)) {
+    console.error(`⚠️  ${ownerResult?.reason ?? "Could not identify pnpm's owning global installation"}. Aborting before stopping the proxy.`);
+    process.exit(1);
+  }
+  const owner = ownerResult?.ok ? ownerResult.owner : undefined;
+  const latest = latestVersion(tag, installer, owner);
   if (latest && latest === current) {
     console.log(`Already on the latest ${tag} version (v${latest}).`);
     return;
@@ -172,7 +445,7 @@ export async function runUpdate(): Promise<void> {
 
   // Pre-flight integrity metadata check — runs BEFORE the proxy is stopped so an
   // anomalous registry entry aborts without unloading the running service.
-  const integrity = checkUpdatePackageIntegrity(latest);
+  const integrity = checkUpdatePackageIntegrity(latest, spawnSync, installer, owner);
   if (integrity.ok === false) {
     console.error(`⚠️  ${integrity.reason} — aborting the update before stopping the proxy.`);
     process.exit(1);
@@ -192,12 +465,16 @@ export async function runUpdate(): Promise<void> {
   }
 
   const { bin, args: cmdArgs } = updateCommand(installer, tag, latest);
-  const target = updateSpawnTarget(bin, cmdArgs);
+  const target = installer === "pnpm" && owner
+    ? pnpmSpawnTarget(cmdArgs, owner)
+    : updateSpawnTarget(bin, cmdArgs);
   if (!target) {
-    console.error("⚠️  Could not resolve npm from a trusted absolute PATH entry; aborting before stopping the proxy.");
+    console.error(`⚠️  Could not resolve ${bin} from a trusted absolute PATH entry; aborting before stopping the proxy.`);
     process.exit(1);
   }
 
+  const { serviceStatePaths } = await import("../service");
+  const updateExitCode = await withUpdateOwnershipLease(serviceStatePaths(), async mutation => {
   // Remember whether a background service manages the proxy BEFORE stopping — `ocx stop`
   // unloads it, so a successful update must repair/restart it afterwards.
   let serviceWasInstalled = false;
@@ -205,6 +482,18 @@ export async function runUpdate(): Promise<void> {
     const { isServiceInstalled } = await import("../service");
     serviceWasInstalled = isServiceInstalled();
   } catch { /* best-effort */ }
+  // What this update may do to the runtime. A desktop takeover vetoes both the stop and the
+  // service refresh below; see `planUpdateRuntimeHandling` for why each half is wrong.
+  const initialOwnership = await resolvedRuntimeOwnership();
+  const runtimePlan = planUpdateRuntimeHandling({
+    ...initialOwnership,
+    serviceInstalled: serviceWasInstalled,
+  });
+  if (runtimePlan.notice) console.log(runtimePlan.notice);
+  if (!runtimePlan.mayReplacePackage) {
+    console.error("⚠️  Update stopped before tray handoff, runtime stop, or package replacement because runtime ownership is unknown.");
+    return 1;
+  }
   let trayWasInstalled = false;
   let trayWasRunning = false;
   if (process.platform === "win32") {
@@ -222,7 +511,7 @@ export async function runUpdate(): Promise<void> {
       trayWasRunning = trayPlan.restoreOnFailure;
     } catch (error) {
       console.error(`⚠️  Could not stop the Windows tray; aborting before package replacement: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(1);
+      return 1;
     }
   }
 
@@ -241,77 +530,295 @@ export async function runUpdate(): Promise<void> {
     ...(runtimeTrusted && livePid ? { oldPid: livePid } : {}),
   };
 
+  const currentPackageRuntimeLiveness = () => inspectPackageRuntimeLiveness({
+    capturedTarget: capturedListen,
+    readCurrentTarget: () => readUpdateRuntimeTarget(getRuntimePortPath(), capturedListen.hostname),
+    probe: target => probeProxyLiveness(target.port, target.hostname),
+  }).overall;
+  const hadRuntimeState = serviceWasInstalled || !!livePid || !!preUpdateRt;
+
+  let stopAttempted = false;
+  let postUpdateLauncher = installer === "pnpm" && owner
+    ? join(owner.packagePath, "bin", "ocx.mjs")
+    : join(packageRoot(), "bin", "ocx.mjs");
+  let postUpdateLauncherUsable = true;
+  const sameOwner = (current: RuntimeOwnershipObservation) => {
+    const before = initialOwnership.ownership, after = current.ownership;
+    return before?.owner === after?.owner && before?.installId === after?.installId
+      && before?.consentGeneration === after?.consentGeneration;
+  };
+  const startProxyDirectly = async (): Promise<boolean> => {
+    if (!postUpdateLauncherUsable || !existsSync(postUpdateLauncher)) return false;
+    // An ordinary owner: a stray sibling marker would otherwise mark it before any probe.
+    const env = mutation.controlEnvironment(withoutSiblingMarker(process.env));
+    delete env.OCX_SERVICE;
+    const child = spawn(process.execPath, [postUpdateLauncher, "start", "--port", String(capturedListen.port)], {
+      detached: true, stdio: "ignore", windowsHide: true, env: withProcessRuntimeProvenance(env),
+    });
+    let failed = false;
+    child.once("error", () => { failed = true; });
+    child.unref();
+    const deadline = Date.now() + 30_000;
+    while (!failed && Date.now() < deadline) {
+      const current = readUpdateRuntimeTarget(getRuntimePortPath(), capturedListen.hostname);
+      if (current.kind === "target" && current.target.port === capturedListen.port
+        && await proxyIdentityAt(current.target.port, { hostname: current.target.hostname, expectedPid: current.target.pid },
+          { timeoutMs: 1500, deadlineAt: deadline, attempts: 1 })) return true;
+      await Bun.sleep(Math.min(100, Math.max(0, deadline - Date.now())));
+    }
+    console.warn("⚠️  Recovery did not report a healthy proxy before its deadline; run 'ocx service repair' or 'ocx start'.");
+    return false;
+  };
+  const recoverStoppedRuntime = async (reason: string): Promise<void> => {
+    try {
+      const planRecovery = async () => {
+        const current = await resolvedRuntimeOwnership();
+        return planStoppedRuntimeRecovery({
+          stopAttempted, ...current, sameOwner: sameOwner(current),
+          liveness: currentPackageRuntimeLiveness(), serviceInstalled: serviceWasInstalled,
+          launcherUsable: postUpdateLauncherUsable && existsSync(postUpdateLauncher), hadRuntimeState,
+        });
+      };
+      let recovery = await planRecovery();
+      if (recovery.action === "service") {
+        // The service manager starts the proxy outside this process tree, so it
+        // cannot join this lease, and holding it through the repair's health wait
+        // keeps that proxy from starting (#5760). Release it, then decide again —
+        // a claim could have landed while the repair ran unleased.
+        mutation.release();
+        recovery = await planRecovery();
+      }
+      if (recovery.action === "manual") {
+        console.warn(`⚠️  ${reason}; runtime recovery requires manual review (${recovery.reason}).`);
+      } else if (recovery.action === "service") {
+        const { serviceReinstallArgs, isServiceViable } = await import("../service");
+        const service = spawnSync(process.execPath, [postUpdateLauncher, ...serviceReinstallArgs()], {
+          stdio: updateChildStdio(), windowsHide: true,
+          env: mutation.controlEnvironment({ ...process.env, OCX_BAKE_PORT: String(capturedListen.port) }),
+        });
+        if (service.status !== 0 || !isServiceViable()) {
+          // The refresh ran unleased; a claim could have landed meanwhile, so take
+          // the lease back before re-reading ownership and authorizing a direct start.
+          mutation.reacquire();
+          const nowOwned = await resolvedRuntimeOwnership();
+          const fallback = planStoppedRuntimeRecovery({
+            stopAttempted, ...nowOwned, sameOwner: sameOwner(nowOwned),
+            liveness: currentPackageRuntimeLiveness(), serviceInstalled: false,
+            launcherUsable: postUpdateLauncherUsable && existsSync(postUpdateLauncher), hadRuntimeState,
+          });
+          if (fallback.action === "direct") await startProxyDirectly();
+          else console.warn("⚠️  Service recovery was not confirmed; no second proxy was started.");
+        }
+      } else if (recovery.action === "direct") {
+        // No-op while the lease is held; re-locks if the service branch released it.
+        mutation.reacquire();
+        await startProxyDirectly();
+      }
+    } catch {
+      console.warn("⚠️  Runtime recovery could not be verified; run 'ocx service repair' or 'ocx start' after checking ownership.");
+    }
+  };
+
+  try {
   // Never replace package files under a live proxy: the running server dynamic-imports
   // modules after startup, so an in-place update leaves it executing mixed old/new code.
   // Gate on the service and the runtime-port record too, not just the pid file — a
   // service-managed or orphaned proxy can be live while ocx.pid is stale/missing.
+  //
+  // An outstanding pending-teardown receipt is a fourth reason to run the stop. After a
+  // parent crashed mid-deferral all three of the other signals can be absent while the
+  // shared client config still points at a proxy that is gone; installing over that
+  // silently skips the recovery the receipt was written to trigger (#3008).
   // Full `ocx stop` semantics (drain, service stop, restore).
-  if (serviceWasInstalled || readPid() || readRuntimePort()) {
+
+  if (runtimePlan.mayStopRuntime && (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding())) {
+    stopAttempted = true;
     console.log("⏹  Stopping the running proxy before updating...");
     const stopStdio = updateChildStdio();
     const stop = spawnSync(process.execPath, selfLaunchArgv(["stop"]), {
+      env: mutation.controlEnvironment(),
       stdio: stopStdio,
       encoding: stopStdio === "pipe" ? "utf8" : undefined,
       windowsHide: true,
     });
     if (stopStdio === "pipe") logSpawnOutput("", stop);
-    if (stop.status !== 0 || readPid() || readRuntimePort()) {
+    // One decision, shared with the package launcher (#3008). The two lanes disagreeing about
+    // the same situation is how this shipped fixed on one side only. Absent PID and runtime
+    // files are weak evidence - a crashed-but-listening proxy leaves none - so the captured
+    // endpoint is asked, and `null` from proxyIdentityAt covers refusal AND timeout alike.
+    const identity = await proxyIdentityAt(capturedListen.port, { hostname: capturedListen.hostname });
+    const decision = decidePostStopUpdate({
+      status: stop.status,
+      hasRuntimeState: !!(readPid() || readRuntimePort()),
+      // Re-checked AFTER the stop: a quarantined receipt lets the stop itself succeed
+      // (there is nothing left to stop), so a pre-stop check alone let the retry install
+      // over a teardown that never ran.
+      teardownOutstanding: pendingTeardownOutstanding(),
+      liveness: identity ? "live" : probeProxyLiveness(capturedListen.port, capturedListen.hostname),
+    });
+    const historyOnlyStop = decision.reason === "history-only";
+    if (!decision.proceed) {
       if (trayWasRunning) {
         try {
           const { startWindowsTray } = await import("../tray/windows");
           startWindowsTray();
         } catch { /* preserve the proxy stop failure */ }
       }
-      console.error("⚠️  Could not stop the running proxy; aborting the update. Run 'ocx stop' and retry.");
-      process.exit(1);
+      if (decision.reason === "teardown-outstanding") {
+        console.error("⚠️  A shared teardown from an earlier stop is still outstanding and needs manual review; aborting the update.");
+        console.error("    Confirm no proxy is running, run 'ocx restore', then remove the pending-teardown file in your opencodex home.");
+      } else {
+        console.error(decision.reason === "proxy-unknown"
+          ? `⚠️  Could not confirm the proxy on ${capturedListen.hostname}:${capturedListen.port} is stopped; aborting the update. Run 'ocx stop' and retry.`
+          : "⚠️  Could not stop the running proxy; aborting the update. Run 'ocx stop' and retry.");
+      }
+      return 1;
     }
-    if (historyRestoreIncomplete()) {
+    if (historyOnlyStop || historyRestoreIncomplete()) {
       console.warn(
-        "⚠️  Codex resume history was NOT restored (history DB locked — Codex app/IDE open?).\n" +
-        "    Your routed threads stay hidden in the native Codex app until restored.\n" +
-        "    After the update: close the Codex app, then run 'ocx stop' once to restore.",
+        "⚠️  Codex resume-history metadata restore is incomplete (a backup manifest remains).\n" +
+        "    The DB may be busy or the manifest/target may need review; untracked routed history is intentionally unchanged.\n" +
+        "    After the update: close the Codex app, run 'ocx doctor', then run 'ocx stop' once to retry.",
+      );
+    }
+    if (decision.reason === "history-deferred") {
+      // Not the same warning: nothing was restored here. Saying "history metadata is
+      // incomplete" would imply config and catalog came back, and an operator who
+      // believed that would not know a teardown is still owed.
+      console.warn(
+        "⚠️  The shared teardown was refused by the Codex history preflight and restored nothing.\n" +
+        "    Config, catalog, history and provenance were preserved, and the teardown receipt was kept.\n" +
+        "    The proxy is down, so the update continues; close the Codex app and run 'ocx stop' once afterwards to finish the restore.",
       );
     }
   }
 
+  const installStdio = updateChildStdio();
+  let r: {
+    status: number | null;
+    signal?: NodeJS.Signals | null;
+    stdout?: string | Buffer | null;
+    stderr?: string | Buffer | null;
+  } | null = null;
+  let replacementRefusal: string | null = null;
+  // Ownership can change while registry work is in flight. Unknown at this exact
+  // boundary blocks replacement; a confirmed desktop claim still permits updating the idle
+  // npm installation while leaving the bundled sidecar alone.
+  const replacementOwnership = await resolvedRuntimeOwnership();
+  const replacementPlan = planUpdateRuntimeHandling({
+    ...replacementOwnership,
+    serviceInstalled: serviceWasInstalled,
+  });
+  const replacementLiveness = currentPackageRuntimeLiveness();
+  if (replacementOwnership.subjectToken !== initialOwnership.subjectToken
+    || !replacementPlan.mayReplacePackage
+    || replacementLiveness !== "dead") {
+    replacementRefusal = replacementPlan.notice
+      ?? (replacementLiveness === "live"
+        ? "⚠️  Update stopped because a proxy became live after the stop decision; rerun from the beginning."
+        : "⚠️  Update stopped because runtime ownership or liveness changed after the stop decision; rerun from the beginning.");
+  } else {
   console.log(`Updating${latest ? ` to v${latest}` : ""}…\n$ ${bin} ${cmdArgs.join(" ")}`);
 
-  const installStdio = updateChildStdio();
-  const r = spawnSync(target.bin, target.args, {
-    stdio: installStdio,
-    encoding: installStdio === "pipe" ? "utf8" : undefined,
-    timeout: 180000,
-    windowsHide: true,
-    ...target.options,
+  // Every post-update action below receives the verified active launcher.
+  if (installer === "pnpm") {
+    let update: ReturnType<typeof runPnpmGlobalUpdate>;
+    try {
+      update = runPnpmGlobalUpdate({
+        packageName: PKG,
+        currentVersion: current,
+        targetVersion: latest || undefined,
+        tag,
+        owner: owner!,
+        runningPackagePath: packageRoot(),
+        runPnpm: (args, capture = false) => runOwnedPnpm(
+          owner!,
+          args,
+          capture,
+          capture ? "pipe" : installStdio,
+        ),
+        log: line => console.log(line),
+      });
+    } catch {
+      // A thrown verifier/runner error means the active group is unknown. Mark the
+      // launcher unusable and let the failure lane report a manual recovery path.
+      update = {
+        ok: false,
+        phase: "rollback",
+        rolledBack: false,
+        error: "pnpm update failed unexpectedly; active package could not be verified",
+      };
+    }
+    if (update.ok) {
+      postUpdateLauncher = join(update.path, "bin", "ocx.mjs");
+      postUpdateLauncherUsable = true;
+      r = { status: 0, signal: null, stdout: "", stderr: "" };
+    } else {
+      postUpdateLauncherUsable = Boolean(update.activePath);
+      if (update.activePath) postUpdateLauncher = join(update.activePath, "bin", "ocx.mjs");
+      console.error(`⚠️  ${update.error}${update.rolledBack ? "." : " Manual recovery may be required."}`);
+      r = { status: 1, signal: null, stdout: "", stderr: "" };
+    }
+  } else {
+    r = spawnSync(target.bin, target.args, {
+      stdio: installStdio,
+      encoding: installStdio === "pipe" ? "utf8" : undefined,
+      timeout: 180000,
+      windowsHide: true,
+      ...target.options,
+      env: mutation.unprivilegedEnvironment(),
+    });
+  }
+  if (r && installStdio === "pipe") logSpawnOutput("", r);
+  }
+  if (replacementRefusal) {
+    await recoverStoppedRuntime("package replacement was refused");
+    if (trayWasRunning) {
+      try {
+        const { startWindowsTray } = await import("../tray/windows");
+        startWindowsTray();
+      } catch { /* preserve the ownership refusal */ }
+    }
+    console.error(replacementRefusal);
+    return 1;
+  }
+  if (!r) throw new Error("update replacement returned no result");
+  const postInstallPlan = planUpdateRuntimeHandling({
+    ...(await resolvedRuntimeOwnership()),
+    serviceInstalled: serviceWasInstalled,
   });
-  if (installStdio === "pipe") logSpawnOutput("", r);
   if (r.status === 0) {
     console.log(`\n✅ Updated${latest ? ` to v${latest}` : ""}.`);
-    // Re-bake the bundled Bun path into the Codex autostart shim on every
-    // platform when one is installed (refresh-only; never installs fresh).
+    // Re-enter through the verified active package launcher. This keeps the Codex
+    // shim, tray, service and proxy recovery paths on the same package/group that
+    // pnpm selected, including when the update changed the global link target.
     try {
-      const { isCodexShimInstalled, installCodexShim } = await import("../codex/shim");
+      const { isCodexShimInstalled } = await import("../codex/shim");
       if (isCodexShimInstalled()) {
-        const result = installCodexShim();
-        if (result.installed) console.log(`🔧 ${result.message}`);
+        const shim = spawnSync(process.execPath, [postUpdateLauncher, "codex-shim", "install"], {
+          stdio: "inherit",
+          windowsHide: true,
+          env: mutation.unprivilegedEnvironment(),
+        });
+        if (shim.status !== 0) console.warn("⚠️  Shim repair skipped: run 'ocx codex-shim install'.");
       }
-    } catch (e) {
-      console.warn(`⚠️  Shim repair skipped: ${e instanceof Error ? e.message : e}`);
+    } catch {
+      console.warn("⚠️  Shim repair skipped; run 'ocx codex-shim install'.");
     }
     if (trayWasInstalled) {
-      const trayArgs = selfLaunchArgv(planWindowsTrayUpdate({ installed: trayWasInstalled, running: trayWasRunning }).installArgs);
-      const tray = spawnSync(process.execPath, trayArgs, { stdio: "inherit", windowsHide: true });
+      const trayArgs = planWindowsTrayUpdate({ installed: trayWasInstalled, running: trayWasRunning }).installArgs;
+      const tray = spawnSync(process.execPath, [postUpdateLauncher, ...trayArgs], { stdio: "inherit", windowsHide: true, env: mutation.unprivilegedEnvironment() });
       if (tray.status === 0) {
         console.log("🔧 Refreshed Windows tray startup paths.");
       } else {
         console.warn("⚠️  Windows tray refresh failed. Run 'ocx tray install'.");
-        if (trayWasRunning) spawnSync(process.execPath, selfLaunchArgv(["tray", "start"]), { stdio: "ignore", windowsHide: true });
+        if (trayWasRunning) spawnSync(process.execPath, [postUpdateLauncher, "tray", "start"], { stdio: "ignore", windowsHide: true, env: mutation.unprivilegedEnvironment() });
       }
     }
     // The stop above unloaded any managed service; repair it with the NEW files
     // (spawn the fresh cli.ts so updated code writes the baked paths) so a
     // launchd/schtasks/systemd user isn't left with the background proxy down.
-    if (serviceWasInstalled) {
+    if (postInstallPlan.mayRestoreService) {
       console.log("🔁 Refreshing the background service with the updated files...");
       const { serviceReinstallArgs } = await import("../service");
       const { reclaimListenPort } = await import("../server/port-reclaim");
@@ -325,11 +832,17 @@ export async function runUpdate(): Promise<void> {
       if (!freed) {
         console.warn(`⚠️  Port ${capturedListen.port} still busy after 30s; repairing service with pinned --port ${capturedListen.port} anyway (refusing to hop).`);
       }
+      // `service repair` re-activates a manager whose `ocx start` child is not a
+      // process descendant and cannot join this lease; held through its serving
+      // wait, the lease makes that child die at the acquire deadline (#5760).
+      // The kill-authorizing reclaim above already ran under the lease.
+      mutation.release();
       const prevBake = process.env.OCX_BAKE_PORT;
       process.env.OCX_BAKE_PORT = String(capturedListen.port);
       try {
         const svcStdio = updateChildStdio();
-        const svc = spawnSync(process.execPath, selfLaunchArgv(serviceReinstallArgs()), {
+        const svc = spawnSync(process.execPath, [postUpdateLauncher, ...serviceReinstallArgs()], {
+          env: mutation.controlEnvironment(),
           stdio: svcStdio,
           encoding: svcStdio === "pipe" ? "utf8" : undefined,
           windowsHide: true,
@@ -346,8 +859,9 @@ export async function runUpdate(): Promise<void> {
           }
         }
         if (!serviceRefreshed || !serviceViable) {
-          // A repair needs no elevation (it never calls `schtasks /create`), but it can
-          // still fail — or exit 0 while leaving stale/missing assets that never start
+          // Repair normally avoids elevation for a healthy scheduler task, but a stale
+          // definition may require guarded create/elevation. It can also fail — or exit 0
+          // while leaving stale/missing assets that never start
           // the proxy. Fall back to a direct detached proxy start so the update
           // never leaves the user without a running proxy — but only when the port is free.
           if (!freed) {
@@ -360,6 +874,29 @@ export async function runUpdate(): Promise<void> {
               ? `   Run 'ocx service repair', then 'ocx start --port ${capturedListen.port}'.`
               : `   Run 'ocx service repair' to see the reason, then 'ocx start --port ${capturedListen.port}'.`);
           } else {
+            // Re-read rather than reuse the plan from before the package install: the app can
+            // claim the runtime during an update that takes minutes, and the refusal the
+            // repair above just returned is indistinguishable from any other failure here.
+            // The refresh above ran outside the lease — take it back so this re-read and
+            // the direct start stay serialized with a claim that landed in that window.
+            // A claim that outlasts the wait is reported here: the package is already
+            // swapped, so the unexpected-failure recovery below would run a second,
+            // unleased repair and surface the raw lock error instead.
+            try {
+              mutation.reacquire();
+            } catch {
+              console.warn("⚠️  Updated, but another process kept the runtime ownership lease claimed, so no proxy was started.");
+              console.warn(`   Run 'ocx service repair', then 'ocx start --port ${capturedListen.port}'.`);
+              return 1;
+            }
+            const nowOwned = planUpdateRuntimeHandling({
+              ...(await resolvedRuntimeOwnership()),
+              serviceInstalled: true,
+            });
+            if (!nowOwned.mayStopRuntime) {
+              console.warn(nowOwned.notice ?? "⚠️  The background runtime is owned elsewhere; not starting a second proxy.");
+              return;
+            }
             console.warn(
               serviceRefreshed
                 ? "⚠️  Service refresh left a non-viable manager (stale or missing assets) — starting the proxy directly instead."
@@ -371,33 +908,31 @@ export async function runUpdate(): Promise<void> {
             console.warn(process.platform === "win32"
               ? "   Run 'ocx service repair' to refresh the background service."
               : "   Run 'ocx service repair' to refresh the background service and see why it failed.");
-            const env = { ...process.env };
-            delete env.OCX_SERVICE;
-            const child = spawn(process.execPath, selfLaunchArgv(["start", "--port", String(capturedListen.port)]), {
-              detached: true,
-              stdio: "ignore",
-              windowsHide: true,
-              env: withProcessRuntimeProvenance(env),
-            });
-            child.unref();
-            console.log(`✅ Proxy starting on port ${capturedListen.port}.`);
+            if (await startProxyDirectly()) console.log(`✅ Proxy is healthy on port ${capturedListen.port}.`);
           }
         }
       } finally {
         if (prevBake === undefined) delete process.env.OCX_BAKE_PORT;
         else process.env.OCX_BAKE_PORT = prevBake;
       }
-    } else {
-      console.log(`Restart the proxy:  ocx start --port ${capturedListen.port}`);
+    } else if (postInstallPlan.mayStopRuntime) {
+      console.log(`Restart the proxy:  ${launcherStartHint(postUpdateLauncher, capturedListen.port)}`);
     }
   } else {
-    if (trayWasRunning) {
-      try {
-        const { startWindowsTray } = await import("../tray/windows");
-        startWindowsTray();
-      } catch { /* keep the primary update failure */ }
+    if (stopAttempted && trayWasRunning && postUpdateLauncherUsable) {
+      spawnSync(process.execPath, [postUpdateLauncher, "tray", "start"], { stdio: "ignore", windowsHide: true, env: mutation.unprivilegedEnvironment() });
     }
-    console.error(`\n⚠️  Update failed (${bin} exit ${r.status ?? "?"}). Try manually:  ${bin} ${cmdArgs.join(" ")}`);
-    process.exit(1);
+    await recoverStoppedRuntime("package update failed");
+    console.error(`\n⚠️  Update failed (${bin} exit ${r.status ?? "?"}). ${manualUpdateFailureGuidance({ bin, args: cmdArgs, owner }).join("\n")}`);
+    return 1;
   }
+  } catch (error) {
+    await recoverStoppedRuntime("update failed unexpectedly");
+    if (trayWasRunning) {
+      try { const { startWindowsTray } = await import("../tray/windows"); startWindowsTray(); } catch { /* retain original failure */ }
+    }
+    throw error;
+  }
+  });
+  if (updateExitCode) process.exit(updateExitCode);
 }

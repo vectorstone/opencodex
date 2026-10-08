@@ -1,0 +1,253 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { claudeConfigDir, fetchGatewayModels, refreshGatewayModelCacheFromProxy, writeGatewayModelCache } from "../../src/claude/gateway-cache";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+const dirs: string[] = [];
+function tempDir(): string {
+  const d = mkdtempSync(join(tmpdir(), "ocx-gwcache-"));
+  dirs.push(d);
+  return d;
+}
+afterEach(() => {
+  for (const d of dirs.splice(0)) removeTreeWithRetry(d);
+});
+
+describe("Claude Code gateway-model cache pre-write (devlog 260712 030)", () => {
+  test("writes the CLI's exact schema and mirrors the usable-id filter", () => {
+    const dir = tempDir();
+    const path = writeGatewayModelCache("http://127.0.0.1:10100", [
+      { id: "claude-opus-4-8-ncb", display_name: "gpt-5.6-sol (native)" },
+      { id: "claude-opus-4-8-ncb[1m]", display_name: "gpt-5.6-sol (native) · 372k" },
+      { id: "anthropic-something", display_name: "x" },
+      { id: "gpt-5.6-sol" }, // fails /^(claude|anthropic)/i — dropped like the CLI would
+    ], dir);
+    expect(path).toBe(join(dir, "cache", "gateway-models.json"));
+    const body = JSON.parse(readFileSync(path!, "utf8"));
+    expect(body.baseUrl).toBe("http://127.0.0.1:10100");
+    expect(typeof body.fetchedAt).toBe("number");
+    expect(body.models).toEqual([
+      { id: "claude-opus-4-8-ncb", display_name: "gpt-5.6-sol (native)" },
+      { id: "claude-opus-4-8-ncb[1m]", display_name: "gpt-5.6-sol (native) · 372k" },
+      { id: "anthropic-something", display_name: "x" },
+    ]);
+  });
+
+  test("no usable models -> authoritative empty written (stale cache cleared)", () => {
+    const dir = tempDir();
+    const path = writeGatewayModelCache("http://127.0.0.1:10100", [{ id: "gpt-only" }], dir);
+    expect(path).not.toBeNull();
+    const cached = JSON.parse(readFileSync(path!, "utf8"));
+    expect(cached.models).toEqual([]);
+  });
+
+  test("claudeConfigDir honors CLAUDE_CONFIG_DIR", () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      process.env.CLAUDE_CONFIG_DIR = "/tmp/custom-claude";
+      expect(claudeConfigDir()).toBe("/tmp/custom-claude");
+      delete process.env.CLAUDE_CONFIG_DIR;
+      // Platform-correct separator (Windows CI joins with backslash).
+      const { homedir } = require("node:os") as typeof import("node:os");
+      expect(claudeConfigDir()).toBe(join(homedir(), ".claude"));
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+  });
+
+  test("proxy refresh pins the readable id family with ?ids=cli (audit 051 #5)", async () => {
+    const dir = tempDir();
+    const originalFetch = globalThis.fetch;
+    let requestedUrl = "";
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        requestedUrl = String(input);
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-opencodex-api-key")).toBe("env-admission");
+        expect(headers.get("authorization")).toBeNull();
+        return new Response(JSON.stringify({ data: [{ id: "claude-ocx-native--gpt-5.6-sol", display_name: "gpt-5.6-sol (native)" }] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      const path = await refreshGatewayModelCacheFromProxy(10100, {
+        timeoutMs: 1000,
+        configDir: dir,
+        admissionConfig: {
+          apiKeys: [{ id: "configured", name: "Configured", key: "configured-admission", createdAt: "" }],
+        },
+        env: { OPENCODEX_API_AUTH_TOKEN: " env-admission " },
+      });
+      expect(requestedUrl).toContain("ids=cli");
+      const body = JSON.parse(readFileSync(path!, "utf8"));
+      expect(body.models[0].id).toBe("claude-ocx-native--gpt-5.6-sol");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("connected refresh targets the hub models endpoint with only the client token", async () => {
+    const dir = tempDir();
+    let requestedUrl = "";
+    let admission = "";
+    const path = await refreshGatewayModelCacheFromProxy({
+      baseUrl: "https://hub.example.test",
+      admissionToken: "ocx_data_connected",
+    }, {
+      configDir: dir,
+      fetchImpl: async (input, init) => {
+        requestedUrl = String(input);
+        admission = new Headers(init?.headers).get("x-opencodex-api-key") ?? "";
+        return new Response(JSON.stringify({ data: [{ id: "claude-ocx-hub-model" }] }), {
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    expect(requestedUrl).toBe("https://hub.example.test/v1/models?limit=1000&ids=cli");
+    expect(admission).toBe("ocx_data_connected");
+    const body = JSON.parse(readFileSync(path!, "utf8"));
+    expect(body.baseUrl).toBe("https://hub.example.test");
+  });
+
+  test("proxy refresh falls back to a configured admission key", async () => {
+    const dir = tempDir();
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-opencodex-api-key")).toBe("configured-admission");
+        return new Response(JSON.stringify({ data: [] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      expect(await refreshGatewayModelCacheFromProxy(10100, {
+        configDir: dir,
+        admissionConfig: {
+          apiKeys: [{ id: "configured", name: "Configured", key: "configured-admission", createdAt: "" }],
+        },
+        env: {},
+      })).not.toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  /**
+   * The cache is only honored while its `baseUrl` equals the launch's ANTHROPIC_BASE_URL, so
+   * this writer must resolve the same local destination `buildClaudeEnv` resolves (#4236).
+   * Three topologies, one answer each.
+   */
+  test("the cached baseUrl follows the unauthenticated loopback listener", async () => {
+    const cases = [
+      { listener: { enabled: true, port: 10104 } as const, expected: "http://127.0.0.1:10104" },
+      { listener: { enabled: true } as const, expected: "http://127.0.0.1:10100" },
+      { listener: { enabled: false } as const, expected: "http://127.0.0.1:10100" },
+      { listener: undefined, expected: "http://127.0.0.1:10100" },
+    ];
+    for (const { listener, expected } of cases) {
+      const dir = tempDir();
+      let requestedUrl = "";
+      const path = await refreshGatewayModelCacheFromProxy(10100, {
+        configDir: dir,
+        admissionConfig: listener === undefined ? {} : { unauthenticatedLoopbackListener: listener },
+        env: {},
+        fetchImpl: async input => {
+          requestedUrl = String(input);
+          return new Response(JSON.stringify({ data: [{ id: "claude-ocx-native--x" }] }), {
+            headers: { "content-type": "application/json" },
+          });
+        },
+      });
+      expect({ listener, url: requestedUrl }).toEqual({
+        listener,
+        url: `${expected}/v1/models?limit=1000&ids=cli`,
+      });
+      const body = JSON.parse(readFileSync(path!, "utf8"));
+      expect({ listener, baseUrl: body.baseUrl }).toEqual({ listener, baseUrl: expected });
+    }
+  });
+
+  test("proxy refresh uses the hardened service token file before a configured key", async () => {
+    const dir = tempDir();
+    const tokenFile = join(tempDir(), "service-api-token");
+    writeFileSync(tokenFile, "  service-file-admission\n", "utf8");
+    const originalFetch = globalThis.fetch;
+    let seen: string | null = null;
+    try {
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        seen = new Headers(init?.headers).get("x-opencodex-api-key");
+        return new Response(JSON.stringify({ data: [] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      await refreshGatewayModelCacheFromProxy(10100, {
+        configDir: dir,
+        admissionConfig: {
+          apiKeys: [{ id: "configured", name: "Configured", key: "configured-admission", createdAt: "" }],
+        },
+        env: { OCX_API_TOKEN_FILE: tokenFile },
+      });
+      expect(seen).toBe("service-file-admission");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("gateway-model cache carries the picker description", () => {
+  test("writer keeps description so the picker stops reading \"From gateway\"", () => {
+    const dir = tempDir();
+    const path = writeGatewayModelCache("http://127.0.0.1:10100", [
+      { id: "claude-ocx-xai--grok-4.7", display_name: "grok-4.7 (xai)", description: "Routed by OpenCodex to xai/grok-4.7" },
+      { id: "claude-ocx-native--gpt-5.5", display_name: "gpt-5.5 (native)" },
+    ], dir);
+    expect(JSON.parse(readFileSync(path!, "utf8")).models).toEqual([
+      { id: "claude-ocx-xai--grok-4.7", display_name: "grok-4.7 (xai)", description: "Routed by OpenCodex to xai/grok-4.7" },
+      { id: "claude-ocx-native--gpt-5.5", display_name: "gpt-5.5 (native)" },
+    ]);
+  });
+
+  test("proxy refresh copies description from /v1/models and ignores non-strings", async () => {
+    const dir = tempDir();
+    const fetchImpl = (async () => new Response(JSON.stringify({ data: [
+      { id: "claude-ocx-xai--grok-4.7", display_name: "grok-4.7 (xai)", description: "Routed by OpenCodex to xai/grok-4.7" },
+      { id: "claude-ocx-p--odd", display_name: "odd (p)", description: 42 },
+    ] }), { headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+    const path = await refreshGatewayModelCacheFromProxy(10100, { timeoutMs: 1000, configDir: dir, env: {}, fetchImpl });
+    expect(JSON.parse(readFileSync(path!, "utf8")).models).toEqual([
+      { id: "claude-ocx-xai--grok-4.7", display_name: "grok-4.7 (xai)", description: "Routed by OpenCodex to xai/grok-4.7" },
+      { id: "claude-ocx-p--odd", display_name: "odd (p)" },
+    ]);
+  });
+});
+
+
+test("fresh discovery remains usable when cache cannot be written", async () => {
+  const dir = tempDir();
+  const blocked = join(dir, "file"); writeFileSync(blocked, "not a directory");
+  let requests = 0;
+  const snapshot = await fetchGatewayModels({ baseUrl: "https://hub.example.test", admissionToken: "fixture-client" }, {
+    configDir: blocked,
+    fetchImpl: async (_url, init) => {
+      requests++;
+      expect(new Headers(init?.headers).get("x-opencodex-api-key")).toBe("fixture-client");
+      expect(new Headers(init?.headers).has("authorization")).toBe(false);
+      return Response.json({ data: [{ id: "ocx-claude-mock--model" }] });
+    },
+  });
+  expect(snapshot?.models).toEqual([{ id: "ocx-claude-mock--model" }]);
+  expect(writeGatewayModelCache(snapshot!.baseUrl, snapshot!.models, blocked)).toBeNull();
+  expect(requests).toBe(1);
+});
+
+test("failed or malformed discovery supplies no exposure and never reads stale cache", async () => {
+  const dir = tempDir();
+  writeGatewayModelCache("https://hub.example.test", [{ id: "ocx-claude-mock--stale" }], dir);
+  for (const result of [Response.json({}, { status: 401 }), Response.json({ data: "bad" }), new Response("{")]) {
+    expect(await fetchGatewayModels({ baseUrl: "https://hub.example.test", admissionToken: "fixture-client" }, {
+      configDir: dir, fetchImpl: async () => result,
+    })).toBeNull();
+  }
+});

@@ -1,13 +1,10 @@
 import type { CodexAccountMode, OcxConfig, OcxProviderConfig, ProviderCostOverlay } from "../types";
 import { OPENAI_PROVIDER_TIER_VERSION } from "../types";
+import { openaiResponsesUrl } from "../adapters/openai-responses-url";
 import { MAX_COST4_RATE } from "../usage/expected-prices";
+import { OPENAI_CODEX_PROVIDER_ID, LEGACY_OPENAI_MULTI_PROVIDER_ID, LEGACY_CHATGPT_PROVIDER_ID, CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider } from "./openai-tiers-destination";
+export { OPENAI_CODEX_PROVIDER_ID, LEGACY_OPENAI_MULTI_PROVIDER_ID, OPENAI_API_PROVIDER_ID, LEGACY_CHATGPT_PROVIDER_ID, CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider, supportsNativeResponsesCompactEndpoint, isOpenAiOperatedResponsesDestination, destinationDecodesNativeCompactionBlob } from "./openai-tiers-destination";
 
-export const OPENAI_CODEX_PROVIDER_ID = "openai";
-export const LEGACY_OPENAI_MULTI_PROVIDER_ID = "openai-multi";
-export const OPENAI_API_PROVIDER_ID = "openai-apikey";
-export const LEGACY_CHATGPT_PROVIDER_ID = "chatgpt";
-
-export const CODEX_FORWARD_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const LEGACY_OPENAI_MULTI_PREFIX = `${LEGACY_OPENAI_MULTI_PROVIDER_ID}/`;
 
 function canonicalCodexForwardProvider(mode: CodexAccountMode): OcxProviderConfig {
@@ -17,41 +14,6 @@ function canonicalCodexForwardProvider(mode: CodexAccountMode): OcxProviderConfi
     authMode: "forward",
     codexAccountMode: mode,
   };
-}
-
-function normalizedBaseUrl(value: string): string | undefined {
-  try {
-    const url = new URL(value.trim());
-    if (url.username || url.password || url.search || url.hash) return undefined;
-    const path = url.pathname.replace(/\/+$/, "");
-    return `${url.origin}${path}`;
-  } catch {
-    return undefined;
-  }
-}
-
-export function isCanonicalOpenAiForwardProvider(provider: OcxProviderConfig): boolean {
-  return provider.adapter === "openai-responses"
-    && provider.authMode === "forward"
-    && normalizedBaseUrl(provider.baseUrl) === CODEX_FORWARD_BASE_URL;
-}
-
-const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
-
-/**
- * Whether this provider can serve `POST /responses/compact`. The canonical ChatGPT
- * backend can, and so can the official OpenAI API — but an arbitrary gateway that
- * merely speaks the Responses wire cannot, and calling it there fails compaction
- * with an unhelpful error instead of falling back to a routed summary (#422).
- */
-export function supportsNativeResponsesCompactEndpoint(
-  providerName: string,
-  provider: OcxProviderConfig,
-): boolean {
-  if (isCanonicalOpenAiForwardProvider(provider)) return true;
-  return providerName === OPENAI_API_PROVIDER_ID
-    && provider.adapter === "openai-responses"
-    && normalizedBaseUrl(provider.baseUrl) === OPENAI_API_BASE_URL;
 }
 
 export interface OpenAiTierMigrationProjection {

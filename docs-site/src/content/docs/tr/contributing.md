@@ -14,11 +14,16 @@ aracının bulunması gerekir. Yayınlanan npm paketi kullanıcılar için kendi
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
+bun run setup:hooks  # eski yönetilen pre-push ve post-merge kancalarını kaldır
 bun run dev:proxy    # geliştirme modunda proxy API
 bun run dev:gui      # kontrol paneli geliştirme sunucusu (başka bir terminalde)
 bun run typecheck    # bun x tsc --noEmit
-bun run test         # bun test ./tests/
+bun run test        # tam test paketi (varsayılan)
 ```
+
+`bun run setup:hooks` değiştirilmemiş eski yönetilen `pre-push` ve `post-merge`
+kancalarını kaldırır; özel kancaları korur. `pre-push` kancası artık zorunlu değildir.
+`bun run prepush` isteğe bağlı bir manuel denetim olarak kullanılabilir.
 
 `bun run dev`, `bun run dev:proxy` komutunun bir takma adıdır. Kontrol paneli
 geliştirme sunucusu `bun run dev:gui` ile çalışır; `GET /` adresindeki
@@ -32,19 +37,27 @@ Yerel komutların CI ile eşleşmesi için depodaki betikleri kullanın:
 
 ```bash
 bun run typecheck                 # katı TypeScript denetimi
+bun run test:changed              # çözümlenen dev merge-base için import grafiği testleri
 bun run test                      # tests/ paketinin tamamı
-bun test tests/router.test.ts     # odaklanmış test dosyası
+bun test tests/routing/router.test.ts     # odaklanmış test dosyası
 bun run build:gui                 # Vite GUI derlemesi + paket hazırlığı
 bun run privacy:scan              # CI tarafından kullanılan kimlik/gizlilik taraması
 bun run prepare:package           # paket başlatıcılarını ve varlıklarını yenileme
 ```
 
-Testlerin çoğu düz `tests/*.test.ts` Bun testleridir. `tests/helpers/`
+Varsayılan olarak `bun run test` çalıştırın. Tam çalıştırma görevin boyutu, makine kaynakları
+veya eşzamanlı kullanılan çalışma ağaçları nedeniyle orantısız derecede maliyetliyse, en azından
+değişen davranışı gerçekten sınayan odaklanmış regresyon testlerini çalıştırmanız gerekir; örneğin
+`bun test tests/<domain>/<name>.test.ts`. Kapsamı daraltma nedenini, tam komutları, sonuçları ve
+test edilmeyen kapsamı açıklayın. `bun run test:changed` kapsamı destekleyebilir ancak tüm dolaylı
+bağımlılıkları bulamaz. Yalnızca CI sonucuna güvenmek veya yerel testleri atlamak için genel bir
+muafiyet yoktur. Birleştirmeden önce tüm zorunlu CI denetimleri PR’ın mevcut başındaki tam commit
+için başarılı olmalıdır.
+
+Bun testleri `src/` yapısını yansıtan alan dizinlerinde (`tests/<domain>/`) bulunur; harita `scripts/test-layout/layout.json` dosyasıdır. `tests/helpers/`
 paylaşılan test ortamlarını (fixtures) ve `tests/e2e-style/` daha geniş yerel
 parite senaryolarını içerir. Değiştirdiğiniz alt sistemin mevcut testlerinin
-yakınında odaklanmış bir regresyon testi bulundurun; paylaşılan yönlendirme,
-adaptörler, yapılandırma veya sunucu davranışları için test paketinin tamamını
-çalıştırın.
+yakınında odaklanmış bir regresyon testi bulundurun.
 
 Okumakta olduğunuz dokümantasyon sitesi `docs-site/` (Astro + Starlight)
 dizinindedir:
@@ -104,11 +117,24 @@ GitHub Actions iş akışları kasıtlı olarak yalın tutulur:
 
 Sürümler için yardımcıyı kullanın:
 
+
+Helper’ı çalıştırmadan önce hedef sürümü belirleyin ve varsayılan daldan
+`.github/workflows/dev-version-bump.yml` iş akışını `intended-version=<version>`
+ve `mode=pre-move` ile başlatın. Açılan PR’ı inceleyip `dev` dalına birleştirin;
+ardından `main` veya `preview` dalına yükseltip helper’ı çalıştırın. `dev` sürümü
+zaten hedef sürümden ilerideyse iş akışı `changed=false` döndürür ve sürüm PR’ı
+gerekmez. Yayın için tam sürüm commit’inin CI kontrollerinden geçmesi hâlâ zorunludur.
+
 ```bash
 bun run release <version>           # sürüm artışını commit/push eder; yayınlama iş akışı varsayılan olarak kuru çalıştırmadır (dry-run)
+bun run release --bump minor        # tag'ler ve npm kanallarından sonraki patch, minor veya major sürümü türetir
 bun run release <version> --publish # CI onaylı kuru çalıştırma anlaşıldıktan sonra yayınlayın
 bun run release:watch               # en yeni Sürüm iş akışı çalıştırmasını izleyin
 ```
+
+Açık bir sürüm yerine `--bump patch|minor|major` kullanılabilir. Daha yüksek bir core için preview
+tag'i açıldıktan sonra `--bump patch`, eski stable patch hattını sürdürmeyi reddeder; düzeltmeyi açık
+preview core içinde yayınlayın.
 
 ## Dallar
 
@@ -139,9 +165,12 @@ commit'leri belirtin.
   ve bir **Test planı** (veya eşdeğer içerik). Boş gövdeler, yalnızca yer tutucu
   metinler ve gerçek satır sonları yerine kaçışlı `\n` kullanan açıklamalar
   denetimden geçemez.
-- Başlık veya açıklama `gui`'den bahsediyorsa açıklamaya UI değişikliğinin bir
-  ekran görüntüsünü ekleyin; `enforce-target` denetimi ekran görüntüsü mevcut
-  olana kadar açıklama düzenlemelerinde yeniden çalışır.
+- Çekme isteği `gui/` altındaki dosyaları değiştiriyorsa UI değişikliğinin
+  ekran görüntüsünü açıklamaya ekleyin. `enforce-target`, ekran görüntüsü eklenene
+  kadar açıklama düzenlemelerinde yeniden çalışır. Görseli dala commit etmek
+  yerine açıklamaya sürükleyin: aksi hâlde squash merge ile `dev` dalına taşınır.
+  Komut satırından yükleyen bakımcılar `pr-assets` dalını kullanır ve commit
+  SHA'sına bağlantı verir.
 - Bu depodaki iş akışı değişiklikleri **`pull_request_target`** kullanır.
   Güncellenmiş zorlama mantığı yalnızca iş akışı depo varsayılan dalına
   yükseltildikten sonra geçerli olur — #631'de belgelenen operasyonel uyarı.
@@ -163,15 +192,15 @@ sahipliği `.github/CODEOWNERS` dosyasında bildirilmiştir.
 - **Sınırlarda asenkron hataları yakalayın** — sidecar'lar istek yoluna asla
   hata fırlatmaz; zarif bir işaretleyiciye indirgenirler.
 - **Yapı SOT** — geçerli bakımcı değişmezleri `structure/` dizininde yer alır.
-  Herkese açık kullanıcı iş akışlarını `docs-site/` dizininde ve geçmiş inceleme
-  notlarını `docs/` dizininde tutun.
+  Herkese açık kullanıcı iş akışlarını `docs-site/` dizininde, planlama ve inceleme
+  notlarını `devlog/` dizininde tutun.
 - **Dışa aktarımları (exports) koruyun** — diğer modüller bunlara bağımlı
   olabilir.
 
 ## Kataloğa sağlayıcı ekleme
 
 Tüm sağlayıcı seçicileri ve tohumları kurallı kayıt defterinden
-(`src/providers/registry.ts`) türetilir:
+(`src/providers/registry/entries-extended.ts`) türetilir:
 
 ```ts
 {
@@ -248,9 +277,6 @@ fabrikayı `src/index.ts` dosyasından dışa aktarın.
 
 ## Bittiğini iddia etmeden önce doğrulayın
 
-Değişikliğinizi kanıtlayan en dar komutu çalıştırın — tipler için `bun run
-typecheck`, davranış için odaklanmış bir `bun test tests/<ad>.test.ts` veya
-çalışma zamanı probu, ardından etkilenen yüzeye uygun daha geniş kapılar.
-opencodex büyük partiler yerine küçük, doğrulanabilir commit'leri tercih eder.
-
-
+Yukarıdaki test politikasını izleyin; tip değişiklikleri için `bun run typecheck` ve etkilenen
+alanın gerektirdiği denetimleri çalıştırın. Komutları, sonuçları ve test edilmeyen kapsamı
+bildirin; yalnızca gerçekten tamamlanan doğrulamaları belirtin.

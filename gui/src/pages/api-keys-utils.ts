@@ -14,6 +14,7 @@ export interface ApiKeyEntry {
   name: string;
   prefix: string;
   createdAt: string;
+  pendingRotation?: { id: string; createdAt: string; expiresAt: string };
   /** Always present from the server; zeroes are a real answer. Whether anything
    *  is attributable at all is the response-level `attributionSince`. */
   usage: ApiKeyUsage;
@@ -62,12 +63,82 @@ export function isApiAuthMatrix(value: unknown): value is ApiAuthMatrixRow[] {
 /** Shared by both key-name inputs; the server rejects anything longer. */
 export const API_KEY_NAME_MAX_LENGTH = 64;
 
+/** Who decided a surface's state; mirrors `ApiSurfaceSource` in src/protocols/settings.ts. */
+export type ApiSurfaceSource = "fixed" | "api-surfaces" | "claude-code-legacy" | "invalid";
+export interface ApiSurfaceInfo {
+  enabled: boolean;
+  source: ApiSurfaceSource;
+}
+export type ApiSurfacesInfo = Record<GatewayInboundProtocol, ApiSurfaceInfo>;
+
+const SURFACE_SOURCES = new Set<ApiSurfaceSource>(["fixed", "api-surfaces", "claude-code-legacy", "invalid"]);
+const SURFACE_NAMES = ["responses", "chat", "messages"] as const satisfies readonly GatewayInboundProtocol[];
+
+/**
+ * `surfaces` from the keys payload, or `undefined` when an older server sent none or the value
+ * is unusable. Callers fall back to the pre-surfaces display rather than inventing a state.
+ */
+export function parseApiSurfaces(value: unknown): ApiSurfacesInfo | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const surfaces = {} as ApiSurfacesInfo;
+  for (const name of SURFACE_NAMES) {
+    const surface = record[name];
+    if (!surface || typeof surface !== "object" || Array.isArray(surface)) return undefined;
+    const { enabled, source } = surface as Record<string, unknown>;
+    if (typeof enabled !== "boolean" || !SURFACE_SOURCES.has(source as ApiSurfaceSource)) return undefined;
+    surfaces[name] = { enabled, source: source as ApiSurfaceSource };
+  }
+  return surfaces;
+}
+
 export interface ApiEndpointInfo {
   baseUrl: string;
   responses: string;
   chatCompletions: string;
   messages: string;
   models: string;
+  audio?: AudioApiInfo;
+}
+
+export interface AudioApiInfo {
+  transcriptionEndpoint: string;
+  dictationStreamEndpoint: string;
+  liveEndpoint: string;
+  realtimeCallsEndpoint: string;
+  transcriptionModel: string;
+  liveModel: string;
+  transcriptionConfigured: boolean;
+  dictationConfigured: boolean;
+  liveConfigured: boolean;
+}
+
+/** Both wire and cache data must keep typed credentials on the advertised inference host. */
+export function isAudioApiInfo(value: unknown, baseUrl: string): value is AudioApiInfo {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const audio = value as Record<string, unknown>;
+  const fields = new Set(["transcriptionEndpoint", "dictationStreamEndpoint", "liveEndpoint", "realtimeCallsEndpoint", "transcriptionModel", "liveModel", "transcriptionConfigured", "dictationConfigured", "liveConfigured"]);
+  if (Object.keys(audio).some(field => !fields.has(field))) return false;
+  try {
+    const base = new URL(baseUrl);
+    if (!["http:", "https:"].includes(base.protocol) || base.username || base.password || base.search || base.hash) return false;
+    const paths = {
+      transcriptionEndpoint: ["/audio/transcriptions", false],
+      dictationStreamEndpoint: ["/audio/transcriptions/stream", true],
+      liveEndpoint: ["/live", true],
+      realtimeCallsEndpoint: ["/realtime/calls", false],
+    } as const;
+    for (const [field, [suffix, socket]] of Object.entries(paths)) {
+      if (typeof audio[field] !== "string") return false;
+      const url = new URL(audio[field]);
+      const protocol = socket ? (base.protocol === "https:" ? "wss:" : "ws:") : base.protocol;
+      if (url.protocol !== protocol || url.username || url.password || url.search || url.hash) return false;
+      url.protocol = base.protocol;
+      if (url.origin !== base.origin || url.pathname !== `${base.pathname.replace(/\/$/, "")}${suffix}`) return false;
+    }
+    return audio.transcriptionModel === "gpt-4o-transcribe" && audio.liveModel === "gpt-live-1-codex"
+      && [audio.transcriptionConfigured, audio.dictationConfigured, audio.liveConfigured].every(flag => typeof flag === "boolean");
+  } catch { return false; }
 }
 
 export type ModelTestState = "idle" | "testing" | "ok" | "error";

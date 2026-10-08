@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { act } from "react";
 import type { Root } from "react-dom/client";
+import { setClientResourceData } from "../src/client-resource";
 
 /**
  * Mounted behavior for the Integrations surfaces.
@@ -30,7 +31,9 @@ let previousGlobals: Record<(typeof globals)[number], unknown>;
 let testWindow: Window;
 let container: HTMLElement;
 let root: Root | null = null;
-let requests: Array<{ url: string; method: string; body: unknown }> = [];
+type RecordedRequest = { url: string; method: string; body: unknown };
+
+let requests: RecordedRequest[] = [];
 /**
  * `useDataSurface` caches by key, and the key includes `apiBase`. Reusing one
  * base across tests replayed the previous test's response, so a fixture change
@@ -48,11 +51,16 @@ type JournalRow = {
   configPath: string;
   snapshot: "none" | "stored" | "expired";
   undoable: boolean;
+  deletable?: boolean;
 };
 
 let stateResponse: () => Response;
 let journalRows: JournalRow[];
-let putResponse: () => Response;
+let putResponse: (request: RecordedRequest) => Response;
+let codexRoutingResponse: () => Response;
+let codexDesiredEnabled = true;
+let deleteResponse: () => Response;
+let previewResponse: (body: Record<string, unknown>, signal?: AbortSignal | null) => Response | Promise<Response>;
 /**
  * The overview also reads Codex routing, API keys, Claude Code, Claude Desktop
  * and the Grok fence. Default answers keep every existing test's card grid
@@ -80,6 +88,27 @@ function status(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function asideStatus(overrides: Record<string, unknown> = {}) {
+  return status({ clientId: "aside", configPath: "/tmp/aside/profiles.json", ...overrides });
+}
+
+function previewPlan(operation: "apply" | "overwrite" | "disable" | "restore", overrides: Record<string, unknown> = {}) {
+  return {
+    version: 1,
+    clientId: "hermes",
+    operation,
+    state: operation === "apply" ? "absent" : "current",
+    foreignEdit: "none",
+    changes: operation === "disable"
+      ? [{ kind: "remove", path: "providers.opencodex" }, { kind: "snapshot", path: "$snapshot" }, { kind: "ownership", path: "$ownership" }, { kind: "journal", path: "$journal" }]
+      : [{ kind: "replace", path: "providers.opencodex" }, { kind: "snapshot", path: "$snapshot" }, { kind: "ownership", path: "$ownership" }, { kind: "journal", path: "$journal" }],
+    fingerprint: `p1:${({ apply: "1", overwrite: "2", disable: "3", restore: "4" } as const)[operation].repeat(32)}`,
+    canApply: true,
+    willChange: true,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   previousGlobals = Object.fromEntries(
     globals.map(key => [key, Reflect.get(globalThis, key)]),
@@ -101,21 +130,38 @@ beforeEach(() => {
   apiBase = `http://ocx-test-${mountCount}.invalid`;
   stateResponse = () => json(status());
   putResponse = () => json({ ok: true, clientId: "hermes", changed: true, state: "absent", message: "disabled" });
+  codexRoutingResponse = () => json({ routingInjected: false, status: "native", recommendedCommand: null });
+  codexDesiredEnabled = true;
+  deleteResponse = () => json({ ok: true, clientId: "hermes", opId: "op-old", snapshotRemoved: true });
+  previewResponse = body => {
+    const clientId = body.clientId ?? "hermes";
+    return json(previewPlan((body.operation as "apply" | "overwrite" | "disable") ?? "apply", {
+      clientId,
+      ...(clientId === "pi" ? { fingerprint: `p1:${"5".repeat(32)}` } : {}),
+    }));
+  };
   failExtraSources = false;
 
   const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
     const method = (init?.method ?? "GET").toUpperCase();
-    requests.push({
+    const request = {
       url,
       method,
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
-    });
+    };
+    requests.push(request);
+    if (url.endsWith("/api/client-integrations/restore/preview")) return json(previewPlan("restore"));
+    if (url.endsWith("/api/client-integrations/preview")) {
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      return previewResponse(body, init?.signal);
+    }
+    if (url.includes("/journal") && method === "DELETE") return deleteResponse();
     if (url.includes("/journal")) return json({ operations: journalRows });
     if (url.includes("/api/startup-health")) {
       return failExtraSources
         ? json({ error: "nope" }, 500)
-        : json({ routingInjected: false, status: "native", recommendedCommand: null });
+        : codexRoutingResponse();
     }
     if (url.includes("/api/keys")) {
       return failExtraSources ? json({ error: "nope" }, 500) : json({ keys: [] });
@@ -125,15 +171,41 @@ beforeEach(() => {
         ? json({ error: "nope" }, 500)
         : json({ desiredEnabled: true, installed: true, observedKind: "standard", applied: false, stale: false, activeProfile: null, appliedAt: null });
     }
-    if (url.includes("/api/native-integrations")) {
-      return json({ clients: [{
-        clientId: "claude-desktop",
-        state: "absent",
-        installed: true,
-        configPath: "/tmp/desktop",
-        desiredEnabled: true,
-        disableBlocked: null,
-      }] });
+    if (method === "PUT" && url.endsWith("/api/native-integrations/codex")) {
+      const body = init?.body ? JSON.parse(String(init.body)) as { enabled?: unknown } : {};
+      codexDesiredEnabled = body.enabled === true;
+      codexRoutingResponse = () => json({
+        routingInjected: codexDesiredEnabled,
+        status: "native",
+        recommendedCommand: null,
+      });
+      return json({
+        ok: true,
+        clientId: "codex",
+        changed: true,
+        state: codexDesiredEnabled ? "current" : "absent",
+        message: codexDesiredEnabled ? "enabled" : "disabled",
+        desiredEnabled: codexDesiredEnabled,
+      });
+    }
+    if (method === "GET" && url.includes("/api/native-integrations")) {
+      return failExtraSources
+        ? json({ error: "nope" }, 500)
+        : json({ clients: [{
+          clientId: "codex",
+          state: codexDesiredEnabled ? "current" : "absent",
+          installed: true,
+          configPath: "/tmp/codex/config.toml",
+          desiredEnabled: codexDesiredEnabled,
+          disableBlocked: null,
+        }, {
+          clientId: "claude-desktop",
+          state: "absent",
+          installed: true,
+          configPath: "/tmp/desktop",
+          desiredEnabled: true,
+          disableBlocked: null,
+        }] });
     }
     if (url.includes("/api/claude-code")) {
       return failExtraSources ? json({ error: "nope" }, 500) : json({ enabled: false });
@@ -141,7 +213,7 @@ beforeEach(() => {
     if (url.includes("/api/grok")) {
       return failExtraSources ? json({ error: "nope" }, 500) : json({ present: false, models: [] });
     }
-    if (method === "PUT") return putResponse();
+    if (method === "PUT") return putResponse(request);
     if (url.includes("/restore")) return json({ ok: true, clientId: "hermes", changed: true, state: "current", message: "restored" });
     return stateResponse();
   }) as typeof fetch;
@@ -166,7 +238,7 @@ afterEach(async () => {
 
 async function mountClient(
   active = true,
-  client: "hermes" | "dsh" = "hermes",
+  client: "hermes" | "dsh" | "kilo" | "droid" = "hermes",
 ): Promise<void> {
   const [{ createRoot }, { LanguageProvider }, { default: FileIntegrationPage }] = await Promise.all([
     import("react-dom/client"),
@@ -184,6 +256,24 @@ async function mountClient(
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
 }
 
+/**
+ * Mount again inside ONE test, against a fresh fixture.
+ *
+ * `useDataSurface` caches by `apiBase`, so a second mount on the same base
+ * replays the first response and the new `stateResponse` has no effect. Rotating
+ * the base is what makes a state sweep in a single test possible at all.
+ */
+async function remountClient(client: "hermes" | "dsh" | "kilo" | "droid" = "hermes"): Promise<void> {
+  if (root) {
+    const current = root;
+    await act(async () => { current.unmount(); });
+    root = null;
+  }
+  mountCount += 1;
+  apiBase = `http://ocx-test-${mountCount}.invalid`;
+  await mountClient(true, client);
+}
+
 test("the DSH surface uses localized ownership semantics and its own API route", async () => {
   stateResponse = () => json(status({
     clientId: "dsh",
@@ -192,13 +282,164 @@ test("the DSH surface uses localized ownership semantics and its own API route",
   await mountClient(true, "dsh");
 
   const text = container.textContent ?? "";
-  expect(text).toContain("DeepSeek Harness (DSH)");
-  expect(text).toContain("llm-pi-ai.providers.opencodex");
+  // The tab strip ran out of room, so the tab and the page heading both read the short
+  // form; the full product name still lives on the API Keys page (api.clientConfig.clientDsh).
+  expect(text).toContain("DSH");
+  expect(text).not.toContain("DeepSeek Harness (DSH)");
+  // DSH 0.1.7+ reads the llm-pi-ai row of the Desktop profile patch; settings.yaml is the fallback.
+  expect(text).toContain("llm-pi-ai row");
+  expect(text).toContain("$DSH_HOME/profiles/desktop/cordis.patch.yml");
+  expect(text).toContain("$DSH_HOME/settings.yaml");
   expect(text).toContain("hot reload");
   expect(text).toContain("default model");
   expect(text).toContain("deepseek-official");
   expect(text).toContain("loopback");
   expect(requests.some(request => request.url.endsWith("/api/client-integrations/dsh"))).toBe(true);
+});
+
+test("a DSH profile without its patch tells the operator which file to create and with what", async () => {
+  const patch = "/tmp/home/.dsh/profiles/desktop/cordis.patch.yml";
+  stateResponse = () => json(status({
+    clientId: "dsh",
+    state: "absent",
+    configPath: "/tmp/home/.dsh/settings.yaml",
+    supersededBy: patch,
+    supersededReason: "missing-store",
+    missingStoreDocument: "[]",
+  }));
+  await mountClient(true, "dsh");
+
+  const text = container.textContent ?? "";
+  expect(text).toContain(`This client keeps its providers in ${patch}, which is missing.`);
+  expect(text).toContain(`Create ${patch} containing [], then press Apply again.`);
+  expect(text).not.toContain("which opencodex does not write");
+
+  // The apply preview refuses; its dialog covers that notice, so it names the path itself.
+  previewResponse = () => json(previewPlan("apply", {
+    clientId: "dsh",
+    changes: [],
+    fingerprint: "p7:unbound",
+    canApply: false,
+    willChange: false,
+    refusalReason: "superseded_store",
+    supersededReason: "missing-store",
+    missingStoreDocument: "[]",
+  }));
+  await act(async () => { toggleSwitch().click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
+  const dialog = container.querySelector("dialog")?.textContent ?? "";
+  expect(dialog).toContain(`Create ${patch} containing [], then press Apply again.`);
+  expect(requests.some(request => request.method === "PUT")).toBe(false);
+});
+
+test("Droid reasoning defaults use one frozen snapshot for review and commit", async () => {
+  let savedDefaults: Record<string, string> = {};
+  stateResponse = () => json(status({
+    clientId: "droid",
+    configPath: "/tmp/factory/settings.json",
+    droidReasoning: {
+      models: [{ model: "openai/gpt-test", label: "Test model", efforts: ["low", "high"] }],
+      defaults: savedDefaults,
+    },
+  }));
+  putResponse = request => {
+    savedDefaults = (request.body as { droidReasoningDefaults?: Record<string, string> }).droidReasoningDefaults ?? {};
+    return json({ ok: true, clientId: "droid", changed: true, state: "current", message: "saved" });
+  };
+  await mountClient(true, "droid");
+
+  expect(container.textContent).toContain("A default is used only when a request omits its reasoning effort");
+  expect(buttonByText("Save / review changes")?.disabled).toBe(false);
+  const selector = container.querySelector<HTMLButtonElement>('[role="combobox"]')!;
+  await act(async () => { selector.click(); });
+  const high = Array.from(testWindow.document.querySelectorAll('[role="option"]')).find(option => option.textContent === "high") as HTMLButtonElement;
+  await act(async () => { high.click(); });
+  await act(async () => { buttonByText("Save / review changes")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
+
+  const preview = requests.find(request => request.method === "POST" && request.url.endsWith("/api/client-integrations/preview"));
+  expect(preview?.body).toMatchObject({
+    clientId: "droid",
+    operation: "apply",
+    droidReasoningDefaults: { "openai/gpt-test": "high" },
+  });
+  expect(container.querySelector<HTMLButtonElement>('[role="combobox"]')?.disabled).toBe(true);
+  await confirmDialog("Apply");
+
+  const mutation = requests.find(request => request.method === "PUT" && request.url.endsWith("/api/client-integrations/droid"));
+  expect(mutation?.body).toMatchObject({
+    enabled: true,
+    droidReasoningDefaults: { "openai/gpt-test": "high" },
+  });
+  expect(savedDefaults).toEqual({ "openai/gpt-test": "high" });
+  expect(container.querySelector<HTMLButtonElement>('[role="combobox"]')?.disabled).toBe(false);
+
+  savedDefaults = { "openai/gpt-test": "low" };
+  await act(async () => {
+    setClientResourceData(`integration-state:${apiBase}:droid`, status({
+      clientId: "droid",
+      configPath: "/tmp/factory/settings.json",
+      droidReasoning: {
+        models: [{ model: "openai/gpt-test", label: "Test model", efforts: ["low", "high"] }],
+        defaults: savedDefaults,
+      },
+    }));
+  });
+  expect(container.querySelector<HTMLButtonElement>('[role="combobox"]')?.textContent).toContain("low");
+});
+
+test.each(["Update", "Save / review changes"])("Droid %s omits unsupported saved defaults while an explicit edit stays frozen through confirm", async (action) => {
+  stateResponse = () => json(status({
+    clientId: "droid",
+    state: "stale",
+    configPath: "/tmp/factory/settings.json",
+    droidReasoning: {
+      models: [{ model: "openai/gpt-test", label: "Test model", efforts: ["low"] }],
+      defaults: { "openai/gpt-test": "high" },
+    },
+  }));
+  await mountClient(true, "droid");
+
+  await act(async () => { buttonByText(action)!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
+  const refreshPreview = requests.find(request => request.method === "POST" && request.url.endsWith("/api/client-integrations/preview"));
+  expect(refreshPreview?.body).not.toHaveProperty("droidReasoningDefaults");
+
+  await confirmDialog("Apply");
+  const unchangedMutation = requests.find(request => request.method === "PUT" && request.url.endsWith("/api/client-integrations/droid"));
+  expect(unchangedMutation).toBeDefined();
+  expect(unchangedMutation?.body).not.toHaveProperty("droidReasoningDefaults");
+
+  const selector = container.querySelector<HTMLButtonElement>('[role="combobox"]')!;
+  await act(async () => { selector.click(); });
+  const low = Array.from(testWindow.document.querySelectorAll('[role="option"]')).find(option => option.textContent === "low") as HTMLButtonElement;
+  await act(async () => { low.click(); });
+  await act(async () => { buttonByText("Save / review changes")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
+
+  const previews = requests.filter(request => request.method === "POST" && request.url.endsWith("/api/client-integrations/preview"));
+  expect(previews[1]?.body).toMatchObject({ droidReasoningDefaults: { "openai/gpt-test": "low" } });
+  expect(container.querySelector<HTMLButtonElement>('[role="combobox"]')?.disabled).toBe(true);
+  await confirmDialog("Apply");
+  const mutation = requests.filter(request => request.method === "PUT" && request.url.endsWith("/api/client-integrations/droid")).at(-1);
+  expect(mutation?.body).toMatchObject({ droidReasoningDefaults: { "openai/gpt-test": "low" } });
+});
+
+test("Droid explicitly clearing its last default sends an empty map for review and commit", async () => {
+  stateResponse = () => json(status({ clientId: "droid", droidReasoning: {
+    models: [{ model: "openai/gpt-test", label: "Test model", efforts: ["low"] }],
+    defaults: { "openai/gpt-test": "low" },
+  } }));
+  await mountClient(true, "droid");
+  await act(async () => { container.querySelector<HTMLButtonElement>('[role="combobox"]')!.click(); });
+  const clear = [...testWindow.document.querySelectorAll('[role="option"]')].find(option => option.textContent === "No default") as HTMLButtonElement;
+  await act(async () => { clear.click(); });
+  await act(async () => { buttonByText("Save / review changes")!.click(); });
+  const preview = requests.find(request => request.method === "POST" && request.url.endsWith("/api/client-integrations/preview"));
+  expect(preview?.body).toHaveProperty("droidReasoningDefaults", {});
+  await confirmDialog("Apply");
+  const mutation = requests.find(request => request.method === "PUT" && request.url.endsWith("/api/client-integrations/droid"));
+  expect(mutation?.body).toHaveProperty("droidReasoningDefaults", {});
 });
 
 function buttons(): HTMLButtonElement[] {
@@ -231,6 +472,16 @@ function toggleSwitch(): HTMLButtonElement {
   return found;
 }
 
+async function confirmDialog(label: string): Promise<void> {
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 0)); });
+  const dialog = container.querySelector("dialog[open]")!;
+  const confirm = Array.from(dialog.querySelectorAll("button")).find(
+    button => (button.textContent ?? "").trim() === label,
+  ) as HTMLButtonElement;
+  await act(async () => { confirm.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 0)); });
+}
+
 test("turning the switch off disables, even when the block is stale", async () => {
   /*
    * The defect this pins: `stale` also means our block is on disk, so the
@@ -244,9 +495,10 @@ test("turning the switch off disables, even when the block is stale", async () =
   const sw = toggleSwitch();
   expect(sw.getAttribute("aria-pressed")).toBe("true");
   await act(async () => { sw.click(); });
+  await confirmDialog("Disable");
 
   const put = requests.find(request => request.method === "PUT");
-  expect(put?.body).toEqual({ enabled: false });
+  expect(put?.body).toEqual({ enabled: false, operation: "disable", planFingerprint: previewPlan("disable").fingerprint });
 });
 
 test("updating a stale block is a separate action from the switch", async () => {
@@ -256,14 +508,58 @@ test("updating a stale block is a separate action from the switch", async () => 
   const update = buttonByText("Update");
   expect(update).toBeDefined();
   await act(async () => { update!.click(); });
-  expect(requests.find(request => request.method === "PUT")?.body).toEqual({ enabled: true });
+  await confirmDialog("Apply");
+  expect(requests.find(request => request.method === "PUT")?.body).toEqual({ enabled: true, operation: "apply", planFingerprint: previewPlan("apply").fingerprint });
 });
 
 test("an absent integration applies", async () => {
   stateResponse = () => json(status({ state: "absent" }));
   await mountClient();
   await act(async () => { toggleSwitch().click(); });
-  expect(requests.find(request => request.method === "PUT")?.body).toEqual({ enabled: true });
+  await confirmDialog("Apply");
+  expect(requests.find(request => request.method === "PUT")?.body).toEqual({ enabled: true, operation: "apply", planFingerprint: previewPlan("apply").fingerprint });
+});
+
+test("a hostile preview fails closed without leaking payload data into the page", async () => {
+  const canary = "private-preview-canary-9f31";
+  stateResponse = () => json(status({ state: "absent" }));
+  previewResponse = body => json({
+    ...previewPlan("apply", { clientId: body.clientId ?? "hermes" }),
+    rawValue: canary,
+    message: canary,
+  });
+  await mountClient();
+  await act(async () => { toggleSwitch().click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
+
+  expect(container.textContent).toContain("The change plan could not be loaded. Nothing was changed.");
+  expect(container.textContent).not.toContain(canary);
+  expect(requests.some(request => request.method === "PUT")).toBe(false);
+});
+
+test("closing a loading preview aborts it and fences a late response", async () => {
+  stateResponse = () => json(status({ state: "absent" }));
+  let previewSignal: AbortSignal | null | undefined;
+  let resolvePreview: ((response: Response) => void) | undefined;
+  previewResponse = (_body, signal) => {
+    previewSignal = signal;
+    return new Promise<Response>(resolve => { resolvePreview = resolve; });
+  };
+  await mountClient();
+  await act(async () => { toggleSwitch().click(); });
+  const dialog = container.querySelector("dialog[open]")!;
+  const close = Array.from(dialog.querySelectorAll("button")).find(button => button.textContent?.trim() === "Close") as HTMLButtonElement;
+  expect(close.disabled).toBe(false);
+  await act(async () => { close.click(); });
+  expect(previewSignal?.aborted).toBe(true);
+  expect(container.querySelector("dialog[open]")).toBeNull();
+
+  await act(async () => {
+    resolvePreview!(json(previewPlan("apply")));
+    await new Promise<void>(resolve => testWindow.setTimeout(resolve, 0));
+  });
+  expect(container.querySelector("dialog[open]")).toBeNull();
+  expect(container.textContent).not.toContain("Server change plan");
 });
 
 test("conflict locks the switch instead of guessing", async () => {
@@ -271,6 +567,139 @@ test("conflict locks the switch instead of guessing", async () => {
   stateResponse = () => json(status({ state: "conflict", reason: "foreign-edit" }));
   await mountClient();
   expect(toggleSwitch().disabled).toBe(true);
+});
+
+/*
+ * The overwrite escape hatch.
+ *
+ * Conflict was a dead end before it existed: the switch locks and the only way
+ * forward was hand-editing the file. These pin the two halves of the deal --
+ * the button appears for exactly one state, and it costs a confirmation.
+ */
+test("a conflict offers an overwrite, and no other state does", async () => {
+  for (const state of ["absent", "current", "stale", "unsafe"] as const) {
+    stateResponse = () => json(status({ state }));
+    await remountClient();
+    expect(buttonByText("Replace")).toBeUndefined();
+  }
+
+  stateResponse = () => json(status({ state: "conflict", reason: "unowned-key" }));
+  await remountClient();
+  expect(buttonByText("Replace")).toBeDefined();
+});
+
+test("Kilo candidate conflict names the other file and offers no overwrite", async () => {
+  const path = "/tmp/home/.config/kilo/opencode.jsonc";
+  stateResponse = () => json(status({ clientId: "kilo", state: "conflict", reason: "candidate-conflict", conflictPaths: [path] }));
+  await mountClient(true, "kilo");
+  expect(buttonByText("Replace")).toBeUndefined();
+  expect(container.textContent).toContain(path);
+  expect(container.textContent).toContain("Remove provider.opencodex from that file");
+});
+
+test("an owned Kilo candidate conflict still offers Disable", async () => {
+  const path = "/tmp/home/.config/kilo/opencode.jsonc";
+  stateResponse = () => json(status({ clientId: "kilo", state: "conflict", reason: "candidate-conflict", conflictPaths: [path], lastOpId: "owned-operation" }));
+  await mountClient(true, "kilo");
+  const sw = toggleSwitch();
+  expect(sw.disabled).toBe(false);
+  expect(sw.getAttribute("aria-pressed")).toBe("true");
+  await act(async () => { sw.click(); });
+  await confirmDialog("Disable");
+  expect(requests.find(request => request.method === "PUT")?.body).toEqual({
+    enabled: false, operation: "disable", planFingerprint: previewPlan("disable").fingerprint,
+  });
+});
+
+test("Kilo can disable past an unsafe later candidate, but not an unsafe selected file", async () => {
+  const configPath = "/tmp/home/.config/kilo/kilo.jsonc";
+  stateResponse = () => json(status({ clientId: "kilo", configPath, state: "unsafe", reason: "unparseable",
+    candidateFailurePath: "/tmp/home/.config/kilo/opencode.jsonc", lastOpId: "owned-operation" }));
+  await mountClient(true, "kilo");
+  expect(toggleSwitch().disabled).toBe(false);
+  expect(toggleSwitch().getAttribute("aria-pressed")).toBe("true");
+
+  stateResponse = () => json(status({ clientId: "kilo", configPath, state: "unsafe", reason: "unparseable",
+    candidateFailurePath: configPath, lastOpId: "owned-operation" }));
+  await remountClient("kilo");
+  expect(toggleSwitch().disabled).toBe(true);
+});
+
+test("a client with no config on disk is never offered an overwrite", async () => {
+  // installed:false means there is nothing to replace; the server refuses it as
+  // not_installed, so offering the button would only produce an error dialog.
+  stateResponse = () => json(status({ state: "conflict", reason: "unowned-key", installed: false }));
+  await mountClient();
+  expect(buttonByText("Replace")).toBeUndefined();
+});
+
+test("the overwrite button mutates nothing until the dialog is confirmed", async () => {
+  stateResponse = () => json(status({ state: "conflict", reason: "unowned-key" }));
+  await mountClient();
+
+  await act(async () => { buttonByText("Replace")!.click(); });
+  // Opening the dialog is not the operation.
+  expect(requests.some(request => request.method === "PUT")).toBe(false);
+
+  // The dialog names the file the user is about to lose a block from, and says
+  // the change is recoverable.
+  const dialog = container.querySelector(".integration-consequence-dialog")!;
+  expect(dialog.textContent).toContain("/tmp/home/.hermes/config.yaml");
+  expect(dialog.textContent).toContain("rollback list");
+
+  const confirm = Array.from(dialog.querySelectorAll("button")).find(
+    button => (button.textContent ?? "").trim() === "Replace",
+  ) as HTMLButtonElement;
+  await act(async () => { confirm.click(); });
+
+  const put = requests.find(request => request.method === "PUT");
+  expect(put?.body).toEqual({ enabled: true, overwriteConflict: true, operation: "overwrite", planFingerprint: previewPlan("overwrite").fingerprint });
+});
+
+test("a foreign edit and an unowned block get different dialog copy", async () => {
+  stateResponse = () => json(status({ state: "conflict", reason: "foreign-edit" }));
+  await remountClient();
+  await act(async () => { buttonByText("Replace")!.click(); });
+  // The user's own edit is what is discarded, and the copy has to say so.
+  expect(container.querySelector(".integration-consequence-dialog")!.textContent)
+    .toContain("Your edit inside the opencodex block");
+
+  stateResponse = () => json(status({ state: "conflict", reason: "unowned-key" }));
+  await remountClient();
+  await act(async () => { buttonByText("Replace")!.click(); });
+  expect(container.querySelector(".integration-consequence-dialog")!.textContent)
+    .toContain("A block we did not write");
+});
+
+test("the dialog's config path can break mid-string, so it cannot overflow a phone", async () => {
+  /*
+   * The dialog is 370px wide at a 390px viewport and the path it names is a long
+   * unbroken token -- a real one is `~/.zcode/v2/config.json` and worse. Without a
+   * break opportunity inside the word that token overflows its own container,
+   * which is how the one piece of information the user needs (WHICH file) ends up
+   * off screen.
+   *
+   * happy-dom does no layout, so measured geometry is not available here; what is
+   * checkable is that the path renders inside an element the stylesheet allows to
+   * break. Rendered geometry was measured separately at 390px in both themes
+   * (dialog 370px wide at left:10, code element 212px, no overflow).
+   */
+  // A synthetic home, not a real one: privacy:scan rejects a committed /Users/<name>/.
+  const longPath = "/home/dev/Library/Application Support/SomeVendor/deeply/nested/config.json";
+  stateResponse = () => json(status({
+    state: "conflict",
+    reason: "unowned-key",
+    configPath: longPath,
+  }));
+  await remountClient();
+  await act(async () => { buttonByText("Replace")!.click(); });
+
+  const dialog = container.querySelector(".integration-consequence-dialog")!;
+  const code = dialog.querySelector("code");
+  // A <code> element, not bare text: `.integration-consequence-body code` is what
+  // carries `overflow-wrap: anywhere`.
+  expect(code).not.toBeNull();
+  expect(code!.textContent).toBe(longPath);
 });
 
 test("unsafe locks the switch instead of guessing", async () => {
@@ -332,6 +761,38 @@ test("an expired snapshot offers nothing, because the bytes are gone", async () 
   expect(container.innerHTML).toContain("Backup expired");
 });
 
+test("the client page reconciles a journal row another tab already deleted", async () => {
+  journalRows = [{
+    opId: "op-stale",
+    clientId: "hermes",
+    kind: "apply",
+    at: "2026-08-02T08:00:00.000Z",
+    configPath: "/tmp/home/.hermes/config.yaml",
+    snapshot: "expired",
+    undoable: false,
+    deletable: true,
+  }];
+  deleteResponse = () => {
+    journalRows = [];
+    return json({
+      error: "integration operation not found",
+      code: "integration_operation_not_found",
+      opId: "op-stale",
+    }, 404);
+  };
+  await mountClient();
+
+  await act(async () => { buttonByText("Delete")!.click(); });
+  expect(container.querySelector(".integration-consequence-dialog")).not.toBeNull();
+  await act(async () => { buttonByText("Delete entry")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+
+  expect(container.querySelector(".integration-consequence-dialog")).toBeNull();
+  expect(buttonByText("Delete")).toBeUndefined();
+  expect(requests.filter(request => request.method === "DELETE")).toHaveLength(1);
+  expect(requests.filter(request => request.method === "GET" && request.url.includes("/journal")).length).toBeGreaterThanOrEqual(2);
+});
+
 test("a residual write tells the user the file may be half-written and where the backup is", async () => {
   /*
    * `residual` means compensation itself failed. It is the single most
@@ -350,6 +811,7 @@ test("a residual write tells the user the file may be half-written and where the
   }, 500);
   await mountClient();
   await act(async () => { toggleSwitch().click(); });
+  await confirmDialog("Disable");
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
 
   const text = container.textContent ?? "";
@@ -371,6 +833,7 @@ test("a refusal routes by reason, not by the state it happened in", async () => 
   }, 500);
   await mountClient();
   await act(async () => { toggleSwitch().click(); });
+  await confirmDialog("Disable");
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
 
   const text = container.textContent ?? "";
@@ -402,6 +865,74 @@ async function mountOverview(): Promise<void> {
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
 }
 
+test("overview names a competing Kilo file without offering Replace", async () => {
+  const path = "/tmp/home/.config/kilo/config.json";
+  stateResponse = () => json({ clients: [status({ clientId: "kilo", state: "conflict", reason: "candidate-conflict", conflictPaths: [path] })] });
+  await mountOverview();
+  const card = container.querySelector('.integration-card[data-client="kilo"]')!;
+  expect(card.textContent).toContain(path);
+  expect(Array.from(card.querySelectorAll("button")).some(button => button.textContent?.trim() === "Replace")).toBe(false);
+});
+
+test("overview allows disabling an owned Kilo block during candidate conflict", async () => {
+  const path = "/tmp/home/.config/kilo/config.json";
+  stateResponse = () => json({ clients: [status({ clientId: "kilo", state: "conflict", reason: "candidate-conflict", conflictPaths: [path], lastOpId: "owned-operation" })] });
+  await mountOverview();
+  const card = container.querySelector('.integration-card[data-client="kilo"]')!;
+  const sw = card.querySelector("button.switch") as HTMLButtonElement;
+  expect(sw.disabled).toBe(false);
+  expect(sw.getAttribute("aria-pressed")).toBe("true");
+  await act(async () => { sw.click(); });
+  expect(requests.some(request => request.url.endsWith("/api/client-integrations/preview")
+    && (request.body as { operation?: string }).operation === "disable")).toBe(true);
+});
+
+test("Disable all includes an owned Kilo block with an off-target candidate conflict", async () => {
+  const path = "/tmp/home/.config/kilo/config.json";
+  stateResponse = () => json({ clients: [status({ clientId: "kilo", state: "conflict", reason: "candidate-conflict", conflictPaths: [path], lastOpId: "owned-operation" })] });
+  await mountOverview();
+  const disableAll = buttonByText("Disable all…");
+  expect(disableAll?.disabled).toBe(false);
+  await act(async () => { disableAll!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+  expect(requests.some(request => request.url.endsWith("/api/client-integrations/preview")
+    && (request.body as { clientId?: string; operation?: string }).clientId === "kilo"
+    && (request.body as { operation?: string }).operation === "disable")).toBe(true);
+});
+
+test("the overview reconciles a journal row another tab already deleted", async () => {
+  stateResponse = () => json({ clients: [status()] });
+  journalRows = [{
+    opId: "op-stale-overview",
+    clientId: "hermes",
+    kind: "apply",
+    at: "2026-08-02T08:00:00.000Z",
+    configPath: "/tmp/home/.hermes/config.yaml",
+    snapshot: "expired",
+    undoable: false,
+    deletable: true,
+  }];
+  deleteResponse = () => {
+    journalRows = [];
+    return json({
+      error: "integration operation not found",
+      code: "integration_operation_not_found",
+      opId: "op-stale-overview",
+    }, 404);
+  };
+  await mountOverview();
+
+  await act(async () => { buttonByText("Delete")!.click(); });
+  expect(container.querySelector(".integration-consequence-dialog")).not.toBeNull();
+  await act(async () => { buttonByText("Delete entry")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+
+  expect(container.querySelector(".integration-consequence-dialog")).toBeNull();
+  expect(buttonByText("Delete")).toBeUndefined();
+  expect(requests.filter(request => request.method === "DELETE")).toHaveLength(1);
+  expect(requests.filter(request => request.method === "GET" && request.url.includes("/journal")).length).toBeGreaterThanOrEqual(2);
+});
+
 test("the overview does not claim nothing is installed while it is still loading", async () => {
   /*
    * `clients` defaults to an empty array, so branching on its length first
@@ -430,6 +961,240 @@ test("the overview does not claim nothing is installed while it is still loading
   expect(container.textContent ?? "").toContain("No installed clients were detected");
 });
 
+test("a failed first read does not claim nothing is installed either", async () => {
+  /*
+   * A failed-cold read carries no data, so it is not an answer: the error
+   * notice must stand alone, without the "nothing detected" panel, and the
+   * file clients stay as unknown rows rather than a server-side omission.
+   */
+  stateResponse = () => json({ error: "nope" }, 500);
+  await mountOverview();
+
+  const text = container.textContent ?? "";
+  expect(text).toContain("Could not load integration state.");
+  expect(text).not.toContain("No installed clients were detected");
+  expect(text).toContain("Hermes");
+});
+
+test("a failed first status read on a client page offers Retry, which reads again", async () => {
+  // The page used to show only the error notice, so recovering from a transient failure
+  // meant reloading the dashboard.
+  stateResponse = () => json({ error: "nope" }, 503);
+  await mountClient();
+  expect(container.textContent ?? "").toContain("Could not load integration state.");
+  const retry = buttonByText("Retry");
+  expect(retry).toBeDefined();
+
+  const before = requests.filter(request => request.method === "GET" && !request.url.includes("/journal")).length;
+  await act(async () => { retry!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+  const after = requests.filter(request => request.method === "GET" && !request.url.includes("/journal")).length;
+  expect(after).toBeGreaterThan(before);
+});
+
+test("the aggregate Aside overview toggle stays unbound", async () => {
+  let applied = true;
+  stateResponse = () => json({ clients: [asideStatus({ state: applied ? "current" : "absent" })] });
+  previewResponse = body => body.clientId === "aside"
+    ? json({ error: "aggregate Aside previews require a profile", code: "invalid_aside_profile" }, 400)
+    : json(previewPlan("disable", { clientId: body.clientId }));
+  putResponse = request => {
+    const body = request.body as Record<string, unknown>;
+    if (body.operation !== undefined || body.planFingerprint !== undefined) {
+      return json({ error: "a confirmed plan applies to one profile", code: "invalid_aside_profile" }, 400);
+    }
+    applied = body.enabled === true;
+    return json({ ok: true, results: [{ profileId: 7, ok: true, state: applied ? "current" : "absent" }] });
+  };
+
+  await mountOverview();
+  await act(async () => { switchFor("aside")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+
+  expect(requests.filter(request => request.url.endsWith("/api/client-integrations/preview"))).toHaveLength(0);
+  const puts = requests.filter(request => request.method === "PUT" && request.url.endsWith("/api/client-integrations/aside/profiles"));
+  expect(puts).toHaveLength(1);
+  expect(puts[0]?.body).toEqual({ enabled: false });
+});
+
+test("aggregate Aside overview failures stay on the card without an unhandled rejection", async () => {
+  stateResponse = () => json({ clients: [asideStatus()] });
+  putResponse = request => {
+    const body = request.body as Record<string, unknown>;
+    if (body.operation !== undefined || body.planFingerprint !== undefined) {
+      return json({ error: "a confirmed plan applies to one profile", code: "invalid_aside_profile" }, 400);
+    }
+    return json({
+      ok: false,
+      message: "one profile failed",
+      results: [{ profileId: 7, ok: false, reason: "write_failed", message: "disk full" }],
+    }, 207);
+  };
+  let unhandled = 0;
+  testWindow.addEventListener("unhandledrejection", () => { unhandled += 1; });
+
+  await mountOverview();
+  await act(async () => { switchFor("aside")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+
+  const card = container.querySelector('[data-client="aside"]')!;
+  expect(card.querySelectorAll(".notice-err")).toHaveLength(1);
+  expect(card.textContent).toContain("disk full");
+  expect(switchFor("aside")?.disabled).toBe(false);
+  expect(unhandled).toBe(0);
+
+  await act(async () => { switchFor("aside")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+  expect(requests.filter(request => request.method === "PUT" && request.url.endsWith("/api/client-integrations/aside/profiles"))).toHaveLength(2);
+  expect(unhandled).toBe(0);
+});
+
+test("Aside-only and mixed bulk disable keep aggregate Aside unbound", async () => {
+  let clients = [asideStatus()];
+  stateResponse = () => json({ clients });
+  previewResponse = body => body.clientId === "aside"
+    ? json({ error: "aggregate Aside previews require a profile", code: "invalid_aside_profile" }, 400)
+    : json(previewPlan("disable", {
+        clientId: body.clientId,
+        fingerprint: body.clientId === "pi" ? `p1:${"5".repeat(32)}` : `p1:${"3".repeat(32)}`,
+      }));
+  putResponse = request => {
+    const body = request.body as Record<string, unknown>;
+    if (request.url.endsWith("/api/client-integrations/aside/profiles")) {
+      if (body.operation !== undefined || body.planFingerprint !== undefined) {
+        return json({ error: "a confirmed plan applies to one profile", code: "invalid_aside_profile" }, 400);
+      }
+      clients = clients.filter(client => client.clientId !== "aside");
+      return json({ ok: true, results: [{ profileId: 7, ok: true, state: "absent" }] });
+    }
+    clients = clients.filter(client => client.clientId !== "pi");
+    return json({ ok: true, clientId: "pi", changed: true, state: "absent", message: "disabled" });
+  };
+
+  await mountOverview();
+  await act(async () => { buttonByText("Disable all…")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+  expect(buttonByText("Disable all")?.disabled).toBe(false);
+  await act(async () => { buttonByText("Disable all")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+  expect(requests.filter(request => request.url.endsWith("/api/client-integrations/preview"))).toHaveLength(0);
+  expect(requests.find(request => request.method === "PUT")?.body).toEqual({ enabled: false });
+
+  if (root) {
+    const current = root;
+    await act(async () => { current.unmount(); });
+    root = null;
+  }
+  mountCount += 1;
+  apiBase = `http://ocx-test-${mountCount}.invalid`;
+  requests = [];
+  clients = [asideStatus(), status({ clientId: "pi", configPath: "/tmp/pi.json" })];
+  await mountOverview();
+  await act(async () => { buttonByText("Disable all…")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+  await act(async () => { buttonByText("Disable all")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+
+  expect(requests.filter(request => request.url.endsWith("/api/client-integrations/preview")).map(request => request.body)).toEqual([
+    { clientId: "pi", operation: "disable" },
+  ]);
+  expect(requests.filter(request => request.method === "PUT").map(request => request.body)).toEqual([
+    { enabled: false },
+    { enabled: false, operation: "disable", planFingerprint: `p1:${"5".repeat(32)}` },
+  ]);
+});
+
+test("bulk confirmation is disabled when every planned target is refused", async () => {
+  stateResponse = () => json({ clients: [status()] });
+  previewResponse = body => json(previewPlan("disable", {
+    clientId: body.clientId,
+    canApply: false,
+    willChange: false,
+    changes: [],
+    refusalReason: "unsafe",
+  }));
+  await mountOverview();
+  await act(async () => { buttonByText("Disable all…")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+
+  expect(buttonByText("Disable all")?.disabled).toBe(true);
+  expect(requests.filter(request => request.method === "PUT")).toHaveLength(0);
+});
+
+test("bulk stale plans require reconfirmation without repeating completed disables", async () => {
+  const applied = new Set(["hermes", "pi", "dsh"]);
+  stateResponse = () => json({ clients: [
+    status({ clientId: "hermes", state: applied.has("hermes") ? "current" : "absent" }),
+    status({ clientId: "pi", configPath: "/tmp/pi.json", state: applied.has("pi") ? "current" : "absent" }),
+    status({ clientId: "dsh", configPath: "/tmp/dsh.yaml", state: applied.has("dsh") ? "current" : "absent" }),
+  ] });
+  previewResponse = body => json(previewPlan("disable", {
+    clientId: body.clientId,
+    fingerprint: `p1:${body.clientId === "pi" ? "5".repeat(32) : body.clientId === "dsh" ? "6".repeat(32) : "3".repeat(32)}`,
+    ...(body.clientId === "dsh" ? { canApply: false, willChange: false, changes: [], refusalReason: "unsafe" } : {}),
+  }));
+  let piAttempts = 0;
+  putResponse = request => {
+    const clientId = request.url.split("/").pop()!;
+    if (clientId === "pi" && piAttempts++ === 0) {
+      return json({
+        code: "integration_preview_stale",
+        plan: previewPlan("disable", { clientId: "pi", fingerprint: `p1:${"9".repeat(32)}` }),
+      }, 409);
+    }
+    applied.delete(clientId);
+    return json({ ok: true, clientId, changed: true, state: "absent", message: "disabled" });
+  };
+
+  await mountOverview();
+  await act(async () => { buttonByText("Disable all…")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+  await act(async () => { buttonByText("Disable all")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+
+  expect(container.textContent).toContain("Review the updated plan");
+  expect(requests.filter(request => request.method === "PUT" && request.url.endsWith("/hermes"))).toHaveLength(1);
+  expect(requests.filter(request => request.method === "PUT" && request.url.endsWith("/pi"))).toHaveLength(1);
+  expect(requests.filter(request => request.method === "PUT" && request.url.endsWith("/dsh"))).toHaveLength(0);
+
+  const staleDialog = container.querySelector("dialog")!;
+  const reconfirm = Array.from(staleDialog.querySelectorAll("button")).find(
+    button => (button.textContent ?? "").trim() === "Disable all",
+  ) as HTMLButtonElement;
+  const close = Array.from(staleDialog.querySelectorAll("button")).find(
+    button => (button.textContent ?? "").trim() === "Close",
+  ) as HTMLButtonElement;
+  expect(staleDialog.getAttribute("aria-busy")).toBe("false");
+  expect(reconfirm.disabled).toBe(false);
+  expect(close.disabled).toBe(false);
+
+  await act(async () => { reconfirm.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+  const hermesPuts = requests.filter(request => request.method === "PUT" && request.url.endsWith("/hermes"));
+  const piPuts = requests.filter(request => request.method === "PUT" && request.url.endsWith("/pi"));
+  expect(hermesPuts).toHaveLength(1);
+  expect(piPuts).toHaveLength(2);
+  expect(piPuts[1]?.body).toEqual({ enabled: false, operation: "disable", planFingerprint: `p1:${"9".repeat(32)}` });
+  expect(container.querySelector("dialog")).toBeNull();
+  expect(container.textContent).toContain("dsh");
+});
+
+test("overview stale replacement does not persist a card failure", async () => {
+  stateResponse = () => json({ clients: [status()] });
+  putResponse = () => json({
+    code: "integration_preview_stale",
+    plan: previewPlan("disable", { fingerprint: `p1:${"9".repeat(32)}` }),
+  }, 409);
+  await mountOverview();
+  await act(async () => { switchFor("hermes")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+  await confirmDialog("Disable");
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+
+  expect(container.querySelector('[data-client="hermes"] .notice')).toBeNull();
+  expect(container.querySelector("dialog")?.textContent).toContain("Review the updated plan");
+});
+
 test("bulk disable confirms the result with the server before claiming success", async () => {
   /*
    * The resource layer's `refresh()` is fire-and-forget, so awaiting it proves
@@ -444,6 +1209,7 @@ test("bulk disable confirms the result with the server before claiming success",
     const method = (init?.method ?? "GET").toUpperCase();
     requests.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
     if (url.includes("/journal")) return json({ operations: [] });
+    if (url.endsWith("/api/client-integrations/preview")) return json(previewPlan("disable"));
     if (method === "PUT") {
       // The server answers OK but the block is still on disk.
       return json({ ok: true, clientId: "hermes", changed: false, state: "current", message: "ok" });
@@ -457,6 +1223,8 @@ test("bulk disable confirms the result with the server before claiming success",
   const disableAll = buttonByText("Disable all…");
   expect(disableAll).toBeDefined();
   await act(async () => { disableAll!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+  await act(async () => { buttonByText("Disable all")!.click(); });
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
 
   const text = container.textContent ?? "";
@@ -477,6 +1245,7 @@ test("bulk disable does report success once the server agrees", async () => {
     const method = (init?.method ?? "GET").toUpperCase();
     requests.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
     if (url.includes("/journal")) return json({ operations: [] });
+    if (url.endsWith("/api/client-integrations/preview")) return json(previewPlan("disable"));
     if (method === "PUT") {
       applied = false;
       return json({ ok: true, clientId: "hermes", changed: true, state: "absent", message: "ok" });
@@ -491,13 +1260,38 @@ test("bulk disable does report success once the server agrees", async () => {
   expect(disableAll).toBeDefined();
   await act(async () => { disableAll!.click(); });
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+  await act(async () => { buttonByText("Disable all")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
 
   const text = container.textContent ?? "";
   expect(text).toContain("Applied client integrations were disabled.");
   expect(text).not.toContain("may be stale");
 });
 
-test("a drifted restore asks a second time instead of failing", async () => {
+test("bulk disable keeps one preview fingerprint per client", async () => {
+  stateResponse = () => json({ clients: [
+    status({ clientId: "hermes", configPath: "/tmp/hermes.yaml" }),
+    status({ clientId: "pi", configPath: "/tmp/pi.json" }),
+  ] });
+  await mountOverview();
+  await act(async () => { buttonByText("Disable all…")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+  await act(async () => { buttonByText("Disable all")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 40)); });
+
+  const previews = requests.filter(request => request.url.endsWith("/api/client-integrations/preview"));
+  expect(previews.map(request => request.body)).toEqual([
+    { clientId: "hermes", operation: "disable" },
+    { clientId: "pi", operation: "disable" },
+  ]);
+  const puts = requests.filter(request => request.method === "PUT");
+  expect(puts.map(request => request.body)).toEqual([
+    { enabled: false, operation: "disable", planFingerprint: previewPlan("disable").fingerprint },
+    { enabled: false, operation: "disable", planFingerprint: `p1:${"5".repeat(32)}` },
+  ]);
+});
+
+test("a drifted restore previews confirmation before its first mutation", async () => {
   /*
    * The server refuses a drifted restore unless `confirmDrift` is set. That
    * refusal is the only moment the user is told their newer edits are about to
@@ -507,17 +1301,17 @@ test("a drifted restore asks a second time instead of failing", async () => {
   const restoreFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     posts.push(body);
+    if (String(input).endsWith("/restore/preview")) {
+      const confirmed = (body as { confirmDrift?: boolean })?.confirmDrift === true;
+      return json(previewPlan("restore", confirmed ? { foreignEdit: "drift", fingerprint: `p1:${"7".repeat(32)}` } : {
+        foreignEdit: "drift", canApply: false, willChange: false, changes: [], refusalReason: "drift_requires_confirm",
+        fingerprint: `p1:${"6".repeat(32)}`,
+      }));
+    }
     if ((body as { confirmDrift?: boolean })?.confirmDrift) {
       return json({ ok: true, clientId: "hermes", changed: true, state: "current", message: "restored" });
     }
-    return json({
-      error: "restore requires drift confirmation",
-      code: "integration_drift_confirmation_required",
-      clientId: "hermes",
-      state: "conflict",
-      reason: "drift_requires_confirm",
-      message: "this file changed after that operation",
-    }, 409);
+    return json({ error: "unexpected unconfirmed restore" }, 409);
   }) as typeof fetch;
   Object.defineProperty(globalThis, "fetch", { configurable: true, value: restoreFetch });
   Object.defineProperty(testWindow, "fetch", { configurable: true, value: restoreFetch });
@@ -545,18 +1339,131 @@ test("a drifted restore asks a second time instead of failing", async () => {
     );
   });
 
-  await act(async () => { buttonByText("Restore")!.click(); });
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
 
-  // First submit asked without confirmation and the dialog escalated.
+  // Both preview calls happen before the first mutation.
   expect((posts[0] as { confirmDrift?: boolean }).confirmDrift).toBe(false);
+  expect((posts[1] as { confirmDrift?: boolean }).confirmDrift).toBe(true);
   expect(container.textContent ?? "").toContain("Newer edits were detected");
 
   const confirm = buttonByText("Back up newer edits and restore");
   expect(confirm).toBeDefined();
   await act(async () => { confirm!.click(); });
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
-  expect((posts[1] as { confirmDrift?: boolean }).confirmDrift).toBe(true);
+  expect((posts[2] as { confirmDrift?: boolean }).confirmDrift).toBe(true);
+  expect((posts[2] as { planFingerprint?: string }).planFingerprint).toBe(`p1:${"7".repeat(32)}`);
+});
+
+/**
+ * #3059: a successful restore starts an asynchronous history refresh before closing
+ * the dialog. That means normal focus restoration first finds the trigger still in
+ * the tree, and only later does the refresh consume its snapshot and remove the
+ * trigger. The region must receive focus on the successful close, before that later
+ * removal can send focus to <body>.
+ */
+test("a successful restore keeps focus on the stable region after refresh removes its trigger", async () => {
+  const [{ createRoot }, { LanguageProvider }, { default: RestoreDialog }] = await Promise.all([
+    import("react-dom/client"),
+    import("../src/i18n/provider"),
+    import("../src/pages/integrations/RestoreDialog"),
+  ]);
+
+  // The shape RollbackHistory renders: a stable region holding the row trigger.
+  const region = testWindow.document.createElement("section");
+  const trigger = testWindow.document.createElement("button");
+  region.appendChild(trigger);
+  testWindow.document.body.appendChild(region);
+  trigger.focus();
+  expect(testWindow.document.activeElement).toBe(trigger);
+
+  const row = {
+    opId: "op-consumed",
+    clientId: "hermes" as const,
+    kind: "apply" as const,
+    at: "2026-08-02T09:00:00.000Z",
+    configPath: "/tmp/home/.hermes/config.yaml",
+    snapshot: "stored" as const,
+    undoable: false,
+  };
+  let resolveRestore: ((response: Response) => void) | undefined;
+  const restoreFetch = ((input: RequestInfo | URL) => {
+    if (String(input).endsWith("/restore/preview")) return Promise.resolve(json(previewPlan("restore")));
+    if (String(input).endsWith("/restore")) {
+      return new Promise<Response>(resolve => { resolveRestore = resolve; });
+    }
+    return Promise.resolve(json({ operations: [] }));
+  }) as typeof fetch;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: restoreFetch });
+  Object.defineProperty(testWindow, "fetch", { configurable: true, value: restoreFetch });
+
+  await act(async () => {
+    root = createRoot(container);
+    root.render(
+      <LanguageProvider>
+        <RestoreDialog
+          apiBase={apiBase}
+          row={row}
+          onRestored={() => {}}
+          onClose={() => {
+            root!.unmount();
+            root = null;
+          }}
+        />
+      </LanguageProvider>,
+    );
+  });
+
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
+  await act(async () => { buttonByText("Restore")!.click(); });
+  expect(resolveRestore).toBeDefined();
+
+  // Restore succeeds and closes while the trigger is still connected.
+  await act(async () => { resolveRestore!(json({ ok: true })); });
+  expect(trigger.isConnected).toBe(true);
+  expect(testWindow.document.activeElement).toBe(region);
+
+  // The asynchronous history refresh then consumes the snapshot and its trigger.
+  trigger.remove();
+  expect(testWindow.document.activeElement).toBe(region);
+  expect(testWindow.document.activeElement).not.toBe(testWindow.document.body);
+  region.remove();
+});
+
+test("focus returns to the trigger itself when it survived", async () => {
+  const [{ createRoot }, { LanguageProvider }, { default: RestoreDialog }] = await Promise.all([
+    import("react-dom/client"),
+    import("../src/i18n/provider"),
+    import("../src/pages/integrations/RestoreDialog"),
+  ]);
+
+  const region = testWindow.document.createElement("section");
+  const trigger = testWindow.document.createElement("button");
+  region.appendChild(trigger);
+  testWindow.document.body.appendChild(region);
+  trigger.focus();
+
+  const row = {
+    opId: "op-kept",
+    clientId: "hermes" as const,
+    kind: "apply" as const,
+    at: "2026-08-02T09:00:00.000Z",
+    configPath: "/tmp/home/.hermes/config.yaml",
+    snapshot: "stored" as const,
+    undoable: true,
+  };
+  await act(async () => {
+    root = createRoot(container);
+    root.render(
+      <LanguageProvider>
+        <RestoreDialog apiBase={apiBase} row={row} onClose={() => {}} onRestored={() => {}} />
+      </LanguageProvider>,
+    );
+  });
+  await act(async () => { root!.unmount(); root = null; });
+
+  // The fallback must not preempt a trigger that is still there.
+  expect(testWindow.document.activeElement).toBe(trigger);
+  region.remove();
 });
 
 test("a card toggles its own client without a trip to the sub-page", async () => {
@@ -569,10 +1476,12 @@ test("a card toggles its own client without a trip to the sub-page", async () =>
   expect(sw!.getAttribute("aria-pressed")).toBe("true");
   await act(async () => { sw!.click(); });
   await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
+  await act(async () => { buttonByText("Disable")!.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 20)); });
 
   const put = requests.find(request => request.method === "PUT");
   expect(put?.url).toContain("/api/client-integrations/hermes");
-  expect(put?.body).toEqual({ enabled: false });
+  expect(put?.body).toEqual({ enabled: false, operation: "disable", planFingerprint: previewPlan("disable").fingerprint });
 });
 
 test("a card cannot toggle a client whose config is in conflict", async () => {
@@ -641,7 +1550,41 @@ test("every reachable client gets a card, not just the file six", async () => {
     ".integration-card[data-client='claudeDesktop'] .integration-card-link",
   ) as unknown as HTMLButtonElement | null;
   await act(async () => { desktopLink!.click(); });
-  expect(testWindow.location.hash).toBe("#integrations/claude/desktop");
+  expect(testWindow.location.hash).toBe("#claude/desktop");
+});
+
+test("Codex disable uses Codex consequences and refreshes observed routing", async () => {
+  codexRoutingResponse = () => json({ routingInjected: true, status: "native", recommendedCommand: null });
+  await mountOverview();
+
+  const sw = switchFor("codex");
+  expect(sw?.getAttribute("aria-pressed")).toBe("true");
+  await act(async () => { sw!.click(); });
+
+  // Opening the consequence gate must not mutate anything, and it must name
+  // the Codex file and the effects of restoring native Codex.
+  expect(requests.some(request => request.method === "PUT")).toBe(false);
+  const dialog = container.querySelector(".integration-consequence-dialog")!;
+  expect(dialog.textContent).toContain("Disable the Codex integration?");
+  expect(dialog.textContent).toContain("/tmp/codex/config.toml");
+  expect(dialog.textContent).toContain("/v1/responses");
+  expect(dialog.textContent).not.toContain("Grok Build");
+
+  const confirm = Array.from(dialog.querySelectorAll("button")).find(
+    button => (button.textContent ?? "").trim() === "Disable",
+  ) as HTMLButtonElement;
+  await act(async () => { confirm.click(); });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 50)); });
+
+  const put = requests.find(request => request.method === "PUT");
+  expect(put?.url).toContain("/api/native-integrations/codex");
+  expect(put?.body).toEqual({ enabled: false });
+  // The mock changes startup-health only after the mutation. This assertion
+  // therefore proves the Codex observed resource, not merely the native toggle,
+  // was refreshed.
+  expect(switchFor("codex")?.getAttribute("aria-pressed")).toBe("false");
+  expect(container.querySelector(".integration-card[data-client='codex'] .badge")
+    ?.getAttribute("data-integration-state")).toBe("absent");
 });
 
 test("a source that cannot be read is unknown, never 'not applied'", async () => {
@@ -719,4 +1662,161 @@ test("a loopback-only refusal is localized, not the server's English message", a
     return text;
   }) as Parameters<typeof describeRefusal>[0], refusal);
   expect(english).toContain("kimi");
+});
+test("a populated overview journal collapses instead of flooding the page", async () => {
+  /*
+   * The overview already carries a summary strip, a credential row and fifteen
+   * cards. It also rendered every row the journal returned — up to the route's
+   * fifty — as individually bordered strips below them, which is what buried
+   * the one control a user reaches for after a mistake.
+   */
+  journalRows = Array.from({ length: 30 }, (_, index) => ({
+    opId: `op-${index}`,
+    clientId: "hermes",
+    kind: "apply" as const,
+    at: new Date(Date.UTC(2026, 7, 31, 10, 0, 0) - index * 60_000).toISOString(),
+    configPath: "/tmp/home/.hermes/config.yaml",
+    snapshot: "stored" as const,
+    undoable: index === 0,
+  }));
+  await mountOverview();
+
+  const outside = Array.from(container.querySelectorAll(".integration-history-row"))
+    .filter(node => !(node as unknown as HTMLElement).closest(".integration-history-older"));
+  expect(outside).toHaveLength(1);
+  // The newest operation's Undo stays a click away, not a disclosure away.
+  expect(buttonByText("Undo")).toBeDefined();
+  const details = container.querySelector(".integration-history-older") as unknown as HTMLDetailsElement;
+  expect(details).not.toBeNull();
+  expect(details.open).toBe(false);
+  // The cross-client chronology is still THERE, just folded.
+  await act(async () => { details.open = true; });
+  expect(container.querySelectorAll(".integration-history-older .integration-history-row").length).toBeGreaterThan(1);
+});
+
+/*
+ * Adding a file client means editing three hand-maintained lists that no type
+ * relates to each other: CLIENTS in client-config-clients.ts, INTEGRATION_TABS,
+ * and FILE_CLIENTS. Miss one and the client half-ships -- it exports from the
+ * API tab but has no Integrations tab to toggle from, or it owns a tab that
+ * renders a page for a client the file surface does not recognize. Both compile,
+ * and both look complete from whichever half you happen to open.
+ *
+ * Aside is the reason this exists: it needed all three, and nothing would have
+ * failed if it had landed in two.
+ */
+test("every export client has both an Integrations tab and a file-surface entry", async () => {
+  const { CLIENTS } = await import("../src/components/apikeys-workspace/client-config-clients");
+  const { TABS, FILE_CLIENTS } = await import("../src/pages/integrations/integration-tabs");
+
+  const tabIds = new Set(TABS.map(tab => tab.id as string));
+  const missing = CLIENTS.filter(id => !tabIds.has(id) || !FILE_CLIENTS.has(id as never));
+  expect(missing).toEqual([]);
+
+  // And no tab claims a client that does not exist, which would render a page
+  // for an id the config surface cannot answer for.
+  const clientIds = new Set<string>(CLIENTS);
+  const orphaned = [...FILE_CLIENTS].filter(id => !clientIds.has(id));
+  expect(orphaned).toEqual([]);
+});
+
+/*
+ * The mark has to reach every surface, not just the API tab it started on. Three
+ * of them are checked here; the fourth is client-config-panel.test.tsx.
+ *
+ * These assert on the rendered DOM rather than on the map, because the map being
+ * right and the component never being called is exactly the failure a map-only
+ * test cannot see -- and it is the failure that would ship, since the marks were
+ * correct in data long before any surface drew them.
+ */
+test("a client page header draws its client's mark", async () => {
+  stateResponse = () => json(status({
+    clientId: "dsh",
+    configPath: "/tmp/home/.dsh/settings.yaml",
+  }));
+  await mountClient(true, "dsh");
+
+  const head = container.querySelector(".integration-client-head")!;
+  const mark = head.querySelector<HTMLElement>(".client-mark");
+  expect(mark, "the client page header should carry a mark").not.toBeNull();
+  // dsh is single-ink but its ink is DeepSeek blue, so it renders as an image.
+  expect(mark!.querySelector("img")?.getAttribute("src")).toBe("/provider-icons/deepseek-harness.svg");
+  // Decoration beside a heading that already names the client.
+  expect(mark!.getAttribute("aria-hidden")).toBe("true");
+});
+
+test("every overview card draws a mark, and none of them names itself", async () => {
+  await mountOverview();
+
+  const cards = [...container.querySelectorAll(".integration-card")];
+  expect(cards.length).toBeGreaterThan(4);
+  const bare = cards
+    .filter(card => card.querySelector(".client-mark") === null)
+    .map(card => card.getAttribute("data-client"));
+  expect(bare).toEqual([]);
+
+  // A mark next to a visible label must not join the accessible name, or a
+  // screen reader says the client twice.
+  for (const mark of container.querySelectorAll(".client-mark")) {
+    expect(mark.getAttribute("aria-hidden")).toBe("true");
+  }
+  for (const img of container.querySelectorAll(".client-mark img")) {
+    expect(img.getAttribute("alt")).toBe("");
+  }
+
+  // The card head is space-between; the mark must sit with the title rather than
+  // after the badge, so it is the first child.
+  const head = cards[0]!.querySelector(".integration-card-head")!;
+  expect(head.firstElementChild?.classList.contains("client-mark")).toBe(true);
+});
+
+test("the tab strip marks every client tab and leaves the two non-client tabs bare", async () => {
+  const [{ createRoot }, { LanguageProvider }, { default: Integrations }] = await Promise.all([
+    import("react-dom/client"),
+    import("../src/i18n/provider"),
+    import("../src/pages/Integrations"),
+  ]);
+  await act(async () => {
+    root = createRoot(container);
+    root.render(
+      <LanguageProvider>
+        <Integrations apiBase={apiBase} />
+      </LanguageProvider>,
+    );
+  });
+  await act(async () => { await new Promise<void>(resolve => testWindow.setTimeout(resolve, 30)); });
+
+  const tabs = [...container.querySelectorAll<HTMLElement>(".page-tab")];
+  expect(tabs.length).toBeGreaterThan(10);
+  const marked = tabs.filter(tab => tab.querySelector(".client-mark") !== null);
+  // overview and keys carry no client, so they carry no mark.
+  expect(tabs.length - marked.length).toBe(2);
+
+  const codexTab = tabs.find(tab => tab.id === "integrations-tab-codex")!;
+  expect(codexTab.querySelector(".client-mark img")?.getAttribute("src")).toBe("/provider-icons/openai.svg");
+  // The label lost its "CLI": the mark carries that identity now, and the row
+  // covers the app and SDK too.
+  expect(codexTab.textContent).toBe("Codex");
+});
+
+test("Droid target changes discard the draft and its confirmation", async () => {
+  stateResponse = () => json(status({ clientId: "droid", droidReasoning: {
+    models: [{ model: "openai/gpt-test", label: "Test model", efforts: ["low", "high"] }], defaults: {},
+  } }));
+  await mountClient(true, "droid");
+  await act(async () => { container.querySelector<HTMLButtonElement>('[role="combobox"]')!.click(); });
+  const high = [...testWindow.document.querySelectorAll('[role="option"]')].find(option => option.textContent === "high") as HTMLButtonElement;
+  await act(async () => { high.click(); });
+  await act(async () => { buttonByText("Save / review changes")!.click(); });
+  expect(container.querySelector("dialog[open]")).not.toBeNull();
+  const [{ LanguageProvider }, { default: FileIntegrationPage }] = await Promise.all([
+    import("../src/i18n/provider"), import("../src/pages/integrations/FileIntegrationPage"),
+  ]);
+  const originalBase = apiBase;
+  for (const target of [`${originalBase}/other`, originalBase]) {
+    await act(async () => { root!.render(<LanguageProvider><FileIntegrationPage apiBase={target} client="droid" /></LanguageProvider>); });
+    expect(container.querySelector("dialog[open]")).toBeNull();
+    expect(container.querySelector('[role="combobox"]')?.textContent).toContain("No default");
+  }
+  expect(requests.some(request => request.method === "PUT")).toBe(false);
 });

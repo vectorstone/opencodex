@@ -1,0 +1,376 @@
+import { describe, expect, test } from "bun:test";
+import { existsSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { repoRoot as resolveRepoRoot } from "../helpers/repo-root";
+
+const repoRoot = resolveRepoRoot();
+
+/**
+ * Local agent/session state must never reach a commit.
+ *
+ * `.gitignore` alone does not enforce this: `git add -f` overrides it silently,
+ * and once a path is tracked the ignore rule stops applying to it entirely. The
+ * `.codexclaw/` goalplans and ledgers were committed exactly that way and rode
+ * along into `main` and `preview` before anyone noticed.
+ *
+ * This test closes that gap by asserting against the real index instead of the
+ * ignore file, so a forced add fails CI on the commit that introduces it.
+ */
+const FORBIDDEN_TRACKED_DIRS = [".codexclaw", ".omo", ".omc", ".claude", ".agents", "node_modules", ".tmp"];
+
+// The fork's reviewed sync runbook is code guidance, not per-machine agent state.
+const REVIEWED_FORK_RUNBOOK = ".agents/skills/opencodex-upstream-sync/SKILL.md";
+function isForbiddenAgentState(path: string): boolean {
+  return path !== REVIEWED_FORK_RUNBOOK
+    && path.split("/").some(segment => FORBIDDEN_TRACKED_DIRS.includes(segment));
+}
+
+const FORBIDDEN_TRACKED_FILENAMES = [".DS_Store", "Thumbs.db"];
+
+/**
+ * Working notes an agent writes for itself or for the next agent. A scoped
+ * `design-debt.md` audit reached the repository root through a bug-train squash,
+ * and the release train 4 lanes committed `_handoff.md` files when they were
+ * stopped and resumed. Durable planning belongs in numbered `devlog/` docs.
+ */
+const AGENT_SCRATCH_FILENAMES = ["design-debt.md", "_handoff.md"];
+
+/**
+ * The retired Go native-runtime experiment. Nothing in `src/`, the build, the
+ * typecheck, or the test path reads from `go/`, so a tracked file there is always
+ * an accident — and this specific one is a repeat offender: `git add -A` pulled
+ * `go/internal/cli/config_parity.go` back into the index three times during the
+ * #820 campaign, and the third one rode a merge into `dev`. `.gitignore` cannot
+ * catch that on its own, because an already-tracked path ignores the rule.
+ */
+/**
+ * The root `docs/` folder and the PR screenshot folders were retired together.
+ * `docs/` had become 4.9 MB, 4.5 MB of it pull-request evidence images that
+ * authors committed on their branch and every squash merge carried into `dev`.
+ * Moving the images did not help: `docs-site/public/pr-screenshots/` grew the
+ * same way and was published to GitHub Pages besides. Evidence images now go in
+ * the PR description or on the orphan `pr-assets` branch.
+ */
+const RETIRED_TRACKED_DIRS = [
+  "go",
+  "docs",
+  ".github/pr-assets",
+  "assets/pr-screenshots",
+  "docs-site/public/pr-screenshots",
+];
+
+/** Loose PR evidence images deleted with the folders above. */
+const RETIRED_TRACKED_FILES = [
+  "assets/pr-gate-screenshot-required.png",
+  "assets/pr2950-capacity-expiry.png",
+  "assets/pr715-selection-order.png",
+  "assets/request-pacing-dashboard.jpg",
+  "assets/zh-tw-providers.png",
+];
+
+function trackedFiles(): string[] {
+  const result = Bun.spawnSync(["git", "ls-files"], { cwd: repoRoot });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ls-files failed: ${new TextDecoder().decode(result.stderr)}`);
+  }
+  return new TextDecoder()
+    .decode(result.stdout)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function trackedEntries(): { mode: string; path: string }[] {
+  const result = Bun.spawnSync(["git", "ls-files", "-s"], { cwd: repoRoot });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ls-files -s failed: ${new TextDecoder().decode(result.stderr)}`);
+  }
+  return new TextDecoder()
+    .decode(result.stdout)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [meta, path] = line.split("\t");
+      return { mode: meta?.split(" ")[0] ?? "", path: path ?? "" };
+    });
+}
+
+describe("repository hygiene", () => {
+  test("no local agent or session state is tracked", () => {
+    const offenders = trackedFiles().filter(isForbiddenAgentState);
+
+    expect(offenders).toEqual([]);
+  });
+
+  test("the fork runbook exemption cannot admit other local agent state", () => {
+    expect(isForbiddenAgentState(REVIEWED_FORK_RUNBOOK)).toBe(false);
+    for (const path of [".agents/session.json", ".agents/skills/other/SKILL.md", "child/.agents/skills/opencodex-upstream-sync/SKILL.md", ".omc/project-memory.json"]) {
+      expect(isForbiddenAgentState(path)).toBe(true);
+    }
+  });
+
+  test("no OS metadata files are tracked", () => {
+    const offenders = trackedFiles().filter((path) =>
+      FORBIDDEN_TRACKED_FILENAMES.includes(path.split("/").pop() ?? ""),
+    );
+
+    expect(offenders).toEqual([]);
+  });
+
+  test("no agent scratch notes are tracked", () => {
+    const offenders = trackedFiles().filter((path) =>
+      AGENT_SCRATCH_FILENAMES.includes(path.split("/").pop() ?? ""),
+    );
+
+    expect(offenders).toEqual([]);
+  });
+
+  test("retired directories stay untracked", () => {
+    const offenders = trackedFiles().filter((path) =>
+      RETIRED_TRACKED_DIRS.some((dir) => path === dir || path.startsWith(`${dir}/`)),
+    );
+
+    expect(offenders).toEqual([]);
+  });
+
+  test("retired PR evidence images stay untracked", () => {
+    const tracked = new Set(trackedFiles());
+    expect(RETIRED_TRACKED_FILES.filter((path) => tracked.has(path))).toEqual([]);
+  });
+
+  test("gitignore still declares the agent-state directories", async () => {
+    const ignore = await Bun.file(join(repoRoot, ".gitignore")).text();
+
+    for (const dir of FORBIDDEN_TRACKED_DIRS) {
+      expect(ignore).toContain(`${dir}/`);
+    }
+
+    for (const dir of RETIRED_TRACKED_DIRS) {
+      expect(ignore).toContain(`${dir}/`);
+    }
+  });
+});
+
+/**
+ * `devlog/` notes are tracked in this repository, and no submodule remains.
+ *
+ * The failure mode this locks down has already happened twice: a `160000` gitlink
+ * lands in the index for a path no workflow initializes, and `actions/checkout`
+ * fails for every contributor. With devlog converted to ordinary files the
+ * invariant is simpler and stronger — there is no gitlink at all.
+ *
+ * The vendored and excision guards matter more than they look. devlog used to carry
+ * its own `.gitignore`, which stopped applying the moment it became part of this
+ * repository. Without these assertions a future `git add -A` would pull 129 MB of
+ * third-party source, or re-introduce security triage that was deliberately excised.
+ */
+describe("devlog is tracked, with no submodule left behind", () => {
+  test("no gitlink is tracked anywhere", () => {
+    const gitlinks = trackedEntries().filter((entry) => entry.mode === "160000");
+
+    expect(gitlinks.map((entry) => entry.path)).toEqual([]);
+  });
+
+  test("devlog markdown is tracked as ordinary blobs", () => {
+    const devlogFiles = trackedFiles().filter((path) => path.startsWith("devlog/"));
+
+    expect(devlogFiles.length).toBeGreaterThan(1000);
+    expect(devlogFiles.some((path) => path.endsWith(".md"))).toBe(true);
+  });
+
+  test("no .gitmodules file remains", () => {
+    expect(existsSync(join(repoRoot, ".gitmodules"))).toBe(false);
+  });
+
+  test("vendored reference clones stay untracked", () => {
+    const vendored = trackedFiles().filter(
+      (path) =>
+        path.startsWith("devlog/_chase/_litellm/")
+        || path.startsWith("devlog/_chase/_cca/")
+        || path.startsWith("devlog/_chase/DSCodex/")
+        || path.startsWith("devlog/_chase/CLIProxyAPIPlus/")
+        || path.startsWith("devlog/_fin/opencode-cursor/"),
+    );
+
+    expect(vendored).toEqual([]);
+  });
+
+  test("security triage excised before publication stays untracked", () => {
+    const excised = trackedFiles().filter((path) =>
+      /^devlog\/_plan\/260730_(?:open_pr_backlog|new_issue_pr)_triage\//.test(path),
+    );
+
+    expect(excised).toEqual([]);
+  });
+
+  /**
+   * Documents that describe the policy itself necessarily quote its vocabulary. This
+   * unit is the conversion's own paper trail: it names the verdict markers and the
+   * boundary terms in order to define what the tripwire looks for. Exempting it is
+   * narrow and path-pinned — a NEW unit gets no exemption, so the check still fires
+   * for real triage.
+   *
+   * The unit closed and moved to `_fin/` (devlog/_fin/260805_devlog_fin_sweep), which
+   * makes this exemption redundant: the scan below reads `_plan/` only. It is repointed
+   * rather than deleted so the reason survives — if the unit ever returns to `_plan/`,
+   * or a reader asks why the tripwire tolerates a document full of its own trigger
+   * words, the answer is still here.
+   */
+  const TRIPWIRE_META_EXEMPT_PREFIX = "devlog/_fin/260730_devlog_publication_feasibility/";
+
+  /**
+   * Security-boundary vocabulary, in both languages this devlog is written in.
+   *
+   * The English-only first draft of this list did NOT catch the very document that
+   * motivated the excision: its verdicts are English markers but its prose is Korean
+   * ("크리덴셜 경계 보안 리뷰"). A tripwire that misses the case it was built for is
+   * worse than no tripwire, because it reads as coverage.
+   */
+  const SECURITY_BOUNDARY_RE =
+    /account.boundary|credential destination|auth bypass|unauthenticated endpoint|account pool|크리덴셜|자격 ?증명|계정 경계|인증 우회|미인증/i;
+
+  /**
+   * Tripwire for the rule that replaced repository privacy.
+   *
+   * This cannot detect every pre-disclosure note — prose is not checkable — but it
+   * catches the shape the violation actually took: an OPEN triage document under
+   * `_plan/` carrying an unresolved review verdict AND discussing a security
+   * boundary. Both signals are required, because an open plan that merely mentions
+   * auth is ordinary work.
+   *
+   * `_fin/` is exempt by design. A closed unit documents a shipped fix, so its
+   * writeup discloses nothing a public diff does not; applying this check there
+   * would fail on the very hardening records that are safe to publish.
+   *
+   * Driven red once during the conversion to prove it is not vacuous.
+   */
+  test("no open devlog plan carries an unresolved security verdict", async () => {
+    const openPlans = trackedFiles().filter(
+      (path) =>
+        path.startsWith("devlog/_plan/")
+        && path.endsWith(".md")
+        && !path.startsWith(TRIPWIRE_META_EXEMPT_PREFIX),
+    );
+
+    expect(openPlans.length).toBeGreaterThan(0);
+
+    const offenders: string[] = [];
+    for (const path of openPlans) {
+      const text = await Bun.file(join(repoRoot, path)).text();
+      const unresolved = /NEEDS-SECURITY-REVIEW|NEEDS-CHANGES/.test(text);
+      if (unresolved && SECURITY_BOUNDARY_RE.test(text)) offenders.push(path);
+    }
+
+    expect(offenders).toEqual([]);
+  });
+
+  test("no workflow checks out submodules", async () => {
+    const listing = Bun.spawnSync(["git", "ls-files", ".github/workflows"], { cwd: repoRoot });
+    const workflows = new TextDecoder()
+      .decode(listing.stdout)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    expect(workflows.length).toBeGreaterThan(0);
+
+    const offenders: string[] = [];
+    for (const workflow of workflows) {
+      const text = await Bun.file(join(repoRoot, workflow)).text();
+      // `submodules: false` is fine; anything that opts in is not.
+      if (/submodules:\s*(true|recursive)/.test(text)) offenders.push(workflow);
+      if (/git submodule update[^\n]*devlog/.test(text)) offenders.push(workflow);
+    }
+
+    expect(offenders).toEqual([]);
+  });
+  test("every relative README asset is actually shipped in the npm tarball", async () => {
+    // npm renders README.md on the package page, and a relative src there resolves inside the
+    // published tarball. Three GIFs were referenced relatively while `files` shipped only one, so
+    // the package page rendered three broken images - visible to every visitor, invisible to every
+    // gate. Absolute URLs are the deliberate alternative: the GIFs total ~3.3MB and there is no
+    // reason to put that in the install path of a proxy.
+    const readme = await Bun.file(join(repoRoot, "README.md")).text();
+    const pkg = JSON.parse(await Bun.file(join(repoRoot, "package.json")).text()) as {
+      files?: string[];
+    };
+    const shipped = pkg.files ?? [];
+    expect(shipped.length).toBeGreaterThan(0);
+
+    // No lower bound on the match count: switching every image to an absolute URL is a legitimate
+    // end state, and a `toBeGreaterThan(0)` guard here would fail the suite for doing it.
+    const relative = [...readme.matchAll(/src="(?!https?:)([^"]+)"/g)].map((match) => match[1]!);
+
+    // A directory entry ships everything beneath it; a regular-file entry ships only itself.
+    // Deciding that by prefix alone let `assets/banner.png` vouch for a nonexistent
+    // `assets/banner.png/missing.gif`, so a broken README reference could pass. Ask the
+    // filesystem what each entry actually is instead of inferring it from the name.
+    const shippedDirectories = shipped.filter((entry) => {
+      const path = join(repoRoot, entry);
+      return existsSync(path) && statSync(path).isDirectory();
+    });
+    const isShipped = (asset: string): boolean =>
+      shipped.includes(asset)
+      || shippedDirectories.some((directory) => asset.startsWith(`${directory}/`));
+
+    expect(isShipped("assets/banner.png/missing.gif")).toBe(false);
+    expect(isShipped("LICENSE/missing.png")).toBe(false);
+
+    const missing = relative.filter((asset) => !isShipped(asset));
+    expect(missing).toEqual([]);
+  });
+});
+
+describe("test layout", () => {
+  test("no two test files share a basename", () => {
+    // Two reorganizations landed on the same day (#3511, #3513) and independently relocated the
+    // same file to different domain directories. Different paths, so git saw no conflict and both
+    // copies survived -- a byte-identical duplicate running its suite twice, invisible until
+    // someone listed the tree by hand.
+    //
+    // A duplicated basename is also how a real fix goes stale: an author edits one copy, CI keeps
+    // running both, and the stale one silently disagrees. Names are the only thing a human uses
+    // to find a test, so they have to be unique.
+    const byName = new Map<string, string[]>();
+    for (const path of trackedFiles()) {
+      if (!path.startsWith("tests/")) continue;
+      if (!path.endsWith(".test.ts") && !path.endsWith(".test.tsx")) continue;
+      const name = path.split("/").pop()!;
+      byName.set(name, [...(byName.get(name) ?? []), path]);
+    }
+    const duplicates = [...byName.entries()]
+      .filter(([, paths]) => paths.length > 1)
+      .map(([name, paths]) => `${name}: ${paths.join(", ")}`);
+    expect(duplicates).toEqual([]);
+  });
+});
+
+describe("429 failover contracts stay covered", () => {
+  test("every contract test this unit shipped is still tracked", () => {
+    // A deleted test is invisible: removing it removes its assertions, so CI stays green and no
+    // reviewer sees red. That is exactly what happened to the quorum cache test -- #3516 rebased
+    // against a branch point where the file sat elsewhere and resolved the conflict by dropping
+    // it, and nothing noticed. The duplicate-basename guard could not help: one copy is not a
+    // duplicate.
+    //
+    // These four are listed by NAME rather than path so the domain reorganizations can keep
+    // moving them freely; what may not happen is a file quietly ceasing to exist. They are worth
+    // naming because each observes something nothing else does -- most sharply the quorum cache,
+    // whose subject is a performance property: the runtime behaves identically without it, so
+    // its loss would surface only as latency nobody attributes.
+    const required = [
+      "always-on-429-failover.test.ts",
+      "anthropic-quorum-cache.test.ts",
+      "generic-oauth-failover.test.ts",
+      "docs-429-failover-claims.test.ts",
+    ];
+    const tracked = new Set(
+      trackedFiles()
+        .filter((path) => path.startsWith("tests/"))
+        .map((path) => path.split("/").pop()!),
+    );
+    const missing = required.filter((name) => !tracked.has(name));
+    expect(missing).toEqual([]);
+  });
+});

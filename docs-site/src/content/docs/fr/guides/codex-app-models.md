@@ -130,8 +130,8 @@ service OpenAI.
 
 ## Couverture stable actuelle des modèles
 
-L'ensemble natif de secours comprend `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` et GPT-5.6
-Sol/Terra/Luna. Pour la famille GPT-5.5/5.4, opencodex conserve les entrées dynamiques plus riches du
+L'ensemble natif de secours comprend `gpt-5.5` et GPT-5.6
+Sol/Terra/Luna. Pour la famille GPT-5.5, opencodex conserve les entrées dynamiques plus riches du
 catalogue Codex installé et ne synthétise qu'une entrée manquante. L'instantané amont fourni n'est employé
 que pour GPT-5.6, auquel il apporte l'identité et les métadonnées réelles de chaque modèle plutôt qu'une
 approximation fondée sur un ancien modèle d'entrée.
@@ -143,8 +143,8 @@ approximation fondée sur un ancien modèle d'entrée.
 | Connexion Codex (ligne Daybreak transférée explicitement) | `openai/gpt-daybreak-blue-latest` uniquement lorsque l'entrée `customModels` exacte est configurée sur le fournisseur canonique `openai`. Elle conserve l'identifiant Daybreak transmis et utilise l'instantané de capacités Sol épinglé (contexte de 372 000 jetons ; compactage automatique à 334 800 jetons). |
 | OpenAI (clé API) | Exactement dix lignes avec espace de noms : `gpt-5.5`, `gpt-5.6`, Sol/Terra/Luna, les trois identifiants virtuels `*-pro` et les deux alias Daybreak (contexte de 1 050 000 jetons ; entrée maximale de 922 000 jetons pour les dix) |
 | OpenRouter | `openrouter/openai/gpt-5.6-sol`, `openrouter/openai/gpt-5.6-terra`, `openrouter/openai/gpt-5.6-luna` (1 050 000) |
-| Cursor | Le repli statique comprend `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra` et `cursor/gpt-5.6-luna` (1 000 000), ainsi que des lignes ordinaires/rapides pour Grok 4.5 et 4.6 (500 000) ; 4.6 ajoute `xhigh`, et la découverte dynamique propre au compte détermine quelles lignes restent visibles. |
-| xAI | La découverte dynamique fait autorité. Le catalogue de secours comprend `xai/grok-4.6` et utilise `xai/grok-4.5` par défaut ; les deux ont une fenêtre de 500 000 jetons. Grok 4.6 propose `low` / `medium` / `high` / `xhigh` (valeur amont par défaut : `high`), tandis que Grok 4.5 s'arrête à `high`. |
+| Cursor | Le repli statique comprend `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra` et `cursor/gpt-5.6-luna` (1 000 000), ainsi que des lignes ordinaires/rapides pour Grok 4.5, 4.6 et 4.7 (500 000) ; 4.6 et 4.7 ajoutent `xhigh`, et la découverte dynamique propre au compte détermine quelles lignes restent visibles. |
+| xAI | La découverte dynamique fait autorité. Le catalogue de secours comprend `xai/grok-4.6` et `xai/grok-4.7` et utilise `xai/grok-4.5` par défaut ; les trois ont une fenêtre de 500 000 jetons. Grok 4.6 et 4.7 proposent `low` / `medium` / `high` / `xhigh` (valeur amont par défaut : `high`), tandis que Grok 4.5 s’arrête à `high`. |
 
 Les entrées GPT-5.6 épinglées préservent exactement l'échelle amont. Sol et Terra proposent les niveaux de
 `low` à `ultra` ; Luna s'arrête à `max`. Sol utilise `low` par défaut, contre `medium` pour Terra et Luna.
@@ -244,6 +244,26 @@ Tant que Desktop ne permet pas de contrôler cette liste d'autorisation :
 - Utilisez Codex CLI ou TUI plutôt que le sélecteur de Desktop ; ces interfaces n'appliquent pas la liste d'autorisation et répertorient normalement les modèles routés.
 
 ## Actualisation de l'état des modèles
+## Limitation du repli sur quota natif
+
+Lorsque l'application Codex épuise son quota natif de cinq heures, elle peut basculer vers un modèle de repli de réserve et griser les autres lignes de son sélecteur. Signalé dans [#2813](https://github.com/lidge-jun/opencodex/issues/2813), ce filtrage masque aussi les lignes routées par opencodex, alors que celles-ci utilisent des identifiants de fournisseur sans rapport et ne consomment aucun quota ChatGPT.
+
+Ce filtrage est appliqué par le client avant que la requête n'atteigne le proxy, donc opencodex ne peut pas le lever. Les lignes routées sont écrites avec `visibility: "list"`, le filtrage du catalogue ne consulte que `disabledModels` et le `selectedModels` de chaque fournisseur, et aucune valeur de quota n'intervient dans la visibilité routée.
+
+Sélectionner un modèle routé explicitement ne passe pas par le sélecteur. Définissez le modèle dans `config.toml` :
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+ou envoyez-le directement :
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+Les deux chemins routent correctement **dès que la requête atteint le proxy** — c'est couvert par des tests. En revanche, l'application de bureau Codex n'envoie pas le modèle configuré pendant le mode réserve : elle détermine l'état de réserve à partir de son propre sondage `wham/usage` (upsell `luna_reserve` plus une limite additionnelle `gpt-reserve` encore autorisée) et force le réglage de modèle sur `gpt-reserve` avant l'envoi, de sorte que la voie `config.toml` est écrasée dans l'application. Jusqu'à la réinitialisation de la fenêtre, utilisez `ocx access test`, Claude Code via le proxy (`ocx claude`) ou tout client `/v1` direct. Voir [Modèles routés pendant le mode réserve de Codex](/guides/codex-integration/#routed-models-during-codex-reserve-mode).
+
 
 Si le sélecteur affiche encore des entrées obsolètes, actualisez le catalogue et redémarrez l'interface Codex concernée :
 

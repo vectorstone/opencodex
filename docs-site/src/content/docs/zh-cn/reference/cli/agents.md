@@ -13,7 +13,14 @@ description: 多代理、combo、可观测性、访问、集成、系统和配�
 
 ```bash
 ocx agent subagents set ark/model-a,openai/gpt-5.5
+ocx agent sidecar web --enabled off
 ```
+
+`--enabled off` 与仪表盘中的 **关闭 (Off)** 行是同一个开关：OpenCodex 不再运行该 sidecar，
+Codex 集成会把 `web_search = "disabled"` 写入 `~/.codex/config.toml`，这正是让 MCP
+搜索服务器成为唯一搜索路径的前提。`--enabled on` 会再次移除该行。当保存确实改变了开关状态时，
+命令会报告由此触发的 Codex 侧写入（`--json` 中的 `codexWebSearch`，否则为末尾的
+`Codex config:` 行），并在无法写入时提示 `ocx sync`。该标志对 `vision` 同样有效。
 
 ### `ocx v2 <status|on|off|mode <v1|default|v2>|threads <n>>`
 
@@ -67,13 +74,15 @@ API key，且绝不会回退到 native alias。启用这组兼容选项前，请
 | 别名 | 对应资源 |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <7d|30d|all>] [--surface <all|codex|claude|grok>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
 ```bash
 ocx observe usage --range 30d --json
 ```
+
+部分用量记录无法计入时，人类可读输出会显示警告，即使没有可读取的记录也是如此。显示的总数仅反映可读取的记录。如果筛选条件没有匹配到可读取的记录，输出将显示警告和提示，而不显示总数行；被跳过的记录可能包含匹配项。`--json` 原样保留响应中的 `usageIncomplete` 诊断及原因。
 
 ### `ocx debug <provider|usage|injection|claude> <on|off|status|reset|logs [-f]>`
 
@@ -92,12 +101,15 @@ ocx debug usage logs [-f|--follow]
 
 ### `ocx access <key|endpoints|models|test> ...`
 
-管理 OpenCodex 准入 API 密钥，并检查外部端点和模型。`ocx api-key
-<list|create|remove> ...` 是 `ocx access key` 的别名。
+查看 OpenCodex 接入 API 密钥列表、外部端点和模型。`ocx api-key` 是 `ocx access key` 命令组的别名。
+
+创建密钥和开始轮换时，无论选择文本还是 JSON 输出，都会返回仅显示一次的明文凭据。代理应将这些步骤交给人在代理会话之外直接操作的终端完成。不要索要密钥本身，也不要让用户将其粘贴到聊天中；只接收配置和连接验证的确认，以及非秘密的密钥 ID 和轮换 ID。
 
 ```bash
-ocx access key create deployment
+ocx access key list --json
 ```
+
+确认新密钥已配置并验证连接，不等于批准撤销旧密钥。提交轮换或删除旧密钥前，需要另行获得撤销该密钥的明确授权。执行获准的操作后，再次查看列表。不要通过直接调用 API 绕过这一流程。
 
 ## Client integrations
 
@@ -124,7 +136,7 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 ### `ocx opencode [opencode args...]`
 
-确保代理正在运行，然后在 OpenCode 的内联运行时层（`OPENCODE_CONFIG_CONTENT`）中启动 opencode，并注入生成的 `provider.opencodex` 块。现有的内联配置会被保留，仅本次启动会替换 `provider.opencodex`。可能会读取全局或项目级 `opencode.json` 文件以警告已有覆盖，但不会修改磁盘上的文件。路由后的模型会显示为 `opencodex/<provider>/<model>`。稍后再次启动普通 `opencode` 时，行为与之前完全一致。
+确保代理正在运行，然后在 OpenCode 的内联运行时层（`OPENCODE_CONFIG_CONTENT`）中启动 opencode，并注入生成的 `provider.opencodex` 和 `providers.opencodex` 块。现有的内联配置会被保留，仅本次启动会替换这两个键。可能会读取全局或项目级 `opencode.json` 文件以警告已有覆盖，但不会修改磁盘上的文件。路由后的模型会显示为 `opencodex/<provider>/<model>`。稍后再次启动普通 `opencode` 时，行为与之前完全一致。
 
 ### `ocx grok <status|exclude|include|set|clear|apply> ...`
 
@@ -132,7 +144,7 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 ## Client config export
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo|cline|kilo|droid>`
 
 输出连接到正在运行代理的客户端配置。此命令会以所选客户端的原生格式序列化 `opencodex` provider 块，其中包含基础 URL、模型列表，以及该客户端适用的凭据引用或 `opencodex-loopback` 占位值。
 
@@ -140,7 +152,7 @@ ocx claude desktop import <path> [--apply]         Validate and import JSON
 
 | 标志 | 动作 |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh>` | 必需。选择客户端配置格式。 |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo\|cline\|kilo\|droid>` | 必需。选择客户端配置格式。 |
 | `--json` | 仅在 stdout 打印配置 JSON，这样重定向即可捕获字节级精确输出。包括 `--out` 写入提示在内的所有诊断信息都会输出到 stderr。 |
 | `--out <path>` | 将配置写入 `<path>`。拒绝替换已存在的文件。 |
 | `--force` | 允许 `--out` 替换已存在的文件。 |
@@ -157,13 +169,23 @@ ocx export --client opencode --out ~/opencodex-opencode.json
 | 客户端 | 规范目标路径 | 下载文件名 | 环境变量 |
 | --- | --- | --- | --- |
 | `opencode` | `~/.config/opencode/opencode.json`（设置了 `XDG_CONFIG_HOME` 时以其为准） | `opencode.json` | `OPENCODEX_OPENCODE_API_KEY` |
-| `pi` | `~/.pi/agent/models.json` | `pi-models.json` | 无 - 块中携带字面值 `opencodex-loopback` |
+| `pi` | `~/.pi/agent/models.json` (设置后 `PI_CODING_AGENT_DIR` 优先；相对路径会被拒绝) | `pi-models.json` | 无 - 块中携带字面值 `opencodex-loopback` |
 | `omp` | `~/.omp/agent/models.yml`（默认路径；即使为空，`OMP_PROFILE` 也优先于 `PI_PROFILE`） | `omp-models.yaml` | 无 - 字面值 `opencodex-loopback` |
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | 无 - loopback placeholder |
-| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
+| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | 非机密的环回占位值 |
 | `dsh` | `$DSH_HOME/settings.yaml`（默认 `~/.dsh/settings.yaml`） | `settings.yaml` | 无 — 非秘密环回 bearer 占位值 |
+| `mcode` | `~/.minimax/config.yaml` (设置后 `MINIMAX_DATA_DIR` 优先，其次是旧的 `MAVIS_DATA_DIR`；相对路径会被拒绝) | `mcode-config.yaml` | 无 — loopback placeholder |
+| `zcode` | `~/.zcode/v2/config.json` (设置后 `ZCODE_DATA_DIR` 优先；相对路径会被拒绝) | `config.json` | 无 — loopback placeholder |
+| `prime` | `~/.prime/agent/models.json` (设置后 `PRIME_AGENT_CODING_AGENT_DIR` 优先；相对路径会被拒绝) | `prime-models.json` | 无 — loopback placeholder |
+| `aside` | `~/.aside/u/<account>/models.json`，对应 Aside 自己的 `accounts.json` 指明的当前账户；清单不可读时会被拒绝，而不是退回到某个账户 | `aside-models.json` | 无 — loopback placeholder |
+| `raycast` | `~/.config/raycast/ai/providers.yaml`（macOS 与 Windows 相同；Raycast 不遵循 `XDG_CONFIG_HOME`） | `raycast-providers.yaml` | 无 — 仅限回环，不会写入 `api_keys` 条目 |
+| `omo` | `~/.omo/agent/models.json`（设置后依次由 `OMO_CODING_AGENT_DIR`、`SENPI_CODING_AGENT_DIR`、`PI_CODING_AGENT_DIR` 优先；相对路径会被拒绝） | `omo-models.json` | 无 — loopback placeholder |
+| `kilo` | `~/.config/kilo` 下最先存在的 `kilo.jsonc`、`kilo.json`、`opencode.jsonc`、`opencode.json` 或 `config.json`（`XDG_CONFIG_HOME` 可更改该目录）；均不存在时使用 `kilo.jsonc` | `kilo.jsonc` | `OPENCODEX_KILO_API_KEY` |
+| `droid` | `~/.factory/settings.json` (`%USERPROFILE%\.factory\settings.json` on Windows) | `factory-settings.json` | 仅限回环；无需环境变量 |
+
+Raycast 导出是一份独立的 `providers.yaml` 文档，在 `providers` 序列中只有一个 `id: opencodex` 元素：`name: OpenCodex`、代理的 `/v1` 基础 URL，以及每个已路由模型及其 `abilities`（`tools` 与 `system_message` 始终支持，`vision` 取自目录的输入模态，`reasoning_effort` 在模型有 effort 阶梯时设置，`temperature` 对推理模型关闭）。Custom Providers 是 Raycast Pro 功能，且 Raycast 会监视该文件，因此保存后的更改无需重启即可生效。格式见 [manual.raycast.com/ai/custom-providers](https://manual.raycast.com/ai/custom-providers)。不会写入任何 `api_keys` 条目，所以该导出仅限回环，非回环绑定会被拒绝。
 
 opencode 会插值 `{env:OPENCODEX_OPENCODE_API_KEY}`。opencodex 生成的 Pi 导出不需要环境变量，而是携带字面占位值 `opencodex-loopback`。这个值是必需的：Pi 在构建模型列表时会解析 `apiKey`，如果已有配置包含未设置的环境变量引用，它就会隐藏整个 provider。回环上的代理从不校验生成的占位值。
 
@@ -171,20 +193,61 @@ opencode 会插值 `{env:OPENCODEX_OPENCODE_API_KEY}`。opencodex 生成的 Pi �
 `ocx export` 从不写入你的真实客户端配置。该命令只会打印目标路径供你手动合并，而 `--out` 在没有 `--force` 的情况下拒绝覆盖已有文件，因为替换配置会破坏其中已有的其他 providers、agents 和 MCP 条目。
 :::
 
-任何密钥都不会被序列化。opencode、Hermes、OpenClaw 和 Gajae 配置里只包含环境引用，因此密钥仍保留在你的环境中；Pi、OMP、Kimi 和 DSH 配置里携带的是环回占位值而不是任何凭据。环回代理（`127.0.0.1`，默认值）根本不需要准入密钥。当代理绑定到环回地址之外时，请设置对应的 `OPENCODEX_OPENCODE_API_KEY`、`OPENCODEX_HERMES_API_KEY` 或 `OPENCODEX_OPENCLAW_API_KEY`。`OPENCODEX_GAJAE_API_KEY` 只会从环境中提供 Gajae provider 凭据，不能发送远程准入 header，因此生成的 Gajae 集成仍与 Pi、OMP、Kimi 和 DSH 一样仅支持环回。关于准入密钥如何签发，请参见 [远程访问](/reference/configuration/#remote-access)。上游 providers 自身的密钥则完全是另一回事，需要按 [Providers](/guides/providers/) 单独配置。
+任何密钥都不会被序列化。生成的配置里携带的要么是有文档记录的环境引用，要么是非机密的环回占位值。仅凭环回地址（`127.0.0.1`）不能认定无需密钥；应检查目标的认证策略和端点。使用所选密钥的模型及音频 CLI 即使在环回上也需要明确提供密钥。当代理绑定到环回地址之外时，只有在客户端配置格式支持的情况下才设置相应的环境变量。有关准入密钥的签发方法，请参阅 [Remote access](/zh-cn/reference/configuration/server/#远程访问)。上游 provider 自身的密钥需要单独配置，请参阅 [Providers](/guides/providers/)。
+
+生成的 gjc 集成使用非机密的本地环回占位值，不需要环境变量。此集成仅支持本地环回，不配置远程准入凭据。
 
 同一份负载会通过 `GET /api/client-config` 提供，并在仪表盘的 API 选项卡中渲染，因此 CLI、API 和 GUI 使用的是同一字节内容。
 
 ## Runtime and configuration
 
-### `ocx system <status|settings|startup|diagnostics|sync|update> ...`
+### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 管理无头运行时设置、启动、同步、诊断和更新。
+
+`ocx system codex-restart --yes` 通过与 `ocx sync --restart-codex` 相同的模块重启 Codex app-server，并完全退出再重新启动 Codex 桌面应用。若代理本身运行在 Codex 应用内部，该命令会给出可执行提示并拒绝，而不是承诺无法完成的移交。
 
 ```bash
 ocx system settings --stream-mode eager-relay
 ```
 
-### `ocx config <show|get|set|unset|validate|export|import> ...`
+`ocx system update` 更新 OpenCodex 本身。Codex CLI 使用以下独立的只读检查命令：
+
+```bash
+ocx system codex-cli-update check --json
+```
+
+`check` 不会向软件包注册表发起请求，只会在限定范围内检查已配置候选项的来源证据，包括经过脱敏的可执行文件位置和所有权证据。受信任的已发布启动器上下文只能验证该候选项快照，并不证明 Codex 已成功运行。由于这条一次性命令绝不会运行 Codex，来自环境变量和持久化记录的候选项仅用于报告（`managed: false`，通常为 `selection_unattested`）；JSON 输出包含 `candidateAvailable`、`candidateVersion` 和 `candidateSource`，且 `selectionAttested` 始终为 `false`。检查已配置候选项需要受信任的已发布启动器上下文；直接使用 Bun 启动或从源码运行时没有这项证明，因此会忽略环境变量和持久化记录中的候选项状态，并可能在 POSIX 系统上报告 `candidate_unavailable`。在 Windows 上，这个首个切片不会对候选路径或配置路径执行任何文件系统 I/O。只有由受信任启动器捕获的绝对环境候选项可以获得应用捆绑或版本管理器的纯词法标签；其他所有 Windows 候选项都会以失败关闭方式处理。由于这个切片完全不读取持久化的选择状态，在未捕获任何环境候选项的 Windows 运行中会报告 `windows_inspection_deferred` 而非 `candidate_unavailable`：该命令无法观测 Codex CLI 是否已安装，因此报告检查被推迟，而不是断言不存在候选项。该命令不会运行 Codex 或软件包管理器，不会修复 shim，不会写入配置或缓存，不会停止进程，也不会安装任何内容。随应用捆绑的候选项、位于已识别版本管理器路径中的候选项、未经验证的独立候选项以及 shim 状态不明确的候选项，都会报告为 `unmanaged` 或 `unknown`，绝不会归类为 `managed`。
+
+在 Windows 上，如果捕获到 `CODEX_CLI_PATH=codex` 这样的裸命令、远程路径或设备路径，则报告 `candidate_path_unavailable`。这些情况下候选项已被捕获，但其路径不适用于此检查。
+
+#### 显式观察 Windows x64 安装
+
+```text
+ocx system codex-cli-update attest [--json]
+ocx system codex-cli-update attest --candidate <absolute-path> --npm-prefix <absolute-path> --npm-cli <absolute-path> --node <absolute-path> [--json]
+```
+
+`attest` 是可选的只读操作，用于观察所选或明确指定的 Windows x64 npm 安装。不带任何选项时，命令会观察由可信启动器快照识别的所选候选项（已配置的 `CODEX_CLI_PATH` 或所捕获 PATH 中的第一个 `codex`），其中 opencodex 包装脚本会解析到其重命名的 `codex.opencodex-real.cmd` npm 备份。提供全部四个绝对路径可覆盖自动识别；自动识别仅提出路径，持有句柄的观察才是最终依据。`--candidate` 必须是标准 npm `<prefix>/codex.cmd` 或 `<prefix>/node_modules/@openai/codex/bin/codex.js`。`--npm-cli` 必须以 `node_modules/npm/bin/npm-cli.js` 结尾，`--node` 明确指定 `node.exe`。应用捆绑安装、已识别的版本管理器布局、缺少 npm 备份的 opencodex 自有 shim 和自定义包装脚本均会被拒绝。
+
+在有界读取期间，原生句柄保持祖先目录和文件打开。非支持平台、重解析点/junction、冲突的写入者、不安全路径以及超出大小限制的文件均会被拒绝。固定格式的报告不包含路径：`status` 为 `observed` 或 `refused`，并提供 `installationIdentityObserved`；`selectionAttested`、`managed` 和 `applyAllowed` 始终为 `false`。报告拒绝时也可能返回退出码 0，因此应检查 `status`。
+
+标识或摘要仅描述观察时的文件，不是持久的更新许可，也不证明选中的运行时、过去的安装程序、实际 npm 配置或工具真实性。明确指定的 Node 也只是被观察，不证明启动器会选择它。命令不会执行目标、请求包注册表、安装、写入配置或控制进程。现有 Windows `check` 仍不执行候选项或配置的文件系统 I/O。
+
+### `ocx config [show|get|set|unset|validate|export|import] ...`
+
+`ocx config [show] [--json] [--source]` 无需运行代理即可显示本地配置。省略 `show` 时，可使用任一标志或按任意顺序组合使用。`--source` 包含诊断来源、错误和警告，仅适用于显示操作。`--json` 可放在显式操作之前，不会改变执行的操作。重复的 `--json` 或 `--source` 标志及未知参数会被拒绝。
 
 检查并安全修改已验证的 OpenCodex 配置。`show` 和 `get` 会隐藏密钥。导入会先验证再写入，并且需要 `--yes`。
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

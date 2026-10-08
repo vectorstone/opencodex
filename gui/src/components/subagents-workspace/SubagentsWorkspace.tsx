@@ -1,6 +1,6 @@
 /**
  * SubagentsWorkspace — a single stacked column for the Subagents tab: the featured roster
- * (reorder + save), the model picker, then the delegation settings.
+ * (reorder; every edit saves itself), the model picker, then the delegation settings.
  *
  * The previous rail layout listed the featured models twice — once as a rail group, once in
  * the main pane — which read as a rendering bug rather than two views of one thing. There is
@@ -23,6 +23,7 @@ import {
 } from "../../icons";
 import { useT } from "../../i18n/shared";
 import { Trans } from "../../i18n/provider";
+import { Tooltip } from "../../ui";
 import { modelLabel } from "../../model-display";
 import { SectionTabs } from "../section-tabs";
 import { sectionAnchorId } from "../../section-anchors";
@@ -31,12 +32,18 @@ import type { DelegationPatch, DelegationModelOption, UltraModePatch, UltraModeS
 
 export interface SubagentsWorkspaceProps {
   available: string[];
+  fallbackAvailable?: string[];
   chosen: string[];
-  busy?: boolean;
   onToggle: (m: string) => void;
   onMove: (i: number, dir: -1 | 1) => void;
-  onSave: () => void;
+  fallback: string[];
+  fallbackPollMs: number;
+  fallbackBusy: boolean;
+  onFallbackChange: (models: string[]) => void;
+  onFallbackPollMsChange: (pollMs: number) => void;
+  onFallbackSave: () => void;
   delegation: {
+    apiBase: string;
     model: string;
     effort: string;
     efforts: string[];
@@ -57,11 +64,11 @@ export const FEATURED_MAX = 5;
 
 export default function SubagentsWorkspace({
   available,
+  fallbackAvailable,
   chosen,
-  busy = false,
   onToggle,
   onMove,
-  onSave,
+  fallback, fallbackPollMs, fallbackBusy, onFallbackChange, onFallbackPollMsChange, onFallbackSave,
   delegation,
 }: SubagentsWorkspaceProps) {
   const t = useT();
@@ -93,11 +100,13 @@ export default function SubagentsWorkspace({
           <div className="swi-featured-head">
             <h2 className="swi-featured-title">{t("sub.featured")}</h2>
             <span className="swi-featured-count">{chosen.length}/{FEATURED_MAX}</span>
+            {/* One-time teaching ("this order is the picker order") rides on a focusable
+                info button beside the counter instead of a paragraph above the list. */}
+            <Tooltip content={<Trans k="sub.orderHint" cmd="spawn_agent" />} side="bottom" maxWidth={380}>
+              <IconInfo width={14} height={14} aria-hidden="true" />
+              <span className="sr-only">{t("sub.orderHintAria")}</span>
+            </Tooltip>
           </div>
-          <p className="swi-featured-hint">
-            <IconInfo width={15} height={15} aria-hidden="true" />
-            <span><Trans k="sub.orderHint" cmd="spawn_agent" /></span>
-          </p>
 
           {chosen.length === 0 ? (
             <div className="swi-featured-empty">{t("sub.noneSelected")}</div>
@@ -112,7 +121,7 @@ export default function SubagentsWorkspace({
                       type="button"
                       className="btn btn-ghost btn-icon btn-sm"
                       onClick={() => onMove(i, -1)}
-                      disabled={busy || i === 0}
+                      disabled={i === 0}
                       aria-label={t("sub.moveUp", { m })}
                     >
                       <IconArrowUp />
@@ -121,7 +130,7 @@ export default function SubagentsWorkspace({
                       type="button"
                       className="btn btn-ghost btn-icon btn-sm"
                       onClick={() => onMove(i, 1)}
-                      disabled={busy || i === chosen.length - 1}
+                      disabled={i === chosen.length - 1}
                       aria-label={t("sub.moveDown", { m })}
                     >
                       <IconArrowDown />
@@ -130,7 +139,6 @@ export default function SubagentsWorkspace({
                       type="button"
                       className="btn btn-ghost btn-icon btn-sm"
                       onClick={() => onToggle(m)}
-                      disabled={busy}
                       aria-label={t("sub.removeAria", { m })}
                       style={{ color: "var(--red)" }}
                     >
@@ -142,11 +150,6 @@ export default function SubagentsWorkspace({
             </div>
           )}
 
-          <div className="swi-save-row">
-            <button type="button" className="btn btn-primary" onClick={onSave} disabled={busy}>
-              {t("common.save")}
-            </button>
-          </div>
         </section>
 
         <section
@@ -176,7 +179,7 @@ export default function SubagentsWorkspace({
                   const isFeatured = chosenSet.has(m);
                   const priority = isFeatured ? chosen.indexOf(m) + 1 : null;
                   // A featured row can always be removed; only adding is blocked when full.
-                  const blocked = !isFeatured && (full || busy);
+                  const blocked = !isFeatured && full;
                   return (
                     <div
                       key={m}
@@ -221,6 +224,7 @@ export default function SubagentsWorkspace({
             <h2 className="swi-featured-title">{t("sub.settings")}</h2>
           </div>
           <SubagentDelegationSection
+            apiBase={delegation.apiBase}
             model={delegation.model}
             effort={delegation.effort}
             efforts={delegation.efforts}
@@ -234,6 +238,13 @@ export default function SubagentsWorkspace({
             onUltraModeSave={delegation.onUltraModeSave}
             ultraLoadFailed={delegation.ultraLoadFailed}
             onUltraModeRetry={delegation.onUltraModeRetry}
+            fallback={fallback}
+            fallbackPollMs={fallbackPollMs}
+            fallbackBusy={fallbackBusy}
+            availableModels={fallbackAvailable ?? available}
+            onFallbackChange={onFallbackChange}
+            onFallbackPollMsChange={onFallbackPollMsChange}
+            onFallbackSave={onFallbackSave}
           />
         </section>
       </div>

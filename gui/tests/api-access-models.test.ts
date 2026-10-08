@@ -6,17 +6,17 @@ import {
 
 describe("classifyExternalModel", () => {
   test("keeps bare native OpenAI ids and marks them native via owned_by", () => {
-    expect(classifyExternalModel({ id: "gpt-5.4", owned_by: "openai" })).toEqual({
-      id: "gpt-5.4",
-      displayName: "gpt-5.4",
+    expect(classifyExternalModel({ id: "gpt-5.5", owned_by: "openai" })).toEqual({
+      id: "gpt-5.5",
+      displayName: "gpt-5.5",
       provider: "openai",
       native: true,
       custom: false,
     });
   });
 
-  test("classifies bare combo aliases from owned_by without rewriting the id", () => {
-    expect(classifyExternalModel({ id: "fast-chat", owned_by: "combo" })).toEqual({
+  test("classifies bare combo aliases from the explicit marker without rewriting the id", () => {
+    expect(classifyExternalModel({ id: "fast-chat", owned_by: "openai", is_combo: true })).toEqual({
       id: "fast-chat",
       displayName: "fast-chat",
       provider: "combo",

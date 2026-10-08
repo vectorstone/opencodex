@@ -40,7 +40,7 @@ describe("assessHygiene", () => {
   it("accepts behavior changes with tests or approved exception", () => {
     assert.deepEqual(assessHygiene({ files: [
       { filename: "src/router.ts", patch: "+change" },
-      { filename: "tests/router.test.ts", patch: "+test" },
+      { filename: "tests/routing/router.test.ts", patch: "+test" },
     ] }), []);
     assert.deepEqual(assessHygiene({
       files: [{ filename: "src/router.ts", patch: "+change" }],
@@ -105,6 +105,38 @@ describe("assessHygiene", () => {
       "@@\n+// note\n+const y = 2;",
       "@@\n+// looks harmless\n+runUntrusted(payload);",
       "@@\n-const y = 2;\n+// removed the line",
+    ]) {
+      const failures = assessHygiene({ files: [{ filename: "src/router.ts", patch }] });
+      assert.equal(failures[0].code, "missing_regression_test", patch);
+    }
+  });
+
+  it("does not mistake private or generator members for comments", () => {
+    for (const patch of [
+      "@@\n+  #disableAuth() { return true; }",
+      "@@\n+  *[Symbol.iterator]() { yield secret; }",
+    ]) {
+      const failures = assessHygiene({ files: [{ filename: "src/router.ts", patch }] });
+      assert.equal(failures[0].code, "missing_regression_test", patch);
+    }
+  });
+
+  it("recognizes block-comment continuations only inside a block comment", () => {
+    assert.deepEqual(assessHygiene({ files: [{
+      filename: "src/router.ts",
+      patch: "@@\n /**\n- * old explanation\n+ * clearer explanation\n */",
+    }] }), []);
+    assert.deepEqual(assessHygiene({ files: [{
+      filename: "src/router.ts",
+      patch: "@@\n+/* one line */\n+/*\n+ * opened here\n+ */",
+    }] }), []);
+  });
+
+  it("does not treat bare lines after an opener as comment text", () => {
+    for (const patch of [
+      // An unchanged template literal holding "/*" must not hide the added SQL.
+      "@@\n const query = `\n+/* note\n+DELETE FROM sessions;\n+*/\n `;",
+      "@@\n+/* note */ runUntrusted(payload);",
     ]) {
       const failures = assessHygiene({ files: [{ filename: "src/router.ts", patch }] });
       assert.equal(failures[0].code, "missing_regression_test", patch);
@@ -225,7 +257,7 @@ describe("collectDeterministicHygieneFailures", () => {
     const failures = collectDeterministicHygieneFailures({
       files: [
         { filename: "src/codex/auth-api.ts", patch: "+change" },
-        { filename: "tests/codex-auth-api.test.ts", patch: "+test" },
+        { filename: "tests/codex-integration/codex-auth-api.test.ts", patch: "+test" },
       ],
       authorHasPushPermission: true,
     });

@@ -1,5 +1,6 @@
 import {
   CliUsageError,
+  RuntimeApiError,
   csv,
   printData,
   rejectArgs,
@@ -11,6 +12,7 @@ import {
   takeOption,
   type RuntimeApiDeps,
 } from "./runtime-api";
+import { clientIntegrationPath, validateAsideProfile } from "./integration-input";
 
 const CLAUDE_USAGE = `Usage:
   ocx claude config [status] [--json]
@@ -18,8 +20,9 @@ const CLAUDE_USAGE = `Usage:
       [--system-env <on|off>] [--fast-mode <on|off>] [--auto-context <on|off>]
       [--compact-window <tokens|default>] [--inject-agents <on|off>]
       [--small-fast-model <id|->] [--model-map <from=to,from=to|->]
-      [--blocked-skills <name,name|->] [--web-model <id|->] [--web-backend <openai|anthropic|->]
-      [--vision-model <id|->] [--vision-backend <openai|anthropic|->] [--json]`;
+      [--blocked-skills <name,name|->] [--web-model <id|->] [--web-backend <openai|anthropic|xai|gemini|exa|->]
+      [--vision-model <id|->] [--vision-backend <openai|anthropic|->] [--json]
+  ocx claude config set --first-party <on|off> [--json]`;
 
 const GROK_USAGE = `Usage:
   ocx grok [status] [--json]
@@ -28,10 +31,17 @@ const GROK_USAGE = `Usage:
   ocx grok apply [--json]`;
 
 const CLIENT_USAGE = `Usage:
-  ocx integration client [status] [--client <id>] [--json]
-  ocx integration client <enable|disable> --client <id> [--json]
-  ocx integration client history [--client <id>] [--json]
-  ocx integration client restore --op <opId> [--confirm-drift] [--json]`;
+  ocx integration client [status] [--client <id>] [--profile <id>] [--json]
+  ocx integration client <enable|disable> --client <id> [--profile <id>] [--overwrite-conflict] [--json]
+  ocx integration client history [--client <id>] [--profile <id>] [--json]
+  ocx integration client restore --op <opId> [--client aside --profile <id>] [--confirm-drift] [--json]
+  ocx integration client preview --client <id> --operation <apply|overwrite|disable> [--profile <id>] [--json]
+  ocx integration client restore --op <opId> --preview [--client aside --profile <id>] [--confirm-drift] [--json]
+  ocx integration client history remove --op <opId> --yes [--client aside] [--profile <id>] [--json]
+  ocx integration client sync --client aside [--json]
+  enable/disable/restore accept --plan-fingerprint <token>; bound Aside operations require one profile.
+  Droid enable/preview accept repeatable --reasoning-default <model=effort> or --clear-reasoning-defaults.
+  --profile selects one Aside account-backed profile; omitted Aside toggles affect all profiles.`;
 
 function parseMap(raw: string): Record<string, string> {
   if (raw === "-") return {};
@@ -58,6 +68,7 @@ export async function handleClaudeConfigCommand(argv: string[], deps: RuntimeApi
     if (action !== "set") throw new CliUsageError(`unknown Claude config command ${action}`, CLAUDE_USAGE);
     const body: Record<string, unknown> = {};
     const enabled = takeBooleanOption(args, "--enabled");
+    const firstParty = takeBooleanOption(args, "--first-party");
     const authMode = takeOption(args, "--auth-mode");
     const systemEnv = takeBooleanOption(args, "--system-env");
     const fastMode = takeBooleanOption(args, "--fast-mode");
@@ -100,9 +111,22 @@ export async function handleClaudeConfigCommand(argv: string[], deps: RuntimeApi
     const vision = sidecar(visionModel, visionBackend);
     if (web) body.webSearchSidecar = web;
     if (vision) body.visionSidecar = vision;
+    if (firstParty !== undefined) {
+      if (Object.keys(body).length > 0) {
+        throw new CliUsageError("--first-party must be set on its own (it writes Claude Code's settings file immediately)", CLAUDE_USAGE);
+      }
+      body.cliFirstParty = firstParty;
+    }
     if (Object.keys(body).length === 0) throw new CliUsageError("at least one Claude setting is required", CLAUDE_USAGE);
     const result = await runtimeRequest("/api/claude-code", { method: "PUT", body: JSON.stringify(body) }, deps);
-    printData(result, wantsJson, ["Claude Code settings updated."]);
+    const warnings = (result as { warnings?: unknown }).warnings;
+    const retained = Array.isArray(warnings) && warnings.includes("shared_proxy_retained");
+    printData(result, wantsJson, [
+      "Claude Code settings updated.",
+      // The route kept the shared proxy env because Claude Desktop may still rely on it. Say so,
+      // or an operator who turned first-party off believes the local interception is gone.
+      ...(retained ? ["Warning: Claude Desktop still uses the shared proxy settings. Run `ocx claude desktop apply --gateway` to release them."] : []),
+    ]);
   });
 }
 
@@ -145,6 +169,39 @@ export async function handleGrokCommand(argv: string[], deps: RuntimeApiDeps = {
   });
 }
 
+/** The Raycast-only block the single-client route adds; see IntegrationStateEnvelope. */
+interface RaycastStatusBlock {
+  plan: string;
+  aiDirPresent: boolean;
+}
+
+function raycastBlock(result: unknown): RaycastStatusBlock | null {
+  if (!result || typeof result !== "object") return null;
+  const block = (result as { raycast?: unknown }).raycast;
+  if (!block || typeof block !== "object") return null;
+  const { plan, aiDirPresent } = block as Partial<RaycastStatusBlock>;
+  return typeof plan === "string" && typeof aiDirPresent === "boolean" ? { plan, aiDirPresent } : null;
+}
+
+/**
+ * Text view of one client's status.
+ *
+ * Raycast carries an extra block, and the generic summary would print it as
+ * three dotted keys. A `current` file that Raycast ignores for want of a Pro
+ * subscription is the one fact this view must not bury, so `plan` gets its own
+ * line and a missing `ai` folder gets the instruction that creates it.
+ */
+function singleClientStatusLines(result: unknown): string[] {
+  const raycast = raycastBlock(result);
+  if (!raycast) return summaryLines(result);
+  const rest = Object.fromEntries(Object.entries(result as Record<string, unknown>).filter(([key]) => key !== "raycast"));
+  const lines = [...summaryLines(rest), `plan: ${raycast.plan}`];
+  if (!raycast.aiDirPresent) {
+    lines.push('On macOS or Windows, open Raycast → Settings → AI → "Reveal Providers Config" once so the ai folder exists.');
+  }
+  return lines;
+}
+
 /**
  * The headless half of the client-integration toggle.
  *
@@ -159,30 +216,58 @@ export async function handleClientIntegrationCommand(
   argv: string[],
   deps: RuntimeApiDeps = {},
 ): Promise<number> {
+  if ((argv[0] === "history" || argv[0] === "journal") && argv[1] === "remove") {
+    const { handleIntegrationJournalRemove } = await import("./integration-journal");
+    return handleIntegrationJournalRemove(argv.slice(2), deps);
+  }
+  if (argv[0] === "sync") {
+    const { handleIntegrationAsideSync } = await import("./integration-aside-sync");
+    return handleIntegrationAsideSync(argv.slice(1), deps);
+  }
+  if (argv[0] === "preview" || argv.some(arg => ["--preview", "--plan-fingerprint", "--reasoning-default", "--clear-reasoning-defaults"]
+    .some(flag => arg === flag || arg.startsWith(`${flag}=`)))) {
+    const { handleIntegrationPreviewCommand } = await import("./integration-preview");
+    return handleIntegrationPreviewCommand(argv, deps);
+  }
   return runCliAction(async () => {
     const args = [...argv];
     const action = (args.shift() ?? "status").toLowerCase();
     const wantsJson = takeFlag(args, "--json");
+    const profile = takeOption(args, "--profile");
 
     if (action === "status" || action === "show" || action === "list") {
       const client = takeOption(args, "--client");
+      validateAsideProfile(profile, client, CLIENT_USAGE);
       rejectArgs(args, CLIENT_USAGE);
       const path = client
-        ? `/api/client-integrations/${encodeURIComponent(client)}`
+        ? clientIntegrationPath(client, profile)
         : "/api/client-integrations";
       const result = await runtimeRequest(path, {}, deps);
       const rows = (result as { clients?: Array<Record<string, unknown>> }).clients;
-      printData(result, wantsJson, rows
-        ? rows.map(row => `${String(row.clientId)}: ${String(row.state)}${row.installed ? "" : " (not installed)"}`)
-        : summaryLines(result));
+      const profiles = (result as { profiles?: Array<Record<string, unknown>> }).profiles;
+      printData(result, wantsJson, profiles
+        ? profiles.length > 0
+          ? profiles.map(row => `${String(row.profileId)}  ${String(row.name ?? "Aside")}: ${row.enabled ? "on" : "off"} (${String(row.state)})${row.current ? " [current]" : ""}`)
+          : [String((result as { error?: string }).error ?? "No Aside profiles found.")]
+        : rows
+        /*
+         * `supersededBy` is named here and not only in the single-client view
+         * because this list is where a user looks to see that everything is
+         * connected, and "current" alone is exactly the reassurance that hid a
+         * client reading a file opencodex does not write.
+         */
+        ? rows.map(row => `${String(row.clientId)}: ${String(row.state)}${row.installed ? "" : " (not installed)"}${row.supersededBy ? " (client reads another file)" : ""}`)
+        : singleClientStatusLines(result));
       return;
     }
 
     if (action === "history" || action === "journal") {
       const client = takeOption(args, "--client");
+      validateAsideProfile(profile, client, CLIENT_USAGE);
       rejectArgs(args, CLIENT_USAGE);
-      const query = client ? `?client=${encodeURIComponent(client)}` : "";
-      const result = await runtimeRequest(`/api/client-integrations/journal${query}`, {}, deps);
+      const path = client === "aside" ? `${clientIntegrationPath(client, profile)}/journal`
+        : `/api/client-integrations/journal${client ? `?client=${encodeURIComponent(client)}` : ""}`;
+      const result = await runtimeRequest(path, {}, deps);
       const operations = (result as { operations?: Array<Record<string, unknown>> }).operations ?? [];
       printData(result, wantsJson, operations.length === 0
         ? ["No integration operations recorded yet."]
@@ -190,7 +275,8 @@ export async function handleClientIntegrationCommand(
           // `snapshot` is resolved against the disk by the route, so "expired"
           // here means the bytes are genuinely gone, not merely old.
           const backup = row.snapshot === "expired" ? "backup expired" : `op ${String(row.opId)}`;
-          return `${String(row.at)}  ${String(row.clientId)}  ${String(row.kind)}  (${backup})`;
+          const owner = row.profileId === undefined ? String(row.clientId) : `${String(row.clientId)}:${String(row.profileId)}`;
+          return `${String(row.at)}  ${owner}  ${String(row.kind)}  (${backup})`;
         }));
       return;
     }
@@ -198,9 +284,12 @@ export async function handleClientIntegrationCommand(
     if (action === "restore") {
       const opId = takeOption(args, "--op") ?? takeOption(args, "--op-id");
       const confirmDrift = takeFlag(args, "--confirm-drift");
+      const client = takeOption(args, "--client");
+      validateAsideProfile(profile, client, CLIENT_USAGE);
+      if (client !== undefined && profile === undefined) throw new CliUsageError("restore --client requires --profile", CLIENT_USAGE);
       rejectArgs(args, CLIENT_USAGE);
       if (!opId) throw new CliUsageError("--op <opId> is required", CLIENT_USAGE);
-      const result = await runtimeRequest("/api/client-integrations/restore", {
+      const result = await runtimeRequest(profile === undefined ? "/api/client-integrations/restore" : `${clientIntegrationPath("aside", profile)}/restore`, {
         method: "POST",
         body: JSON.stringify({ opId, confirmDrift }),
       }, deps);
@@ -212,13 +301,40 @@ export async function handleClientIntegrationCommand(
       throw new CliUsageError(`unknown client integration command ${action}`, CLIENT_USAGE);
     }
     const client = takeOption(args, "--client");
+    validateAsideProfile(profile, client, CLIENT_USAGE);
+    /*
+     * The conflict escape hatch, spelled the way `restore --confirm-drift` is: the
+     * refusal is the default and the waiver has to be typed.
+     *
+     * Without it the dashboard could resolve a conflict and the CLI could not,
+     * which strands exactly the user who cannot open a browser -- an SSH session,
+     * or an agent driving the proxy. That dead end is the reason the overwrite
+     * path exists at all.
+     */
+    const overwriteConflict = takeFlag(args, "--overwrite-conflict");
     rejectArgs(args, CLIENT_USAGE);
     if (!client) throw new CliUsageError("--client <id> is required", CLIENT_USAGE);
-    const result = await runtimeRequest(`/api/client-integrations/${encodeURIComponent(client)}`, {
+    /*
+     * Refused here rather than forwarded. The route answers 400 for this pair, but
+     * a local usage error names the flag that is wrong, where the route's reply
+     * arrives as a generic failed request.
+     */
+    if (overwriteConflict && action === "disable") {
+      throw new CliUsageError("--overwrite-conflict applies only to enable", CLIENT_USAGE);
+    }
+    const result = await runtimeRequest(clientIntegrationPath(client, profile), {
       method: "PUT",
-      body: JSON.stringify({ enabled: action === "enable" }),
+      // Sent only when asked for, so a proxy on an older build sees the request it
+      // has always seen rather than an unknown field.
+      body: JSON.stringify(overwriteConflict
+        ? { enabled: true, overwriteConflict: true }
+        : { enabled: action === "enable" }),
     }, deps);
-    printData(result, wantsJson, [String((result as Record<string, unknown>).message ?? `${client} ${action}d.`)]);
+    const batch = result as { ok?: boolean; message?: string; results?: Array<Record<string, unknown>> };
+    printData(result, wantsJson, batch.results
+      ? batch.results.map(row => `aside:${String(row.profileId)}  ${String(row.message ?? (row.ok ? "updated" : "refused"))}${row.residual === true ? " Recovery did not finish." : ""}${typeof row.snapshotPath === "string" ? ` Backup: ${row.snapshotPath}` : ""}`)
+      : [String(batch.message ?? `${client} ${action}d.`)]);
+    if (batch.ok === false) throw new RuntimeApiError(batch.message ?? "Some Aside profiles could not be updated", 207, result);
   });
 }
 
@@ -257,4 +373,17 @@ export async function handleZcodeCommand(argv: string[], deps: RuntimeApiDeps = 
     console.error("Restart ZCode to pick up the provider change.");
   }
   return code;
+}
+
+export async function handleClaudeInterceptCommand(argv: string[], deps: RuntimeApiDeps = {}): Promise<number> {
+  return runCliAction(async () => {
+    const args = [...argv];
+    const action = args.shift();
+    const wantsJson = takeFlag(args, "--json");
+    const usage = "Usage: ocx claude intercept start [--json]";
+    rejectArgs(args, usage);
+    if (action !== "start") throw new CliUsageError("Expected start", usage);
+    const result = await runtimeRequest("/api/claude-intercept/start", { method: "POST" }, deps);
+    printData(result, wantsJson, summaryLines(result));
+  });
 }

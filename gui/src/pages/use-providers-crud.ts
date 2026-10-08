@@ -1,9 +1,17 @@
 import { useCallback } from "react";
 import type { TFn } from "../i18n/shared";
-import type { ProviderUpdatePatch } from "../components/provider-workspace/types";
+import type { ProviderUpdatePatch, ProviderUpdateResult } from "../components/provider-workspace/types";
 import { apiErrorMessage } from "../api-error";
 
 type ProviderError = { code?: unknown; combos?: unknown; error?: unknown };
+type ShadowDependency = { model: string; enabled: boolean };
+
+/** The shadow-call target a disable or delete left without its provider, when interception is on. */
+function activeShadowDependency(data: { dependentShadowIntercept?: unknown }): ShadowDependency | null {
+  const dependency = data.dependentShadowIntercept as Partial<ShadowDependency> | undefined;
+  if (!dependency || typeof dependency.model !== "string" || dependency.enabled !== true) return null;
+  return { model: dependency.model, enabled: true };
+}
 
 function providerErrorMessage(data: ProviderError, t: TFn, fallback: string): string {
   switch (data.code) {
@@ -37,7 +45,8 @@ export function useProvidersCrud({
   workspaceSelected: string | null;
   setWorkspaceSelected: (name: string | null) => void;
   setRemoveConfirmName: (name: string | null) => void;
-  notify: (msg: string, ok: boolean) => void;
+  /** A "warn" notice with ok=false stays until dismissed, like an error, in the warning tone. */
+  notify: (msg: string, ok: boolean, tone?: "warn") => void;
   fetchConfig: () => Promise<void>;
   fetchOauth: () => Promise<void>;
   fetchProviderQuotas: (refresh?: boolean) => Promise<void>;
@@ -57,9 +66,11 @@ export function useProvidersCrud({
     try {
       const res = await fetch(`${apiBase}/api/providers?name=${encodeURIComponent(name)}`, { method: "DELETE" });
       if (res.ok) {
-        const data = await res.json().catch(() => ({})) as { defaultProvider?: unknown };
+        const data = await res.json().catch(() => ({})) as { defaultProvider?: unknown; dependentShadowIntercept?: unknown };
         const defaultProvider = typeof data.defaultProvider === "string" ? data.defaultProvider : null;
-        notify(defaultProvider
+        const shadow = activeShadowDependency(data);
+        if (shadow) notify(t("prov.removedShadowTarget", { name, model: shadow.model }), false, "warn");
+        else notify(defaultProvider
           ? t("prov.removedDefault", { name, defaultProvider })
           : t("prov.removed", { name }), true);
         if (workspaceSelected === name) setWorkspaceSelected(null);
@@ -87,13 +98,16 @@ export function useProvidersCrud({
       notify(await apiErrorMessage(res, disabled ? t("prov.disableFail", { name }) : t("prov.enableFail", { name })), false);
       return;
     }
-    notify(disabled ? t("prov.disabled", { name }) : t("prov.enabled", { name }), true);
+    const data = await res.json().catch(() => ({})) as { dependentShadowIntercept?: unknown };
+    const shadow = activeShadowDependency(data);
+    if (shadow) notify(t("prov.disabledShadowTarget", { name, model: shadow.model }), false, "warn");
+    else notify(disabled ? t("prov.disabled", { name }) : t("prov.enabled", { name }), true);
     fetchConfig();
     fetchOauth();
     fetchProviderQuotas(true);
   }, [apiBase, fetchConfig, fetchOauth, fetchProviderQuotas, notify, t]);
 
-  const updateProvider = useCallback(async (name: string, patch: ProviderUpdatePatch): Promise<{ ok: boolean; error?: string }> => {
+  const updateProvider = useCallback(async (name: string, patch: ProviderUpdatePatch): Promise<ProviderUpdateResult> => {
     try {
       const res = await fetch(`${apiBase}/api/providers?name=${encodeURIComponent(name)}`, {
         method: "PATCH",
@@ -103,6 +117,7 @@ export function useProvidersCrud({
       if (!res.ok) {
         return { ok: false, error: await apiErrorMessage(res, t("prov.updateFail")) };
       }
+      const data = await res.json().catch(() => ({})) as { xaiResponsesOptInState?: unknown };
       // Await refresh so callers (e.g. notes editor) only leave edit mode once
       // item.note reflects the saved value.
       await fetchConfig();
@@ -113,7 +128,13 @@ export function useProvidersCrud({
         if (refreshCodexAccount) refreshes.push(Promise.resolve(refreshCodexAccount()));
         await Promise.all(refreshes);
       }
-      return { ok: true };
+      const state = data.xaiResponsesOptInState;
+      return {
+        ok: true,
+        ...(state === true || state === false || state === "mixed"
+          ? { xaiResponsesOptInState: state }
+          : {}),
+      };
     } catch {
       return { ok: false, error: t("prov.networkError") };
     }

@@ -9,11 +9,16 @@ description: opencodex の開発環境、構成、規約、プロバイダーと
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
+bun run setup:hooks  # 旧管理対象 pre-push・post-merge の削除
 bun run dev:proxy    # 開発モードのプロキシ API
 bun run dev:gui      # ダッシュボード dev サーバー(別ターミナル)
 bun run typecheck    # bun x tsc --noEmit
-bun run test         # bun test ./tests/
+bun run test        # 全テストスイート（既定）
 ```
+
+`bun run setup:hooks` は変更されていない旧管理対象の `pre-push` と `post-merge`
+フックを削除します。カスタムフックは保持します。`pre-push` フックは必須ではなくなりました。
+`bun run prepush` は任意の手動チェックとして引き続き利用できます。
 
 `bun run dev` は引き続き `bun run dev:proxy` のエイリアスとして動作します。ダッシュボード dev サーバーは
 `bun run dev:gui` で、`GET /` で提供するパッケージダッシュボードは `bun run build:gui` でビルドして
@@ -26,17 +31,25 @@ bun run test         # bun test ./tests/
 
 ```bash
 bun run typecheck                 # 厳密な TypeScript 検査
+bun run test:changed              # 解決した dev マージベースに対する import graph テスト
 bun run test                      # tests/ の全体スイート
-bun test tests/router.test.ts     # 特定テストファイル
+bun test tests/routing/router.test.ts     # 特定テストファイル
 bun run build:gui                 # Vite GUI ビルド + パッケージ準備
 bun run privacy:scan              # CI で使う資格情報/個人情報検査
 bun run prepare:package           # パッケージランチャー/asset 更新
 ```
 
-ほとんどのテストは `tests/*.test.ts` に並んで配置された Bun テストです。共有 fixture は
+既定では `bun run test` で全テストスイートを実行してください。作業規模、マシンのリソース、
+同時使用中のワークツリーに対して全体実行の負担が過大な場合でも、変更した動作を実際に検証する
+回帰テストを最低限実行する必要があります。例は `bun test tests/<domain>/<name>.test.ts` です。
+範囲を絞った理由、正確なコマンド、結果、未テストの範囲を明記してください。
+`bun run test:changed` は補完に使えますが、すべての間接依存関係を検出するものではありません。
+CI だけに任せたり、ローカルテストを一律に省略したりする例外はありません。マージ前には、
+現在の PR ヘッドの正確なコミットですべての必須 CI チェックが成功している必要があります。
+
+テストは `src/` を写したドメインディレクトリ（`tests/<domain>/`）に置かれた Bun テストで、対応表は `scripts/test-layout/layout.json` です。共有 fixture は
 `tests/helpers/`、範囲の広いネイティブ等価性シナリオは `tests/e2e-style/` にあります。変更した
-サブシステムの既存テストの近くに集中した回帰テストを追加してください。共有ルーティング、アダプター、設定、サーバー
-動作を触った場合は全体スイートも実行します。
+サブシステムの既存テストの近くに集中した回帰テストを追加してください。
 
 いま読んでいるドキュメントサイトは `docs-site/` にあります(Astro + Starlight)。
 
@@ -72,11 +85,24 @@ GitHub Actions は必要な作業のみを行います。
 
 リリースには helper を使ってください。
 
+
+helper の実行前にリリース予定のバージョンを決め、デフォルトブランチから
+`.github/workflows/dev-version-bump.yml` を `intended-version=<version>`、
+`mode=pre-move` で実行してください。生成された PR をレビューして `dev` にマージし、
+`main` または `preview` に昇格してから helper を実行します。`dev` がすでに予定の
+バージョンより新しい場合は `changed=false` となり、バージョン更新 PR は不要です。
+公開には正確なリリースコミットの CI 成功が引き続き必要です。
+
 ```bash
 bun run release <version>           # バージョン bump を commit/push、publish ワークフローはデフォルト dry-run
+bun run release --bump minor        # tag と npm channel から次の patch、minor、major バージョンを導出
 bun run release <version> --publish # CI-gated dry-run を確認した後、実際の publish
 bun run release:watch               # 直近の Release ワークフロー run を監視
 ```
+
+明示的なバージョンの代わりに `--bump patch|minor|major` を指定できます。上位 core の preview tag が
+作られた後は、`--bump patch` は古い stable patch ラインの継続を拒否します。その修正は開いている
+preview core に含めてください。
 
 ## ブランチ
 
@@ -103,12 +129,12 @@ Go ネイティブポートを担っていた `dev2-go` は廃止し、2 本の�
 - **非同期エラーは境界で処理** — サイドカーはリクエストパスにエラーを投げず、適切な marker で
   低下します。
 - **Structure SOT** — 現在のメンテナンス不変条件は `structure/` に置きます。公開ユーザーワークフローは
-  `docs-site/`、過去の調査/診断記録は `docs/` に置きます。
+  `docs-site/`、計画と調査の記録は `devlog/` に置きます。
 - **export の保存** — 他のモジュールが依存している可能性があります。
 
 ## カタログにプロバイダーを追加
 
-すべてのプロバイダー選択肢と seed は canonical レジストリ(`src/providers/registry.ts`)から派生します。
+すべてのプロバイダー選択肢と seed は canonical レジストリ(`src/providers/registry/entries-extended.ts`)から派生します。
 
 ```ts
 {
@@ -138,8 +164,22 @@ OAuth 設定 seed に供給します。`enrichProviderFromCatalog()` はモデ�
 `runTurn` を使ってください。`tests/` の下に集中したテストを追加し、公開パッケージ API に含まれる
 factory の場合は `src/index.ts` からも export してください。
 
+### 互換性クレームを追加
+
+互換性クレームは `src/compatibility/` に置きます。クレームの範囲はアダプターより狭く、検証済みの
+正確なプロバイダー、正規化された upstream base URL、認証モード、inbound/upstream プロトコル、
+model id を指定します。同じアダプターや wire format を使う別のプロバイダーや接続先へ、クレームを
+そのままコピーしないでください。
+
+versioned disposition は `passthrough`、`translated`、`degraded`、`unsupported` のいずれかを使います。
+`passthrough` 以外のクレームには具体的な制限を記載し、fixture に基づくクレームでは根拠となる正確な
+assertion id を指定してください。秘密情報を含まない request vector を `tests/fixtures/compatibility/` に
+追加し、production adapter に対して実行する集中テストを用意します。
+
+compatibility manifest は受動的なデータです。通常の router、Responses handler、server startup path から
+manifest catalog を import したり、Compatibility Lab を有効化したりしてはいけません。
+
 ## 完了を主張する前に検証
 
-変更を証明する最も狭いコマンドから実行してください。型は `bun run typecheck`、動作は集中した
-`bun test tests/<name>.test.ts` またはランタイム probe で確認した後、影響範囲に応じた広い gate を
-実行します。opencodex は大きな batch より小さく検証可能な commit を好みます。
+上記のテスト方針に従い、型の変更には `bun run typecheck` を含め、影響範囲に必要な検証を
+実行してください。コマンド、結果、未テストの範囲を報告し、実際に完了した検証だけを主張してください。

@@ -1,12 +1,14 @@
 import type { TKey } from "./i18n/shared";
 
 export interface StartupRiskDetail {
+  desktop?: { owned: boolean };
   routingKind: "native" | "opencodex-local" | "custom-local" | "custom-remote" | "unknown";
   shimCoverage: "full" | "cli-only" | "none";
 }
 
 export function startupRiskDetailKey(health: StartupRiskDetail): TKey {
   if (health.routingKind === "custom-local") return "startup.riskDetailCustomLocal";
+  if (health.desktop?.owned) return "startup.desktopRecovery";
   if (health.shimCoverage === "cli-only") return "startup.riskDetailWindowsShim";
   return "startup.riskDetail";
 }
@@ -105,12 +107,15 @@ export function probeNeedsFastRetry(probe: StartupHealthProbe | undefined | null
 /**
  * Settings may only seed startup health while it is still unknown or a hard error.
  * After `/api/startup-health` has produced a real status, it stays authoritative.
+ * A `diagnosticStale` seed never colors the chip: it is a placeholder while the server
+ * refreshes (on a cold server, a synthetic not-installed reading), so a healthy service
+ * would flash `at-risk` until the dedicated probe answered.
  */
 export function seedStartupHealthFromSettings(
   previous: StartupHealthStatus | null,
   seeded: { status: "native" | "protected" | "at-risk"; diagnosticStale: boolean } | null | undefined,
 ): StartupHealthStatus | null {
-  if (!seeded) return previous;
+  if (!seeded || seeded.diagnosticStale) return previous;
   // A prior hard "error" (or unknown) may be replaced by a settings seed; a real
   // status from the dedicated probe must not be overwritten.
   if (previous !== null && previous !== "error") return previous;

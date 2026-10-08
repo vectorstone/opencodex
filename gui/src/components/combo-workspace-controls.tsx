@@ -1,7 +1,12 @@
 import { useState } from "react";
-import type { ComboEffort, ComboStrategy, ComboTarget } from "../combo-workspace-data";
+import type { ComboEffort, ComboStrategy, ComboTarget, ProviderQuotaStates } from "../combo-workspace-data";
 import { comboImagesSupported } from "../combo-capabilities";
-import { COMBO_EFFORTS, newComboTarget } from "../combo-workspace-data";
+import {
+  COMBO_EFFORTS,
+  COMBO_STRATEGIES,
+  COMBO_STRATEGY_LABEL_KEYS,
+  newComboTarget,
+} from "../combo-workspace-data";
 import { IconArrowDown, IconArrowUp, IconGrip, IconPlus, IconTrash } from "../icons";
 import { useT } from "../i18n/shared";
 import { Switch } from "../ui";
@@ -21,10 +26,7 @@ export function StrategySeg({
   const t = useT();
   return (
     <div className="cwi-strategy-seg" role="radiogroup" aria-label={t("cws.strategy")}>
-      {([
-        ["failover", "cws.strategy.failover"],
-        ["round-robin", "cws.strategy.roundRobin"],
-      ] as const).map(([id, key]) => (
+      {COMBO_STRATEGIES.map((id) => (
         <button
           key={id}
           type="button"
@@ -34,7 +36,7 @@ export function StrategySeg({
           disabled={disabled}
           onClick={() => onChange(id)}
         >
-          {t(key)}
+          {t(COMBO_STRATEGY_LABEL_KEYS[id])}
         </button>
       ))}
     </div>
@@ -90,14 +92,16 @@ export function ComboCapabilities({
   targets,
   models,
   imageInput,
+  reasoningEffortMode,
   disabled,
   onChange,
 }: {
   targets: ComboTarget[];
   models: ModelOption[];
   imageInput: "auto" | "disabled";
+  reasoningEffortMode: "strict" | "adaptive";
   disabled?: boolean;
-  onChange: (patch: { imageInput?: "auto" | "disabled" }) => void;
+  onChange: (patch: { imageInput?: "auto" | "disabled"; reasoningEffortMode?: "strict" | "adaptive" }) => void;
 }) {
   const t = useT();
   const imagesSupported = comboImagesSupported(targets, models);
@@ -124,6 +128,20 @@ export function ComboCapabilities({
           label={t("cws.capability.imageInput")}
         />
       </div>
+      <div className="cwi-capability-row">
+        <div>
+          <span className="cwi-capability-label">{t("cws.capability.adaptiveEffort")}</span>
+          <p className="muted cwi-capability-hint">{t("cws.capability.adaptiveEffortHint")}</p>
+        </div>
+        <Switch
+          on={reasoningEffortMode === "adaptive"}
+          onClick={() => {
+            onChange({ reasoningEffortMode: reasoningEffortMode === "adaptive" ? "strict" : "adaptive" });
+          }}
+          disabled={disabled}
+          label={t("cws.capability.adaptiveEffort")}
+        />
+      </div>
     </section>
   );
 }
@@ -133,21 +151,42 @@ export function TargetEditor({
   strategy,
   providers,
   models,
+  providerQuotaStates,
   onChange,
 }: {
   targets: ComboTarget[];
   strategy: ComboStrategy;
   providers: ProviderOption[];
   models: ModelOption[];
+  providerQuotaStates: ProviderQuotaStates;
   onChange: (next: ComboTarget[]) => void;
 }) {
   const t = useT();
   const provs = enabledProviders(providers);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
+  const failOpenIndex = strategy === "jev"
+    ? targets.findIndex((target) => {
+        const provider = providers.find(candidate => candidate.name === target.provider.trim());
+        return !!target.provider.trim()
+          && !!target.model.trim()
+          && provider !== undefined
+          && provider.disabled !== true
+          && provider.adapter !== "jev-decision"
+          && providerQuotaStates[target.provider.trim()] !== "exhausted";
+      })
+    : -1;
 
   const update = (index: number, patch: Partial<ComboTarget>) => {
     onChange(targets.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  };
+
+  const replaceModel = (index: number, patch: Pick<ComboTarget, "provider" | "model">) => {
+    onChange(targets.map((row, i) => {
+      if (i !== index) return row;
+      const { reasoningEfforts: _reasoningEfforts, modelProfile: _modelProfile, ...rest } = row;
+      return { ...rest, ...patch };
+    }));
   };
 
   const reorder = (from: number, to: number) => {
@@ -172,12 +211,27 @@ export function TargetEditor({
         const modelSelectDisabled = !row.provider;
         const dragging = dragIndex === index;
         const dropTarget = overIndex === index && dragIndex !== null && dragIndex !== index;
+        const quotaState = providerQuotaStates[row.provider.trim()] ?? "unknown";
+        const advertisedReasoningEfforts = models.find(
+          model => model.provider === row.provider && model.id === row.model,
+        )?.reasoningEfforts;
+        const advertisedEffortSet = advertisedReasoningEfforts === undefined ? undefined : new Set(advertisedReasoningEfforts);
+        const selectableReasoningEfforts = advertisedEffortSet === undefined
+          ? undefined
+          : COMBO_EFFORTS.filter(effort => advertisedEffortSet.has(effort));
+        const selectableEffortSet = new Set(selectableReasoningEfforts ?? []);
+        const selectedReasoningEfforts = selectableReasoningEfforts === undefined
+          ? []
+          : row.reasoningEfforts === undefined
+            ? selectableReasoningEfforts
+            : row.reasoningEfforts.filter(effort => selectableEffortSet.has(effort));
+        const selectedEffortSet = new Set(selectedReasoningEfforts);
         return (
+          <div key={row.clientKey ?? `${row.provider}:${row.model}`} className="cwi-target-entry">
           <div
-            key={row.clientKey ?? `${row.provider}:${row.model}`}
             className={[
               "cwi-target-row",
-              strategy === "failover" ? "cwi-target-row--failover" : "",
+              strategy === "failover" || strategy === "jev" ? "cwi-target-row--failover" : "",
               dragging ? "cwi-target-row--dragging" : "",
               dropTarget ? "cwi-target-row--drop" : "",
             ].filter(Boolean).join(" ")}
@@ -239,7 +293,7 @@ export function TargetEditor({
               onChange={(e) => {
                 const provider = e.target.value;
                 const first = modelsForProvider(models, provider, providers)[0] ?? "";
-                update(index, { provider, model: first });
+                replaceModel(index, { provider, model: first });
               }}
             >
               <option value="">{t("cws.target.pickProvider")}</option>
@@ -254,7 +308,7 @@ export function TargetEditor({
               value={row.model}
               disabled={modelSelectDisabled}
               aria-label={t("cws.target.model")}
-              onChange={(e) => update(index, { model: e.target.value })}
+              onChange={(e) => replaceModel(index, { provider: row.provider, model: e.target.value })}
             >
               <option value="">
                 {modelSelectDisabled
@@ -267,7 +321,7 @@ export function TargetEditor({
                 <option key={id} value={id}>{id}</option>
               ))}
             </select>
-            {strategy === "round-robin" && (
+            {(strategy === "round-robin" || strategy === "random") && (
               <input
                 className="input mono"
                 type="number"
@@ -282,6 +336,12 @@ export function TargetEditor({
                 }}
               />
             )}
+            <span
+              className={`cwi-quota-badge cwi-quota-badge--${quotaState}`}
+              aria-label={t(`cws.quota.${quotaState}`)}
+            >
+              {t(`cws.quota.${quotaState}`)}
+            </span>
             <div className="cwi-target-actions">
               <button
                 type="button"
@@ -293,6 +353,56 @@ export function TargetEditor({
                 <IconTrash width={14} height={14} />
               </button>
             </div>
+          </div>
+          {strategy === "jev" && (
+            <div className="cwi-jev-target-meta">
+              {index === failOpenIndex && <span className="chip">{t("cws.jev.failOpen")}</span>}
+              {selectableReasoningEfforts === undefined
+                ? <span className="muted">{t("cws.jev.effortsUnknown")}</span>
+                : selectableReasoningEfforts.length === 0
+                  ? <span className="muted">{t("cws.jev.effortsNone")}</span>
+                  : (
+                    <fieldset className="cwi-jev-efforts">
+                      <legend>{t("cws.jev.allowedEfforts")}</legend>
+                      {selectableReasoningEfforts.map((effort) => {
+                        const checked = selectedEffortSet.has(effort);
+                        return (
+                          <label key={effort} className="cwi-jev-effort">
+                            <input
+                              type="checkbox"
+                              data-jev-effort
+                              value={effort}
+                              checked={checked}
+                              disabled={checked && selectedReasoningEfforts.length === 1}
+                              onChange={(event) => {
+                                const nextSet = new Set(selectedReasoningEfforts);
+                                if (event.target.checked) nextSet.add(effort);
+                                else nextSet.delete(effort);
+                                update(index, {
+                                  reasoningEfforts: selectableReasoningEfforts.filter(candidate => nextSet.has(candidate)),
+                                });
+                              }}
+                            />
+                            <span>{effort}</span>
+                          </label>
+                        );
+                      })}
+                    </fieldset>
+                  )}
+              <label className="cwi-field">
+                <span className="field-label">{t("cws.jev.modelProfile")}</span>
+                <textarea
+                  className="input"
+                  rows={3}
+                  maxLength={512}
+                  value={row.modelProfile ?? ""}
+                  placeholder={t("cws.jev.modelProfilePlaceholder")}
+                  onChange={(event) => update(index, { modelProfile: event.target.value })}
+                />
+                <span className="muted">{t("cws.jev.modelProfileHint")}</span>
+              </label>
+            </div>
+          )}
           </div>
         );
       })}

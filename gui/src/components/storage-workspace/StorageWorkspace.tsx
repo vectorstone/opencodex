@@ -17,8 +17,6 @@ import {
 } from "../../i18n/log-guard-state-labels";
 import { formatBytes } from "../../format-bytes";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "";
-
 export interface StorageLargestEntry {
   path: string;
   bytes: number;
@@ -72,6 +70,10 @@ export interface CodexLogGuardReport {
     freelistPages: number;
     reclaimableBytes: number;
     estimatedLogBytes: number | null;
+  };
+  metricsSkipped?: null | {
+    reason: "database_too_large";
+    thresholdBytes: number;
   };
 }
 
@@ -204,6 +206,22 @@ function CodexLogGuardPanel({
               <dd className="stw-kv-mono">{formatBytes(metrics.reclaimableBytes, locale)}</dd>
             </div>
           </>
+        )}
+        {/*
+          Say WHY the rows are missing (#2605). Skipping the aggregates above the size threshold
+          is what keeps a cold inspection off the proxy thread, but silently dropping the row
+          block reads as "this database has no rows" — the exact confusion the null-vs-zero
+          distinction on the server exists to prevent. A user who sees a 1 GB database and no
+          row count deserves the reason.
+        */}
+        {!metrics && report.metricsSkipped && (
+          <div className="stw-kv-row" data-testid="log-guard-metrics-skipped">
+            <dt>{t("storage.col.rows")}</dt>
+            <dd className="muted">
+              {logGuardLabel(locale, "metricsSkippedLarge")
+                .replace("{threshold}", formatBytes(report.metricsSkipped.thresholdBytes, locale))}
+            </dd>
+          </div>
         )}
         <div className="stw-kv-row">
           <dt><code>sqlite_home</code></dt>
@@ -350,6 +368,7 @@ function CodexLogGuardUnavailablePanel({ locale, t }: { locale: Locale; t: TFn }
 export interface StorageWorkspaceProps {
   report: StorageReport;
   locale: Locale;
+  apiBase?: string;
   logGuardBusy?: boolean;
   onLogGuardAction?: (action: CodexLogGuardAction) => void;
 }
@@ -378,6 +397,7 @@ type GenerationScopedCompaction = {
 export default function StorageWorkspace({
   report,
   locale,
+  apiBase = "",
   logGuardBusy = false,
   onLogGuardAction,
 }: StorageWorkspaceProps) {
@@ -440,7 +460,7 @@ export default function StorageWorkspace({
             body: JSON.stringify({ mode: action.mode }),
           } : {}),
         };
-        const response = await fetch(`${API_BASE}/api/storage/codex-logs/${suffix}`, init);
+        const response = await fetch(`${apiBase}/api/storage/codex-logs/${suffix}`, init);
         if (!response.ok) {
           const errorPayload = await response.json().catch(() => ({})) as Record<string, unknown>;
           setLogGuardError({ generation, message: mutationErrorLabel(locale, errorPayload.error) });
@@ -492,7 +512,7 @@ export default function StorageWorkspace({
           // The mutation has already succeeded. Refresh is deliberately best effort so
           // a transient GET/JSON failure cannot be presented as a failed compaction.
           try {
-            const refreshed = await fetch(`${API_BASE}/api/storage/codex-logs`);
+            const refreshed = await fetch(`${apiBase}/api/storage/codex-logs`);
             if (refreshed.ok) {
               const payload = await refreshed.json() as CodexLogGuardReport;
               setLogGuardOverride({ generation, report: payload });

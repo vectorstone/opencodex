@@ -7,10 +7,11 @@
  *
  * Design of record: devlog/_fin/260802_client_toggle_api/021 §5-6.
  */
-import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import type { ConfigFormat } from "../clients/config-export";
+import { canonicalizeJsonc } from "../lib/jsonc";
 import { MAX_JSON_NESTING } from "./serialize";
-import { atomicWriteFile } from "../config";
+import { atomicWriteFileNoFollow, isMissingPathError } from "../config/atomic-write";
 import type { JournalEntry } from "./journal";
 import type { OwnershipRecord } from "./ownership";
 import type { IntegrationClientId } from "./registry";
@@ -132,7 +133,11 @@ function jsonTextSafeToRewrite(text: string): boolean {
 }
 
 /** Parse a client config, tolerating absence. PARSE_FAILED on garbage. */
-export function parseConfig(text: string | null, format: ConfigFormat): unknown | typeof PARSE_FAILED {
+export function parseConfig(
+  text: string | null,
+  format: ConfigFormat,
+  options?: { jsonc?: boolean },
+): unknown | typeof PARSE_FAILED {
   if (text === null || text.trim().length === 0) return {};
   try {
     switch (format) {
@@ -143,9 +148,13 @@ export function parseConfig(text: string | null, format: ConfigFormat): unknown 
          * would otherwise cap the rewrite only after JSON.parse had already
          * built the 50k-deep object graph. The outcome is unchanged: invalid
          * JSON still returns PARSE_FAILED, from the catch below.
+         *
+         * Kilo's global file is JSONC. Comments and trailing commas are
+         * stripped first so the rewrite-safety scan sees JSON, not comment text.
          */
-        if (!jsonTextSafeToRewrite(text)) return PARSE_FAILED;
-        return JSON.parse(text);
+        const source = options?.jsonc ? canonicalizeJsonc(text) : text;
+        if (!jsonTextSafeToRewrite(source)) return PARSE_FAILED;
+        return JSON.parse(source);
       }
       case "json5": return Bun.JSON5.parse(text);
       case "yaml": return Bun.YAML.parse(text);
@@ -162,7 +171,22 @@ export function parseConfig(text: string | null, format: ConfigFormat): unknown 
          * evidence is gone.
          */
         if (/(^|[\s,[=])[-+]?(?:inf|nan)(?=[\s,\]]|$)/mi.test(text)) return PARSE_FAILED;
-        return Bun.TOML.parse(text);
+        const document = Bun.TOML.parse(text);
+        // TOML date/time scalars are Temporal objects with toJSON methods.
+        // The merge layer JSON-clones documents, which silently turns these
+        // into strings. Refuse before either status or a writer can admit a
+        // lossy rewrite, including dates nested in arrays and inline tables.
+        const pending: unknown[] = [document];
+        while (pending.length > 0) {
+          const value = pending.pop();
+          if (value === null || typeof value !== "object") continue;
+          if (!Array.isArray(value)) {
+            const prototype = Object.getPrototypeOf(value);
+            if (prototype !== Object.prototype && prototype !== null) return PARSE_FAILED;
+          }
+          for (const child of Object.values(value)) pending.push(child);
+        }
+        return document;
       }
     }
   } catch {
@@ -177,6 +201,15 @@ export type ReadResult =
 
 export type StatKind = "file" | "dir" | "other" | "missing" | "failed";
 
+function lstatKind(path: string): StatKind {
+  try {
+    const stats = lstatSync(path);
+    return stats.isFile() ? "file" : stats.isDirectory() ? "dir" : "other";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "failed";
+  }
+}
+
 export interface IntegrationIO {
   /**
    * ONLY a missing file yields `missing`. Every other failure (EACCES, EPERM,
@@ -185,6 +218,8 @@ export interface IntegrationIO {
   readText: (path: string) => ReadResult;
   /** `failed` is distinct from `missing` for the same reason. */
   statKind: (path: string) => StatKind;
+  /** Optional no-follow probe for paired-file clients. */
+  lstatKind?: (path: string) => StatKind;
   writeText: (path: string, text: string) => void;
   removeFile: (path: string) => void;
   mkdirp: (path: string) => void;
@@ -193,6 +228,16 @@ export interface IntegrationIO {
   appendJournal: (entry: JournalEntry) => void;
   putRecord: (record: OwnershipRecord) => void;
   dropRecord: (clientId: IntegrationClientId) => void;
+  beginTransaction?: (transaction: IntegrationTransaction) => void;
+  finishTransaction?: () => void;
+}
+
+export interface IntegrationTransaction {
+  entry: JournalEntry;
+  before: string | null;
+  nextText: string | null;
+  record: OwnershipRecord | null;
+  priorRecord: OwnershipRecord | null;
 }
 
 export type TargetState =
@@ -207,6 +252,18 @@ export type TargetState =
  * an unreadable config gets clobbered.
  */
 export function loadTarget(io: IntegrationIO, configPath: string): TargetState {
+  // Managed client paths are a lower-trust boundary. Never inspect through a
+  // final symlink that can be retargeted between this read and the eventual
+  // write: when a no-follow probe exists, the named directory entry itself must
+  // be a regular file or absent. `missing` stays legal so a virtual pair probe
+  // (such as Cline's pair-aware statKind) can still report one absent member.
+  const named = io.lstatKind?.(configPath);
+  // A failed probe is uncertainty, not evidence about the entry's shape: it
+  // keeps the read-failed classification the follow-probe would have produced.
+  if (named === "failed") return { ok: false, why: "read-failed" };
+  if (named !== undefined && named !== "file" && named !== "missing") {
+    return { ok: false, why: "not-regular-file" };
+  }
   const kind = io.statKind(configPath);
   if (kind === "missing") return { ok: true, before: null };
   if (kind === "failed") return { ok: false, why: "read-failed" };
@@ -225,6 +282,7 @@ export function loadTarget(io: IntegrationIO, configPath: string): TargetState {
  */
 export function fileIO(): Omit<IntegrationIO, "appendJournal" | "putRecord" | "dropRecord"> {
   return {
+    lstatKind,
     readText: path => {
       try {
         return { kind: "text", text: readFileSync(path, "utf8") };
@@ -241,7 +299,30 @@ export function fileIO(): Omit<IntegrationIO, "appendJournal" | "putRecord" | "d
         return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "failed";
       }
     },
-    writeText: (path, text) => atomicWriteFile(path, text),
+    writeText: (path, text) => {
+      const kind = lstatKind(path);
+      if (kind !== "file" && kind !== "missing") {
+        throw new Error(`refusing unsafe integration write target: ${path}`);
+      }
+      assertIntegrationWriteOwnership(path);
+      atomicWriteFileNoFollow(path, text, undefined, {
+        // The pre-check above rejects a symlink already in place; this one runs
+        // inside the atomic write immediately before the rename, so a link
+        // exchanged after validation is refused rather than followed. Even a
+        // swap past this point can only replace the named entry, never redirect
+        // the write through it.
+        validateBeforeRename: target => {
+          try {
+            if (lstatSync(target).isSymbolicLink()) {
+              throw new Error(`refusing to replace symbolic-link integration target: ${target}`);
+            }
+          } catch (error) {
+            if (isMissingPathError(error)) return;
+            throw error;
+          }
+        },
+      });
+    },
     removeFile: path => rmSync(path, { force: true }),
     mkdirp: path => mkdirSync(path, { recursive: true, mode: 0o700 }),
     now: () => Date.now(),
@@ -266,4 +347,53 @@ export function defaultIntegrationIO(store: {
     putRecord: record => store.putRecord(record),
     dropRecord: clientId => store.dropRecord(clientId),
   };
+}
+
+/**
+ * Refuse to replace an integration file this process does not own.
+ *
+ * `atomicWriteFile` writes a private temp file and renames it over the target. That is the right
+ * shape for a secret — the replacement is atomic and the result is owner-only `0600` — but it also
+ * means the surviving inode belongs to whoever runs opencodex. When the target is another product's
+ * configuration on a shared mount, the replace quietly takes the file away from its owner. #4197 is
+ * that case: opencodex at uid 1000 replaces a DSH `settings.yaml` owned by uid 987, and DSH dies with
+ * `EACCES` on its next read while the restore call reports success.
+ *
+ * Preserving the previous uid would need a `chown` capability we usually do not have, and relaxing
+ * `0600` would weaken every integration to fix one. So refuse before writing, and say what is wrong,
+ * rather than succeeding into a broken state.
+ *
+ * Windows has no uid model here; `hardenSecretPath` owns that platform, so the check is skipped when
+ * the runtime exposes no effective uid.
+ */
+export function assertIntegrationWriteOwnership(
+  path: string,
+  deps: {
+    effectiveUid?: () => number | undefined;
+    ownerUid?: (target: string) => number | undefined;
+  } = {},
+): void {
+  const effectiveUid = deps.effectiveUid ?? (() =>
+    typeof process.geteuid === "function" ? process.geteuid() : undefined);
+  const euid = effectiveUid();
+  if (euid === undefined) return;
+
+  const ownerUid = deps.ownerUid ?? ((target: string) => {
+    try {
+      return statSync(target).uid;
+    } catch {
+      // An absent or unreadable target has no owner to dispossess; the write itself will report
+      // any real failure.
+      return undefined;
+    }
+  });
+  const owner = ownerUid(path);
+  if (owner === undefined || owner === euid) return;
+
+  throw new Error(
+    `refusing to replace ${path}: it belongs to uid ${owner} while opencodex runs as uid ${euid}. `
+    + "An atomic replace would transfer ownership of that file and leave its owner unable to read "
+    + "its own configuration. Run both under the same user, or give each one its own copy instead "
+    + "of sharing the mount.",
+  );
 }

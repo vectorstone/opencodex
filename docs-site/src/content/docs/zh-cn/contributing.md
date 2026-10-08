@@ -9,11 +9,15 @@ description: opencodex 的开发环境、结构、约定，以及添加 provider
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
+bun run setup:hooks  # 移除旧的托管 pre-push 和 post-merge
 bun run dev:proxy    # 开发模式代理 API
 bun run dev:gui      # 仪表盘 dev 服务器（另一个终端）
 bun run typecheck    # bun x tsc --noEmit
-bun run test         # bun test ./tests/
+bun run test        # 完整测试套件（默认）
 ```
+
+`bun run setup:hooks` 移除未经修改的旧版托管 `pre-push` 和 `post-merge` 钩子，
+保留自定义钩子。`pre-push` 钩子不再是必需项；`bun run prepush` 仍可作为可选的手动检查。
 
 `bun run dev` 继续作为 `bun run dev:proxy` 的别名。仪表盘 dev 服务器使用 `bun run dev:gui`；
 `GET /` 提供的打包仪表盘由 `bun run build:gui` 构建到 `gui/dist`。
@@ -25,16 +29,23 @@ bun run test         # bun test ./tests/
 
 ```bash
 bun run typecheck                 # 严格 TypeScript 检查
+bun run test:changed              # 针对解析出的 dev merge-base 的导入图测试
 bun run test                      # 完整 tests/ suite
-bun test tests/router.test.ts     # 聚焦单个测试文件
+bun test tests/routing/router.test.ts     # 聚焦单个测试文件
 bun run build:gui                 # Vite GUI 构建 + package 准备
 bun run privacy:scan              # CI 使用的 credential/privacy 扫描
 bun run prepare:package           # 刷新 package launcher/asset
 ```
 
-大多数测试是平铺在 `tests/*.test.ts` 下的 Bun test。`tests/helpers/` 存放共享 fixture，
+默认运行 `bun run test` 执行完整测试套件。如果相对于任务规模、机器资源或并行使用的工作树，
+完整运行的成本过高，仍必须至少运行实际验证变更行为的针对性回归测试，例如
+`bun test tests/<domain>/<name>.test.ts`。说明缩小范围的原因，并报告准确的命令、结果和未测试范围。
+`bun run test:changed` 可以补充覆盖，但无法发现所有间接依赖。不存在仅依赖 CI 或完全跳过本地测试
+的一概豁免。合并前，所有必需的 CI 检查必须在当前 PR 头部的确切提交上通过。
+
+测试是按 `src/` 划分的领域目录（`tests/<domain>/`）下的 Bun test，映射表在 `scripts/test-layout/layout.json`。`tests/helpers/` 存放共享 fixture，
 `tests/e2e-style/` 存放范围更广的原生一致性场景。请在对应 subsystem 的现有测试附近加入聚焦的
-回归测试；若改动涉及共享 routing、adapter、config 或 server 行为，还应运行完整 suite。
+回归测试。
 
 你正在阅读的文档站点位于 `docs-site/`（Astro + Starlight）：
 
@@ -68,11 +79,22 @@ GitHub Actions 有意只保留必要步骤：
 
 发布请使用 helper：
 
+
+运行 helper 前，先确定目标发布版本，并从默认分支运行
+`.github/workflows/dev-version-bump.yml`，设置 `intended-version=<version>` 和
+`mode=pre-move`。审核生成的 PR 并合并到 `dev`，再提升到 `main` 或 `preview`，
+最后运行 helper。如果 `dev` 的版本已经高于目标版本，工作流会返回
+`changed=false`，无需创建版本更新 PR。发布仍要求对应发布提交的 CI 全部通过。
+
 ```bash
 bun run release <version>           # commit/push 版本 bump；publish workflow 默认 dry-run
+bun run release --bump minor        # 根据 tag 与 npm channel 推导下一个 patch、minor 或 major 版本
 bun run release <version> --publish # 确认 CI-gated dry-run 后真正 publish
 bun run release:watch               # 观察最新的 Release workflow run
 ```
+
+可用 `--bump patch|minor|major` 代替显式版本。较高 core 的 preview tag 建立后，`--bump patch`
+会拒绝继续旧的 stable patch 版本线；请将修复包含在已开启的 preview core 中发布。
 
 ## 分支
 
@@ -95,12 +117,12 @@ bun run release:watch               # 观察最新的 Release workflow run
   小而专注的 module 位于单一 `index.ts` 之后。
 - **在边界处理异步错误** —— sidecar 不会把异常抛进请求路径，而会降级成合适的 marker。
 - **Structure SOT** —— 当前维护者不变量放在 `structure/`；公开用户流程放在 `docs-site/`；
-  历史调查/诊断记录放在 `docs/`。
+  规划与调查记录放在 `devlog/`。
 - **保留 export** —— 其他 module 可能依赖它们。
 
 ## 向目录中添加 provider
 
-所有 provider picker 与 seed 都来自 canonical registry（`src/providers/registry.ts`）：
+所有 provider picker 与 seed 都来自 canonical registry（`src/providers/registry/entries-extended.ts`）：
 
 ```ts
 {
@@ -130,8 +152,21 @@ bun run release:watch               # 观察最新的 Release workflow run
 这类真正的双向 transport 应使用 `runTurn`。在 `tests/` 中添加聚焦测试；如果 factory 属于 public
 package API，还要从 `src/index.ts` export。
 
+### 添加兼容性声明
+
+兼容性声明位于 `src/compatibility/`。声明的范围比 adapter 更窄：它必须指定已经验证的准确 provider、
+规范化 upstream base URL、认证模式、inbound/upstream 协议和 model id。不要仅因为使用相同的 adapter
+或 wire format，就把声明复制到其他 provider 或目标地址。
+
+请使用带版本的 disposition：`passthrough`、`translated`、`degraded` 或 `unsupported`。每个非
+`passthrough` 声明都必须说明具体限制；基于 fixture 的声明必须列出证明它的准确 assertion id。
+在 `tests/fixtures/compatibility/` 中添加不含 secret 的 request vector，并编写通过 production adapter
+执行该向量的聚焦测试。
+
+兼容性 manifest 是被动数据。普通 router、Responses handler 和 server startup path 不得导入 manifest
+目录或激活 Compatibility Lab。
+
 ## 在声称完成前先验证
 
-先运行能证明改动的最小命令：类型检查用 `bun run typecheck`，行为检查用聚焦的
-`bun test tests/<name>.test.ts` 或 runtime probe，然后再执行适合影响范围的更宽 gate。
-opencodex 倾向于小而可验证的 commit，而不是大批量改动。
+遵循上述测试政策，并针对类型变更运行 `bun run typecheck`，以及受影响范围所需的其他检查。
+报告命令、结果和未测试范围，只声明实际完成的验证。

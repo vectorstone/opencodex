@@ -1,3 +1,5 @@
+import { idleDeadline } from "./abort";
+
 /** Maximum number of response-body bytes that may be retained for an error. */
 export const BOUNDED_BODY_MAX_BYTES = 65_536;
 
@@ -13,6 +15,8 @@ export interface BoundedBodyOptions {
 	 * Reader cancellation and lock release still run. Defaults to false.
 	 */
 	fatalUtf8?: boolean;
+	/** Report UTF-8 validity without rejecting malformed bodies. */
+	reportUtf8Validity?: boolean;
 	/**
 	 * Byte ceiling for retained body data. Defaults to BOUNDED_BODY_MAX_BYTES (64 KiB),
 	 * which suits error bodies; callers materializing whole success payloads (e.g. a
@@ -42,6 +46,8 @@ export interface BoundedBodyResult {
 	oversized: boolean;
 	/** False means callers should use a status-only fallback, not `text`. */
 	displaySafe: boolean;
+	/** Present when reportUtf8Validity was requested and the retained body reached EOF. */
+	utf8Valid?: boolean;
 }
 
 export interface BoundedBytesOptions {
@@ -49,6 +55,8 @@ export interface BoundedBytesOptions {
 	signal?: AbortSignal;
 	/** Maximum number of raw bytes retained from the response body. */
 	maxBytes: number;
+	/** Deadline between non-empty raw chunks. Omitted means no body-read deadline. */
+	inactivityTimeoutMs?: number;
 }
 
 export interface BoundedBytesResult {
@@ -80,15 +88,46 @@ export function boundedBodyBufferGrowthsForTests(): number {
 	return bufferGrowthsForTests;
 }
 
-function timeoutPromise(ms: number, value: symbol): { promise: Promise<symbol>; clear: () => void } {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const promise = new Promise<symbol>((resolve) => {
-		timer = setTimeout(() => resolve(value), Math.max(0, ms));
-	});
+function bodyDeadline(ms: number, onTimeout: () => void): { clear: () => void } {
+	const timer = setTimeout(onTimeout, Math.max(0, ms));
 	return {
-		promise,
-		clear: () => {
-			if (timer !== undefined) clearTimeout(timer);
+		clear: () => clearTimeout(timer),
+	};
+}
+
+/**
+ * A reader is consumed serially. Deadlines and abort own only its current wait,
+ * never a promise raced against every read: those reactions retain completed
+ * read results (including empty chunks) until the long-lived promise settles.
+ */
+function interruptibleRead<T = never>(reader: ReadableStreamDefaultReader<Uint8Array>) {
+	type Outcome = Awaited<ReturnType<typeof reader.read>> | T;
+	type Interruption = { value: T } | { error: unknown };
+	let interruption: Interruption | undefined;
+	let pending: { resolve: (value: Outcome) => void; reject: (error: unknown) => void } | undefined;
+	const interrupt = (outcome: Interruption) => {
+		// Latch an interruption even between reads or before the first wait.
+		interruption ??= outcome;
+		if ("error" in interruption) pending?.reject(interruption.error);
+		else pending?.resolve(interruption.value);
+	};
+	return {
+		interrupt,
+		async read(): Promise<Outcome> {
+			try {
+				return await new Promise<Outcome>((resolve, reject) => {
+					pending = { resolve, reject };
+					if (interruption) {
+						interrupt(interruption);
+						return;
+					}
+					// Both reactions belong to this read only. A late rejection stays
+					// observed after interruption, even if cancel throws or never settles.
+					void reader.read().then(resolve, reject);
+				});
+			} finally {
+				pending = undefined;
+			}
 		},
 	};
 }
@@ -100,6 +139,16 @@ function cancelWithoutWaiting(reader: ReadableStreamDefaultReader<Uint8Array>, r
 		void reader.cancel(reason).catch(() => undefined);
 	} catch {
 		// Some stream implementations throw synchronously from cancel().
+	}
+}
+
+function cancelBodyWithoutWaiting(body: ReadableStream<Uint8Array>, reason?: unknown): void {
+	// A signal can already be aborted before a reader is attached. Still settle the
+	// original body so fetch-backed streams cannot retain a rejected read in that gap.
+	try {
+		void body.cancel(reason).catch(() => undefined);
+	} catch {
+		// A locked or non-conforming stream may throw synchronously from cancel().
 	}
 }
 
@@ -115,9 +164,11 @@ export async function readBoundedResponseBytes(
 	options: BoundedBytesOptions,
 ): Promise<BoundedBytesResult> {
 	const signal = options.signal;
-	if (signal?.aborted) throw signal.reason;
-
 	const body = response.body;
+	if (signal?.aborted) {
+		if (body) cancelBodyWithoutWaiting(body, signal.reason);
+		throw signal.reason;
+	}
 	if (!body) return { bytes: new Uint8Array(0), oversized: false };
 
 	const reader = body.getReader();
@@ -126,22 +177,21 @@ export async function readBoundedResponseBytes(
 	let retainedBytes = 0;
 	let mustCancel = false;
 	let cancelReason: unknown;
+	const inactivityReason = new DOMException("Response body stalled", "TimeoutError");
+	const waiting = interruptibleRead(reader);
+	const inactivity = options.inactivityTimeoutMs === undefined
+		? null
+		: idleDeadline(options.inactivityTimeoutMs, () => waiting.interrupt({ error: inactivityReason }));
+	inactivity?.reset();
 
-	let rejectForAbort: ((reason: unknown) => void) | undefined;
-	const aborted = new Promise<never>((_resolve, reject) => {
-		rejectForAbort = reject;
-	});
-	const onAbort = () => rejectForAbort?.(signal?.reason);
+	const onAbort = () => waiting.interrupt({ error: signal?.reason });
 	signal?.addEventListener("abort", onAbort, { once: true });
 	// Close the narrow race between the preflight check and listener install.
 	if (signal?.aborted) onAbort();
 
 	try {
 		while (true) {
-			const read = reader.read();
-			// Observe a late read rejection when abort/cancellation wins the race.
-			void read.catch(() => undefined);
-			const outcome = await Promise.race([read, aborted]);
+			const outcome = await waiting.read();
 			if (signal?.aborted) {
 				mustCancel = true;
 				cancelReason = signal.reason;
@@ -153,6 +203,7 @@ export async function readBoundedResponseBytes(
 				return { bytes: retained.subarray(0, retainedBytes), oversized: false };
 			}
 			if (!value || value.byteLength === 0) continue;
+			inactivity?.reset();
 
 			if (value.byteLength > maxBytes - retainedBytes) {
 				mustCancel = true;
@@ -177,6 +228,7 @@ export async function readBoundedResponseBytes(
 		cancelReason = error;
 		throw error;
 	} finally {
+		inactivity?.cancel();
 		signal?.removeEventListener("abort", onAbort);
 		if (mustCancel) cancelWithoutWaiting(reader, cancelReason);
 		try {
@@ -187,13 +239,36 @@ export async function readBoundedResponseBytes(
 	}
 }
 
-function decodeUtf8(chunks: readonly Uint8Array[], fatal: boolean): string {
+// Mark only exceptions thrown by our decoder, preserving their identity and TypeError contract.
+// Timeout-path flushing may fail too; retain that origin so callers do not lose the deadline.
+const decodeFailures = new WeakMap<object, "invalid_utf8" | "timeout">();
+
+export function boundedBodyDecodeFailure(error: unknown): "invalid_utf8" | "timeout" | undefined {
+	return error !== null && typeof error === "object" ? decodeFailures.get(error) : undefined;
+}
+
+function decodeUtf8(chunks: readonly Uint8Array[], fatal: boolean, timedOut = false): string {
 	const decoder = new TextDecoder("utf-8", { fatal });
-	let text = "";
-	for (const chunk of chunks) text += decoder.decode(chunk, { stream: true });
-	// Flush an incomplete trailing UTF-8 sequence deterministically.
-	text += decoder.decode();
-	return text;
+	try {
+		let text = "";
+		for (const chunk of chunks) text += decoder.decode(chunk, { stream: true });
+		// Flush an incomplete trailing UTF-8 sequence deterministically.
+		text += decoder.decode();
+		return text;
+	} catch (error) {
+		if (error !== null && typeof error === "object") {
+			decodeFailures.set(error, timedOut ? "timeout" : "invalid_utf8");
+		}
+		throw error;
+	}
+}
+
+function decodeUtf8WithValidity(bytes: Uint8Array): { text: string; utf8Valid: boolean } {
+	try {
+		return { text: decodeUtf8([bytes], true), utf8Valid: true };
+	} catch {
+		return { text: decodeUtf8([bytes], false), utf8Valid: false };
+	}
 }
 
 /**
@@ -208,9 +283,11 @@ export async function readBoundedResponseBody(
 	options: BoundedBodyOptions = {},
 ): Promise<BoundedBodyResult> {
 	const signal = options.signal;
-	if (signal?.aborted) throw signal.reason;
-
 	const body = response.body;
+	if (signal?.aborted) {
+		if (body) cancelBodyWithoutWaiting(body, signal.reason);
+		throw signal.reason;
+	}
 	if (!body) {
 		return {
 			text: "",
@@ -233,30 +310,26 @@ export async function readBoundedResponseBody(
 	bufferGrowthsForTests = 0;
 	let mustCancel = false;
 	let cancelReason: unknown;
-	const total = timeoutPromise(options.totalTimeoutMs ?? BOUNDED_BODY_TIMEOUT_MS, TOTAL_TIMEOUT);
-	let inactivity = timeoutPromise(
+	const waiting = interruptibleRead<symbol>(reader);
+	const total = bodyDeadline(
+		options.totalTimeoutMs ?? BOUNDED_BODY_TIMEOUT_MS,
+		() => waiting.interrupt({ value: TOTAL_TIMEOUT }),
+	);
+	let inactivity = bodyDeadline(
 		options.firstByteTimeoutMs ?? options.inactivityTimeoutMs ?? BOUNDED_BODY_TIMEOUT_MS,
-		INACTIVITY_TIMEOUT,
+		() => waiting.interrupt({ value: INACTIVITY_TIMEOUT }),
 	);
 
-	let rejectForAbort: ((reason: unknown) => void) | undefined;
-	const aborted = new Promise<never>((_resolve, reject) => {
-		rejectForAbort = reject;
-	});
-	const onAbort = () => rejectForAbort?.(signal?.reason);
+	const onAbort = () => waiting.interrupt({ error: signal?.reason });
 	signal?.addEventListener("abort", onAbort, { once: true });
 	// Close the narrow race between the preflight check and listener install.
 	if (signal?.aborted) onAbort();
 
 	try {
 		while (true) {
-			// Attach a rejection handler before racing. If a deadline wins and
-			// cancellation later rejects this read, it remains observed.
-			const read = reader.read();
-			void read.catch(() => undefined);
-			const outcome = await Promise.race([read, total.promise, inactivity.promise, aborted]);
+			const outcome = await waiting.read();
 			// Cancellation owns the body lifetime even when EOF/readability settles in
-			// the same turn. Promise.race otherwise lets array order hide the abort.
+			// the same turn, even if the read settled before the abort callback.
 			if (signal?.aborted) {
 				mustCancel = true;
 				cancelReason = signal.reason;
@@ -270,7 +343,7 @@ export async function readBoundedResponseBody(
 					"TimeoutError",
 				);
 				return {
-					text: decodeUtf8([retained.subarray(0, retainedBytes)], options.fatalUtf8 === true),
+					text: decodeUtf8([retained.subarray(0, retainedBytes)], options.fatalUtf8 === true, true),
 					truncated: true,
 					timedOut: true,
 					totalTimedOut: outcome === TOTAL_TIMEOUT,
@@ -282,6 +355,24 @@ export async function readBoundedResponseBody(
 
 			const { value, done } = outcome as ReadableStreamReadResult<Uint8Array>;
 			if (done) {
+				if (options.reportUtf8Validity) {
+					const bytes = retained.subarray(0, retainedBytes);
+					// A fatal decode that returned already proved the bytes valid; still
+					// honour the reporting contract instead of dropping utf8Valid.
+					const decoded = options.fatalUtf8 === true
+						? { text: decodeUtf8([bytes], true), utf8Valid: true }
+						: decodeUtf8WithValidity(bytes);
+					return {
+						text: decoded.text,
+						truncated: false,
+						timedOut: false,
+						totalTimedOut: false,
+						inactivityTimedOut: false,
+						oversized: false,
+						displaySafe: true,
+						utf8Valid: decoded.utf8Valid,
+					};
+				}
 				return {
 					text: decodeUtf8([retained.subarray(0, retainedBytes)], options.fatalUtf8 === true),
 					truncated: false,
@@ -296,9 +387,9 @@ export async function readBoundedResponseBody(
 			if (!value || value.byteLength === 0) continue;
 
 			inactivity.clear();
-			inactivity = timeoutPromise(
+			inactivity = bodyDeadline(
 				options.inactivityTimeoutMs ?? BOUNDED_BODY_TIMEOUT_MS,
-				INACTIVITY_TIMEOUT,
+				() => waiting.interrupt({ value: INACTIVITY_TIMEOUT }),
 			);
 
 			if (value.byteLength > maxBytes - retainedBytes) {

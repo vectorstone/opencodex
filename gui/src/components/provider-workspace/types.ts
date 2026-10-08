@@ -1,9 +1,11 @@
+import type { QuotaFailureCode } from "../../../../src/providers/quota-types";
 /**
  * provider-workspace/types.ts — shared view-model types for the Providers
  * workspace shell/rail/detail (WP080a). Data shapes only; no React.
  */
 import type { ProviderSortMode, WorkspaceItem } from "../../provider-workspace/catalog";
 import type { AccountQuota } from "../../codex-quota-utils";
+import type { BrowserLaunch } from "../../oauth-browser-launch";
 
 export type { ProviderSortMode, WorkspaceItem };
 
@@ -29,6 +31,7 @@ export interface ProviderUsageTotals {
 export interface ProviderModelUsageRow {
   model: string;
   resolvedModel?: string;
+  hasUnresolvedRequestedModel?: true;
   requests: number;
   totalTokens: number;
   inputTokens: number;
@@ -40,22 +43,35 @@ export interface ProviderModelUsageRow {
 // Auth types consumed by ProviderAuthPanel (WP091).
 export type OAuthAccountHealthStatus = "healthy" | "cooldown" | "reauth_required" | "warning";
 
-export type OAuthAccountRow = {
+export type AccountQuotaMode = "probe" | "passive" | "unsupported";
+export interface AccountQuotaReading {
+  quotaMode?: AccountQuotaMode;
+  quota?: AccountQuota | null;
+  quotaUnavailable?: boolean;
+  quotaFailure?: QuotaFailureCode;
+  /** Client-owned enrichment state, never inferred from missing quota data. */
+  quotaPending?: boolean;
+}
+
+export type OAuthAccountRow = AccountQuotaReading & {
   id: string;
   alias?: string;
   email?: string;
   active: boolean;
   needsReauth?: boolean;
+  autoSelectable?: boolean;
+  skipReason?: "needs_reauth" | "paused" | "suspended" | "cooldown" | "quota_exhausted";
+  paused?: boolean;
+  autoSwitchThresholdOverride?: number | null;
+  autoSwitchThreshold?: number;
+  effectiveAutoSwitchThreshold?: number;
   health?: { status: OAuthAccountHealthStatus; reason?: string; until?: string };
   healthLabel?: string;
   healthSummary?: string;
   healthAction?: string;
-  /** Per-account rate limits, for providers that report usage per credential (anthropic). */
-  quota?: AccountQuota | null;
-  quotaUnavailable?: boolean;
 };
 
-export type ApiKeyRow = {
+export type ApiKeyRow = AccountQuotaReading & {
   id: string;
   label?: string;
   masked: string;
@@ -67,22 +83,34 @@ export type LoginHint = {
   url?: string;
   instructions?: string;
   deviceCode?: string;
+  browserLaunch?: BrowserLaunch;
 };
 
 export type AccountLoadState = "idle" | "loading" | "ready" | "error";
 
 export interface ProviderAuthHandlers {
   onLogin: (provider: string, addAccount?: boolean) => void | Promise<void>;
+  onNativeLoginSettled?: (provider: string, outcome: "added" | "ended" | "failed") => void | Promise<void>;
   onCancelLogin?: (provider: string) => void;
   onLogout: (provider: string) => void | Promise<void>;
   onReauth: (provider: string, accountId?: string) => void | Promise<void>;
   onSwitchAccount: (provider: string, account: OAuthAccountRow) => void | Promise<void>;
+  onPauseAccount: (provider: string, account: OAuthAccountRow, paused: boolean) => void | Promise<void>;
+  onAccountThreshold?: (provider: string, account: OAuthAccountRow, threshold: number | null) => Promise<boolean>;
+  onAccountPoolThreshold?: (provider: string, threshold: number) => void | Promise<boolean>;
   onRemoveAccount: (provider: string, account: OAuthAccountRow) => void | Promise<void>;
   onRetryAccounts?: (provider: string) => void | Promise<void>;
   onAddApiKey: (provider: string, key: string) => Promise<boolean>;
   onSwitchApiKey: (provider: string, entry: ApiKeyRow) => void | Promise<void>;
   onRemoveApiKey: (provider: string, entry: ApiKeyRow) => void | Promise<void>;
   onEditAlias: (provider: string, type: "oauth" | "api-key", id: string, current?: string) => void | Promise<void>;
+  /**
+   * Force a fresh quota read for this provider, resolving with whether it succeeded.
+   *
+   * Optional: the Codex account pool owns its own refresh control, and a caller that
+   * cannot force a read simply renders no button rather than one that does nothing.
+   */
+  onRefreshQuota?: (provider: string) => Promise<boolean>;
 }
 
 export type ProviderUpdatePatch = {
@@ -102,4 +130,12 @@ export type ProviderUpdatePatch = {
   requestPacing?: WorkspaceItem["requestPacing"] | null;
   /** Dedicated field: the API PATCHes it alone for the canonical `openai` provider. */
   codexAccountMode?: "direct" | "pool";
+  /** Management-only write that atomically owns the two supported xAI Grok adapter rows. */
+  xaiResponsesOptIn?: boolean;
+};
+
+export type ProviderUpdateResult = {
+  ok: boolean;
+  error?: string;
+  xaiResponsesOptInState?: WorkspaceItem["xaiResponsesOptInState"];
 };

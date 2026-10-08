@@ -1,3 +1,4 @@
+import { codexAccountUsesCreditsAfterLimit } from "./account-credit-use";
 /**
  * Quota-aware subagent model fallback (issue #374).
  *
@@ -15,18 +16,19 @@ import { CODEX_HOME, getCodexHome } from "./paths";
 import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota } from "./quota";
 import {
   canAcquireCodexQuotaProbeLease,
+  canAcquireCodexQuotaScopeProbeLease,
   codexQuotaScopeForModel,
   computeCodexUsageScore,
   getCodexQuotaHealthSnapshot,
   getEffectiveActiveCodexAccountId,
   getPoolAccountPlan,
-  isCodexAccountInCooldown,
 } from "./routing";
 import {
   isCodexAccountUsable,
   type CodexAccountUsabilityOptions,
 } from "./account-usability";
 import { isCodexAccountPaused } from "./account-pause";
+import { getEffectiveCodexAutoSwitchThreshold } from "./account-auto-switch";
 import { slugEquals } from "../providers/slug-codec";
 import { isThreadSpawnRequest } from "../server/effort-policy";
 import { PROVIDER_REGISTRY } from "../providers/registry";
@@ -38,6 +40,9 @@ import {
 import { routeModel, type RouteResult } from "../router";
 import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
 import { codexAccountNamespaceForModel } from "./account-namespace-match";
+import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS, NATIVE_MAIN_DRAIN_SENTINEL_MODELS } from "./catalog/native-models";
+import { MAIN_CODEX_ACCOUNT_ID } from "./main-account";
+import { decodeTomlBasicString } from "./prompt-layers/encoding";
 import {
   getUpstreamHostHealth,
   normalizeUpstreamHostCircuitThreshold,
@@ -48,6 +53,17 @@ export const DEFAULT_SUBAGENT_MODEL_FALLBACK_POLL_MS = 60_000;
 const CODEX_FORWARD_ORIGIN = new URL(CODEX_FORWARD_BASE_URL).origin.toLowerCase();
 
 type SubagentQuotaPrimeFn = (config: OcxConfig, reason: string) => Promise<void>;
+/** Side-effect-free Pool account preview for one resolved fallback candidate. */
+export type SubagentPoolAccountPreview = (
+  modelId: string | undefined,
+  now: number,
+  modelEligibleAccountIds?: ReadonlySet<string>,
+) => string | null;
+export type SubagentModelEligibleAccountIds = (
+  modelId: string | undefined,
+) => ReadonlySet<string> | undefined;
+/** Additional resolved routes that a restricted fallback caller has independently approved. */
+export type SubagentFallbackRouteEligibility = (route: RouteResult) => boolean;
 let subagentQuotaPrimeForTests: SubagentQuotaPrimeFn | null = null;
 let quotaPrimeInFlight: Promise<void> | null = null;
 
@@ -144,8 +160,8 @@ export function buildSubagentModelChain(
   return normalizedChain(primary, config, extraFallback);
 }
 
-function quotaThreshold(config: OcxConfig): number {
-  const threshold = config.autoSwitchThreshold ?? 80;
+function quotaThreshold(config: OcxConfig, accountId: string): number {
+  const threshold = getEffectiveCodexAutoSwitchThreshold(config, accountId);
   return threshold > 0 ? threshold : Number.POSITIVE_INFINITY;
 }
 
@@ -177,8 +193,15 @@ function resolveRouteFallbackAccountId(
   route: RouteResult | null,
   config: OcxConfig,
   accountId?: string | null,
+  now = Date.now(),
+  poolAccountPreview?: SubagentPoolAccountPreview,
+  modelEligibleAccountIds?: ReadonlySet<string>,
 ): string | null {
-  return route?.codexAccountId ?? resolvePoolFallbackAccountId(config, accountId);
+  if (route?.codexAccountId !== undefined) return route.codexAccountId;
+  if (route && isPoolCodexRoute(route) && poolAccountPreview) {
+    return poolAccountPreview(route.modelId, now, modelEligibleAccountIds);
+  }
+  return resolvePoolFallbackAccountId(config, accountId);
 }
 
 function isRoutableFallbackModel(model: string, config: OcxConfig): boolean {
@@ -208,9 +231,12 @@ export function isNativeModelQuotaExhausted(
   const resolvedAccountId = resolveRouteFallbackAccountId(route, config, accountId);
   if (!resolvedAccountId) return false;
   const quota = getAccountQuota(resolvedAccountId);
-  const usage = computeCodexUsageScore(quota, getPoolAccountPlan(config, resolvedAccountId));
+  // Subagent fallback reads the same score, so a stale terminal reading would push
+  // subagents off a native model whose window has already reset. Thread the caller's clock
+  // rather than letting the scorer read wall time - the two would silently diverge.
+  const usage = computeCodexUsageScore(quota, getPoolAccountPlan(config, resolvedAccountId), now, codexAccountUsesCreditsAfterLimit(config, resolvedAccountId));
   if (usage >= CODEX_UNKNOWN_USAGE_SCORE) return false;
-  return usage >= quotaThreshold(config);
+  return usage >= quotaThreshold(config, resolvedAccountId);
 }
 
 export function isModelHealthBlocked(
@@ -237,33 +263,98 @@ export function isSubagentModelUnavailable(
   accountId?: string | null,
   now = Date.now(),
   accountUsabilityOptions?: CodexAccountUsabilityOptions,
+  poolAccountPreview?: SubagentPoolAccountPreview,
+  modelEligibleAccountIdsForModel?: SubagentModelEligibleAccountIds,
 ): boolean {
   if (isDisabledFallbackModel(model, config)) return true;
   if (!isRoutableFallbackModel(model, config)) return true;
   const route = tryRouteFallbackModel(config, model);
   if (!route || route.provider.disabled === true) return true;
-  if (isModelHealthBlocked(model, config, accountId, now)) return true;
-  if (!isPoolCodexRoute(route)) return false;
+  const modelEligibleAccountIds = modelEligibleAccountIdsForModel?.(route.modelId);
+  const candidateAccountUsabilityOptions = modelEligibleAccountIds !== undefined
+    ? {
+        ...accountUsabilityOptions,
+        modelEligibleAccountIds,
+      }
+    : accountUsabilityOptions;
+  const resolvedAccountId = resolveRouteFallbackAccountId(
+    route,
+    config,
+    accountId,
+    now,
+    poolAccountPreview,
+    candidateAccountUsabilityOptions?.modelEligibleAccountIds,
+  );
+  const accountUnavailable = (
+    candidateAccountId: string | null,
+    usabilityOptions: CodexAccountUsabilityOptions | undefined,
+    includeQuotaExhaustion: boolean,
+  ): boolean => {
+    if (isModelHealthBlocked(model, config, candidateAccountId, now)) return true;
+    if (!isPoolCodexRoute(route)) return false;
 
-  // Pool candidates need a usable account. Derive requirement from the resolved
-  // route (canonical openai defaults to pool even when codexAccountMode is omitted).
-  const resolvedAccountId = resolveRouteFallbackAccountId(route, config, accountId);
-  if (!resolvedAccountId) return true;
-  if (isCodexAccountPaused(config, resolvedAccountId)) return true;
-  if (!isCodexAccountUsable(config, resolvedAccountId, accountUsabilityOptions)) return true;
-  if (route.codexAccountId !== undefined) {
-    // An account-qualified route is pinned and cannot consume Pool's recovery-probe
-    // escape hatch. Honor both account-wide and model-scoped cooldowns so fallback
-    // advances instead of selecting a candidate that exact auth will reject.
-    const quotaScope = codexQuotaScopeForModel(route.modelId);
-    if (getCodexQuotaHealthSnapshot(resolvedAccountId, quotaScope, now) !== null) return true;
-  } else if (
-    isCodexAccountInCooldown(resolvedAccountId, now)
-    && !canAcquireCodexQuotaProbeLease(resolvedAccountId, now)
-  ) {
-    return true;
-  }
-  return isNativeModelQuotaExhausted(model, config, accountId, now);
+    // Pool candidates need a usable account. Derive requirement from the resolved
+    // route (canonical openai defaults to pool even when codexAccountMode is omitted).
+    if (!candidateAccountId) return true;
+    if (isCodexAccountPaused(config, candidateAccountId)) return true;
+    if (!isCodexAccountUsable(config, candidateAccountId, usabilityOptions)) return true;
+    if (route.codexAccountId !== undefined) {
+      // An account-qualified route is pinned and cannot consume Pool's recovery-probe
+      // escape hatch. Honor both account-wide and model-scoped cooldowns so fallback
+      // advances instead of selecting a candidate that exact auth will reject.
+      const quotaScope = codexQuotaScopeForModel(route.modelId);
+      if (getCodexQuotaHealthSnapshot(candidateAccountId, quotaScope, now) !== null) return true;
+    } else {
+      const quotaScope = codexQuotaScopeForModel(route.modelId);
+      const cooldown = getCodexQuotaHealthSnapshot(candidateAccountId, quotaScope, now);
+      if (cooldown !== null) {
+        const probeAvailable = cooldown.quotaScope
+          ? canAcquireCodexQuotaScopeProbeLease(candidateAccountId, cooldown.quotaScope, now)
+          : canAcquireCodexQuotaProbeLease(candidateAccountId, now);
+        if (!probeAvailable) return true;
+      }
+    }
+    if (
+      !includeQuotaExhaustion
+      || (
+        candidateAccountId === MAIN_CODEX_ACCOUNT_ID
+        && usabilityOptions?.nativeMainSelectionOnly === true
+      )
+    ) return false;
+    return isNativeModelQuotaExhausted(model, config, candidateAccountId, now);
+  };
+
+  // Prefer a genuinely usable entitled pool account. Preview can deliberately return
+  // the configured active account even when no selectable candidate exists, so a
+  // null/main-only check is not enough to detect the temporary-drain case.
+  if (!accountUnavailable(resolvedAccountId, candidateAccountUsabilityOptions, true)) return false;
+
+  // During a temporary native-main drain, entitlement discovery excludes main to
+  // preserve the credential fence. If no non-main candidate can serve an unqualified
+  // gated model, retain main only as a read-free sentinel: final auth owns the atomic
+  // claim and returns maintenance instead of letting a routed fallback bypass it.
+  //
+  // The predicate is its OWN set, not the account-gated one. The sentinel protects the atomic
+  // main claim during a drain, which has nothing to do with entitlement; it read the gated set
+  // only because the two happened to hold the same slugs. Ungating the flagships (2026-09-04)
+  // would have flipped this false and let a drain silently rewrite the operator's configured
+  // subagent model instead of reporting maintenance -- a different model answering than was
+  // chosen. The set is explicit rather than every supported native, so gpt-5.5 and friends keep
+  // their existing fall-back-and-answer behaviour.
+  const preserveDrainingMainCandidate = route.codexAccountId === undefined
+    && candidateAccountUsabilityOptions?.nativeMainSelectionOnly === true
+    && NATIVE_MAIN_DRAIN_SENTINEL_MODELS.has(route.modelId);
+  if (!preserveDrainingMainCandidate) return true;
+  const drainingMainUsabilityOptions: CodexAccountUsabilityOptions = {
+    ...candidateAccountUsabilityOptions,
+    modelEligibleAccountIds: new Set([
+      ...(modelEligibleAccountIds ?? []),
+      MAIN_CODEX_ACCOUNT_ID,
+    ]),
+  };
+  // Quota scoring main would lazily read the native credential/plan. Cached health,
+  // pause, reauth, and cooldown state are safe; defer physical scoring to final auth.
+  return accountUnavailable(MAIN_CODEX_ACCOUNT_ID, drainingMainUsabilityOptions, false);
 }
 
 export function selectAvailableSubagentModel(
@@ -275,18 +366,37 @@ export function selectAvailableSubagentModel(
   nativeFallbackOnly = false,
   accountUsabilityOptions?: CodexAccountUsabilityOptions,
   trailingFallback: readonly string[] = [],
+  poolAccountPreview?: SubagentPoolAccountPreview,
+  modelEligibleAccountIdsForModel?: SubagentModelEligibleAccountIds,
+  resolvedChain?: readonly string[],
+  restrictedRouteEligible?: SubagentFallbackRouteEligibility,
 ): { model: string; rewritten: boolean; skipped: string[] } {
-  const chain = normalizedChain(primary, config, extraFallback, trailingFallback);
+  const chain = resolvedChain ?? normalizedChain(primary, config, extraFallback, trailingFallback);
   const skipped: string[] = [];
   for (const candidate of chain) {
     if (nativeFallbackOnly) {
       const route = tryRouteFallbackModel(config, candidate);
-      if (!route || !isCanonicalOpenAiForwardProvider(route.provider)) {
+      if (
+        !route
+        || route.combo !== undefined
+        || (
+          !isCanonicalOpenAiForwardProvider(route.provider)
+          && restrictedRouteEligible?.(route) !== true
+        )
+      ) {
         skipped.push(candidate);
         continue;
       }
     }
-    if (isSubagentModelUnavailable(candidate, config, accountId, now, accountUsabilityOptions)) {
+    if (isSubagentModelUnavailable(
+      candidate,
+      config,
+      accountId,
+      now,
+      accountUsabilityOptions,
+      poolAccountPreview,
+      modelEligibleAccountIdsForModel,
+    )) {
       skipped.push(candidate);
       continue;
     }
@@ -515,8 +625,43 @@ export function applySubagentModelFallback(
   now = Date.now(),
   nativeFallbackOnly = false,
   accountUsabilityOptions?: CodexAccountUsabilityOptions,
+  poolAccountPreview?: SubagentPoolAccountPreview,
+  modelEligibleAccountIdsForModel?: SubagentModelEligibleAccountIds,
+  resolvedFallbackChain?: readonly string[] | null,
+  restrictedRouteEligible?: SubagentFallbackRouteEligibility,
 ): { from?: string; to?: string; skipped?: string[] } | null {
   if (!isThreadSpawnRequest(headers)) return null;
+  const fallbackChain = resolvedFallbackChain === undefined
+    ? resolveSubagentFallbackChain(parsed, config)
+    : resolvedFallbackChain;
+  if (!fallbackChain) return null;
+  const selection = selectAvailableSubagentModel(
+    parsed.modelId,
+    config,
+    [],
+    accountId,
+    now,
+    nativeFallbackOnly,
+    accountUsabilityOptions,
+    [],
+    poolAccountPreview,
+    modelEligibleAccountIdsForModel,
+    fallbackChain,
+    restrictedRouteEligible,
+  );
+  if (!selection.rewritten) return selection.skipped.length > 0
+    ? { from: parsed.modelId, to: parsed.modelId, skipped: selection.skipped }
+    : null;
+  const from = parsed.modelId;
+  rewriteParsedModel(parsed, selection.model);
+  return { from, to: selection.model, skipped: selection.skipped };
+}
+
+/** Resolve the effective fallback chain once for one logical spawn request. */
+export function resolveSubagentFallbackChain(
+  parsed: OcxParsedRequest,
+  config: OcxConfig,
+): readonly string[] | null {
   const tomlRoleFallback = resolveAgentModelFallbackForPrimary(
     parsed.modelId,
     getCodexHome(),
@@ -527,22 +672,20 @@ export function applySubagentModelFallback(
   const configuredFallback = resolveConfiguredModelFallbackForPrimary(parsed.modelId, config);
   const globalFallback = config.subagentModelFallback ?? [];
   if (globalFallback.length === 0 && configuredFallback.length === 0 && tomlRoleFallback.length === 0) return null;
-  const selection = selectAvailableSubagentModel(
-    parsed.modelId,
-    config,
-    configuredFallback,
-    accountId,
-    now,
-    nativeFallbackOnly,
-    accountUsabilityOptions,
-    tomlRoleFallback,
-  );
-  if (!selection.rewritten) return selection.skipped.length > 0
-    ? { from: parsed.modelId, to: parsed.modelId, skipped: selection.skipped }
-    : null;
-  const from = parsed.modelId;
-  rewriteParsedModel(parsed, selection.model);
-  return { from, to: selection.model, skipped: selection.skipped };
+  return normalizedChain(parsed.modelId, config, configuredFallback, tomlRoleFallback);
+}
+
+/** Whether the effective fallback chain crosses an account-gated native Pool model. */
+export function subagentFallbackNeedsModelEntitlements(
+  fallbackChain: readonly string[] | null,
+  config: OcxConfig,
+): boolean {
+  return fallbackChain?.some((candidate) => {
+    const route = tryRouteFallbackModel(config, candidate);
+    return !!route
+      && isPoolCodexRoute(route)
+      && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId);
+  }) === true;
 }
 
 export function subagentFallbackGuidanceText(config: OcxConfig): string {
@@ -630,10 +773,14 @@ function findTomlMultilineStringEnd(text: string, from: number, quote: string): 
   const delimiter = quote.repeat(3);
   let index = text.indexOf(delimiter, from);
   while (index !== -1) {
-    if (quote === "'") return index;
     let backslashes = 0;
-    for (let j = index - 1; j >= 0 && text[j] === "\\"; j--) backslashes += 1;
-    if (backslashes % 2 === 0) return index;
+    if (quote === '"') for (let j = index - 1; j >= 0 && text[j] === "\\"; j--) backslashes += 1;
+    if (backslashes % 2 === 0) {
+      // TOML lets one or two quotes sit right before the closing delimiter, so """a""""" ends on its last three.
+      let extra = 0;
+      while (extra < 2 && text[index + 3 + extra] === quote) extra += 1;
+      return index + extra;
+    }
     index = text.indexOf(delimiter, index + 1);
   }
   return -1;
@@ -765,8 +912,171 @@ export function hasCodexAgentModelFallbackField(role: string, codexHome = CODEX_
 }
 
 /** Roles whose TOML still carries `model_fallback`, including empty arrays. */
-export function scanCodexAgentRolesWithTomlModelFallback(codexHome = CODEX_HOME): string[] {
-  return listCodexAgentRoles(codexHome).filter(role => hasCodexAgentModelFallbackField(role, codexHome));
+export function scanCodexAgentRolesWithTomlModelFallback(
+  codexHome = CODEX_HOME,
+  onListError?: (cause: unknown) => void,
+): string[] {
+  try {
+    return listCodexAgentRoles(codexHome).filter(role => hasCodexAgentModelFallbackField(role, codexHome));
+  } catch (cause) {
+    onListError?.(cause);
+    return [];
+  }
+}
+
+const TOML_ROOT_KEY = /^\s*(?:([A-Za-z0-9_-]+)|("(?:\\.|[^"\\])*")|'([^'\n]*)')\s*=/;
+const TOML_TABLE_HEADER = /^\s*\[/;
+
+function tomlKeyName(match: RegExpMatchArray): string | undefined {
+  if (match[1] !== undefined) return match[1];
+  if (match[3] !== undefined) return match[3];
+  return decodeTomlBasicString(match[2]!) ?? undefined;
+}
+
+export interface TomlModelKeyLocation {
+  /** Index into `content.split("\n")`; a trailing `\r` stays on the line. */
+  readonly line: number;
+  readonly inRootTable: boolean;
+  /** Column span of the quoted value on `line`; null when it is not a one-line string. */
+  readonly span: { readonly start: number; readonly end: number } | null;
+  readonly value: string | null;
+}
+
+/**
+ * Locate the first `model` key outside multiline strings and arrays.
+ *
+ * The one scan behind both the read ({@link parseTomlModelPin}) and the dashboard's write of a
+ * role's model, so the line the writer edits is the line the reader reports.
+ */
+export function locateTomlModelKey(content: string): TomlModelKeyLocation | null {
+  return locateTomlStringKey(content, "model");
+}
+
+/** The same scan for a role's root model_reasoning_effort, which the dashboard edits beside the pin. */
+export function locateTomlReasoningEffortKey(content: string): TomlModelKeyLocation | null {
+  return locateTomlStringKey(content, "model_reasoning_effort");
+}
+
+function locateTomlStringKey(content: string, keyName: string): TomlModelKeyLocation | null {
+  const lines = content.split(/\r?\n/);
+  const state: TomlScanState = { inMultilineString: null, arrayDepth: 0 };
+  let inRootTable = true;
+  let undecodedRootKeyLine: number | null = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    if (state.inMultilineString) {
+      const end = findTomlMultilineStringEnd(line, 0, state.inMultilineString[0]!);
+      if (end === -1) continue;
+      state.inMultilineString = null;
+      scanTomlLine(line.slice(end + 3), state);
+      continue;
+    }
+    if (state.arrayDepth === 0) {
+      if (TOML_TABLE_HEADER.test(line)) inRootTable = false;
+      const key = line.match(TOML_ROOT_KEY);
+      const name = key ? tomlKeyName(key) : null;
+      if (key && name === undefined && inRootTable) undecodedRootKeyLine ??= i;
+      if (key && name === keyName) {
+        const rest = `${line.slice(key[0].length)}\n${lines.slice(i + 1).join("\n")}`;
+        let at = 0;
+        while (at < rest.length && (rest[at] === " " || rest[at] === "\t")) at += 1;
+        if (rest[at] !== '"' && rest[at] !== "'") return { line: i, inRootTable, span: null, value: null };
+        const parsed = parseTomlStringAt(rest, at);
+        const value = parsed?.value.trim() ?? "";
+        const onLine = parsed !== null && parsed.end <= line.length - key[0].length;
+        return {
+          line: i,
+          inRootTable,
+          span: onLine ? { start: key[0].length + at, end: key[0].length + parsed.end } : null,
+          value: value === "" ? null : value,
+        };
+      }
+    }
+    scanTomlLine(line, state);
+  }
+  // A root key that might spell the wanted key cannot be ruled out, so a writer must not add a second one.
+  return undecodedRootKeyLine === null ? null : { line: undecodedRootKeyLine, inRootTable: true, span: null, value: null };
+}
+
+/**
+ * TOML-aware read of the root `model` pin, or null when there is none.
+ *
+ * Distinct from {@link readCodexAgentModel}, which matches one exact unindented double-quoted
+ * line. That is fine for resolving a fallback chain opencodex itself wrote, but it is the wrong
+ * question for a diagnostic: the file being judged was written by somebody else, so `model = 'x'`,
+ * an indented key, or a trailing comment are all valid TOML that Codex honours and that a
+ * stricter matcher would report as unpinned.
+ *
+ * It shares the scanner used for `model_fallback` for the reason that matters here: an imported
+ * role file keeps its instructions in a multiline string, and that string contains the very words
+ * this scan looks for. A line matcher would read a key out of prose.
+ *
+ * The scan reports whether the key sits in the root table, and this read ignores that flag on
+ * purpose: a `model` key under a later table header still counts as a pin, because for a warning
+ * the conservative direction is to stay quiet. The role listing and the writer in
+ * `src/codex/agent-role-models.ts` do gate on it, since they show and edit only the root value.
+ */
+function parseTomlModelPin(content: string): string | null {
+  return locateTomlModelKey(content)?.value ?? null;
+}
+
+/** Filename prefix opencodex gives the Claude agents it generates. */
+const OPENCODEX_DERIVED_ROLE_PREFIX = "ocx-";
+
+/**
+ * Body markers that survive the Codex desktop external-agent import.
+ *
+ * The import carries the generated Claude agent's instructions across, so both the provenance
+ * marker and the routing directive end up inside the role TOML. `ocx-route:` is matched without
+ * its `<!--` comment prefix on purpose: the same import text-replaces "Claude Code" with "Codex"
+ * inside that body, so anything around the directive should be assumed rewritten.
+ */
+const OPENCODEX_DERIVED_ROLE_MARKERS = ["generated-by: opencodex", "ocx-route:"] as const;
+
+/**
+ * Roles that look opencodex-derived but pin no model, so Codex runs them on the parent model.
+ *
+ * opencodex does not create, repair, or remove Codex role TOMLs. Its one write into them is the
+ * root `model` value, and only when a user picks a model for that role in the dashboard or with
+ * `ocx agent roles set` (`src/codex/agent-role-models.ts`). These arrive when the Codex desktop external-agent
+ * import converts `~/.claude/agents/ocx-*.md` into `$CODEX_HOME/agents/ocx-*.toml`, dropping the
+ * `model:` frontmatter because a `claude-ocx-native--` id is not a Codex model and keeping only the
+ * instructions. The surviving `ocx-route` directive cannot make up the difference: it is honoured
+ * only on the Claude `/v1/messages` path and is inert on `/v1/responses`. So the role file names
+ * one model while every spawn runs on another, which is invisible until someone diffs
+ * `session_meta.agent_role` against `turn_context.model` (#4790).
+ *
+ * Detection is a heuristic for a warning, deliberately not an ownership claim. Nothing here
+ * authorizes writing to, repairing, or removing these files, and the marker-based ownership rules
+ * that govern the files opencodex does write are unchanged.
+ */
+export function scanOpencodexDerivedCodexAgentRolesWithoutModelPin(
+  codexHome = CODEX_HOME,
+  onListError?: (cause: unknown) => void,
+): string[] {
+  const findings: string[] = [];
+  let roles: string[];
+  try {
+    roles = listCodexAgentRoles(codexHome);
+  } catch (cause) {
+    onListError?.(cause);
+    return [];
+  }
+  for (const role of roles) {
+    let content: string;
+    try {
+      content = readFileSync(join(codexHome, "agents", `${role}.toml`), "utf8");
+    } catch {
+      // An unreadable file is not evidence of a missing pin.
+      continue;
+    }
+    const derived = role.startsWith(OPENCODEX_DERIVED_ROLE_PREFIX)
+      || OPENCODEX_DERIVED_ROLE_MARKERS.some(marker => content.includes(marker));
+    if (!derived) continue;
+    if (parseTomlModelPin(content) !== null) continue;
+    findings.push(role);
+  }
+  return findings.sort();
 }
 
 export function listCodexAgentRoles(codexHome = CODEX_HOME): string[] {

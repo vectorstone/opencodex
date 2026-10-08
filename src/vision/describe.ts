@@ -4,14 +4,18 @@ import { FORWARD_HEADERS } from "../adapters/openai-responses";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { redactSecretString } from "../lib/redact";
 import { sidecarEnter } from "../lib/sidecar-tracker";
-import { fetchWithResetRetry } from "../lib/upstream-retry";
+import { applyUpstreamRecoveryInit, fetchWithResetRetry } from "../lib/upstream-retry";
 import { parseSidecarSSE } from "../web-search/parse";
 import type { SidecarOutcomeRecorder } from "../web-search/executor";
+import { NATIVE_RESERVE_MODEL } from "../codex/catalog/native-models";
+import { openAiSidecarCreditRefusal } from "../providers/openai-sidecar-credit";
 
 export interface VisionSettings {
   model: string;
   reasoning: VisionReasoningEffort;
   timeoutMs: number;
+  /** Effective Desktop authless compatibility does not grant auxiliary model use. */
+  reserveCompatibility?: boolean;
 }
 
 /** A description, or an `error` string when it couldn't run (caller injects a graceful marker). */
@@ -57,7 +61,11 @@ export async function describeImage(
   settings: VisionSettings,
   abortSignal?: AbortSignal,
   recordOutcome?: SidecarOutcomeRecorder,
+  beforeDispatch?: () => void,
 ): Promise<DescribeOutcome> {
+  if (settings.reserveCompatibility && settings.model === NATIVE_RESERVE_MODEL) {
+    return { text: "", error: "Luna Reserve compatibility is only available as a conversation model, not a vision helper. Choose another vision helper model." };
+  }
   const invalid = validateImageUrl(imageUrl);
   if (invalid) return { text: "", error: invalid };
 
@@ -81,7 +89,7 @@ export async function describeImage(
     input: [{ type: "message", role: "user", content }],
     reasoning: { effort: settings.reasoning },
     // The ChatGPT (codex) backend rejects `max_output_tokens` ("Unsupported parameter"); the shared
-    // SSE parser bounds raw response bytes before DESC_MAX_CHARS applies its display clamp.
+    // SSE parser bounds wire and decoded payload before DESC_MAX_CHARS applies its display clamp.
     store: false,
     stream: true,
   };
@@ -90,38 +98,50 @@ export async function describeImage(
   const t0 = Date.now();
   try {
     const res = await fetchWithResetRetry(
-      () => fetch(`${forwardProvider.baseUrl}/responses`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: linkedSignal.signal,
-        // Credential-bearing: do not follow a cross-origin 3xx. Bun strips `Authorization`
-        // across origins but forwards nonstandard headers such as `chatgpt-account-id`,
-        // `session_id`, and `x-codex-turn-metadata` to the redirect target.
-        redirect: "manual",
-      }),
-      { abortSignal: linkedSignal.signal, label: "vision-sidecar" },
+      // The replay needs `keepalive: false` to abandon the half-closed pooled socket; Bun has
+      // ignored a bare `Connection: close` (oven-sh/bun#20492).
+      recovery => {
+        beforeDispatch?.();
+        return fetch(`${forwardProvider.baseUrl}/responses`, applyUpstreamRecoveryInit({
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: linkedSignal.signal,
+          // Credential-bearing: do not follow a cross-origin 3xx. Bun strips `Authorization`
+          // across origins but forwards nonstandard headers such as `chatgpt-account-id`,
+          // `session_id`, and `x-codex-turn-metadata` to the redirect target.
+          redirect: "manual",
+        }, recovery));
+      },
+      { replaySafe: true, abortSignal: linkedSignal.signal, label: "vision-sidecar" },
     );
-    recordOutcome?.(res.status);
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      console.warn(`[vision] sidecar HTTP ${res.status} (${Date.now() - t0}ms)`);
-      return { text: "", error: `vision sidecar HTTP ${res.status}: ${redactSecretString(t.slice(0, 200))}` };
-    }
     const detachBodyGuard = cancelBodyOnAbort(res.body, linkedSignal.signal);
-    let parsed;
     try {
-      parsed = await parseSidecarSSE(res);
+      if (!res.ok) {
+        recordOutcome?.(res.status);
+        const t = await res.text().catch(() => "");
+        console.warn(`[vision] sidecar HTTP ${res.status} (${Date.now() - t0}ms)`);
+        return { text: "", error: `vision sidecar HTTP ${res.status}: ${redactSecretString(t.slice(0, 200))}` };
+      }
+      const parsed = await parseSidecarSSE(res);
+      if (linkedSignal.signal.aborted) throw linkedSignal.signal.reason;
+      recordOutcome?.(res.status);
+      // Any parser error invalidates decoded text: it may be a prefix from a bounded or incomplete
+      // stream and must never be rendered or cached as a complete image description.
+      if (parsed.error) return { text: "", error: parsed.error };
+      return { text: parsed.text };
     } finally {
       detachBodyGuard();
     }
-    // The backend can return HTTP 200 then stream a `response.failed`/`error` event with no text;
-    // surface that as a describe error instead of an empty (silently-blank) description.
-    if (!parsed.text.trim() && parsed.error) return { text: "", error: parsed.error };
-    return { text: parsed.text };
   } catch (e) {
-    recordOutcome?.(e instanceof Error && e.name === "TimeoutError" ? "timeout" : "connect_error");
+    const policyRefusal = openAiSidecarCreditRefusal(e);
+    if (policyRefusal) return { text: "", error: policyRefusal.message };
     const kind = e instanceof Error && e.name === "TimeoutError" ? "timeout" : "connect_error";
+    const callerAborted = abortSignal?.aborted === true
+      && linkedSignal.signal.aborted
+      && linkedSignal.signal.reason === abortSignal.reason
+      && e === linkedSignal.signal.reason;
+    recordOutcome?.(callerAborted ? "connect_neutral" : kind);
     console.warn(`[vision] sidecar ${kind} (${Date.now() - t0}ms)`);
     return { text: "", error: e instanceof Error ? e.message : String(e) };
   } finally {

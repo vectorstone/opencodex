@@ -27,19 +27,27 @@ export line, and how many models carry authoritative context limits.
       "baseUrl": "http://127.0.0.1:10100/v1",
       "api": "openai-completions",
       "apiKey": "$OPENCODEX_API_KEY",
+      "compat": {
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false
+      },
       "models": [
         {
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         }
       ]
     }
   }
 }
 ```
+
+Generated Pi providers enable `compat.sendSessionAffinityHeaders`. Keep this flag when merging or manually editing the provider: Pi supplies a stable session identity and OpenCodex derives canonical OpenCode Go affinity from it. Pi may omit the identity when `cacheRetention` is `none`.
+
+Generated Pi providers also set `compat.supportsDeveloperRole` to `false`, so Pi sends its system prompt as `system` instead of `developer`. OpenCodex forwards Chat Completions roles as sent, and several OpenAI-compatible upstreams reject `developer` with a 400; every upstream accepts `system`.
 
 Model ids are the proxy's canonical selectors, so routed models appear as `provider/model`
 (`anthropic/claude-opus-5`) and native OpenAI slugs stay unprefixed (`gpt-5.6-sol`). The `name`
@@ -90,17 +98,16 @@ That name is Pi's alone. opencode uses a different variable
 **A loopback proxy needs no key at all.** opencodex binds `127.0.0.1` by default and authenticates
 nothing there, so the `$OPENCODEX_API_KEY` reference is inert and you can leave the variable unset.
 It matters only when `hostname` is set beyond loopback, which is also the case where the proxy
-refuses to start without a token — see [Remote access](/reference/configuration/#remote-access).
+refuses to start without a token — see [Remote access](/reference/configuration/server/#remote-access).
 
 ## Model metadata
 
-`contextWindow` and `maxTokens` are emitted only when the catalog reports an authoritative context
-window. When it does not, both fields are omitted for that model and Pi applies its own defaults;
-`ocx export` prints how many rows fell into that case.
+`contextWindow` and `maxTokens` are independent authoritative capabilities. Each field is emitted
+only when that value is known; otherwise Pi applies its own default for the missing value.
+`ocx export` reports how many rows lack a complete supported limit pair.
 
-`maxTokens` is a schema-satisfying budget of `32000`, clamped down to the context window so a
-small-context model is never given more output than context. It is not a claim about any specific
-model's true maximum.
+`maxTokens` comes from exact provider metadata or an explicit custom-model value. It is clamped to
+the context window when both are known. OpenCodex never substitutes the old `32000` placeholder.
 
 Two fields are deliberately absent. `cost` requires all four price fields and opencodex has no
 price data for routed models — emitting zeros would assert that every model is free.
@@ -123,6 +130,35 @@ upstream natively supports a reasoning parameter. What the proxy actually sends 
 through, translate it (wire aliases), clamp it to the configured ladder, emulate it, or omit it
 entirely (e.g. `noReasoningModels`). The boolean only controls whether Pi offers the control at
 all.
+
+## Attachment and request compatibility
+
+:::note[Pending development behavior]
+The provider-parity changes described here are on the development PR stack; an older installed
+release may still have the previous conversion behavior.
+:::
+
+OpenCodex normalizes Pi/MCP and Anthropic-shaped user images before choosing the native Chat
+or translated route. Images returned by tools use a translated user-message carrier after the
+paired tool results; ordinary user images and text-only tool results can keep the native path.
+Use modern `tool_calls` and `role: "tool"` with `tool_call_id`: legacy `function`-result image
+translation is rejected instead of silently discarding the result.
+
+An explicit reasoning effort of `none` survives Chat conversion. Output limits and sampling
+controls are preserved for generic API-key Responses targets; the canonical ChatGPT target
+still applies its own restrictions. This does not make all providers' controls equivalent.
+
+**Audio and most file attachments need a native input wire that supports them.** A document
+that carries its own base64 bytes in a user message is the exception: it survives translation
+and reaches the Anthropic, OpenAI Chat and Google wires as a native document, file part and
+inline data part. Everything else still returns an explicit error rather than succeeding
+without the attachment — audio, a file-ID or remote reference the proxy cannot dereference, an
+attachment in a tool output or a system message, and a document routed to a wire with no byte
+carrier. File-ID-only images have the same restriction because translated adapters cannot
+resolve those IDs. Convert the attachment to text first, or use a native wire and model that
+support it. Native Chat and raw Responses (including Azure) retain their existing behavior;
+this is not a promise of every model's upstream media support. Video conversion limits remain
+adapter-specific.
 
 ## Schema status
 

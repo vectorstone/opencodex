@@ -43,6 +43,19 @@ ocx --version
 opencodex --version
 ```
 
+## 독립 실행형 바이너리(npm 없음)
+
+릴리스에는 지원되는 macOS, Linux, Windows용 독립 실행형 `ocx` 바이너리도 포함됩니다.
+Bun 런타임과 대시보드가 포함되어 있으므로 npm, Node 또는 별도의 Bun 설치가 필요하지 않습니다.
+플랫폼에 맞는 아카이브를 다운로드해 압축을 풀고 다음과 같이 실행하세요.
+
+```bash
+./ocx --version
+./ocx start
+```
+
+대시보드를 제공하려면 압축을 푼 `gui/dist` 디렉터리를 바이너리 옆에 그대로 두어야 합니다.
+
 ### 배포 채널
 
 안정화 채널인 `latest`에도 ChatGPT, OpenAI API 키, OpenRouter, 실험 단계의 Cursor 경로를 위한
@@ -80,7 +93,7 @@ opencodex 상태 파일은 `$OPENCODEX_HOME`(기본값 `~/.opencodex`) 아래에
 | --- | --- |
 | `$OPENCODEX_HOME/config.json` | 프로바이더, 기본 프로바이더, 포트, 옵션. |
 | `$OPENCODEX_HOME/ocx.pid` | 실행 중인 프록시의 PID(단일 인스턴스 가드). |
-| `$OPENCODEX_HOME/runtime-port.json` | 자동으로 고른 대체 포트를 포함한 현재 PID, 호스트명, 포트. |
+| `$OPENCODEX_HOME/runtime-port.json` | 현재 PID, 호스트명, 포트. `config.port`가 `0`이면 OS가 할당한 포트도 포함합니다. |
 | `$OPENCODEX_HOME/auth.json` | 저장된 OAuth 자격 증명(`ocx login` 시). |
 | `$OPENCODEX_HOME/catalog-backup*.json` | opencodex가 수정하기 전에 만든 Codex 모델 카탈로그 백업. |
 | `$CODEX_HOME/config.toml` | 로컬 전용 구성에서는 opencodex가 관리하는 루트 `openai_base_url`을 추가합니다. 로컬이 아닌 주소에 바인딩할 때는 Codex가 API 인증 헤더를 보낼 수 있도록 `model_provider = "opencodex"`와 `[model_providers.opencodex]`를 사용합니다. |

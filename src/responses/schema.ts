@@ -11,11 +11,29 @@ const inputImageBlockSchema = z.object({
 }).refine(v => typeof v.image_url === "string" || typeof v.file_id === "string", {
   message: "input_image requires at least one of image_url or file_id",
 });
+const inputVideoBlockSchema = z.object({
+  type: z.literal("input_video"),
+  video_url: z.string().min(1),
+  // Gemini agentic video understanding (#3271). z.object() strips unknown keys,
+  // so without declaring it here the mode is dropped before any adapter sees it
+  // and the request silently degrades to frame-by-frame decoding.
+  processing: z.string().min(1).optional(),
+});
 const inputFileBlockSchema = z.object({
   type: z.literal("input_file"),
   file_id: z.string().optional(),
   filename: z.string().optional(),
   file_data: z.string().optional(),
+});
+// codex-rs protocol/src/models.rs sends audio as input_audio with an audio_url, in
+// both user content and tool output. Accepting the block keeps a legitimate audio turn
+// out of the malformed-item catch-all. The translated IR records only its PRESENCE —
+// there is no audio carrier and no adapter-level refusal; a typed unsupported-modality
+// signal reaching final adapter dispatch remains a recorded residual.
+const inputAudioBlockSchema = z.object({
+  type: z.literal("input_audio"),
+  audio_url: z.string().min(1),
+  format: z.string().optional(),
 });
 const outputTextSchema = z.object({ type: z.literal("output_text"), text: z.string() });
 const outputRefusalSchema = z.object({ type: z.literal("refusal"), refusal: z.string() });
@@ -24,12 +42,12 @@ const reasoningTextSchema = z.object({ type: z.literal("reasoning_text"), text: 
 // codex-rs FunctionCallOutputContentItem (protocol/src/models.rs): input_text | input_image | encrypted_content.
 const encryptedContentBlockSchema = z.object({ type: z.literal("encrypted_content"), encrypted_content: z.string() });
 
-const inputContentBlockSchema = z.union([inputTextSchema, plainTextSchema, inputImageBlockSchema, inputFileBlockSchema]);
+const inputContentBlockSchema = z.union([inputTextSchema, plainTextSchema, inputImageBlockSchema, inputVideoBlockSchema, inputAudioBlockSchema, inputFileBlockSchema]);
 const outputContentBlockSchema = z.union([outputTextSchema, plainTextSchema, outputRefusalSchema]);
 // Tool outputs on the wire mix codex-rs FunctionCallOutputContentItem with legacy output blocks.
 const toolOutputContentBlockSchema = z.union([
   outputTextSchema, plainTextSchema, outputRefusalSchema,
-  inputTextSchema, inputImageBlockSchema, encryptedContentBlockSchema,
+  inputTextSchema, inputImageBlockSchema, inputAudioBlockSchema, encryptedContentBlockSchema,
 ]);
 const toolOutputSchema = z.union([z.string(), z.array(toolOutputContentBlockSchema)]);
 
@@ -108,14 +126,24 @@ export const toolSchema = z.object({
   description: z.string().optional(),
   parameters: z.record(z.string(), z.unknown()).optional(),
   strict: z.boolean().optional(),
+  // Unknown keys are stripped here, so a field the parser is expected to read has to be
+  // declared: an undeclared allowed_callers never reached buildTools at all (#5210).
+  allowed_callers: z.array(z.string()).optional(),
 });
 
 const builtinToolSchema = z.object({ type: z.string() }).loose();
 
-const hostedToolType = z.enum([
+/**
+ * Hosted tool types a client may declare on an inbound Responses request. Exported so the
+ * provider-side capability vocabulary in `src/responses/hosted-tool-policy.ts` can be
+ * asserted to cover all of them: a gateway must be able to deny anything it can be sent.
+ */
+export const HOSTED_TOOL_TYPES = [
   "web_search", "web_search_preview", "file_search", "computer_use_preview",
   "code_interpreter", "image_generation", "mcp",
-]);
+] as const;
+
+const hostedToolType = z.enum(HOSTED_TOOL_TYPES);
 
 const allowedToolEntrySchema = z.object({ type: z.string(), name: z.string().optional() });
 

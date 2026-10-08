@@ -13,27 +13,33 @@ yardımcı özellikleri nasıl çalıştıracağını kontrol eder.
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` | Proxy dinleme portu. |
 | `hostname?` | `string` | `"127.0.0.1"` | Bağlama adresi. Geri döngü olmayan bağlamalar `OPENCODEX_API_AUTH_TOKEN` gerektirir. |
-| `proxy?` | `string` | — | Giden HTTP(S) proxy URL'si veya `${ENV_VAR}`. Yalnızca bu değişkenler ayarlanmadığında `HTTP_PROXY` / `HTTPS_PROXY`'ye uygulanır; geri döngü `NO_PROXY` içinde kalır. |
+| `proxy?` | `string` | — | Giden HTTP(S) veya SOCKS5 proxy URL'si (`socks5://host:port`) ya da `${ENV_VAR}`. HTTP URL'leri değişkenler boşsa `HTTP_PROXY` / `HTTPS_PROXY`'ye yazılır. SOCKS5 URL'leri yerleşik gerçek SOCKS5 tünelini kullanır ve `ALL_PROXY`'ye de yazılır (`ocx start --socks5`); bu süreçte miras `HTTP(S)_PROXY` temizlenir. Geri döngü `NO_PROXY` içinde kalır. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Metin veya araç çağrısı içermeyen bir Responses tamamlamasını aynı istekle bir kez yeniden denemeyi açıkça etkinleştirir. Yeniden deneme ücretlendirilebilir. `OCX_EMPTY_COMPLETION_RETRY=0`, yapılandırmayı değiştirmeden devre dışı bırakır; combo ve routed-compaction turları hariçtir. |
-| `stallTimeoutSec?` | `number` | `300` | `response.incomplete` öncesinde yukarı akış verisi olmadan geçen saniye. Minimum 1. |
+| `stallTimeoutSec?` | `number` | `300` (public) / kapalı (local) | Akış kesilmeden önce anlamlı üst sunucu ilerlemesi olmadan geçen saniye (Responses ve yerel Chat). Ayarlanmamışsa **yerel** üst sunucu (loopback, private, `.local`/`.lan` adı) için varsayılan kapalı, genel üst sunucu için 300 sn; pozitif değer ikisine de uygulanır (en az 1 sn); `0` sessizlik watchdog'unu her yerde kapatır. Canonical ChatGPT SSE'yi akışsız JSON'a katlayan Responses isteklerinde watchdog kapalı olsa bile bağımsız 15 dakikalık toplam tur sınırı kalır. `/v1/responses/compact` için bekleyen gövde okumaları bu bütçeyi paylaşır ama yerel üst sunucuda bile varsayılan 300 sn'dir; açık değer (`0` dahil) önceliklidir. |
 | `connectTimeoutMs?` | `number` | `200000` | Deneme başına DNS/TCP/TLS/nihai başlık son tarihi; gövde üretiminden önce biter. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Aktif turlar iptal edilmeden önce zarif boşaltma süresi sınırı. |
 | `websockets?` | `boolean` | `false` | Responses WebSocket yolu için `supports_websockets` bildirin. False, HTTP/SSE'yi tutar. |
 | `corsAllowOrigins?` | `string[]` | `[]` | CORS tarafından izin verilen ek tam kaynaklar. Geri döngü kaynaklarına her zaman izin verilir. `chrome-extension://<extension-id>` gibi yetki tabanlı tarayıcı uzantısı kaynakları desteklenir; `*` bir joker karakter değildir. Firefox ve Safari uzantı UUID'sini yeniden oluşturur (yükleme başına / tarayıcı başlatma başına), bu nedenle kaynak değiştiğinde girdiyi güncelleyin. |
-| `apiKeys?` | `OcxApiKey[]` | `[]` | Geri döngü olmayan bağlamalarda yönetim ve veri düzlemi kimlik doğrulaması tarafından kabul edilen oluşturulmuş `ocx_…` kimlik bilgileri. Kontrol paneli tarafından yönetilir. |
+| `apiKeys?` | `OcxApiKey[]` | `[]` | Geri döngü olmayan bağlamalarda veri düzlemi kabulü için oluşturulmuş `ocx_…` kimlik bilgileri. Yönetim API'lerini yetkilendirmezler; yönetim erişimi [yönetim API referansında](/tr/reference/management-api/) açıklanan ayrı kimlik bilgisini kullanır. Kontrol paneli tarafından yönetilir. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | devre dışı | İsteğe bağlı arşivlenmiş oturum temizleme politikası. Asla örtük olarak etkinleştirilmez. |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` | Çıkarılabilir uygulamaya ait günlükler, önbellekler, bloblar ve devam yükleri için MiB cinsinden sınır. Aralık 64–4096; bir RSS sınırı değildir. |
+| `metricsExport.enabled?` | `boolean` | `false` | Kimliği doğrulanmış `GET /api/metrics` üzerinde süreç yerel toplu istek metriklerini etkinleştirir. Yeniden başlatma gerekir; devre dışıyken yol 404 döndürür ve dışa aktarıcı etkinliği başlamaz. |
 | `codexAutoStart?` | `boolean` | `true` | Codex dolgusunun Codex'i başlatmadan önce `ocx ensure` çalıştırmasına izin verin. False, ensure'ı bir işlem yapmayan (no-op) hale getirir. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Tamamlanan harici bir Codex güncellemesi değiştirdikten sonra kurulu bir dolguyu geri yükleyin. Ortam vazgeçmesi: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Tersine çevrilebilir Codex App geçmişi uyumluluğu. Orijinal meta veriler yedeklenir ve `ocx stop` / `ocx restore` tarafından geri yüklenir. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını düşük çabayla seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını, istek için yapılandırılan akıl yürütme çabasını koruyarak seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-6-luna`, `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | kullanılabilir olduğunda açık | Web arama sidecar seçenekleri. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | kullanılabilir olduğunda açık | Görsel açıklama sidecar seçenekleri. |
 | `images?` | `OcxImagesConfig` | otomatik OpenAI seçimi | Codex `image_gen` için bağımsız Görseller aktarma seçenekleri. |
 
 Daha eski bir geliştirme derlemesi yedekleme desteği var olmadan önce devam
 geçmişi meta verilerini değiştirdiyse yerel sağlayıcı kurtarmasını zorlamak için
-`ocx recover-history --legacy-openai` çalıştırın.
+`ocx recover-history --legacy-openai --yes` çalıştırın.
+Komut, geçerli dedicated-provider geçmişi de dahil olmak üzere kullanıcı iletisi bulunan tüm `opencodex` satırlarını yeniden etiketler; çalıştırmadan önce lifecycle başvurusundaki tam kapsam uyarısını okuyun.
+
+### Yerel Chat zaman aşımı ve tamamlanma
+
+Yerel Chat de üst sunucu çıktısını beklerken `stallTimeoutSec` kullanır. Boş olmayan metin, akıl yürütme, ret içeriği, araç güncellemeleri ve bitiş olayları süreyi yeniler; bağlantıyı canlı tutan yorumlar, yalnızca rol ve yalnızca kullanım bilgileri yenilemez. Yavaş istemcinin okumasını beklemek süreyi duraklatır. Zaman aşımı `upstream_stall_timeout` üretir: akış istemcileri hata olayı, akışsız istemciler HTTP 502 alır. Sonuç tamamlanmadan iptal edilen istek, başarılı bir kısmi yanıt yerine iptal hatası döndürür. Akışsız Chat, LF ve CRLF ayraçlarını ve çok satırlı data alanlarını destekler.
 
 ## Uzaktan erişim
 
@@ -110,8 +116,9 @@ tarafından atanmaz: geçici bir port yeniden başlatmalar arasında değişirke
 zaten çalışan app-server'lar önceki `base_url`'i tutardı.
 
 Dinleyici yalnızca `POST /v1/responses`, onun WebSocket yükseltmesi, `POST
-/v1/responses/compact` ve `GET /v1/models` sunar. `/api/*` ve kontrol paneli
-dahil diğer her şey `404` döndürür.
+/v1/responses/compact`, `POST /v1/alpha/search` (yerel Codex web arama aktarımı),
+`GET /v1/models` ve bağımsız sesli WebSocket yükseltmelerini sunar. `/api/*` ve
+kontrol paneli dahil diğer her şey `404` döndürür.
 
 :::danger[Bu kimliği doğrulanmamış bir yüzeydir]
 Makinedeki her süreç bu dinleyiciyi kullanabilir. Hesap kotasını ve ücretli
@@ -190,28 +197,36 @@ ve Claude kontrol paneli sayfasını yönetir.
 Otomatik kimlik doğrulama saklanan Claude kimlik doğrulaması bulunduğunda
 subscription'ı, hiçbiri bulunmadığında proxy'yi ve algılama yetersiz olduğunda
 bir uyarı ile subscription'ı seçer. Bkz. [Claude Code kimlik doğrulama
-modu](/tr/guides/claude-code/#auth-mode).
+modu](/tr/guides/claude-code/#kimlik-doğrulama-modu-auth-mode).
 
 ## Gölge çağrılar
 
 Codex, başlıklar ve commit mesajları gibi görevler için küçük yardımcı modeller
-kullanır. Tanınan kaynak model öneklerini düşük çabayla yapılandırılmış başka
-bir modele yeniden yönlendirmek için `shadowCallIntercept`'i etkinleştirin.
+kullanır. Tanınan kaynak model öneklerini yapılandırılmış başka bir modele yeniden
+yönlendirmek için `shadowCallIntercept`'i etkinleştirin. Değiştirilen istek, yapılandırılmış
+akıl yürütme çabasını korur.
 `sourceModels`'ı yalnızca bir istemci farklı yardımcı kimlikleri kullandığında
-ayarlayın. Codex 0.145.0+, istek amacını `x-codex-turn-metadata` içinde
-işaretler: normal `request_kind: "turn"` istekleri seçilen modeli tutarken
-tanınan bakım istekleri yeniden yönlendirilebilir. Bu meta verileri içermeyen
-istemciler eski önek davranışını korur.
+ayarlayın. Yakalama model tabanlıdır: çıplak model kimliği `sourceModels` ile
+eşleşen her istek, normal `request_kind: "turn"` istekleri dahil, yeniden
+yönlendirilebilir. `x-openai-subagent: collab_spawn` veya `x-codex-turn-metadata` JSON üst bilgisindeki
+`subagent_kind: "thread_spawn"` ile oluşturulmuş çocuk olarak işaretlenen istekler muaftır; açıkça oluşturulan
+bir alt aracının modeli korunur.
 
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### Hedef kullanılamadığında
+
+Yerine geçen model, operatörün seçtiği tek hedeftir; bu yüzden artık çözümlenemeyen bir hedef, çağrıyı başka yere göndermek yerine yardımcı çağrıyı başarısız kılar. Hedefin sağlayıcısı devre dışı bırakılmış ya da silinmişse veya kombosu artık yoksa, yakalanan istek üst kaynağa bir şey gönderilmeden önce `409` ve `intercept_target_unavailable` hata koduyla döner. İstek günlüğü de aynı kodu kaydeder. İstek yerel yardımcı modele aktarılmaz ve varsayılan sağlayıcıya geri düşmez; ikisi de sizin seçiminiz olmadan hedefi, kimlik bilgilerini ve maliyeti değiştirirdi. Bir kombo veya yönlendirme profili hedefi kendi üyeleri arasında yük devretmeye devam eder. Sağlayıcı kısmı yapılandırılmış hiçbir şeyi göstermeyen `provider/model` gibi nitelikli bir hedef de aynı şekilde ele alınır ve ayarlar API'si bunu kaydetmeyi reddeder. Varsayılan sağlayıcı üzerinden çözümlenen yalın bir model kimliği geçerli kalır.
+
+Hedefin çözümlendiği sağlayıcıyı devre dışı bırakmak (`disabled: true` ile `PATCH /api/providers?name=<provider>`) veya silmek yine başarılı olur; yanıta `dependentShadowIntercept: { model, enabled }` eklenir ve pano bir uyarı gösterir. Sağlayıcıyı yeniden etkinleştirmek veya başka bir hedef seçmek yakalamayı geri getirir.
 
 ## Sidecar'lar
 
@@ -231,9 +246,11 @@ Images API yollarını ve yanıt şeklini uygulamalıdır.
 
 | Alan | Tip | Varsayılan | Anlamı |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana anahtar. |
-| `backend?` | `"openai" \| "anthropic"` | auto | Açık olan kazanır; aksi takdirde kullanılabilir saklanan Anthropic OAuth `anthropic`'i, ardından `openai`'yi seçer. |
-| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna` veya Anthropic için `claude-sonnet-5`. Eski açık `gpt-5.4-mini` başlangıçta geçirilir. |
+| `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana anahtar. `false` olduğunda OpenCodex `web_search` yakalamayı bırakır ve Codex entegrasyonu `~/.codex/config.toml` dosyasına `web_search = "disabled"` yazar. |
+| `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Açık değer kazanır; ayarlanmadığında her zaman `openai` seçilir. `anthropic` ve `xai` yalnızca açıkça yapılandırıldığında çalışır; `gemini` ve `exa` executor'ları sunulana kadar ayrılmıştır. |
+| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna`, Anthropic için `claude-sonnet-5` veya xAI için `grok-4.6`. Eski açık `gpt-5.4-mini` başlangıçta geçirilir. |
+| `exaApiKey?` | `string` | yok | `exa` arka ucu için operatör anahtarı. Yalnızca yazılır; yönetim okumaları saklanan değeri asla döndürmez. |
+| `xSearch?` | `object` | atlanmış | Yalnızca xAI için hosted `x_search` opt-in: `enabled`, birbirini dışlayan `allowedXHandles` / `excludedXHandles` dizileri (en fazla 20) ve ISO `fromDate` / `toDate` (`YYYY-MM-DD`). |
 | `reasoning?` | `string` | `low` | Sidecar çabası. `minimal` web araması ile reddedilir. |
 | `maxSearchesPerTurn?` | `number` | `3` | Ana model turu başına izin verilen gerçek aramalar. |
 | `routedModelStallTimeoutMs?` | `number` | `200000` | Yalnızca yapılandırma dosyasındaki yönlendirilen model ham gövde hareketsizlik süresi sınırı. Tamsayı 1–2147483647; boş olmayan her parça onu sıfırlar. |
@@ -246,6 +263,11 @@ etkinleştirilmiş bir Anthropic OAuth sağlayıcısından gelen aktif saklanan 
 bilgisini kullanır. Kullanılabilir hesabı olmayan açıkça seçilmiş bir Anthropic
 arka ucu geri dönmek yerine kapalı olarak başarısız olur. Anthropic yürütücüsü
 yerel `web_search_20250305` aracını kullanır.
+xAI arka ucu kullanılabilir, saklanmış bir Grok OAuth hesabı gerektirir, hosted `web_search` kullanır
+ve `xSearch.enabled` true olduğunda hosted `x_search` ekler. Hatalı `xSearch` yönetim girdisi `400`
+döndürür; hatalı kalıcı blok planlama sırasında kapalı olarak başarısız olur. `gemini` ve `exa`
+hatları kimlik bilgisi keşfi veya fallback ile hiçbir zaman etkinleşmez; operatör bunları açıkça
+seçmelidir. `exaApiKey` yazmalarda kabul edilir ancak yönetim yanıtlarından çıkarılır.
 
 Aramayı dört saat yönetir: temel `stallTimeoutSec`, `connectTimeoutMs`,
 yönlendirilen model hareketsizliği ve barındırılan arama zaman aşımı. Geçerli
@@ -257,8 +279,8 @@ hareketsizlik korumasıdır, toplam bir üretim süresi sınırı değildir.
 | Alan | Tip | Varsayılan | Anlamı |
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana görsel açıklama anahtarı. |
-| `backend?` | `"openai" \| "anthropic"` | auto | Web araması ile aynı açık öncelikli, Anthropic kimlik bilgisine duyarlı seçim. |
-| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.4-mini` veya Anthropic için `claude-sonnet-5`. |
+| `backend?` | `"openai" \| "anthropic"` | auto | Açık değer önceliklidir; ayarlanmadığında kullanılabilir kayıtlı bir Anthropic OAuth kimlik bilgisi tercih edilir, aksi halde `openai` kullanılır. |
+| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna` veya Anthropic için `claude-sonnet-5`. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | Ana tur başına kabul edilen yeni açıklama önbellek ıskalamaları. `0` çağrıları devre dışı bırakır; geçersiz değerler varsayılanı kullanır. |
 | `timeoutMs?` | `number` | `45000` | Sidecar getirme zaman aşımı. Tamsayı 1–2147483647. |
 
@@ -274,3 +296,24 @@ sınırı tüketmez. Uzak `https:` görselleri ve başarısız veya boş açıkl
 Anthropic OAuth sidecar'ları opencodex'in mevcut Claude Code OAuth parmak izini
 yeniden kullanır. Hedeflenen hesap ve iş yükünü kapsamlı bir şekilde test edin.
 
+## Remote Hub anahtarları ve varsayılanlar
+
+`runtimeRole` varsayılan olarak `standalone` değerindedir. Hub; `hub.managementPublicOrigin`, yalnız loopback `hub.managementIngress` (yokken `enabled:false`) ve tam `remoteGui.allowedTailscaleUsers` (yokken boş) kullanır. İstemci anahtarı `config.json` yerine `service-api-token` içinde kalır; döndürme sırasında `service-api-token.prev` geçici olarak bulunabilir. Kullanım kayıtları yansıtılmaz.
+
+`remoteGui.allowInsecureHttp`, yalnızca eski strict-schema yapılandırmalarının yüklenebilmesi için tutulan, kullanımdan kaldırılmış bir no-op'tur. Yapılandırmadan silin: pairing grant'leri yalnız loopback veya kimliği doğrulanmış HTTPS üzerinden kabul edilir ve `true` değeri düz HTTP pairing'i yeniden açmaz.
+
+## Codex kota ağı tanılaması
+
+Ana Codex hesabının satırındaki `quotaRefresh`, kalan kotayı veya model erişim yetkisini değil, kota sorgusunun sonucunu açıklar. Önbellek kullanıldığında ya da sorgu yapılmadığında alan bulunmayabilir. Sorgu, etkileşimli terminalin değil çalışan proxy servisinin ortamını kullanır. `proxy` ayarlanmazsa mevcut ortam korunur; `"auto"` başlangıçta Windows veya macOS statik HTTP/HTTPS ayarlarını okur. macOS üzerinde devralınmış proxy varsa bu ayarlar okunmaz. macOS üzerinde geçerli `*.<domain>` kalıbı `.<domain>` olur: `*.local` için `foo.local` ve yalın `local` doğrudan gider, `xlocal` gitmez. Tam `169.254/16`, `169.254.0.0/16` ve `fe80::/10` aralıkları bir tanıyla atlanır; link-local IP adresleri proxy kullanır. IP adresleri ve `*` kabul edilir; diğer CIDR, glob ve yalın ana makine istisnaları ortam değiştirilmeden keşfi reddeder. PAC/WPAD, yalnızca SOCKS ayarları ve çalışma sırasındaki değişiklikler otomatik uygulanmaz. TUN ile başarı, HTTP proxy yolunun da çalıştığını tek başına göstermez. [Komutlar ve durumlar için İngilizce bölüme](/reference/configuration/server/#codex-quota-network-diagnostics) bakın.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

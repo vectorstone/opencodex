@@ -9,6 +9,26 @@
  * dropping images oldest-first — see toolCallStep in protobuf-request.ts).
  */
 
+import {
+  CODE_MODE_HOST_RECOVERY_PREFIX,
+  EMPTY_EXEC_OUTPUT_MESSAGE,
+  EMPTY_EXEC_OUTPUT_REGEX,
+  FAILED_EXEC_OUTPUT_MESSAGE,
+  annotateCodeModeHostFailure,
+  isCodexCodeModeExecResult,
+  isFailedEmptyExecWrapper,
+  isCodexExecBridgeTool,
+} from "../exec-tool-result-normalize";
+
+/**
+ * Cursor treats a failed-but-empty wrapper as an empty result too (its Computer Use branch marks
+ * such results `isError` separately). The shared success regex deliberately excludes
+ * `Script failed`, so restore that arm here rather than widening the shared one.
+ */
+function isEmptyOrFailedExecWrapper(text: string): boolean {
+  return EMPTY_EXEC_OUTPUT_REGEX.test(text) || isFailedEmptyExecWrapper(text);
+}
+
 const COMPUTER_USE_TOOL_NAMES = new Set([
   "node_repl",
   "node_repl__js",
@@ -49,9 +69,6 @@ const RUNTIME_FAILURE_GUIDANCE: ReadonlyArray<{ marker: string; guidance: string
   },
 ];
 
-/** Matches exec wrappers whose only payload is an empty-output marker. */
-const EMPTY_EXEC_OUTPUT_REGEX = /^(?:(?:Script completed|Script failed|Command finished|Execution finished)[^\n]*\n+)?(?:Wall time[^\n]*\n+)?(?:Output:\s*)?(?:<empty>)?\s*$/;
-
 export interface NormalizedToolResultText {
   text: string;
   isError: boolean;
@@ -69,18 +86,45 @@ export interface NormalizedToolResultText {
  */
 export function normalizeCursorToolResultText(
   text: string,
-  options: { toolName?: string; toolNamespace?: string; isError?: boolean } = {},
+  options: {
+    toolName?: string;
+    toolNamespace?: string;
+    isError?: boolean;
+    /** True only when the request's visible catalog is Codex code mode. */
+    codeMode?: boolean;
+  } = {},
 ): NormalizedToolResultText {
   const isError = options.isError === true;
   const computerUse = isNodeReplOrComputerUseTool(options.toolName, options.toolNamespace);
-  if (computerUse && EMPTY_EXEC_OUTPUT_REGEX.test(text.trim())) {
+  if (computerUse && isEmptyOrFailedExecWrapper(text.trim())) {
     return {
       text: "[empty output: the tool ran but produced no stdout or return value. Verify application state with get_app_state, or make the script emit output.]",
       isError: true,
       changed: true,
     };
   }
-  if (!isError) {
+  if (isCodexExecBridgeTool(options.toolName, options.toolNamespace) && isEmptyOrFailedExecWrapper(text.trim())) {
+    return {
+      // A `Script failed` wrapper is empty but NOT a success: reporting it as an empty success
+      // would erase the only failure signal. Text classification stays separate from Cursor's
+      // isError policy, which the Computer Use branch above owns.
+      text: isFailedEmptyExecWrapper(text.trim()) ? FAILED_EXEC_OUTPUT_MESSAGE : EMPTY_EXEC_OUTPUT_MESSAGE,
+      isError: false,
+      changed: true,
+    };
+  }
+  // Replayed guidance and successful wrappers must not enter the legacy substring matcher.
+  if (text.includes(CODE_MODE_HOST_RECOVERY_PREFIX)
+    || /^(?:Script completed|Command finished|Execution finished)\b/.test(text.trimStart())) {
+    return { text, isError, changed: false };
+  }
+  // The request's visible catalog establishes provenance; the name alone also matches structured
+  // exec tools. Host guidance preserves Cursor's original error status.
+  if (options.codeMode === true && isCodexCodeModeExecResult(options.toolName, options.toolNamespace)) {
+    const hostFailure = annotateCodeModeHostFailure(text, options);
+    if (hostFailure !== undefined) return { text: hostFailure, isError, changed: true };
+  }
+  if (computerUse && !isError) {
     for (const { marker, guidance } of RUNTIME_FAILURE_GUIDANCE) {
       if (text.includes(marker)) {
         return { text: `${text}\n[recovery: ${guidance}]`, isError: true, changed: true };
@@ -89,4 +133,3 @@ export function normalizeCursorToolResultText(
   }
   return { text, isError, changed: false };
 }
-

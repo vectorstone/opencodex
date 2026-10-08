@@ -1,0 +1,616 @@
+import { describe, expect, test } from "bun:test";
+import { FORWARD_HEADERS, createResponsesPassthroughAdapter as createResponsesPassthroughAdapterProduction } from "../../src/adapters/openai-responses";
+import { headersForCodexAuthContext } from "../../src/codex/auth-context";
+import type { OcxParsedRequest, OcxProviderConfig } from "../../src/types";
+import { withTestTranslatorBudget } from "../helpers/translator-budget";
+
+const createResponsesPassthroughAdapter = (...args: Parameters<typeof createResponsesPassthroughAdapterProduction>) =>
+  withTestTranslatorBudget(createResponsesPassthroughAdapterProduction(...args));
+
+const accountA = {
+  accountId: "pool-a",
+  accessToken: "pool_a_token",
+  chatgptAccountId: "acct_pool_a",
+};
+
+const poolAuthContext = {
+  kind: "pool" as const,
+  accountId: accountA.accountId,
+  generation: 1,
+  accessToken: accountA.accessToken,
+  chatgptAccountId: accountA.chatgptAccountId,
+};
+
+function minimalParsed(): OcxParsedRequest {
+  return {
+    modelId: "gpt-5.4",
+    context: { messages: [] },
+    stream: false,
+    options: {},
+    _rawBody: { model: "gpt-5.4", input: [] },
+  };
+}
+
+describe("Codex metadata integrity", () => {
+  test("FORWARD_HEADERS includes client metadata allowlist entries", () => {
+    for (const name of [
+      "originator",
+      "session_id",
+      "session-id",
+      "thread-id",
+      "chatgpt-account-id",
+      "x-codex-parent-thread-id",
+    ]) {
+      expect(FORWARD_HEADERS).toContain(name);
+    }
+  });
+
+  /**
+   * Fork F-002 regression guard. `user-agent` is relayed by the adapter's own fallback, never by
+   * this allowlist: eleven call sites read `FORWARD_HEADERS` (Claude inbound, Chat bridge, WS
+   * bridge, the sidecars), so listing it here would relay the caller fingerprint on surfaces that
+   * never opted into the contract.
+   */
+  test("FORWARD_HEADERS does not list user-agent", () => {
+    expect(FORWARD_HEADERS).not.toContain("user-agent");
+  });
+
+  test("does not fabricate originator when absent", () => {
+    const incoming = new Headers({
+      "x-codex-parent-thread-id": "thread-1",
+    });
+    const headers = headersForCodexAuthContext(incoming, poolAuthContext);
+    expect(headers.get("originator")).toBeNull();
+    expect(headers.get("chatgpt-account-id")).toBe(accountA.chatgptAccountId);
+  });
+
+  test("preserves genuine originator", () => {
+    const incoming = new Headers({
+      originator: "codex_cli_rs",
+      "x-codex-parent-thread-id": "thread-1",
+    });
+    const headers = headersForCodexAuthContext(incoming, poolAuthContext);
+    expect(headers.get("originator")).toBe("codex_cli_rs");
+  });
+
+  test("preserves genuine session_id and thread-id", () => {
+    const incoming = new Headers({
+      session_id: "sess-real-1",
+      "thread-id": "thread-real-1",
+      "x-codex-parent-thread-id": "thread-1",
+    });
+    const headers = headersForCodexAuthContext(incoming, poolAuthContext);
+    expect(headers.get("session_id")).toBe("sess-real-1");
+    expect(headers.get("thread-id")).toBe("thread-real-1");
+    expect(headers.get("x-codex-parent-thread-id")).toBe("thread-1");
+  });
+
+  test("does not fabricate session_id or thread-id when absent", () => {
+    const headers = headersForCodexAuthContext(new Headers(), poolAuthContext);
+    expect(headers.get("session_id")).toBeNull();
+    expect(headers.get("session-id")).toBeNull();
+    expect(headers.get("thread-id")).toBeNull();
+    expect(headers.get("originator")).toBeNull();
+  });
+
+  test("outgoing chatgpt-account-id matches selected pool credential", () => {
+    const incoming = new Headers({
+      authorization: "Bearer caller_token",
+      "chatgpt-account-id": "caller_acct_should_be_replaced",
+      originator: "codex_cli_rs",
+    });
+    const headers = headersForCodexAuthContext(incoming, poolAuthContext);
+    expect(headers.get("authorization")).toBe(`Bearer ${accountA.accessToken}`);
+    expect(headers.get("chatgpt-account-id")).toBe(accountA.chatgptAccountId);
+    expect(headers.get("originator")).toBe("codex_cli_rs");
+  });
+
+  test("main-pool auth context also overwrites chatgpt-account-id without fabricating originator", () => {
+    const incoming = new Headers({
+      "chatgpt-account-id": "stale_caller_acct",
+      "x-codex-parent-thread-id": "thread-1",
+    });
+    const headers = headersForCodexAuthContext(incoming, {
+      kind: "main-pool",
+      accountId: "__main__",
+      accessToken: "main_access",
+      chatgptAccountId: "main_acct",
+    });
+    expect(headers.get("chatgpt-account-id")).toBe("main_acct");
+    expect(headers.get("authorization")).toBe("Bearer main_access");
+    expect(headers.get("originator")).toBeNull();
+  });
+
+  test("adapter forward mode does not fabricate originator and applies pool override", () => {
+    const provider: OcxProviderConfig & {
+      _codexAccountOverride: { accessToken: string; chatgptAccountId: string };
+      _codexAccountRequired: boolean;
+    } = {
+      adapter: "openai-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      authMode: "forward",
+      _codexAccountRequired: true,
+      _codexAccountOverride: {
+        accessToken: accountA.accessToken,
+        chatgptAccountId: accountA.chatgptAccountId,
+      },
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), {
+      headers: new Headers({
+        "x-codex-parent-thread-id": "thread-1",
+        "chatgpt-account-id": "caller_stale",
+      }),
+    });
+    expect(request).not.toBeInstanceOf(Promise);
+    const sync = request as { headers: Record<string, string> };
+    expect(sync.headers.originator).toBeUndefined();
+    expect(sync.headers["chatgpt-account-id"]).toBe(accountA.chatgptAccountId);
+    expect(sync.headers.authorization).toBe(`Bearer ${accountA.accessToken}`);
+  });
+
+  test("adapter forward mode preserves genuine client metadata", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "openai-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      authMode: "forward",
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), {
+      headers: new Headers({
+        authorization: "Bearer caller-token",
+        originator: "codex_cli_rs",
+        session_id: "sess-real-2",
+        "thread-id": "thread-real-2",
+      }),
+    });
+    const sync = request as { headers: Record<string, string> };
+    expect(sync.headers.authorization).toBe("Bearer caller-token");
+    expect(sync.headers.originator).toBe("codex_cli_rs");
+    expect(sync.headers.session_id).toBe("sess-real-2");
+    expect(sync.headers["thread-id"]).toBe("thread-real-2");
+  });
+
+  test("adapter API key mode forwards User-Agent", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "openai-responses",
+      baseUrl: "https://upstream.test/v1",
+      apiKey: "sk-test-key",
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), {
+      headers: new Headers({
+        "user-agent": "codex_cli_rs/0.147.0",
+        originator: "codex_cli_rs",
+      }),
+    });
+    const sync = request as { headers: Record<string, string> };
+    expect(new Headers(sync.headers).get("user-agent")).toBe("codex_cli_rs/0.147.0");
+  });
+
+  /**
+   * F-002's boundary. The fallback relays exactly one non-credential header; it must not become
+   * a second route for the forward-mode allowlist, which carries attestation and turn metadata.
+   */
+  test("key mode relays only the caller User-Agent, not the wider forward allowlist", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "openai-responses",
+      baseUrl: "https://upstream.test/v1",
+      apiKey: "sk-test-key",
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), {
+      headers: new Headers({
+        "user-agent": "codex_cli_rs/0.147.0",
+        "x-oai-attestation": "attestation-should-not-leave",
+        "x-codex-turn-metadata": "{}",
+        session_id: "sess-should-not-leave",
+      }),
+    });
+    const sync = new Headers((request as { headers: Record<string, string> }).headers);
+    expect(sync.get("user-agent")).toBe("codex_cli_rs/0.147.0");
+    expect(sync.get("x-oai-attestation")).toBeNull();
+    expect(sync.get("x-codex-turn-metadata")).toBeNull();
+    expect(sync.get("session_id")).toBeNull();
+  });
+
+  test("a configured provider User-Agent wins case-insensitively and is not duplicated", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "openai-responses",
+      baseUrl: "https://upstream.test/v1",
+      apiKey: "sk-test-key",
+      headers: { "uSeR-aGeNt": "operator-agent/1" },
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), {
+      headers: new Headers({ "User-Agent": "caller-agent/1" }),
+    });
+    const raw = (request as { headers: Record<string, string> }).headers;
+    expect(Object.keys(raw).filter(name => name.toLowerCase() === "user-agent")).toHaveLength(1);
+    expect(new Headers(raw).get("user-agent")).toBe("operator-agent/1");
+  });
+
+  test("a caller with no User-Agent gets no invented client identity", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "openai-responses",
+      baseUrl: "https://upstream.test/v1",
+      apiKey: "sk-test-key",
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), { headers: new Headers() });
+    expect(new Headers((request as { headers: Record<string, string> }).headers).get("user-agent"))
+      .toBeNull();
+  });
+
+  test("adapter API key mode does not forward authorization", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "openai-responses",
+      baseUrl: "https://upstream.test/v1",
+      apiKey: "sk-test-key",
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), {
+      headers: new Headers({
+        authorization: "incoming-caller-token",
+        originator: "codex_cli_rs",
+      }),
+    });
+    const sync = request as { headers: Record<string, string> };
+    // The incoming lowercase authorization must not be forwarded.
+    expect(sync.headers["authorization"]).toBeUndefined();
+    // The api-key-derived Authorization header is still present.
+    expect(sync.headers["Authorization"]).toContain("sk-test-key");
+  });
+
+  test("adapter API key mode does not forward chatgpt-account-id", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "openai-responses",
+      baseUrl: "https://upstream.test/v1",
+      apiKey: "sk-test-key",
+    };
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest(minimalParsed(), {
+      headers: new Headers({
+        "chatgpt-account-id": "acct-should-not-leak",
+        originator: "codex_cli_rs",
+      }),
+    });
+    const sync = request as { headers: Record<string, string> };
+    expect(sync.headers["chatgpt-account-id"]).toBeUndefined();
+  });
+
+  test("Responses preserves caller User-Agent as a fallback in key and forward modes", async () => {
+    for (const provider of [
+      {
+        adapter: "openai-responses",
+        baseUrl: "https://gateway.example/v1",
+        authMode: "key",
+        apiKey: "test-key",
+      },
+      {
+        adapter: "openai-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authMode: "forward",
+      },
+    ] satisfies OcxProviderConfig[]) {
+      const request = await createResponsesPassthroughAdapter(provider).buildRequest(minimalParsed(), {
+        headers: new Headers({ "User-Agent": "codex_cli_rs/0.154.0" }),
+      });
+      expect(new Headers(request.headers).get("user-agent")).toBe("codex_cli_rs/0.154.0");
+    }
+  });
+
+  test("configured User-Agent wins case-insensitively and a missing caller value stays absent", async () => {
+    const configured = await createResponsesPassthroughAdapter({
+      adapter: "openai-responses",
+      baseUrl: "https://gateway.example/v1",
+      authMode: "key",
+      headers: { "uSeR-aGeNt": "operator-agent/1" },
+    }).buildRequest(minimalParsed(), {
+      headers: new Headers({ "User-Agent": "caller-agent/1" }),
+    });
+    expect(new Headers(configured.headers).get("user-agent")).toBe("operator-agent/1");
+    expect(Object.keys(configured.headers).filter(name => name.toLowerCase() === "user-agent"))
+      .toHaveLength(1);
+
+    const absent = await createResponsesPassthroughAdapter({
+      adapter: "openai-responses",
+      baseUrl: "https://gateway.example/v1",
+      authMode: "key",
+    }).buildRequest(minimalParsed(), { headers: new Headers() });
+    expect(new Headers(absent.headers).has("user-agent")).toBe(false);
+  });
+
+  test("the preserved User-Agent is the value received by the HTTP upstream", async () => {
+    let resolveObserved!: (value: string | null) => void;
+    const observed = new Promise<string | null>(resolve => { resolveObserved = resolve; });
+    const upstream = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        resolveObserved(request.headers.get("user-agent"));
+        return Response.json({ id: "response-fixture", output: [] });
+      },
+    });
+    try {
+      const built = await createResponsesPassthroughAdapter({
+        adapter: "openai-responses",
+        baseUrl: `http://127.0.0.1:${upstream.port}/v1`,
+        authMode: "key",
+      }).buildRequest(minimalParsed(), {
+        headers: new Headers({ "User-Agent": "codex_cli_rs/receiver-proof" }),
+      });
+      await fetch(built.url, {
+        method: built.method,
+        headers: built.headers,
+        body: built.body,
+      });
+      expect(await observed).toBe("codex_cli_rs/receiver-proof");
+    } finally {
+      upstream.stop(true);
+    }
+  });
+});
+
+
+describe("Codex request transport metadata", () => {
+  const url = "https://chatgpt.com/backend-api/codex/responses";
+  const liteHeader = "x-openai-internal-codex-responses-lite";
+  const liteKey = "ws_request_header_x_openai_internal_codex_responses_lite";
+  const hintHeader = "x-codex-routing-hint";
+
+  test("caller Lite false replaces a mixed-case configured true header", async () => {
+    const { prepareCodexWsRequest } = await import("../../src/server/responses/codex-ws-request");
+    const parsed = minimalParsed();
+    parsed._rawBody = { model: "gpt-5.6-sol", stream: true, input: [], client_metadata: { [liteKey]: "true" } };
+    const adapter = createResponsesPassthroughAdapter({
+      adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex",
+      headers: { "X-OpenAI-Internal-Codex-Responses-Lite": "true" },
+    });
+    const request = await adapter.buildRequest(parsed, { headers: new Headers({ [liteHeader]: "false" }) });
+    expect(new Headers(request.headers).get(liteHeader)).toBe("false");
+    const prepared = prepareCodexWsRequest(url, { body: request.body, headers: request.headers })!;
+    expect(JSON.parse(prepared.frameText).client_metadata[liteKey]).toBe("false");
+  });
+
+  test("canonical adapter forwards Lite through selected auth and derives the final wire tier/model", async () => {
+    const parsed = minimalParsed();
+    parsed.modelId = "gpt-5.6-luna";
+    parsed._rawBody = { model: "gpt-5.6-sol", input: [], service_tier: "flex" };
+    parsed.options.tierDecision = { kind: "set", value: "priority" };
+    const before = JSON.stringify(parsed._rawBody);
+    const incoming = headersForCodexAuthContext(new Headers({
+      [liteHeader]: "false", [hintHeader]: "model=stale;service_tier=default", originator: "codex_desktop",
+    }), poolAuthContext);
+    const adapter = createResponsesPassthroughAdapter({
+      adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex",
+      headers: { "X-Codex-Routing-Hint": "model=configured;service_tier=default" },
+    });
+    const request = await adapter.buildRequest(parsed, { headers: incoming });
+    const headers = new Headers(request.headers);
+    expect(headers.get(liteHeader)).toBe("false");
+    expect(headers.get(hintHeader)).toBe("model=gpt-5.6-sol;tier=priority");
+    expect(headers.get("authorization")).toBe("Bearer pool_a_token");
+    expect(headers.get("originator")).toBe("codex_desktop");
+    expect(JSON.parse(request.body).service_tier).toBe("priority");
+    expect(JSON.stringify(parsed._rawBody)).toBe(before);
+    parsed.options.tierDecision = { kind: "drop" };
+    const dropped = await adapter.buildRequest(parsed, { headers: incoming });
+    expect(new Headers(dropped.headers).get(hintHeader)).toBe("model=gpt-5.6-sol");
+  });
+
+  test("canonical adapter preserves generic Lite caller and static header intent", async () => {
+    const adapter = createResponsesPassthroughAdapter({
+      adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex",
+      headers: { "X-OpenAI-Internal-Codex-Responses-Lite": "true" },
+    });
+
+    for (const [model, incomingLite, expectedLite] of [
+      ["gpt-5.6-luna", "true", "true"],
+      ["gpt-6-astra", undefined, "true"],
+      ["gpt-5.6-sol", "false", "false"],
+      // A manually typed retired id gets no model-specific transport policy.
+      ["gpt-5.3-codex-spark", "true", "true"],
+      ["gpt-5.6-sol", "true", "true"],
+    ] as const) {
+      const parsed = minimalParsed();
+      parsed.modelId = model;
+      parsed._rawBody = { model, input: [], stream: true };
+      const incoming = new Headers();
+      if (incomingLite !== undefined) incoming.set(liteHeader, incomingLite);
+      const request = await adapter.buildRequest(parsed, {
+        headers: incoming,
+      });
+      expect(new Headers(request.headers).get(liteHeader)).toBe(expectedLite);
+    }
+
+    const routed = minimalParsed();
+    routed.modelId = "sol-alias";
+    routed._rawBody = { model: "gpt-5.6-sol", input: [], stream: true };
+    const request = await adapter.buildRequest(routed, { headers: new Headers({ [liteHeader]: "true" }) });
+    expect(new Headers(request.headers).get(liteHeader)).toBe("true");
+  });
+
+  test("noncanonical adapters neither forward caller Lite nor synthesize a routing hint", async () => {
+    for (const authMode of ["forward", "key"] as const) {
+      const adapter = createResponsesPassthroughAdapter({
+        adapter: "openai-responses", authMode, baseUrl: "https://gateway.example/v1",
+        headers: { [hintHeader]: "operator-owned" },
+      });
+      const parsed = minimalParsed();
+      parsed.modelId = "gpt-5.3-codex-spark";
+      parsed._rawBody = { model: parsed.modelId, input: [] };
+      const request = await adapter.buildRequest(parsed, {
+        headers: new Headers({ [liteHeader]: "true", [hintHeader]: "caller-owned" }),
+      });
+      expect(new Headers(request.headers).has(liteHeader)).toBe(false);
+      expect(new Headers(request.headers).get(hintHeader)).toBe("operator-owned");
+    }
+  });
+
+  test("canonical preparation copies metadata, lets explicit Lite true/false win, and preserves HTTP init", async () => {
+    const { prepareCodexWsRequest } = await import("../../src/server/responses/codex-ws-request");
+    for (const lite of ["true", "false"]) {
+      const body = JSON.stringify({ model: "gpt-5.6-sol", service_tier: "priority", stream: true, type: "old",
+        input: [], reasoning: { effort: "high" },
+        client_metadata: { [liteKey]: lite === "true" ? "false" : "true", other: "한글; untouched" },
+      });
+      const headers = new Headers({
+        [liteHeader]: lite, [hintHeader]: "model=stale;service_tier=flex", originator: "codex_desktop",
+        authorization: "Bearer selected-fixture", "chatgpt-account-id": "selected-fixture",
+        "content-type": "application/json", "content-length": "123", accept: "text/event-stream",
+        "accept-encoding": "gzip", "openai-beta": "other=fixture",
+      });
+      const beforeHeaders = [...headers];
+      const init = { method: "POST", body, headers, signal: new AbortController().signal,
+        redirect: "error" as const, httpVersion: "1.1" as const };
+      const prepared = prepareCodexWsRequest(url, init)!;
+      expect(prepared.canonical).toBe(true);
+      expect(JSON.parse(prepared.frameText)).toEqual({ model: "gpt-5.6-sol", service_tier: "priority",
+        type: "response.create", input: [], reasoning: { effort: "high" },
+        client_metadata: { [liteKey]: lite, other: "한글; untouched" },
+      });
+      const wsHeaders = new Headers(prepared.headers);
+      expect(wsHeaders.get(hintHeader)).toBe("model=gpt-5.6-sol;tier=priority");
+      expect(wsHeaders.get("openai-beta")).toBe("other=fixture, responses_websockets=2026-02-06");
+      for (const name of ["content-type", "content-length", "accept", "accept-encoding"]) {
+        expect(wsHeaders.has(name)).toBe(false);
+      }
+      for (const name of [liteHeader, "originator", "authorization", "chatgpt-account-id"]) {
+        expect(wsHeaders.get(name)).toBe(headers.get(name));
+      }
+      expect(prepared.httpInit).not.toBe(init);
+      expect(prepared.httpInit).toEqual({ ...init, headers: new Headers({
+        ...Object.fromEntries(headers), [hintHeader]: "model=gpt-5.6-sol;tier=priority",
+      }) });
+      expect(prepared.httpInit.body).toBe(body);
+      expect(prepared.httpInit.signal).toBe(init.signal);
+      expect([...headers]).toEqual(beforeHeaders);
+      expect(init.body).toBe(body);
+    }
+  });
+
+  test("absent Lite preserves native metadata, invalid HTTP Lite does not coerce it, and no identity is invented", async () => {
+    const { prepareCodexWsRequest } = await import("../../src/server/responses/codex-ws-request");
+    for (const lite of [undefined, "yes", "1", "TRUE", "true, false"]) {
+      const headers = new Headers({ "openai-beta": "responses_websockets=existing" });
+      if (lite !== undefined) headers.set(liteHeader, lite);
+      const prepared = prepareCodexWsRequest(url, { headers, body: JSON.stringify({ model: "gpt-5.6-luna",
+        client_metadata: { [liteKey]: "false", thread_id: "thread-fixture" }, stream: true,
+      }) })!;
+      expect(JSON.parse(prepared.frameText).client_metadata).toEqual({ [liteKey]: "false", thread_id: "thread-fixture" });
+      expect(new Headers(prepared.headers).get("openai-beta")).toBe("responses_websockets=existing");
+      expect(new Headers(prepared.headers).has("originator")).toBe(false);
+      expect(new Headers(prepared.headers).has("user-agent")).toBe(false);
+    }
+    const absent = prepareCodexWsRequest(url, { body: '{"model":"gpt-5.6-luna","stream":true}' })!;
+    expect(JSON.parse(absent.frameText).client_metadata).toBeUndefined();
+    const explicit = prepareCodexWsRequest(url, {
+      headers: { [liteHeader]: "true" }, body: '{"model":"gpt-5.6-luna","stream":true}',
+    })!;
+    expect(JSON.parse(explicit.frameText).client_metadata).toEqual({ [liteKey]: "true" });
+  });
+
+  test("noncanonical WS preparation retains its prior wire serialization and operator headers", async () => {
+    const { prepareCodexWsRequest } = await import("../../src/server/responses/codex-ws-request");
+    for (const target of ["https://gateway.example/v1/responses", `${url}?mode=other`, `${url}/`]) {
+      const body = { model: "gpt-5.6-sol", stream: true, client_metadata: ["gateway-specific"], input: [] };
+      const prepared = prepareCodexWsRequest(target, { body: JSON.stringify(body),
+        headers: { [liteHeader]: "true", [hintHeader]: "operator-owned" },
+      })!;
+      expect(prepared.canonical).toBe(false);
+      expect(prepared.frameText).toBe(JSON.stringify({ model: "gpt-5.6-sol", client_metadata: ["gateway-specific"], input: [], type: "response.create" }));
+      expect(new Headers(prepared.headers).get(hintHeader)).toBe("operator-owned");
+      expect(new Headers(prepared.httpInit.headers).get(hintHeader)).toBe("operator-owned");
+      const noHint = prepareCodexWsRequest(target, { body: JSON.stringify(body) })!;
+      expect(new Headers(noHint.headers).has(hintHeader)).toBe(false);
+    }
+  });
+
+  test("malformed JSON records or native metadata retain HTTP fallback eligibility", async () => {
+    const { prepareCodexWsRequest } = await import("../../src/server/responses/codex-ws-request");
+    for (const body of [undefined, "{", "null", "[]", "true", "1", '"text"']) {
+      expect(prepareCodexWsRequest(url, { body })).toBeNull();
+    }
+    for (const client_metadata of [null, [], true, 1, "text", { unrelated: false }, { [liteKey]: true }]) {
+      const init = { body: JSON.stringify({ model: "gpt-5.6-luna", client_metadata }), headers: { [liteHeader]: "true" } };
+      const before = JSON.stringify(init);
+      expect(prepareCodexWsRequest(url, init)).toBeNull();
+      expect(JSON.stringify(init)).toBe(before);
+    }
+  });
+
+  test("routing hint removes stale values and rejects invalid model or tier components without changing the body", async () => {
+    const { applyCodexRoutingHint } = await import("../../src/codex/forward-transport-headers");
+    const invalid = ["", " ", "model;service_tier=priority", "model=tier", "a b", "a\t", "a\n", "a\r", "a\0", "a\x7f", "é", null, 42];
+    for (const body of [null, [], "text", {}, ...invalid.map(model => ({ model })),
+      ...invalid.map(service_tier => ({ model: "gpt-5.6-luna", service_tier })),
+      { model: "m".repeat(257) }, { model: "gpt-5.6-luna", service_tier: "t".repeat(65) }]) {
+      const headers = new Headers({ [hintHeader]: "model=stale;service_tier=priority", originator: "unchanged" });
+      const before = JSON.stringify(body);
+      applyCodexRoutingHint(headers, body);
+      expect(headers.has(hintHeader)).toBe(false);
+      expect(headers.get("originator")).toBe("unchanged");
+      expect(JSON.stringify(body)).toBe(before);
+    }
+    const headers = new Headers();
+    applyCodexRoutingHint(headers, { model: "m".repeat(256), service_tier: "t".repeat(64) });
+    expect(headers.get(hintHeader)).toBe(`model=${"m".repeat(256)};tier=${"t".repeat(64)}`);
+    applyCodexRoutingHint(headers, { model: "gpt-5.6-luna" });
+    expect(headers.get(hintHeader)).toBe("model=gpt-5.6-luna");
+  });
+});
+
+
+describe("Lite follows the serialized wire model", () => {
+  const liteHeader = "x-openai-internal-codex-responses-lite";
+  const liteKey = "ws_request_header_x_openai_internal_codex_responses_lite";
+  test("bracket normalization and both alias directions use the wire model", async () => {
+    const adapter = createResponsesPassthroughAdapter({ adapter: "openai-responses", authMode: "forward",
+      baseUrl: "https://chatgpt.com/backend-api/codex", modelSuffixBracketStrip: true });
+    for (const [selector, model, expectedModel, expectedLite] of [
+      // A retired id is just a string on the wire now, so the caller's Lite intent survives in
+      // both alias directions while bracket stripping and the routing hint still follow the body.
+      ["alias", "gpt-5.3-codex-spark[1m]", "gpt-5.3-codex-spark", "true"],
+      ["gpt-5.3-codex-spark", "gpt-5.6-sol", "gpt-5.6-sol", "true"],
+    ]) {
+      const parsed = minimalParsed();
+      parsed.modelId = selector;
+      parsed._rawBody = { model, input: [] };
+      const before = JSON.stringify(parsed._rawBody);
+      const built = await adapter.buildRequest(parsed, { headers: new Headers({ [liteHeader]: "true" }) });
+      expect(JSON.parse(built.body).model).toBe(expectedModel);
+      expect(new Headers(built.headers).get(liteHeader)).toBe(expectedLite);
+      expect(new Headers(built.headers).get("x-codex-routing-hint")).toContain(`model=${expectedModel}`);
+      expect(JSON.stringify(parsed._rawBody)).toBe(before);
+    }
+  });
+
+  test("a retired-id body keeps its tool groups and the configured Lite header", async () => {
+    // Spark's tool filtering is gone: no group is dropped or rewritten, and the static header wins.
+    const { prepareCodexWsRequest } = await import("../../src/server/responses/codex-ws-request");
+    const tools = [{ type: "namespace", name: "functions", tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }] }];
+    const adapter = createResponsesPassthroughAdapter({ adapter: "openai-responses", authMode: "forward",
+      baseUrl: "https://chatgpt.com/backend-api/codex", headers: { [liteHeader]: "true" } });
+    const parsed = minimalParsed();
+    parsed.modelId = "gpt-5.3-codex-spark";
+    parsed._rawBody = { model: parsed.modelId, input: [{ type: "additional_tools", tools }] };
+    const built = await adapter.buildRequest(parsed);
+    const body = JSON.parse(built.body);
+    expect(body.input.find((item: { type: string }) => item.type === "additional_tools")?.tools).toEqual(tools);
+    expect(new Headers(built.headers).get(liteHeader)).toBe("true");
+    const prepared = prepareCodexWsRequest("https://chatgpt.com/backend-api/codex/responses", { body: built.body, headers: built.headers });
+    expect(JSON.parse(prepared!.frameText).client_metadata[liteKey]).toBe("true");
+  });
+
+  test("noncanonical static Lite remains operator-owned", async () => {
+    for (const authMode of ["key", "forward"] as const) {
+      const adapter = createResponsesPassthroughAdapter({ adapter: "openai-responses", authMode,
+        baseUrl: "https://gateway.example/v1", headers: { [liteHeader]: "operator-owned" } });
+      const parsed = minimalParsed();
+      parsed._rawBody = { model: "gpt-5.3-codex-spark", input: [] };
+      const built = await adapter.buildRequest(parsed, { headers: new Headers({ [liteHeader]: "true" }) });
+      expect(new Headers(built.headers).get(liteHeader)).toBe("operator-owned");
+    }
+  });
+});

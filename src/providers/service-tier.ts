@@ -1,5 +1,5 @@
 import type { OcxProviderConfig } from "../types";
-import { captureWireAdapterHardPins } from "../types";
+import { captureWireAdapterHardPinPrefixes, captureWireAdapterHardPins } from "../types";
 import { isCanonicalOpenAiForwardProvider } from "./openai-tiers";
 import {
   getProviderRegistryEntry,
@@ -15,6 +15,7 @@ import {
   type FastPolicyAuthority,
   type ResolvedFastPolicy,
 } from "./fastwire";
+import { providerFastSwitchOff } from "./fast-opt-in";
 
 /** OpenAI-compatible adapters that can carry the standard `service_tier` field. */
 export const SERVICE_TIER_ADAPTERS = new Set(["openai-chat", "openai-responses"]);
@@ -35,6 +36,7 @@ type ServiceTierCapabilityProvider = Pick<
   | "apiKeyTransport"
   | "chatServiceTier"
   | "fastWire"
+  | "fastEnabled"
 >;
 
 function cloneRegistryWireDefaults(
@@ -45,7 +47,16 @@ function cloneRegistryWireDefaults(
   for (const [modelId, declaration] of Object.entries(defaults)) {
     clone[modelId.trim().toLowerCase()] = typeof declaration === "string"
       ? declaration
-      : Object.freeze({ wire: declaration.wire, inbound: Object.freeze([...declaration.inbound]) });
+      : Object.freeze({
+          wire: declaration.wire,
+          inbound: Object.freeze([...declaration.inbound]),
+          ...(declaration.authModes
+            ? { authModes: Object.freeze([...declaration.authModes]) }
+            : {}),
+          ...(declaration.forwardCallerServiceTier !== undefined
+            ? { forwardCallerServiceTier: declaration.forwardCallerServiceTier }
+            : {}),
+        });
   }
   return Object.freeze(clone);
 }
@@ -61,33 +72,55 @@ function buildFastPolicyAuthority(
   capabilityProvider: ServiceTierCapabilityProvider = provider,
 ): FastPolicyAuthority {
   const registry = registryTransportMatch ? getProviderRegistryEntry(providerName) : undefined;
+  const authTransport = resolveProviderAuthTransport(
+    provider.adapter,
+    provider.authMode ?? registry?.authKind ?? "key",
+    provider.apiKeyTransport,
+  );
+  const keyAuthDefaults = registry?.allowKeyAuthOverride === true
+    && (authTransport === "authorization_bearer" || authTransport === "x_api_key")
+    ? registry.keyAuthServiceTier
+    : undefined;
   const registryModelCapabilities = registry
     && registryModelServiceTierCapabilityApplies(registry, capabilityProvider)
     ? registry.modelSupportsServiceTier
     : undefined;
-  const providerCapability = capabilityProvider.supportsServiceTier ?? registry?.supportsServiceTier;
+  const fastSwitchOff = providerFastSwitchOff(providerName, {
+    fastEnabled: capabilityProvider.fastEnabled ?? provider.fastEnabled,
+  });
+  const providerCapability = fastSwitchOff
+    ? false
+    : capabilityProvider.supportsServiceTier
+      ?? keyAuthDefaults?.supportsServiceTier
+      ?? registry?.supportsServiceTier;
   const authority: FastPolicyAuthority = Object.freeze({
     providerAdapter: provider.adapter,
+    providerAuthMode: provider.authMode ?? registry?.authKind ?? "key",
     fastWireDeclaration: cloneFastWire(
       provider.fastWire !== undefined ? provider.fastWire : registry?.fastWire,
       { freeze: true },
     ),
+    ...(registry?.fastTierDescription !== undefined
+      ? { fastTierDescription: registry.fastTierDescription }
+      : {}),
     modelWireOverrideAllowed: !isCanonicalOpenAiForwardProvider(provider as OcxProviderConfig),
-    authTransport: resolveProviderAuthTransport(
-      provider.adapter,
-      provider.authMode ?? registry?.authKind ?? "key",
-      provider.apiKeyTransport,
-    ),
+    authTransport,
     capability: Object.freeze({
       ...(providerCapability !== undefined ? { provider: providerCapability } : {}),
       models: Object.freeze({
         ...(registryModelCapabilities ?? {}),
+        ...(keyAuthDefaults?.modelSupportsServiceTier ?? {}),
         ...(capabilityProvider.modelSupportsServiceTier ?? {}),
       }),
-      ...(provider.chatServiceTier !== undefined ? { chatServiceTier: provider.chatServiceTier } : {}),
+      ...(provider.chatServiceTier !== undefined
+        ? { chatServiceTier: provider.chatServiceTier }
+        : keyAuthDefaults?.chatServiceTier !== undefined
+          ? { chatServiceTier: keyAuthDefaults.chatServiceTier }
+          : {}),
     }),
     modelAdapters: Object.freeze({ ...(provider.modelAdapters ?? {}) }),
     hardPins: captureWireAdapterHardPins(providerName),
+    hardPinPrefixes: captureWireAdapterHardPinPrefixes(providerName, provider),
     registryWireDefaults: cloneRegistryWireDefaults(registry?.modelWireDefaults),
   });
   return authority;
@@ -133,6 +166,7 @@ function authorityForProvider(
       ...authority,
       modelAdapters: Object.freeze({}),
       hardPins: Object.freeze({}),
+      hardPinPrefixes: Object.freeze({}),
       registryWireDefaults: Object.freeze({}),
     });
   }
@@ -241,13 +275,11 @@ export function serviceTierSupportFromPolicy(
 ): boolean | undefined {
   if (policy.eligibility === "eligible") return true;
   if (policy.eligibility === "unclassified") {
-    // B1 regression guard: an unclassified chat-wire route whose final adapter will not
-    // forward any tier cannot serialize service_tier, so projecting "unknown" would let
-    // require.serviceTier: "unsupported" routing stop matching groq/ollama-class providers
-    // that main projected as false. Chat + no forwarding stays a definitive false; a
-    // chat route with chatServiceTier: true (forwarding allowed) keeps the historical
-    // unknown, as does every unclassified Responses-wire route.
-    if (policy.adapter === "openai-chat" && !policy.forwardCallerTier) return false;
+    // An unclassified route that cannot forward a caller tier has definitive negative
+    // evidence even when its adapter can normally serialize service_tier. This covers both
+    // Chat routes without chatServiceTier and a registry default that explicitly closes a
+    // subscription gateway. Generic unclassified Responses routes still project unknown.
+    if (!policy.forwardCallerTier) return false;
     return undefined;
   }
   return false;

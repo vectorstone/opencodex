@@ -14,8 +14,10 @@ export interface ProvidersConfig {
     authMode?: string;
     keyOptional?: boolean;
     disabled?: boolean;
+    initialModelSelection?: { status: "pending" | "ready" | "all-off"; modelCount?: number };
     note?: string;
     codexAccountMode?: "direct" | "pool";
+    xaiResponsesOptInState?: boolean | "mixed";
   }>;
 }
 
@@ -24,6 +26,7 @@ export interface OAuthStatus {
   email?: string;
   error?: string;
   done?: boolean;
+  hint?: import("../components/login-url-block").LoginHintData;
   needsReauth?: boolean;
   activeAccountId?: string | null;
 }
@@ -48,9 +51,17 @@ const OAUTH_LABELS: Record<string, string> = {
   xai: "xAI (Grok)",
   anthropic: "Anthropic (Claude)",
   kimi: "Kimi (Moonshot)",
+  "meta-muse": "Meta Muse Code (CLI)",
   "google-antigravity": "Google Antigravity",
   "github-copilot": "GitHub Copilot",
   cursor: "Cursor",
+  // Brand only: the experimental/use-at-your-own-risk notice is localized in the login warning.
+  zed: "Zed Hosted AI",
+  // Accounts rows title through this map, not `formatProviderDisplayName`.
+  // Without an entry the row reads its raw id. `devin-cli` needs no entry:
+  // it is a deprecated alias that startup migration rewrites to `devin`, so a
+  // stored row can never reach this map under the old id.
+  devin: "Devin",
 };
 
 export const oauthLabel = (id: string) => OAUTH_LABELS[id] ?? id;

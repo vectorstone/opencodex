@@ -1,0 +1,198 @@
+# opencodex Structure Index
+
+This folder is the maintainer source of truth for the current system shape. Public user workflows
+belong in `docs-site/`. Development work is recorded in `devlog/` units — `_plan/` while open,
+`_fin/` once closed.
+
+Generated from `structure/manifest.json` by `bun run structure:index`. Do not edit by hand; `bun run structure:check` fails when this file and the manifest disagree. The rules for changing anything
+in this folder are in [`AGENTS.md`](AGENTS.md).
+
+## Reading order
+
+### Tier 1 — Foundation
+
+What opencodex is, what it owns on disk, and the invariants nothing may break.
+
+| Doc | Scope |
+| --- | --- |
+| [`overview.md`](overview.md) | Product boundary, local state ownership, and the non-negotiable invariants index. |
+| [`runtime.md`](runtime.md) | Entrypoints, process lifecycle, CLI surface, and the Remote Hub, sideband, and request-compatibility contracts on that path. |
+
+### Tier 2 — Configuration and catalog
+
+Persisted config, the Codex home it writes into, and the model catalog it publishes.
+
+| Doc | Scope |
+| --- | --- |
+| [`config.md`](config.md) | Persisted config schema, both injection forms, provider validation, and restore. |
+| [`codex-home.md`](codex-home.md) | CODEX_HOME resolution, the files opencodex manages there, and Codex-home diagnostics. |
+| [`catalog.md`](catalog.md) | Shared Codex catalog assembly, account namespaces, pool rotation, and effort ladders. |
+| [`subagents.md`](subagents.md) | Multi-agent surface mode and subagent roster ordering. |
+| [`config-proxy.md`](config-proxy.md) | Global proxy activation, start flags, and credential-safe CLI output. |
+
+### Tier 3 — Data planes and transports
+
+The wire surfaces a client actually talks to.
+
+| Doc | Scope |
+| --- | --- |
+| [`transports/byte-accounting.md`](transports/byte-accounting.md) | Request-copy and stream-buffer byte accounting shared by parsing, SSE rewriting, the adapters, and the translator budget. |
+| [`transports/responses.md`](transports/responses.md) | The Responses HTTP/SSE endpoint, dispatch, credential and upload boundaries, and core module ownership. |
+| [`transports/responses-wire-shapes.md`](transports/responses-wire-shapes.md) | Mixed-wire model defaults, xAI agent-message continuation, declared-tool membership, and passthrough SSE stream shapes. |
+| [`transports/responses-failover.md`](transports/responses-failover.md) | Upstream reset retry, the ambiguous-resend gate, combo failover and commit boundaries, compaction routing, and output headroom. |
+| [`transports/policy-fallback.md`](transports/policy-fallback.md) | Original policy authorization, concrete candidate retries and physical destination deduplication. |
+| [`transports/responses-spend.md`](transports/responses-spend.md) | Credential-hop and durable spend reservations, and what a spent budget tells the client. |
+| [`transports/streaming-health.md`](transports/streaming-health.md) | Heartbeat and stall deadlines, plus the opt-in WebSocket transport. |
+| [`transports/inventory.md`](transports/inventory.md) | The per-provider transport table and diagnostic outbound safety. |
+| [`data-planes/images.md`](data-planes/images.md) | Standalone image generation/edit relay and local hosted Responses image display. |
+| [`data-planes/search.md`](data-planes/search.md) | Hosted search relay and exact account selectors. |
+| [`data-planes/inbound-compat.md`](data-planes/inbound-compat.md) | Chat Completions inbound, Anthropic-shaped clients, and JSON-upstream streaming clients. |
+| [`data-planes/protocol-paths.md`](data-planes/protocol-paths.md) | Shared protocol vocabulary, declared feature dispositions, the ingress-by-upstream baseline, plan/trace shapes, and protocol settings. |
+| [`remote-workspace.md`](remote-workspace.md) | Opt-in workspace identity, executor grants, runtime adapters, management and dashboard integration. |
+| [`remote-link.md`](remote-link.md) | SSH machine-link building blocks: OpenSSH argument policy, ssh_config candidates, tunnel lifecycle reducer, the private link store, and standalone pairing-grant delivery. |
+
+### Tier 4 — Providers and adapters
+
+Per-vendor contracts and the adapter authority that constructs them.
+
+| Doc | Scope |
+| --- | --- |
+| [`providers/anthropic-account-thresholds.md`](providers/anthropic-account-thresholds.md) | Account-owned usage thresholds, inheritance, routing boundaries and durable policy changes. |
+| [`providers-and-adapters.md`](providers-and-adapters.md) | Provider and adapter selection, the adapter inventory, live model discovery, and the hosted-search continuation bridge. |
+| [`providers/jev-decision.md`](providers/jev-decision.md) | JEV Combo decision methods (TypeSafe, self-hosted System One rows, opencodex models), the decision request path, dashboard surfaces, and the content-free statistics projection. |
+| [`providers/anthropic-account-pool.md`](providers/anthropic-account-pool.md) | Anthropic OAuth account pause, model routes, and quota labels. |
+| [`providers/openai-tiers.md`](providers/openai-tiers.md) | Pool/Direct account modes, API-key separation, and the public provider and quota contract. |
+| [`providers/openai-accounts.md`](providers/openai-accounts.md) | Migration and restore, wire identity, store concurrency, pool ordering and exclusions, quota observations, and account-bound retention. |
+| [`providers/cursor.md`](providers/cursor.md) | Cursor native exec, parameterized models, checkpoints, and active-context usage. |
+| [`providers/google.md`](providers/google.md) | Gemini thought-text, response parts, thought-signature replay, and adjacency repair. |
+| [`providers/kiro.md`](providers/kiro.md) | Kiro parallel-tool hints, Responses text controls, and reasoning round-trip. |
+| [`providers/xai-grok.md`](providers/xai-grok.md) | Grok Build contract parity and hardening. |
+| [`providers/chat-compat.md`](providers/chat-compat.md) | Cross-vendor Chat Completions behavior: reasoning, tool results, structured output, parallel tools. |
+| [`adapters/registry.md`](adapters/registry.md) | The single adapter construction authority and contract inheritance. |
+| [`adapters/compatibility-contracts.md`](adapters/compatibility-contracts.md) | Versioned provider compatibility claims and fixture-evidence boundaries. |
+| [`adapters/compatibility-lab.md`](adapters/compatibility-lab.md) | Optional Lab evidence, automation, and its core-runtime isolation boundary. |
+
+### Tier 5 — Surfaces and clients
+
+The dashboard, the management API, and third-party client config ownership.
+
+| Doc | Scope |
+| --- | --- |
+| [`cli-management.md`](cli-management.md) | Terminal help and capability metadata, management-client output and the generated operating reference. |
+| [`gui-and-management-api.md`](gui-and-management-api.md) | Dashboard serving, authentication boundaries, /api/* ownership, and startup safety. |
+| [`dashboard-and-usage.md`](dashboard-and-usage.md) | Dashboard page contracts, usage accounting and request metrics, and per-surface management settings. |
+| [`clients/integrations.md`](clients/integrations.md) | Third-party client config ownership, snapshots, refresh, disable, and restore. |
+| [`clients/chatgpt-desktop.md`](clients/chatgpt-desktop.md) | Experimental macOS app-server stdout shim, opt-in launch, restore and failure boundaries. |
+| [`clients/claude-desktop.md`](clients/claude-desktop.md) | Claude Desktop profile ownership and config-library resolution. |
+| [`companion.md`](companion.md) | Shared timeline filtering, usage/quotas, native and web tray title, and WidgetKit display contracts. |
+| [`codex-account-controls.md`](codex-account-controls.md) | Account selection order, custom usage thresholds, and stable account-card editing. |
+
+### Tier 6 — Operations and process
+
+Background service, docs, release, and design discipline.
+
+| Doc | Scope |
+| --- | --- |
+| [`desktop-shell.md`](desktop-shell.md) | Tauri desktop shell, proxy attachment and sidecar lifecycle, tray controls, bootstrap navigation, and desktop companion presence. |
+| [`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) | Service install/repair, platform launchers, tray, and sidecar processes. |
+| [`ops/plugins.md`](ops/plugins.md) | Plugin loading from OPENCODEX_HOME/plugins and the upstream rewrite slot plugins attach to. |
+| [`ops/docs-and-release.md`](ops/docs-and-release.md) | Docs site, workflow map, branch policy, release flow, and cross-platform CI. |
+| [`design-methodology.md`](design-methodology.md) | Stage ordering for new GUI, CLI, and user-facing surfaces. |
+| [`ops/cross-platform-ci.md`](ops/cross-platform-ci.md) | Test lanes, platform coverage, aggregate gating, and release CI proof. |
+| [`ops/test-sandbox-cleanup.md`](ops/test-sandbox-cleanup.md) | Test-runner home and case-scoped lifecycle teardown ordering. |
+
+## Which doc describes which source
+
+A source area can be described by more than one doc, because these docs are organised by topic and
+`src/` is organised by module. Changing an area requires review of every listed document. Edit only the documents whose local explanation changes; named cross-cutting authorities and dependents are listed below.
+
+| Source path | Described by |
+| --- | --- |
+| `.github/` | [`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `app/` | [`overview.md`](overview.md)<br>[`companion.md`](companion.md) |
+| `bin/` | [`runtime.md`](runtime.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `desktop/` | [`desktop-shell.md`](desktop-shell.md)<br>[`companion.md`](companion.md) |
+| `docs-site/` | [`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `gui/` | [`overview.md`](overview.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`design-methodology.md`](design-methodology.md)<br>[`companion.md`](companion.md) |
+| `scripts/` | [`overview.md`](overview.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `scripts/generate-ocx-skill-surface.ts` | [`cli-management.md`](cli-management.md) |
+| `skills/ocx/` | [`cli-management.md`](cli-management.md) |
+| `src/adapters/` | [`runtime.md`](runtime.md)<br>[`transports/byte-accounting.md`](transports/byte-accounting.md)<br>[`transports/responses-wire-shapes.md`](transports/responses-wire-shapes.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`data-planes/inbound-compat.md`](data-planes/inbound-compat.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md)<br>[`providers/cursor.md`](providers/cursor.md)<br>[`providers/chat-compat.md`](providers/chat-compat.md)<br>[`adapters/registry.md`](adapters/registry.md) |
+| `src/bridge.ts` | [`transports/responses.md`](transports/responses.md) |
+| `src/bridge/` | [`transports/responses.md`](transports/responses.md)<br>[`transports/responses-wire-shapes.md`](transports/responses-wire-shapes.md) |
+| `src/chat/` | [`runtime.md`](runtime.md)<br>[`transports/byte-accounting.md`](transports/byte-accounting.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`data-planes/inbound-compat.md`](data-planes/inbound-compat.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md)<br>[`providers/chat-compat.md`](providers/chat-compat.md) |
+| `src/chatgpt/` | [`clients/chatgpt-desktop.md`](clients/chatgpt-desktop.md) |
+| `src/claude/` | [`runtime.md`](runtime.md)<br>[`clients/claude-desktop.md`](clients/claude-desktop.md) |
+| `src/cli.ts` | [`runtime.md`](runtime.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `src/cli/` | [`runtime.md`](runtime.md)<br>[`config.md`](config.md)<br>[`cli-management.md`](cli-management.md)<br>[`clients/integrations.md`](clients/integrations.md)<br>[`clients/chatgpt-desktop.md`](clients/chatgpt-desktop.md)<br>[`clients/claude-desktop.md`](clients/claude-desktop.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `src/client/` | [`runtime.md`](runtime.md)<br>[`clients/claude-desktop.md`](clients/claude-desktop.md) |
+| `src/clients/` | [`clients/integrations.md`](clients/integrations.md) |
+| `src/codex/` | [`runtime.md`](runtime.md)<br>[`config.md`](config.md)<br>[`codex-home.md`](codex-home.md)<br>[`catalog.md`](catalog.md)<br>[`subagents.md`](subagents.md)<br>[`transports/responses-failover.md`](transports/responses-failover.md)<br>[`providers/openai-tiers.md`](providers/openai-tiers.md)<br>[`providers/openai-accounts.md`](providers/openai-accounts.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`clients/chatgpt-desktop.md`](clients/chatgpt-desktop.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `src/combos/` | [`runtime.md`](runtime.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md)<br>[`providers/jev-decision.md`](providers/jev-decision.md) |
+| `src/companion/` | [`overview.md`](overview.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`companion.md`](companion.md) |
+| `src/compatibility/` | [`runtime.md`](runtime.md)<br>[`adapters/compatibility-contracts.md`](adapters/compatibility-contracts.md) |
+| `src/config.ts` | [`overview.md`](overview.md)<br>[`runtime.md`](runtime.md)<br>[`config.md`](config.md)<br>[`providers/openai-accounts.md`](providers/openai-accounts.md) |
+| `src/config/` | [`runtime.md`](runtime.md)<br>[`config.md`](config.md) |
+| `src/config/persisted-mutation.ts` | [`runtime.md`](runtime.md) |
+| `src/generated/` | [`runtime.md`](runtime.md) |
+| `src/github/` | [`runtime.md`](runtime.md) |
+| `src/grok/` | [`runtime.md`](runtime.md) |
+| `src/images/` | [`runtime.md`](runtime.md)<br>[`transports/inventory.md`](transports/inventory.md) |
+| `src/index.ts` | [`runtime.md`](runtime.md) |
+| `src/integrations/` | [`clients/integrations.md`](clients/integrations.md) |
+| `src/lab/` | [`runtime.md`](runtime.md)<br>[`adapters/compatibility-lab.md`](adapters/compatibility-lab.md) |
+| `src/lib/` | [`overview.md`](overview.md)<br>[`runtime.md`](runtime.md)<br>[`transports/byte-accounting.md`](transports/byte-accounting.md)<br>[`transports/responses-wire-shapes.md`](transports/responses-wire-shapes.md)<br>[`transports/responses-failover.md`](transports/responses-failover.md)<br>[`transports/responses-spend.md`](transports/responses-spend.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`clients/integrations.md`](clients/integrations.md)<br>[`ops/service-and-sidecars.md`](ops/service-and-sidecars.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `src/lib/gui-pair-intent.ts` | [`remote-link.md`](remote-link.md) |
+| `src/lib/windows-owner-acl.ts` | [`remote-link.md`](remote-link.md) |
+| `src/link/` | [`remote-link.md`](remote-link.md) |
+| `src/oauth/` | [`runtime.md`](runtime.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`providers/anthropic-account-thresholds.md`](providers/anthropic-account-thresholds.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md)<br>[`providers/anthropic-account-pool.md`](providers/anthropic-account-pool.md)<br>[`providers/xai-grok.md`](providers/xai-grok.md) |
+| `src/plugins/` | [`ops/plugins.md`](ops/plugins.md) |
+| `src/protocols/` | [`data-planes/protocol-paths.md`](data-planes/protocol-paths.md) |
+| `src/providers/` | [`runtime.md`](runtime.md)<br>[`subagents.md`](subagents.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md)<br>[`providers/anthropic-account-pool.md`](providers/anthropic-account-pool.md)<br>[`providers/xai-grok.md`](providers/xai-grok.md) |
+| `src/quota/` | [`dashboard-and-usage.md`](dashboard-and-usage.md) |
+| `src/reasoning-effort.ts` | [`runtime.md`](runtime.md) |
+| `src/remote-control/` | [`remote-workspace.md`](remote-workspace.md) |
+| `src/remote/` | [`runtime.md`](runtime.md) |
+| `src/responses/` | [`runtime.md`](runtime.md)<br>[`transports/responses.md`](transports/responses.md)<br>[`transports/responses-wire-shapes.md`](transports/responses-wire-shapes.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md)<br>[`providers/kiro.md`](providers/kiro.md)<br>[`providers/xai-grok.md`](providers/xai-grok.md)<br>[`providers/chat-compat.md`](providers/chat-compat.md) |
+| `src/router.ts` | [`runtime.md`](runtime.md) |
+| `src/routing/` | [`catalog.md`](catalog.md) |
+| `src/server/` | [`runtime.md`](runtime.md)<br>[`catalog.md`](catalog.md)<br>[`subagents.md`](subagents.md)<br>[`transports/byte-accounting.md`](transports/byte-accounting.md)<br>[`transports/responses.md`](transports/responses.md)<br>[`transports/responses-wire-shapes.md`](transports/responses-wire-shapes.md)<br>[`transports/responses-failover.md`](transports/responses-failover.md)<br>[`transports/policy-fallback.md`](transports/policy-fallback.md)<br>[`transports/streaming-health.md`](transports/streaming-health.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`data-planes/images.md`](data-planes/images.md)<br>[`data-planes/inbound-compat.md`](data-planes/inbound-compat.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md)<br>[`providers/jev-decision.md`](providers/jev-decision.md)<br>[`providers/xai-grok.md`](providers/xai-grok.md)<br>[`adapters/registry.md`](adapters/registry.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`clients/claude-desktop.md`](clients/claude-desktop.md)<br>[`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) |
+| `src/server/gui-pair-delivery.ts` | [`remote-link.md`](remote-link.md) |
+| `src/server/index.ts` | [`adapters/compatibility-lab.md`](adapters/compatibility-lab.md) |
+| `src/server/management/companion-routes.ts` | [`desktop-shell.md`](desktop-shell.md) |
+| `src/service-manager-probe.ts` | [`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) |
+| `src/service.ts` | [`runtime.md`](runtime.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
+| `src/service/` | [`runtime.md`](runtime.md) |
+| `src/sidecar/` | [`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) |
+| `src/stall-timeout.ts` | [`runtime.md`](runtime.md) |
+| `src/storage/` | [`runtime.md`](runtime.md) |
+| `src/tray/` | [`runtime.md`](runtime.md) |
+| `src/types.ts` | [`runtime.md`](runtime.md)<br>[`config.md`](config.md) |
+| `src/types/` | [`providers-and-adapters.md`](providers-and-adapters.md) |
+| `src/update/` | [`runtime.md`](runtime.md)<br>[`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) |
+| `src/usage/` | [`runtime.md`](runtime.md)<br>[`providers/jev-decision.md`](providers/jev-decision.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`companion.md`](companion.md) |
+| `src/usage/timeline.ts` | [`gui-and-management-api.md`](gui-and-management-api.md) |
+| `src/vision/` | [`runtime.md`](runtime.md)<br>[`gui-and-management-api.md`](gui-and-management-api.md) |
+| `src/web-search/` | [`runtime.md`](runtime.md)<br>[`providers-and-adapters.md`](providers-and-adapters.md) |
+| `tests/` | [`ops/test-sandbox-cleanup.md`](ops/test-sandbox-cleanup.md) |
+
+### Not described by any doc
+
+| Source path | Why |
+| --- | --- |
+
+## Cross-cutting contracts
+
+Source review remains defined by the source-to-doc map above. This registry names each authoritative statement and the documents that review it. Link validation proves declared topology, not behavioral correctness.
+
+| Contract | Authority | Review dependents |
+| --- | --- | --- |
+| `paginated-history-writer` | [`codex-home.md#paginated-history-writer-boundary`](codex-home.md#paginated-history-writer-boundary) | [`catalog.md`](catalog.md)<br>[`config.md`](config.md)<br>[`dashboard-and-usage.md`](dashboard-and-usage.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md)<br>[`providers/openai-accounts.md`](providers/openai-accounts.md)<br>[`runtime.md`](runtime.md)<br>[`subagents.md`](subagents.md) |
+| `request-copy-accounting` | [`transports/byte-accounting.md#request-copy-accounting`](transports/byte-accounting.md#request-copy-accounting) | [`adapters/registry.md`](adapters/registry.md)<br>[`catalog.md`](catalog.md)<br>[`clients/claude-desktop.md`](clients/claude-desktop.md)<br>[`clients/integrations.md`](clients/integrations.md)<br>[`data-planes/images.md`](data-planes/images.md)<br>[`data-planes/inbound-compat.md`](data-planes/inbound-compat.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md)<br>[`ops/service-and-sidecars.md`](ops/service-and-sidecars.md)<br>[`overview.md`](overview.md)<br>[`providers/chat-compat.md`](providers/chat-compat.md)<br>[`providers/cursor.md`](providers/cursor.md)<br>[`providers/xai-grok.md`](providers/xai-grok.md)<br>[`runtime.md`](runtime.md)<br>[`subagents.md`](subagents.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`transports/streaming-health.md`](transports/streaming-health.md) |
+| `stream-buffer-accounting` | [`transports/byte-accounting.md#stream-buffer-accounting`](transports/byte-accounting.md#stream-buffer-accounting) | [`adapters/registry.md`](adapters/registry.md)<br>[`catalog.md`](catalog.md)<br>[`clients/claude-desktop.md`](clients/claude-desktop.md)<br>[`clients/integrations.md`](clients/integrations.md)<br>[`data-planes/images.md`](data-planes/images.md)<br>[`data-planes/inbound-compat.md`](data-planes/inbound-compat.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md)<br>[`ops/service-and-sidecars.md`](ops/service-and-sidecars.md)<br>[`overview.md`](overview.md)<br>[`providers/chat-compat.md`](providers/chat-compat.md)<br>[`providers/cursor.md`](providers/cursor.md)<br>[`providers/xai-grok.md`](providers/xai-grok.md)<br>[`runtime.md`](runtime.md)<br>[`subagents.md`](subagents.md)<br>[`transports/inventory.md`](transports/inventory.md)<br>[`transports/streaming-health.md`](transports/streaming-health.md) |
+
+## Decision records
+
+Superseded reasoning lives in `decisions/` as numbered records. A doc states the contract that holds now and
+links the record that explains why; it never carries the reasoning inline.
+

@@ -1,16 +1,54 @@
 import * as readline from "node:readline";
+import { modelSelectionGuidance } from "../cli/model-selection-guidance";
+import { initializeProviderModelSelection } from "../providers/initial-model-selection";
 import { openUrl } from "../lib/open-url";
+import { createBrowserLaunchReport } from "../lib/browser-launch-notice";
 import { loadConfig, saveConfig } from "../config";
 import { findLiveProxy } from "../server/proxy-liveness";
 import {
   requestBoundLocalProviderReload,
   type LocalProviderReloadResult,
 } from "../server/local-provider-reload-client";
-import { isPublicOAuthProvider, listOAuthProviders, runLogin } from "./index";
+import { DEPRECATED_OAUTH_PROVIDER_ALIASES, isPublicOAuthProvider, listOAuthProviders, runLogin } from "./index";
 import { KEY_LOGIN_PROVIDERS, isKeyLoginProvider, validateApiKey, type KeyLoginProvider } from "./key-providers";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import { configuredAdminToken } from "../lib/admin-secrets";
 import { codexAccountNamespaceProviderCollisionError } from "../codex/account-namespace-match";
+
+/**
+ * Seams a test drives in place of a browser, a terminal and a real provider. Production passes
+ * none of them.
+ *
+ * They exist because the thing worth proving here is an ORDER — that a browser which did not
+ * open is on screen before the question that assumes it did — and an order is only observable
+ * from something that records both events. Spawning a launcher and attaching to stdin to find
+ * that out would test the operating system instead.
+ */
+export interface LoginCliDeps {
+  runLogin?: typeof runLogin;
+  openUrl?: typeof openUrl;
+  warn?: (message: string) => void;
+  /** Ask one question, read one line. Defaults to a readline prompt that owns its own lifetime. */
+  ask?: (question: string) => Promise<string>;
+}
+
+/**
+ * Run `body` with a line reader, creating and closing a real one only when the caller did not
+ * supply its own. A readline interface attaches to stdin, so building one that nothing will ask
+ * a question keeps the process alive for no reason.
+ */
+async function withPrompt<T>(
+  supplied: ((question: string) => Promise<string>) | undefined,
+  body: (ask: (question: string) => Promise<string>) => Promise<T>,
+): Promise<T> {
+  if (supplied) return await body(supplied);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await body(question => new Promise<string>(resolve => rl.question(question, resolve)));
+  } finally {
+    rl.close();
+  }
+}
 
 const LIVE_RELOAD_PROVIDERS = new Set<string>([
   ...listOAuthProviders(),
@@ -63,36 +101,69 @@ export function warnIfLiveReloadSkipped(result: LocalProviderReloadResult | null
   );
 }
 
-export async function handleLogin(provider?: string): Promise<void> {
+/**
+ * The provider wall is the first thing an unfamiliar user sees, so it names the Codex
+ * route before the ~90 provider ids. 'codex' is not in either list on purpose: it is
+ * routed to the account-pool login in dispatch.ts, and 'chatgpt' stays off the public
+ * OAuth surface (isPublicOAuthProvider) because the pool owns that credential.
+ *
+ * It names 'openai-apikey' for the same reason it exists at all: 'openai' now routes to
+ * the pool, so someone who typed it looking for a platform key no longer sees the list
+ * that used to be their only pointer to it.
+ */
+export function loginUsageMessage(): string {
+  return `Usage: ocx login <provider>\n`
+    + `  Codex / ChatGPT: ocx login codex   (account pool, needs a running proxy; 'chatgpt' and\n`
+    + `                   'openai' are the same route. An OpenAI platform key is 'openai-apikey'.)\n`
+    + `  OAuth login:   ${listOAuthProviders().join(", ")}\n`
+    + `  API-key login: ${Object.keys(KEY_LOGIN_PROVIDERS).join(", ")}`;
+}
+
+export async function handleLogin(provider?: string, deps: LoginCliDeps = {}): Promise<void> {
   const name = (provider ?? "").trim().toLowerCase();
-  if (isPublicOAuthProvider(name)) return handleOAuthLogin(name);
-  if (isKeyLoginProvider(name)) return handleKeyLogin(name);
-  console.error(
-    `Usage: ocx login <provider>\n` +
-      `  OAuth login:   ${listOAuthProviders().join(", ")}\n` +
-      `  API-key login: ${Object.keys(KEY_LOGIN_PROVIDERS).join(", ")}`,
-  );
+  // A removed provider id reached through its alias still logs in — the merged
+  // successor owns the flow. Warn rather than silently reroute so scripts and
+  // docs that still say `devin-cli` surface the rename to whoever runs them.
+  const alias = DEPRECATED_OAUTH_PROVIDER_ALIASES[name];
+  if (alias) {
+    console.error(`${name} is deprecated; logging in as ${alias}`);
+    return handleOAuthLogin(alias, deps);
+  }
+  if (isPublicOAuthProvider(name)) return handleOAuthLogin(name, deps);
+  if (isKeyLoginProvider(name)) return handleKeyLogin(name, deps);
+  console.error(loginUsageMessage());
   process.exit(1);
 }
 
-async function handleOAuthLogin(name: string): Promise<void> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    await runLogin(name, {
+export async function handleOAuthLogin(name: string, deps: LoginCliDeps = {}): Promise<void> {
+  const login = deps.runLogin ?? runLogin;
+  const launch = deps.openUrl ?? openUrl;
+  const browser = createBrowserLaunchReport(deps.warn);
+  await withPrompt(deps.ask, async (ask) => {
+    await login(name, {
       onAuth: ({ url, instructions }) => {
         console.log(`\n🔐 Opening browser for ${name} login...\n${url}\n`);
         if (instructions) console.log(instructions);
-        openUrl(url);
+        // The controller does not await onAuth, so the launcher's answer cannot be reported from
+        // here — this returns long before it arrives. It reports itself instead, and the one
+        // thing that could collide with it waits below (#5261).
+        browser.track(launch(url));
       },
       onProgress: (m) => console.log(`   ${m}`),
-      onManualCodeInput: () =>
-        new Promise((res) => rl.question("Paste redirect URL or code (or wait for browser): ", res)),
+      onManualCodeInput: async () => {
+        // "or wait for browser" is a lie if nothing opened, and a warning printed after readline
+        // has drawn the prompt lands on the line the user is typing on.
+        await browser.settled();
+        return await ask("Paste redirect URL or code (or wait for browser): ");
+      },
     });
-  } finally {
-    rl.close();
-  }
+  });
+  // A device or polling provider never prompts, so nothing above waited on the launcher. It is
+  // still owed an answer before this claims the login worked.
+  await browser.settled();
   const reload = await notifyRunningProxyAfterOAuthLogin(name);
   console.log(`\n✅ Logged in to ${name}. Try: ocx sync`);
+  for (const line of modelSelectionGuidance(name)) console.log(line);
   warnIfLiveReloadSkipped(reload);
 }
 
@@ -118,6 +189,7 @@ export function providerConfigFromKeyLoginProvider(def: KeyLoginProvider, key: s
     ...(def.noReasoningModels ? { noReasoningModels: [...def.noReasoningModels] } : {}),
     ...(def.noTemperatureModels ? { noTemperatureModels: [...def.noTemperatureModels] } : {}),
     ...(def.noTopPModels ? { noTopPModels: [...def.noTopPModels] } : {}),
+    ...(def.noStopModels ? { noStopModels: [...def.noStopModels] } : {}),
     ...(def.noPenaltyModels ? { noPenaltyModels: [...def.noPenaltyModels] } : {}),
     ...(def.autoToolChoiceOnlyModels ? { autoToolChoiceOnlyModels: [...def.autoToolChoiceOnlyModels] } : {}),
     ...(def.preserveReasoningContentModels ? { preserveReasoningContentModels: [...def.preserveReasoningContentModels] } : {}),
@@ -156,6 +228,7 @@ export async function commitKeyLoginProvider(
   onLiveReload?: (result: LocalProviderReloadResult | null) => void,
 ): Promise<OcxProviderConfig> {
   const mergedProvider = mergeKeyLoginProviderRow(provider, config.providers[name]);
+  initializeProviderModelSelection(name, mergedProvider, config.providers[name], config);
   config.providers[name] = mergedProvider;
   saveConfig(config);
   // Evaluate the reload BEFORE the optional call: `onLiveReload?.(await ...)` short-circuits
@@ -166,8 +239,9 @@ export async function commitKeyLoginProvider(
   return mergedProvider;
 }
 
-async function handleKeyLogin(name: string): Promise<void> {
+export async function handleKeyLogin(name: string, deps: LoginCliDeps = {}): Promise<void> {
   const def = KEY_LOGIN_PROVIDERS[name];
+  const launch = deps.openUrl ?? openUrl;
   const preflightConfig = loadConfig();
   const namespaceCollision = codexAccountNamespaceProviderCollisionError(preflightConfig.codexAccountNamespaces, name);
   if (namespaceCollision) {
@@ -175,21 +249,25 @@ async function handleKeyLogin(name: string): Promise<void> {
     process.exit(1);
   }
   console.log(`\n🔑 ${def.label} — opening ${def.dashboardUrl} so you can create/copy an API key...`);
-  openUrl(def.dashboardUrl);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const key = (await new Promise<string>((res) => rl.question(`Paste your ${def.label} API key: `, res))).trim();
-  // Template URL with placeholders needs resolution before saving.
-  let baseUrl = def.baseUrl;
-  if (/\{[^}]*\}/.test(baseUrl)) {
-    const resolved = (await new Promise<string>((res) => rl.question(`Your endpoint URL (${baseUrl}): `, res))).trim();
-    if (!resolved) {
-      rl.close();
-      console.error("A resolved URL is required — replace the {placeholder} with your actual value.");
-      process.exit(1);
+  const browser = createBrowserLaunchReport(deps.warn);
+  browser.track(launch(def.dashboardUrl));
+  // The next question asks for a key the user gets FROM that page, so a page that never opened
+  // has to be on screen before the question rather than underneath it (#5261).
+  await browser.settled();
+  const { key, baseUrl } = await withPrompt(deps.ask, async (ask) => {
+    const entered = (await ask(`Paste your ${def.label} API key: `)).trim();
+    // Template URL with placeholders needs resolution before saving.
+    let resolvedBaseUrl = def.baseUrl;
+    if (/\{[^}]*\}/.test(resolvedBaseUrl)) {
+      const resolved = (await ask(`Your endpoint URL (${resolvedBaseUrl}): `)).trim();
+      if (!resolved) {
+        console.error("A resolved URL is required — replace the {placeholder} with your actual value.");
+        process.exit(1);
+      }
+      resolvedBaseUrl = resolved;
     }
-    baseUrl = resolved;
-  }
-  rl.close();
+    return { key: entered, baseUrl: resolvedBaseUrl };
+  });
   if (!key) {
     console.error("No key entered.");
     process.exit(1);
@@ -211,6 +289,7 @@ async function handleKeyLogin(name: string): Promise<void> {
   let reload: LocalProviderReloadResult | null = null;
   await commitKeyLoginProvider(config, name, provider, result => { reload = result; });
   console.log(`✅ ${def.label} added. Try: ocx sync`);
+  for (const line of modelSelectionGuidance(name)) console.log(line);
   warnIfLiveReloadSkipped(reload);
 }
 

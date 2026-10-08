@@ -7,9 +7,21 @@
  */
 type Rec = Record<string, unknown>;
 
-import { decodeServerSentEvents, sseFieldValue } from "../lib/sse-decoder";
-import { isTranslatorBudgetExceededError, type TranslatorBudget } from "../lib/translator-budget";
-import { classifyError, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode, isCyberPolicyMessage } from "../lib/errors";
+import { decodeServerSentEvents } from "../lib/sse-decoder";
+import {
+  isTranslatorBudgetExceededError,
+  type TranslatorBudget,
+  type TranslatorTransientReservation,
+} from "../lib/translator-budget";
+import {
+  classifyError,
+  cyberPolicyErrorType,
+  CYBER_POLICY_ERROR_CODE,
+  isCyberPolicyCode,
+  isCyberPolicyMessage,
+} from "../lib/errors";
+import { redactSecretString } from "../lib/redact";
+import { createSseBlockBuffer, sseDataPayload } from "../server/sse-payload-rewrite";
 
 function isRec(v: unknown): v is Rec {
   return !!v && typeof v === "object" && !Array.isArray(v);
@@ -19,7 +31,7 @@ function uuid(): string {
   return crypto.randomUUID().replace(/-/g, "");
 }
 
-function completionId(): string {
+export function completionId(): string {
   return `chatcmpl-${uuid().slice(0, 24)}`;
 }
 
@@ -48,14 +60,14 @@ export function chatCompletionsUsage(usage: unknown): Rec {
 export function chatCompletionsErrorBody(
   status: number,
   message: string,
-  type = "invalid_request_error",
+  type?: string,
   code?: string | null,
 ): Rec {
   if (isCyberPolicyCode(code) || isCyberPolicyMessage(message)) {
     return {
       error: {
         message,
-        type: "invalid_request_error",
+        type: cyberPolicyErrorType(type),
         param: null,
         code: CYBER_POLICY_ERROR_CODE,
       },
@@ -64,7 +76,7 @@ export function chatCompletionsErrorBody(
   return {
     error: {
       message,
-      type,
+      type: type ?? "invalid_request_error",
       param: null,
       code: code !== undefined
         ? code
@@ -121,12 +133,12 @@ function streamErrorStatus(message: string): number {
   return 502;
 }
 
-function dataFrame(payload: Rec | "[DONE]"): string {
+export function dataFrame(payload: Rec | "[DONE]"): string {
   if (payload === "[DONE]") return "data: [DONE]\n\n";
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
 
-function chunkBase(id: string, model: string, created: number): Rec {
+export function chunkBase(id: string, model: string, created: number): Rec {
   return {
     id,
     object: "chat.completion.chunk",
@@ -142,11 +154,105 @@ function appendedUtf8Bytes(previous: string, previousBytes: number, fragment: st
   const fragmentFirst = fragment.charCodeAt(0);
   if (previousLast >= 0xd800 && previousLast <= 0xdbff
     && fragmentFirst >= 0xdc00 && fragmentFirst <= 0xdfff) {
-    // Buffer.byteLength() replaces each isolated surrogate with three bytes, while the joined
-    // pair is one four-byte scalar. Preserve full-string sizing without re-encoding the prefix.
-    nextBytes -= 2;
+    // Buffer implementations disagree on the encoded size of an isolated surrogate. Measure
+    // the join delta so incremental accounting equals the completed scalar on every runtime.
+    const tail = previous[previous.length - 1]!;
+    const head = fragment[0]!;
+    nextBytes += Buffer.byteLength(tail + head) - Buffer.byteLength(tail) - Buffer.byteLength(head);
   }
   return nextBytes;
+}
+
+/** Details a streamed Chat failure carries into its error frame. */
+export interface ChatCompletionsStreamFailure {
+  code?: string | null;
+  type?: string;
+  status?: number;
+}
+
+/**
+ * The `data: {error}` payload a streamed Chat failure ends with, and whether it is one of the
+ * fixed, bounded failures that must be delivered even when the translation budget is exhausted.
+ * Provider text is redacted; the two fixed failures carry no provider text at all.
+ */
+export function chatCompletionsStreamErrorPayload(
+  message: string,
+  details?: ChatCompletionsStreamFailure,
+): { payload: Rec; bounded: boolean } {
+  const translatorOverflow = details?.code === "translation_buffer_limit";
+  const safeMessage = translatorOverflow ? "upstream translation buffer exceeded the safe limit"
+    : details?.code === "invalid_refusal" ? "upstream refusal representations are inconsistent"
+    : redactSecretString(message);
+  const statusHint = details?.status ?? streamErrorStatus(safeMessage);
+  const classified = classifyError(statusHint, details?.type ?? "upstream_error", safeMessage);
+  if (translatorOverflow) {
+    classified.code = "translation_buffer_limit";
+    // Provider-controlled overflow is an upstream failure on every path:
+    // streaming frame, collector, and defensive JSON agree on 502.
+    classified.type = "upstream_error";
+  } else if (details?.code === "invalid_refusal") {
+    classified.code = details.code;
+    classified.type = "upstream_error";
+  } else if (isCyberPolicyCode(details?.code) || classified.code === CYBER_POLICY_ERROR_CODE) {
+    classified.code = CYBER_POLICY_ERROR_CODE;
+    classified.type = cyberPolicyErrorType(details?.type);
+  } else if (details?.code !== undefined && details.code !== null && !classified.code) {
+    classified.code = details.code;
+  }
+  return {
+    payload: {
+      error: {
+        message: classified.message,
+        type: classified.type,
+        param: null,
+        code: classified.code,
+      },
+    },
+    bounded: translatorOverflow || details?.code === "invalid_refusal",
+  };
+}
+
+/** How a Responses `response.failed` error object becomes a streamed Chat failure. */
+export function chatCompletionsFailedResponse(error: Rec): { message: string; details: ChatCompletionsStreamFailure } {
+  const message = typeof error.message === "string" ? error.message : "upstream request failed";
+  const code = typeof error.code === "string" ? error.code : null;
+  const type = typeof error.type === "string" ? error.type : undefined;
+  return {
+    message,
+    details: {
+      code,
+      ...(code === "translation_buffer_limit"
+        ? { status: 502, type: "upstream_error" }
+        : { type, ...(code === CYBER_POLICY_ERROR_CODE ? { status: 400 } : {}) }),
+    },
+  };
+}
+
+/**
+ * A Responses incomplete reason as the Chat client sees it: a truthful early finish for an
+ * output cap or a content filter, and a failure for every other reason (stall, adapter EOF,
+ * proxy-synthesized incompletes), which must never look like a clean stop.
+ */
+export function chatCompletionsIncompleteOutcome(
+  reason: unknown,
+  message: unknown,
+): { finishReason: "length" | "content_filter" } | { failMessage: string } {
+  if (reason === "max_output_tokens") return { finishReason: "length" };
+  if (reason === "content_filter") return { finishReason: "content_filter" };
+  const why = typeof reason === "string" ? reason : "unknown";
+  return {
+    failMessage: typeof message === "string" && message.length > 0
+      ? message
+      : `upstream stream ended early (${why})`,
+  };
+}
+
+function refusalTranslationError(): ChatCompletionsStreamError {
+  // Never include provider-controlled refusal text or correlation IDs in diagnostics.
+  return new ChatCompletionsStreamError("upstream refusal representations are inconsistent", {
+    type: "upstream_error",
+    code: "invalid_refusal",
+  });
 }
 
 /**
@@ -163,6 +269,10 @@ export function responsesSseToChatCompletionsSse(
   let cancelled = false;
   let started = false;
   let sawToolUse = false;
+  // The upstream response-level service-tier echo (xAI Priority Processing, OpenAI
+  // fast tier), captured from any response event and stamped on every emitted chunk,
+  // matching how the source annotates its own streamed chat chunks.
+  let serviceTier: string | undefined;
   const id = completionId();
   const created = Math.floor(Date.now() / 1000);
   // tool call_id -> streaming index (OpenAI requires stable indices per tool call)
@@ -181,6 +291,134 @@ export function responsesSseToChatCompletionsSse(
   let emittedFrames = 0;
   let stepping = false;
   let decoderStarted = false;
+  // Raw output/content positions are the ordering authority; IDs only constrain identity.
+  // Charge a fixed entry allowance as well as keys/IDs so empty parts remain bounded.
+  const refusalEntryBytes = 64;
+  const refusalItems = new Map<number, {
+    id?: string;
+    parts: Map<number, { text: string; bytes: number; present: boolean }>;
+  }>();
+  const refusalIndexById = new Map<string, number>();
+  let refusalMetadataBytes = 0;
+  let refusalTextBytes = 0;
+  const releaseRefusals = () => {
+    refusalItems.clear();
+    refusalIndexById.clear();
+    translatorBudget.releaseRetained(refusalMetadataBytes, { kind: "item_ids" });
+    translatorBudget.releaseRetained(refusalTextBytes, { kind: "retained_collectors" });
+    refusalMetadataBytes = 0;
+    refusalTextBytes = 0;
+  };
+  const position = (value: unknown): number => {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw refusalTranslationError();
+    }
+    return value;
+  };
+  const chargeRefusalMetadata = (bytes: number) => {
+    translatorBudget.chargeRetained(bytes, { kind: "item_ids" });
+    refusalMetadataBytes += bytes;
+  };
+  const refusalItem = (outputIndex: unknown, source: Rec, idField: string) => {
+    const index = position(outputIndex);
+    const hasId = Object.hasOwn(source, idField);
+    const candidate = source[idField];
+    if (hasId && typeof candidate !== "string") throw refusalTranslationError();
+    let item = refusalItems.get(index);
+    if (!item) {
+      chargeRefusalMetadata(refusalEntryBytes + Buffer.byteLength(String(index)));
+      item = { parts: new Map() };
+      refusalItems.set(index, item);
+    }
+    if (hasId && typeof candidate === "string") {
+      const knownIndex = refusalIndexById.get(candidate);
+      if (knownIndex !== undefined && knownIndex !== index) throw refusalTranslationError();
+      if (item.id !== undefined && item.id !== candidate) throw refusalTranslationError();
+      if (item.id === undefined) {
+        chargeRefusalMetadata(refusalEntryBytes + Buffer.byteLength(candidate));
+        item.id = candidate;
+        refusalIndexById.set(candidate, index);
+      }
+    }
+    return item;
+  };
+  const retainRefusal = (outputIndex: unknown, contentIndex: unknown, source: Rec,
+    idField: string, evidence: Rec, field: string, delta = false) => {
+    const item = refusalItem(outputIndex, source, idField);
+    const index = position(contentIndex);
+    let part = item.parts.get(index);
+    if (!part) {
+      chargeRefusalMetadata(refusalEntryBytes + Buffer.byteLength(String(index)));
+      part = { text: "", bytes: 0, present: false };
+      item.parts.set(index, part);
+    }
+    if (!Object.hasOwn(evidence, field)) {
+      if (delta) throw refusalTranslationError();
+      return;
+    }
+    const candidate = evidence[field];
+    if (typeof candidate !== "string") throw refusalTranslationError();
+    part.present = true;
+    if (!delta) {
+      // Equal, empty, and stale-prefix snapshots add no evidence; never erase deltas.
+      if (part.text.startsWith(candidate)) return;
+      if (!candidate.startsWith(part.text)) throw refusalTranslationError();
+    }
+    const nextBytes = delta ? appendedUtf8Bytes(part.text, part.bytes, candidate) : Buffer.byteLength(candidate);
+    const reservation = translatorBudget.reserveTransient(nextBytes, { kind: "retained_collectors" });
+    try {
+      const next = delta ? part.text + candidate : candidate;
+      reservation.commitRetained();
+      translatorBudget.releaseRetained(part.bytes, { kind: "retained_collectors" });
+      refusalTextBytes += nextBytes - part.bytes;
+      part.text = next;
+      part.bytes = nextBytes;
+    } catch (error) {
+      reservation.release();
+      throw error;
+    }
+  };
+  const snapshotRefusalItem = (outputIndex: unknown, item: Rec) => {
+    const existing = typeof outputIndex === "number" ? refusalItems.get(outputIndex) : undefined;
+    // Sparse final snapshots may omit type/content but cannot change a known ID.
+    if (Object.hasOwn(item, "id")
+      && (existing || (typeof item.id === "string" && refusalIndexById.has(item.id)))) {
+      refusalItem(outputIndex, item, "id");
+    }
+    if (item.type !== "message") {
+      if (existing && existing.parts.size > 0 && item.type !== undefined) throw refusalTranslationError();
+      return;
+    }
+    // Only an item that actually carries refusal content belongs in the refusal ledger.
+    // The exit used to be the position guard alone, so every message that had an index
+    // was enrolled — ordinary assistant text included — and the id/index consistency
+    // checks inside refusalItem() then governed streams containing no refusal at all.
+    // One index legitimately carrying two item ids was then fatal: a bridge that flushes
+    // a hidden reasoning envelope at the index of a still-open message failed a healthy
+    // turn with invalid_refusal. `existing` keeps a ledger already opened by real refusal
+    // evidence under the same scrutiny as before. The non-streaming collector below has
+    // always scoped itself this way; this is the streaming path catching up.
+    const hasRefusalPart = Array.isArray(item.content)
+      && item.content.some(part => isRec(part) && part.type === "refusal");
+    if (!existing && !hasRefusalPart) return;
+    const known = refusalItem(outputIndex, item, "id");
+    if (!Array.isArray(item.content)) return;
+    item.content.forEach((part: unknown, contentIndex: number) => {
+      if (!isRec(part)) return;
+      if (part.type === "refusal") {
+        retainRefusal(outputIndex, contentIndex, item, "id", part, "refusal");
+      } else if (part.type !== undefined && known.parts.has(contentIndex)) {
+        throw refusalTranslationError();
+      }
+    });
+  };
+  const snapshotRefusals = (response: Rec) => {
+    if (!Array.isArray(response.output)) return;
+    response.output.forEach((item: unknown, outputIndex: number) => {
+      if (isRec(item)) snapshotRefusalItem(outputIndex, item);
+    });
+  };
+  let terminalBatch: Array<{ frame: Uint8Array; reservation: TranslatorTransientReservation }> | undefined;
   const queuedLiveFrameBytes: number[] = [];
   const enqueueLiveFrame = (frame: Uint8Array) => {
     const reservation = translatorBudget.reserveTransient(frame.byteLength, { kind: "live_transient" });
@@ -228,8 +466,23 @@ export function responsesSseToChatCompletionsSse(
   };
       const emit = (payload: Rec | "[DONE]") => {
         if (failed) return;
-        enqueueLiveFrame(encoder.encode(dataFrame(payload)));
-        emittedFrames++;
+        if (serviceTier !== undefined && isRec(payload) && Array.isArray(payload.choices)) {
+          payload.service_tier = serviceTier;
+        }
+        if (terminalBatch) {
+          const serialized = dataFrame(payload);
+          const stringReservation = translatorBudget.reserveTransient(Buffer.byteLength(serialized), { kind: "live_transient" });
+          try {
+            const frame = encoder.encode(serialized);
+            const reservation = translatorBudget.reserveTransient(frame.byteLength, { kind: "live_transient" });
+            terminalBatch.push({ frame, reservation });
+          } finally {
+            stringReservation.release();
+          }
+        } else {
+          enqueueLiveFrame(encoder.encode(dataFrame(payload)));
+          emittedFrames++;
+        }
       };
       const ensureRole = () => {
         if (started) return;
@@ -291,55 +544,60 @@ export function responsesSseToChatCompletionsSse(
       };
       const finish = (finishReason: string, usage: unknown) => {
         if (terminated) return;
-        // A valid completed/incomplete terminal frame may arrive without output_item.done.
-        // Preserve any known tool call before emitting its finish reason.
-        flushPendingToolCalls();
+        // Admit every pending role/tool/refusal/finish/DONE frame before exposing any
+        // of this terminal batch. Serialization and encoded bytes coexist and both count.
+        const batch: NonNullable<typeof terminalBatch> = [];
+        terminalBatch = batch;
+        try {
+          flushPendingToolCalls();
+          ensureRole();
+          for (const [, item] of [...refusalItems.entries()].sort(([a], [b]) => a - b)) {
+            for (const [, part] of [...item.parts.entries()].sort(([a], [b]) => a - b)) {
+              if (!part.present) continue;
+              const refusal = chunkBase(id, model, created);
+              refusal.choices = [{ index: 0, delta: { refusal: part.text }, finish_reason: null }];
+              emit(refusal);
+            }
+          }
+          const frame = chunkBase(id, model, created);
+          frame.choices = [{ index: 0, delta: {}, finish_reason: finishReason }];
+          if (usage) frame.usage = chatCompletionsUsage(usage);
+          emit(frame);
+          emit("[DONE]");
+        } catch (error) {
+          for (const staged of batch) staged.reservation.release();
+          throw error;
+        } finally {
+          terminalBatch = undefined;
+        }
+        for (const staged of batch) {
+          controller.enqueue(staged.frame);
+          staged.reservation.commitRetained();
+          queuedLiveFrameBytes.push(staged.frame.byteLength);
+          emittedFrames++;
+        }
         terminated = true;
-        ensureRole();
-        const frame = chunkBase(id, model, created);
-        frame.choices = [{ index: 0, delta: {}, finish_reason: finishReason }];
-        if (usage) frame.usage = chatCompletionsUsage(usage);
-        emit(frame);
-        emit("[DONE]");
+        releaseRefusals();
       };
       const fail = (message: string, details?: { code?: string | null; type?: string; status?: number }) => {
         if (terminated) return;
         terminated = true;
         failed = true;
+        releaseRefusals();
+        closeToolCalls();
+        upstreamAbort.abort(new Error("upstream chat translation failed"));
+        try { void sseIterator?.return(undefined).catch(() => {}); } catch { /* already closed */ }
         // OpenAI-compatible clients need a real error event, not a success completion
         // that embeds `[error] ...` text followed by a clean [DONE].
         // Deliver the error frame then close the stream abnormally (no [DONE]).
         // Do not controller.error() — that can drop already-enqueued bytes from consumers
         // like response.text().
-        const statusHint = details?.status ?? streamErrorStatus(message);
-        const classified = classifyError(statusHint, details?.type ?? "upstream_error", message);
-        const translatorOverflow = details?.code === "translation_buffer_limit";
-        if (translatorOverflow) {
-          upstreamAbort.abort(new Error("upstream translation buffer exceeded the safe limit"));
-          closeToolCalls();
-          try { void sseIterator?.return(undefined).catch(() => {}); } catch { /* already closed */ }
-          classified.code = "translation_buffer_limit";
-          // Provider-controlled overflow is an upstream failure on every path:
-          // streaming frame, collector, and defensive JSON agree on 502.
-          classified.type = "upstream_error";
-        } else if (isCyberPolicyCode(details?.code) || classified.code === CYBER_POLICY_ERROR_CODE) {
-          classified.code = CYBER_POLICY_ERROR_CODE;
-          classified.type = "invalid_request_error";
-        } else if (details?.code !== undefined && details.code !== null && !classified.code) {
-          classified.code = details.code;
-        }
+        const { payload, bounded } = chatCompletionsStreamErrorPayload(message, details);
         try {
-          const frame = encoder.encode(dataFrame({
-            error: {
-              message: classified.message,
-              type: classified.type,
-              param: null,
-              code: classified.code,
-            },
-          }));
-          // The budget is already exhausted. This bounded emergency frame is the sole
-          // typed overflow closure and therefore cannot reserve from that budget again.
-          if (translatorOverflow) controller.enqueue(frame);
+          const frame = encoder.encode(dataFrame(payload));
+          // These fixed, bounded failures must survive even when decoder-owned input
+          // still fills the budget. They contain no provider text or IDs.
+          if (bounded) controller.enqueue(frame);
           else enqueueLiveFrame(frame);
           emittedFrames++;
         } catch {
@@ -349,10 +607,21 @@ export function responsesSseToChatCompletionsSse(
       };
 
       const handleFrame = (eventName: string, data: Rec) => {
+        if (isRec(data.response) && typeof data.response.service_tier === "string") {
+          serviceTier = data.response.service_tier;
+        }
         switch (eventName) {
           case "response.created":
+            ensureRole();
+            break;
           case "response.heartbeat":
             ensureRole();
+            // A typed Responses heartbeat carries transport liveness, not Chat content. Preserve
+            // that signal as an SSE comment so idle-sensitive Chat clients receive bytes without
+            // inventing a semantic chunk that parsers, usage counters, or progress watchdogs could
+            // mistake for model output.
+            enqueueLiveFrame(encoder.encode(": opencodex heartbeat\n\n"));
+            emittedFrames++;
             break;
           case "response.output_text.delta": {
             if (typeof data.delta === "string") emitContent(data.delta);
@@ -363,8 +632,37 @@ export function responsesSseToChatCompletionsSse(
             if (typeof data.delta === "string") emitReasoning(data.delta);
             break;
           }
+          case "response.refusal.delta":
+          case "response.refusal.done": {
+            const delta = eventName === "response.refusal.delta";
+            retainRefusal(data.output_index, data.content_index, data, "item_id", data, delta ? "delta" : "refusal", delta);
+            break;
+          }
+          case "response.content_part.added":
+          case "response.content_part.done": {
+            const part = isRec(data.part) ? data.part : null;
+            if (part?.type === "refusal") {
+              retainRefusal(data.output_index, data.content_index, data, "item_id", part, "refusal");
+            } else if (typeof data.output_index === "number" && refusalItems.has(data.output_index)) {
+              const item = refusalItem(data.output_index, data, "item_id");
+              if (part?.type !== undefined && item.parts.has(position(data.content_index))) throw refusalTranslationError();
+            }
+            break;
+          }
           case "response.output_item.added": {
             const item = isRec(data.item) ? data.item : null;
+            if (item?.type === "message") {
+              snapshotRefusalItem(data.output_index, item);
+              // Bind the event-level id only for an index the refusal ledger already
+              // tracks. Testing membership directly rather than through position()
+              // matters: position() throws on a malformed index, which would add a
+              // failure to refusal-free streams instead of removing one.
+              if (Object.hasOwn(data, "item_id")
+                && typeof data.output_index === "number"
+                && refusalItems.has(data.output_index)) {
+                refusalItem(data.output_index, data, "item_id");
+              }
+            }
             if (!item || item.type !== "function_call") break;
             ensureRole();
             sawToolUse = true;
@@ -408,6 +706,12 @@ export function responsesSseToChatCompletionsSse(
           case "response.output_item.done": {
             const item = isRec(data.item) ? data.item : null;
             if (!item) break;
+            snapshotRefusalItem(data.output_index, item);
+            if (item.type === "message" && Object.hasOwn(data, "item_id")
+              && typeof data.output_index === "number"
+              && refusalItems.has(data.output_index)) {
+              refusalItem(data.output_index, data, "item_id");
+            }
             if (item.type === "function_call") {
               sawToolUse = true;
               const callId = typeof item.call_id === "string" ? item.call_id : "";
@@ -437,42 +741,30 @@ export function responsesSseToChatCompletionsSse(
           }
           case "response.completed": {
             const response = isRec(data.response) ? data.response : {};
+            snapshotRefusals(response);
             finish(sawToolUse ? "tool_calls" : "stop", response.usage);
             break;
           }
           case "response.incomplete": {
             const response = isRec(data.response) ? data.response : {};
             const details = isRec(response.incomplete_details) ? response.incomplete_details : {};
-            const reason = details.reason === "max_output_tokens" ? "length"
-              : details.reason === "content_filter" ? "content_filter"
-              : undefined;
-            if (reason !== undefined) {
+            const outcome = chatCompletionsIncompleteOutcome(details.reason, details.message);
+            if ("finishReason" in outcome) {
               // Truthful OpenAI-compatible finish reasons: the turn ended, just early.
-              finish(reason, response.usage);
+              snapshotRefusals(response);
+              finish(outcome.finishReason, response.usage);
             } else {
               // upstream_stall_timeout / adapter_eof / proxy-synthesized incompletes are
               // failures, not early finishes: emit an error frame and close WITHOUT
               // [DONE] instead of a success-looking stop/tool_calls + [DONE].
-              const why = typeof details.reason === "string" ? details.reason : "unknown";
-              const message = typeof details.message === "string" && details.message.length > 0
-                ? details.message
-                : `upstream stream ended early (${why})`;
-              fail(message);
+              fail(outcome.failMessage);
             }
             break;
           }
           case "response.failed": {
             const response = isRec(data.response) ? data.response : {};
-            const error = isRec(response.error) ? response.error : {};
-            const message = typeof error.message === "string" ? error.message : "upstream request failed";
-            const code = typeof error.code === "string" ? error.code : null;
-            const type = typeof error.type === "string" ? error.type : undefined;
-            fail(message, {
-              code,
-              ...(code === "translation_buffer_limit"
-                ? { status: 502, type: "upstream_error" }
-                : { type, ...(code === CYBER_POLICY_ERROR_CODE ? { status: 400 } : {}) }),
-            });
+            const failure = chatCompletionsFailedResponse(isRec(response.error) ? response.error : {});
+            fail(failure.message, failure.details);
             break;
           }
           default:
@@ -492,6 +784,7 @@ export function responsesSseToChatCompletionsSse(
           while (!cancelled && emittedFrames === emittedAtStart) {
             decoderStarted = true;
             const next = await sseIterator!.next();
+            if (cancelled) break;
             if (next.done) {
               if (!cancelled && !terminated) {
                 fail("upstream stream ended before a terminal frame (truncated response)");
@@ -517,6 +810,8 @@ export function responsesSseToChatCompletionsSse(
             upstreamAbort.abort(err);
             closeToolCalls();
             fail(err.message, { status: 502, type: "upstream_error", code: err.code });
+          } else if (isChatCompletionsStreamError(err)) {
+            fail(err.message, { status: err.status, type: err.type, code: err.code });
           } else {
             fail(err instanceof Error ? err.message : String(err));
           }
@@ -537,6 +832,7 @@ export function responsesSseToChatCompletionsSse(
     },
     cancel(reason) {
       cancelled = true;
+      releaseRefusals();
       while (queuedLiveFrameBytes.length > 0) releaseDeliveredFrame();
       closeToolCalls();
       // Abort first: it cancels the decoder's underlying reader, settling any in-flight
@@ -552,55 +848,99 @@ export function responsesSseToChatCompletionsSse(
 }
 
 /** Non-streaming: /v1/responses JSON -> Chat Completions message JSON. */
-export function responsesJsonToChatCompletion(json: unknown, model: string): Rec {
+export function responsesJsonToChatCompletion(json: unknown, model: string, translatorBudget?: TranslatorBudget): Rec {
   const body = isRec(json) ? json : {};
+  const incomplete = isRec(body.incomplete_details) ? body.incomplete_details : {};
+  let incompleteFinish: "length" | "content_filter" | undefined;
+  if (body.status === "incomplete") {
+    if (incomplete.reason === "max_output_tokens") incompleteFinish = "length";
+    else if (incomplete.reason === "content_filter") incompleteFinish = "content_filter";
+    else throw new ChatCompletionsStreamError("upstream response ended without a supported completion boundary", {
+      code: "upstream_incomplete", type: "upstream_error",
+    });
+  }
   const output = Array.isArray(body.output) ? body.output : [];
   let content = "";
+  let refusal: string | null = null;
+  let refusalBytes = 0;
   let reasoning = "";
+  let contentBytes = 0;
+  let reasoningBytes = 0;
   const toolCalls: Rec[] = [];
+  const append = (previous: string, previousBytes: number, fragment: string): { text: string; bytes: number } => {
+    if (!fragment) return { text: previous, bytes: previousBytes };
+    const scope = { kind: "retained_collectors" as const };
+    const nextBytes = appendedUtf8Bytes(previous, previousBytes, fragment);
+    const reservation = translatorBudget?.reserveTransient(nextBytes, scope);
+    try {
+      const next = previous + fragment;
+      reservation?.commitRetained();
+      translatorBudget?.releaseRetained(previousBytes, scope);
+      return { text: next, bytes: nextBytes };
+    } catch (error) {
+      reservation?.release();
+      throw error;
+    }
+  };
 
   for (const raw of output) {
     if (!isRec(raw)) continue;
     if (raw.type === "message" && Array.isArray(raw.content)) {
       for (const part of raw.content) {
         if (isRec(part) && part.type === "output_text" && typeof part.text === "string") {
-          content += part.text;
+          ({ text: content, bytes: contentBytes } = append(content, contentBytes, part.text));
+        } else if (isRec(part) && part.type === "refusal" && Object.hasOwn(part, "refusal")) {
+          if (typeof part.refusal !== "string") throw refusalTranslationError();
+          const next = append(refusal ?? "", refusalBytes, part.refusal);
+          refusal = next.text;
+          refusalBytes = next.bytes;
         }
       }
     } else if (raw.type === "reasoning") {
       if (Array.isArray(raw.summary)) {
         for (const part of raw.summary) {
           if (isRec(part) && part.type === "summary_text" && typeof part.text === "string") {
-            reasoning += part.text;
+            ({ text: reasoning, bytes: reasoningBytes } = append(reasoning, reasoningBytes, part.text));
           }
         }
       }
       if (Array.isArray(raw.content)) {
         for (const part of raw.content) {
           if (isRec(part) && part.type === "reasoning_text" && typeof part.text === "string") {
-            reasoning += part.text;
+            ({ text: reasoning, bytes: reasoningBytes } = append(reasoning, reasoningBytes, part.text));
           }
         }
       }
     } else if (raw.type === "function_call") {
-      toolCalls.push({
+      const call = {
         id: typeof raw.call_id === "string" ? raw.call_id : `call_${uuid().slice(0, 16)}`,
         type: "function",
         function: {
           name: typeof raw.name === "string" ? raw.name : "",
           arguments: typeof raw.arguments === "string" ? raw.arguments : "{}",
         },
+      };
+      // A complete buffered call still obeys the same per-call cap as live deltas.
+      // Reserve before serializing, then transfer ownership to the complete call.
+      // The internal scope stays nonempty even when an upstream call_id is empty.
+      const argumentsReservation = translatorBudget?.reserveTransient(Buffer.byteLength(call.function.arguments), {
+        kind: "tool_args", callId: `chat_json_${toolCalls.length}`,
       });
+      try {
+        translatorBudget?.chargeRetained(Buffer.byteLength(JSON.stringify(call)), { kind: "retained_collectors" });
+        toolCalls.push(call);
+      } finally {
+        argumentsReservation?.release();
+      }
     }
   }
 
-  const finishReason = toolCalls.length > 0 ? "tool_calls"
-    : body.status === "incomplete" ? "length"
-    : "stop";
+  const finishReason = incompleteFinish ?? (toolCalls.length > 0 ? "tool_calls" : "stop");
 
   const message: Rec = {
     role: "assistant",
     content: content || null,
+    refusal,
   };
   if (reasoning) message.reasoning_content = reasoning;
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
@@ -617,6 +957,10 @@ export function responsesJsonToChatCompletion(json: unknown, model: string): Rec
       logprobs: null,
     }],
     usage: chatCompletionsUsage(body.usage),
+    // Relay the upstream service-tier echo (xAI Priority Processing, OpenAI fast tier)
+    // so a Chat Completions caller can confirm the tier the turn actually used, the
+    // same field the Responses lane already relays for responses-wire upstreams.
+    ...(typeof body.service_tier === "string" ? { service_tier: body.service_tier } : {}),
   };
 }
 
@@ -626,121 +970,125 @@ export async function collectChatCompletion(
   model: string,
   translatorBudget: TranslatorBudget,
 ): Promise<Rec> {
+  const reader = stream.getReader();
   const decoder = new TextDecoder();
-  let buffer = "";
+  const buffer = createSseBlockBuffer(translatorBudget);
   let content = "";
+  let refusal: string | null = null;
   let reasoning = "";
+  const retainedBytes = { content: 0, refusal: 0, reasoning: 0 };
   const toolCalls = new Map<number, { id: string; name: string; arguments: string; argumentBytes: number }>();
   // Per-call budget scopes (2 MiB/call enforced by the budget): the map key is the
   // wire index, which is stable across deltas and present before the call id.
   const callScope = (index: number) => `chat_collect_${index}`;
   let finishReason = "stop";
   let usage: unknown;
-  let streamError: ChatCompletionsStreamError | null = null;
-  const replaceRetained = (previous: string, next: string, kind: "live_transient" | "retained_collectors") => {
-    const reservation = translatorBudget.reserveTransient(Buffer.byteLength(next), { kind });
-    reservation.commitRetained();
-    translatorBudget.releaseRetained(Buffer.byteLength(previous), { kind });
-    return next;
+  let serviceTier: unknown;
+  const appendRetained = (key: keyof typeof retainedBytes, previous: string, fragment: string): string => {
+    const previousBytes = retainedBytes[key];
+    const nextBytes = appendedUtf8Bytes(previous, previousBytes, fragment);
+    const reservation = translatorBudget.reserveTransient(nextBytes, { kind: "retained_collectors" });
+    try {
+      const next = previous + fragment;
+      reservation.commitRetained();
+      translatorBudget.releaseRetained(previousBytes, { kind: "retained_collectors" });
+      retainedBytes[key] = nextBytes;
+      return next;
+    } catch (error) {
+      reservation.release();
+      throw error;
+    }
   };
-  const reader = stream.getReader();
+  const releaseCollectors = () => {
+    translatorBudget.releaseRetained(retainedBytes.content + retainedBytes.refusal + retainedBytes.reasoning,
+      { kind: "retained_collectors" });
+  };
   try {
+    // Share native relay framing, while retaining the collector's existing admission
+    // order: release each consumed input frame before accumulating its output fields.
+    // CRLF and multiline data obey the same contract as the streaming response.
     for (;;) {
-      let done = false;
-      let value: Uint8Array | undefined;
-      try {
-        ({ done, value } = await reader.read());
-      } catch (err) {
-        if (isChatCompletionsStreamError(err)) throw err;
-        if (isTranslatorBudgetExceededError(err)) {
-          // Provider-controlled overflow is an upstream failure, not a client
-          // request error: match the adapter/bridge contract (502 upstream_error).
-          throw new ChatCompletionsStreamError(err.message, {
-            status: 502,
-            type: "upstream_error",
-            code: err.code,
-          });
-        }
-        throw new ChatCompletionsStreamError(err instanceof Error ? err.message : String(err));
-      }
+      const { done, value } = await reader.read();
       if (done) break;
       if (!value) continue;
-      buffer = replaceRetained(buffer, buffer + decoder.decode(value, { stream: true }), "live_transient");
-      let sep: number;
-      while ((sep = buffer.indexOf("\n\n")) !== -1) {
-        const rawFrame = buffer.slice(0, sep);
-        buffer = replaceRetained(buffer, buffer.slice(sep + 2), "live_transient");
-        for (const line of rawFrame.split("\n")) {
-          const rawData = sseFieldValue(line, "data");
-          if (rawData === null) continue;
-          const data = rawData.trim();
-          if (!data || data === "[DONE]") continue;
-          let parsed: unknown;
-          try { parsed = JSON.parse(data); } catch { continue; }
-          if (!isRec(parsed)) continue;
-          if (isRec(parsed.error)) {
-            const message = typeof parsed.error.message === "string"
-              ? parsed.error.message
-              : "upstream request failed";
-            const type = typeof parsed.error.type === "string" ? parsed.error.type : "server_error";
-            const code = typeof parsed.error.code === "string" ? parsed.error.code : null;
-            const status = code === "translation_buffer_limit"
-              ? 502
-              : code === CYBER_POLICY_ERROR_CODE || isCyberPolicyMessage(message)
-                ? 400
-                : streamErrorStatus(message);
-            streamError = new ChatCompletionsStreamError(message, {
-              status,
-              type: code === "translation_buffer_limit" ? "upstream_error" : type,
-              code,
-            });
-            continue;
-          }
-          if (parsed.usage) usage = parsed.usage;
-          const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
-          const choice = isRec(choices[0]) ? choices[0] : null;
-          if (!choice) continue;
-          if (typeof choice.finish_reason === "string") finishReason = choice.finish_reason;
-          const delta = isRec(choice.delta) ? choice.delta : null;
-          if (!delta) continue;
-          if (typeof delta.content === "string") content = replaceRetained(content, content + delta.content, "retained_collectors");
-          if (typeof delta.reasoning_content === "string") reasoning = replaceRetained(reasoning, reasoning + delta.reasoning_content, "retained_collectors");
-          if (Array.isArray(delta.tool_calls)) {
-            for (const tc of delta.tool_calls) {
-              if (!isRec(tc)) continue;
-              const index = typeof tc.index === "number" ? tc.index : 0;
-              let current = toolCalls.get(index);
-              if (!current) {
-                current = { id: "", name: "", arguments: "", argumentBytes: 0 };
-                toolCalls.set(index, current);
-                translatorBudget.openCall(callScope(index));
-              }
-              if (typeof tc.id === "string") current.id = tc.id;
-              const fn = isRec(tc.function) ? tc.function : {};
-              // Done-frame final arguments are authoritative last-write-wins snapshots.
-              if (typeof fn.name === "string" && fn.name.length > 0) current.name = fn.name;
-              if (typeof fn.arguments === "string") {
-                const replace = fn.arguments.startsWith("{") || fn.arguments.startsWith("[") || current.arguments.length === 0;
-                const nextBytes = replace
-                  ? Buffer.byteLength(fn.arguments)
-                  : appendedUtf8Bytes(current.arguments, current.argumentBytes, fn.arguments);
-                const reservation = translatorBudget.reserveTransient(nextBytes, { kind: "tool_args", callId: callScope(index) });
-                try {
-                  current.arguments = replace ? fn.arguments : current.arguments + fn.arguments;
-                  reservation.commitRetained();
-                  translatorBudget.releaseRetained(current.argumentBytes, { kind: "tool_args", callId: callScope(index) });
-                  current.argumentBytes = nextBytes;
-                } catch (error) {
-                  reservation.release();
-                  throw error;
-                }
+      buffer.append(decoder.decode(value, { stream: true }));
+      for (let frame = buffer.next(); frame; frame = buffer.next()) {
+        const data = sseDataPayload(frame.block)?.trim();
+        if (!data || data === "[DONE]") continue;
+        let parsed: unknown;
+        try { parsed = JSON.parse(data); } catch { continue; }
+        if (!isRec(parsed)) continue;
+        if (isRec(parsed.error)) {
+          const message = typeof parsed.error.message === "string"
+            ? parsed.error.message
+            : "upstream request failed";
+          const type = typeof parsed.error.type === "string" ? parsed.error.type : "server_error";
+          const code = typeof parsed.error.code === "string" ? parsed.error.code : null;
+          const status = code === "translation_buffer_limit"
+            ? 502
+            : code === CYBER_POLICY_ERROR_CODE || isCyberPolicyMessage(message)
+              ? 400
+              : streamErrorStatus(message);
+          const streamError = new ChatCompletionsStreamError(message, {
+            status,
+            type: code === "translation_buffer_limit" ? "upstream_error" : type,
+            code,
+          });
+          throw streamError;
+        }
+        if (parsed.usage) usage = parsed.usage;
+        if (typeof parsed.service_tier === "string") serviceTier = parsed.service_tier;
+        const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+        const choice = isRec(choices[0]) ? choices[0] : null;
+        if (!choice) continue;
+        if (typeof choice.finish_reason === "string") finishReason = choice.finish_reason;
+        const delta = isRec(choice.delta) ? choice.delta : null;
+        if (!delta) continue;
+        if (typeof delta.content === "string") content = appendRetained("content", content, delta.content);
+        if (delta.refusal !== undefined && delta.refusal !== null) {
+          if (typeof delta.refusal !== "string") throw refusalTranslationError();
+          refusal = appendRetained("refusal", refusal ?? "", delta.refusal);
+        }
+        if (typeof delta.reasoning_content === "string") reasoning = appendRetained("reasoning", reasoning, delta.reasoning_content);
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!isRec(tc)) continue;
+            const index = typeof tc.index === "number" ? tc.index : 0;
+            let current = toolCalls.get(index);
+            if (!current) {
+              current = { id: "", name: "", arguments: "", argumentBytes: 0 };
+              toolCalls.set(index, current);
+              translatorBudget.openCall(callScope(index));
+            }
+            if (typeof tc.id === "string") current.id = tc.id;
+            const fn = isRec(tc.function) ? tc.function : {};
+            // Done-frame final arguments are authoritative last-write-wins snapshots.
+            if (typeof fn.name === "string" && fn.name.length > 0) current.name = fn.name;
+            if (typeof fn.arguments === "string") {
+              const replace = fn.arguments.startsWith("{") || fn.arguments.startsWith("[") || current.arguments.length === 0;
+              const nextBytes = replace
+                ? Buffer.byteLength(fn.arguments)
+                : appendedUtf8Bytes(current.arguments, current.argumentBytes, fn.arguments);
+              const reservation = translatorBudget.reserveTransient(nextBytes, { kind: "tool_args", callId: callScope(index) });
+              try {
+                current.arguments = replace ? fn.arguments : current.arguments + fn.arguments;
+                reservation.commitRetained();
+                translatorBudget.releaseRetained(current.argumentBytes, { kind: "tool_args", callId: callScope(index) });
+                current.argumentBytes = nextBytes;
+              } catch (error) {
+                reservation.release();
+                throw error;
               }
             }
           }
         }
       }
+      buffer.compact();
     }
   } catch (error) {
+    // Cancel while we still own the reader so a failed collection releases its upstream.
+    try { await reader.cancel(error); } catch { /* preserve the original failure */ }
+    releaseCollectors();
     // Never leak an open call scope on the error path; the turn budget's
     // dispose is a backstop, not the owner of this transfer.
     for (const index of toolCalls.keys()) translatorBudget.closeCall(callScope(index));
@@ -753,18 +1101,19 @@ export async function collectChatCompletion(
         code: error.code,
       });
     }
-    throw error;
+    if (isChatCompletionsStreamError(error)) throw error;
+    throw new ChatCompletionsStreamError(error instanceof Error ? error.message : String(error));
   } finally {
+    // Preserve the previous EOF contract: only delimiter-terminated events are collected.
+    // A partial final frame is discarded, with its retained input ownership released.
+    buffer.clear();
     reader.releaseLock();
-  }
-  if (streamError) {
-    for (const index of toolCalls.keys()) translatorBudget.closeCall(callScope(index));
-    throw streamError;
   }
 
   const message: Rec = {
     role: "assistant",
     content: content || null,
+    refusal,
   };
   if (reasoning) message.reasoning_content = reasoning;
   if (toolCalls.size > 0) {
@@ -789,6 +1138,7 @@ export async function collectChatCompletion(
           return copy;
         });
     } catch (error) {
+      releaseCollectors();
       for (const copyBytes of chargedCopies) {
         translatorBudget.releaseRetained(copyBytes, { kind: "retained_collectors" });
       }
@@ -817,5 +1167,6 @@ export async function collectChatCompletion(
       logprobs: null,
     }],
     usage: usage && isRec(usage) ? usage : chatCompletionsUsage(undefined),
+    ...(typeof serviceTier === "string" ? { service_tier: serviceTier } : {}),
   };
 }

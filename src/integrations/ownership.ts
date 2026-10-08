@@ -22,8 +22,38 @@ export function fingerprint(text: string): string {
 }
 
 /**
- * Canonical bytes of a contribution. Fragments are sorted by path so two builds
- * of the same contribution hash identically regardless of emission order.
+ * Canonicalize JSON object members recursively for semantic comparisons.
+ * Arrays stay ordered because their position can carry configuration meaning.
+ */
+function semanticJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(semanticJsonValue);
+  if (value === null || typeof value !== "object") return value;
+
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.keys(record)
+      .sort()
+      .map(key => [key, semanticJsonValue(record[key])]),
+  );
+}
+
+/**
+ * Stable semantic bytes of a contribution. Third-party clients may
+ * re-serialize JSON object members in a different order; that formatting-only
+ * rewrite must not look like a protected-value edit.
+ */
+export function semanticContribution(contribution: ManagedContribution): string {
+  const sorted = [...contribution.fragments].sort((a, b) => {
+    const left = a.path.join("\u0000");
+    const right = b.path.join("\u0000");
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return JSON.stringify(sorted.map(fragment => [fragment.path, semanticJsonValue(fragment.value)]));
+}
+
+/**
+ * Legacy-compatible bytes used by existing persisted fingerprints. Fragment
+ * paths are stable, while nested object insertion order remains exact.
  */
 export function canonicalContribution(contribution: ManagedContribution): string {
   const sorted = [...contribution.fragments].sort((a, b) => {
@@ -41,6 +71,20 @@ export interface OwnershipRecord {
   fileFingerprint: string;
   /** Hash of our contribution — detects catalog/port drift. */
   blockFingerprint: string;
+  /** Key-order-independent companion for JSON clients that normalize objects. */
+  semanticBlockFingerprint?: string;
+  /**
+   * Hash of the fields the client must not rewrite. Present only when a
+   * client has explicitly declared runtime-derived paths below.
+   */
+  protectedBlockFingerprint?: string;
+  /** Key-order-independent companion to `protectedBlockFingerprint`. */
+  semanticProtectedBlockFingerprint?: string;
+  /**
+   * Exact document paths a client may derive after apply. These are recorded
+   * per operation so later catalog changes cannot widen an older grant.
+   */
+  refreshablePaths?: readonly (readonly string[])[];
   /** The exact paths we own. Removal touches these and nothing else. */
   fragmentPaths: readonly (readonly string[])[];
   /**
@@ -55,6 +99,42 @@ export interface OwnershipRecord {
   createdContainers?: readonly string[];
   appliedAt: string;
   opId: string;
+}
+
+/** Recovery needs proven metadata, unlike the tolerant status-reader fallback. */
+export function isOwnershipRecord(value: unknown): value is OwnershipRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const hash = (item: unknown) => typeof item === "string" && /^[a-f0-9]{16}$/.test(item);
+  const paths = (item: unknown) => Array.isArray(item) && item.every(path =>
+    Array.isArray(path) && path.length > 0 && path.every(key => typeof key === "string" && key.length > 0));
+  return typeof record.clientId === "string" && record.clientId.length > 0
+    && typeof record.configPath === "string" && record.configPath.length > 0
+    && typeof record.opId === "string" && record.opId.length > 0
+    && typeof record.appliedAt === "string" && Number.isFinite(Date.parse(record.appliedAt))
+    && hash(record.fileFingerprint) && hash(record.blockFingerprint)
+    && paths(record.fragmentPaths) && (record.fragmentPaths as unknown[]).length > 0
+    && ["semanticBlockFingerprint", "protectedBlockFingerprint", "semanticProtectedBlockFingerprint"]
+      .every(key => record[key] === undefined || hash(record[key]))
+    && (record.refreshablePaths === undefined || paths(record.refreshablePaths))
+    && (record.createdContainers === undefined || (Array.isArray(record.createdContainers)
+      && record.createdContainers.every(path => typeof path === "string")));
+}
+
+/** Missing is empty; corrupt/unreadable ownership is uncertainty and must abort recovery. */
+export function readRecordsStrict(dir: string = integrationsDir()): Partial<Record<IntegrationClientId, OwnershipRecord>> {
+  let text: string;
+  try { text = readFileSync(recordsPath(dir), "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new Error("integration ownership cannot be read for recovery");
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || !Object.entries(parsed).every(([key, value]) => isOwnershipRecord(value) && value.clientId === key)) throw new Error();
+    return parsed as Partial<Record<IntegrationClientId, OwnershipRecord>>;
+  } catch { throw new Error("integration ownership is invalid for recovery"); }
 }
 
 /**

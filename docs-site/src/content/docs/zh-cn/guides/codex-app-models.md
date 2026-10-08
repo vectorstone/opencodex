@@ -61,7 +61,7 @@ visibility = "list"
 
 ## 当前稳定模型覆盖
 
-原生回退集合包含 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex-spark` 以及 GPT-5.6 Sol/Terra/Luna。对于 GPT-5.5/5.4 家族，opencodex 会保留已安装 Codex 目录中更丰富的实时条目，只在缺失时才合成条目。内置的上游快照只用于 GPT-5.6，因为它提供的是每个模型真实的身份和元数据，而不是较旧模板的近似版本。
+原生回退集合包含 `gpt-5.5` 以及 GPT-5.6 Sol/Terra/Luna。对于 GPT-5.5 家族，opencodex 会保留已安装 Codex 目录中更丰富的实时条目，只在缺失时才合成条目。内置的上游快照只用于 GPT-5.6，因为它提供的是每个模型真实的身份和元数据，而不是较旧模板的近似版本。
 
 | 路由 | 选择器 id 与目录元数据 |
 | --- | --- |
@@ -69,8 +69,8 @@ visibility = "list"
 | Codex 登录（账户限定的选择器行已启用且存在有效 selector） | 为每个有效 selector 与受支持原生模型的组合显示 `<selector>/<native-openai-model>` 行。每行只使用映射账户，裸原生行会从选择器中隐藏。原生 metadata 与 context window 会保留。 |
 | OpenAI（API key） | 恰好八个命名空间行：`gpt-5.5`、`gpt-5.6`、Sol/Terra/Luna，以及三个 `*-pro` 虚拟 id（八个条目均为 1,050,000 context / 922,000 max input） |
 | OpenRouter | `openrouter/openai/gpt-5.6-sol`、`openrouter/openai/gpt-5.6-terra`、`openrouter/openai/gpt-5.6-luna`（922,000） |
-| Cursor | 静态回退包含 `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna`（1,000,000），以及 Grok 4.5/4.6 的普通和 Fast 条目（500,000）。4.6 还提供 `xhigh`；实时账户发现会决定最终哪些条目仍然可见。 |
-| xAI | 实时发现具有权威性。回退目录包含 `xai/grok-4.6`，默认模型仍为 `xai/grok-4.5`；两者的上下文窗口均为 500,000。Grok 4.6 提供 `low` / `medium` / `high` / `xhigh`（上游默认值为 `high`），Grok 4.5 最高为 `high`。 |
+| Cursor | 静态回退包含 `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna`（1,000,000），以及 Grok 4.5/4.6/4.7 的普通和 Fast 条目（500,000）。4.6 和 4.7 还提供 `xhigh`；实时账户发现会决定最终哪些条目仍然可见。 |
+| xAI | 实时发现具有权威性。回退目录包含 `xai/grok-4.6` 和 `xai/grok-4.7`，默认模型仍为 `xai/grok-4.5`；三者的上下文窗口均为 500,000。Grok 4.6 和 4.7 提供 `low` / `medium` / `high` / `xhigh`（上游默认值为 `high`），Grok 4.5 最高为 `high`。 |
 
 固定的 GPT-5.6 条目保留了精确的上游阶梯。Sol 和 Terra 暴露从 `low` 到 `ultra` 的档位；Luna 只到 `max`。Sol 默认是 `low`，Terra 和 Luna 默认是 `medium`。`ultra` 是面向客户端的最大 reasoning 加主动委派选项，在后端会以 `max` 传入。选择器里的一个条目只表示目录已经准备好：关联的账户或 API key 仍然必须有权使用该模型。
 
@@ -131,6 +131,26 @@ Codex Desktop 的远程服务器模式会针对客户端自己的 `available_mod
 - 改用 Codex CLI 或 TUI，而不是 Desktop 选择器；它们不应用该白名单，会正常列出路由模型。
 
 ## 刷新模型状态
+## 原生配额回退限制
+
+Codex 应用用完原生的五小时配额后，可能切换到预备回退模型，并把选择器里其他行置灰。正如 [#2813](https://github.com/lidge-jun/opencodex/issues/2813) 所报告的，这个限制同样会隐藏 opencodex 路由的行，而那些行使用的是无关的提供方凭据，不消耗任何 ChatGPT 配额。
+
+这个限制由客户端在请求到达代理之前施加，因此 opencodex 无法解除。路由行写入时带 `visibility: "list"`，目录过滤只读取 `disabledModels` 和各提供方的 `selectedModels`，任何配额值都不参与路由行的可见性。
+
+显式选择路由模型不经过选择器。在 `config.toml` 中设置模型：
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+或者直接发送：
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+**请求到达代理之后**，两条路径都能正确路由，这一点有测试覆盖。但预备模式生效时，Codex 桌面应用不会发送已配置的模型：它根据自己的 `wham/usage` 轮询（`luna_reserve` 升级提示加上仍被允许的 `gpt-reserve` 附加限额）判定预备状态，并在请求发出前把模型设置强制改为 `gpt-reserve`，所以 `config.toml` 这条路会在应用内被覆盖。在窗口重置之前，请使用 `ocx access test`、经代理的 Claude Code（`ocx claude`）或任意直连 `/v1` 的客户端。参见[Codex 预备模式下的路由模型](/guides/codex-integration/#routed-models-during-codex-reserve-mode)。
+
 
 如果选择器里仍然显示旧条目，请刷新目录并重启目标 Codex 界面：
 

@@ -1,0 +1,315 @@
+/**
+ * Client-scoped exceptions to strict managed-fragment ownership.
+ *
+ * Most clients must preserve every byte represented by their managed
+ * contribution. A client that persists runtime-derived fields back into an
+ * OpenCodex-owned fragment needs a narrower contract: name the exact paths it
+ * may rewrite, then fingerprint everything else. Keeping that policy here
+ * prevents a client quirk from weakening the shared classifier.
+ */
+import {
+  OPENCODE_PROVIDER_ID,
+  type ManagedContribution,
+  type ManagedFragment,
+} from "../clients/config-export";
+import { canonicalContribution, fingerprint, semanticContribution, type OwnershipRecord } from "./ownership";
+import { readPath } from "./merge";
+import { serializeDocument } from "./serialize";
+
+type JsonObject = Record<string, unknown>;
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * One-way Hermes upgrade: the old owned block is unchanged, or has only gained
+ * the supported dynamic affinity setting. Once applied, that field is protected
+ * like every other field; this is not a permanent refreshable-path exemption.
+ * Callers must first establish the record's client and config-path ownership.
+ */
+export function isHermesAffinityUpgrade(
+  doc: unknown,
+  record: OwnershipRecord,
+  desired: ManagedContribution,
+): boolean {
+  if (record.clientId !== "hermes" || desired.clientId !== "hermes") return false;
+  const path = ["providers", OPENCODE_PROVIDER_ID];
+  const matchesPath = (candidate: readonly string[]) => (
+    candidate.length === path.length && candidate.every((key, index) => key === path[index])
+  );
+  if (record.fragmentPaths.length !== 1 || !matchesPath(record.fragmentPaths[0]!)) return false;
+  const fragment = desired.fragments.find(item => matchesPath(item.path));
+  if (!isObject(fragment?.value) || fragment.value.session_affinity_header !== "session-id") return false;
+  const observed = readPath(doc, path);
+  if (!isObject(observed)) return false;
+  if (Object.hasOwn(observed, "session_affinity_header") && observed.session_affinity_header !== "session-id") return false;
+  const value = { ...observed };
+  delete value.session_affinity_header;
+  const predecessor: ManagedContribution = { clientId: "hermes", fragments: [{ path, value }] };
+  return fingerprint(canonicalContribution(predecessor)) === record.blockFingerprint
+    || (typeof record.semanticBlockFingerprint === "string"
+      && fingerprint(semanticContribution(predecessor)) === record.semanticBlockFingerprint);
+}
+
+function removeDroidNormalizationFields(row: Record<string, unknown>): boolean {
+  let projected = false;
+  if (Object.hasOwn(row, "id")) {
+    delete row.id;
+    projected = true;
+  }
+  if (Object.hasOwn(row, "index")) {
+    delete row.index;
+    projected = true;
+  }
+  return projected;
+}
+
+function projectObservedDroidContribution(
+  contribution: ManagedContribution,
+): ManagedContribution {
+  if (contribution.clientId !== "droid") return contribution;
+  let projected = false;
+  const fragments = contribution.fragments.map(fragment => {
+    if (
+      fragment.path.length !== 2
+      || fragment.path[0] !== "customModels"
+      || !isObject(fragment.value)
+    ) return fragment;
+    const value = { ...fragment.value };
+    if (!removeDroidNormalizationFields(value)) return fragment;
+    projected = true;
+    return { ...fragment, value };
+  });
+  return projected ? { ...contribution, fragments } : contribution;
+}
+
+export function droidNormalizedContributionMatchesRecord(
+  observed: ManagedContribution,
+  record: OwnershipRecord,
+): boolean {
+  const projectedObserved = projectObservedDroidContribution(observed);
+  return projectedObserved !== observed
+    && (
+      fingerprint(canonicalContribution(projectedObserved)) === record.blockFingerprint
+      || (typeof record.semanticBlockFingerprint === "string"
+        && fingerprint(semanticContribution(projectedObserved)) === record.semanticBlockFingerprint)
+    );
+}
+
+export function droidNormalizedFileMatchesRecord(
+  document: unknown,
+  record: OwnershipRecord,
+): boolean {
+  if (record.clientId !== "droid") return false;
+  try {
+    const normalized = structuredClone(document);
+    let projected = false;
+    for (const path of record.fragmentPaths) {
+      if (path.length !== 2 || path[0] !== "customModels") return false;
+      const row = readPath(normalized, path);
+      if (!isObject(row)) return false;
+      if (removeDroidNormalizationFields(row)) projected = true;
+    }
+    return projected && fingerprint(serializeDocument(normalized, "json")) === record.fileFingerprint;
+  } catch {
+    return false;
+  }
+}
+
+function pathStartsWith(path: readonly string[], prefix: readonly string[]): boolean {
+  return prefix.length <= path.length && prefix.every((part, index) => path[index] === part);
+}
+
+/** Delete one nested object member and prune only the empty ancestors created by that deletion. */
+function deletePath(root: unknown, path: readonly string[]): void {
+  if (!isObject(root) || path.length === 0) return;
+  const parents: Array<{ parent: JsonObject; key: string }> = [];
+  let cursor: JsonObject = root;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const key = path[index]!;
+    const next = cursor[key];
+    if (!isObject(next)) return;
+    parents.push({ parent: cursor, key });
+    cursor = next;
+  }
+  delete cursor[path[path.length - 1]!];
+  for (let index = parents.length - 1; index >= 0; index -= 1) {
+    if (Object.keys(cursor).length > 0) break;
+    const { parent, key } = parents[index]!;
+    delete parent[key];
+    cursor = parent;
+  }
+}
+
+function cloneFragment(fragment: ManagedFragment): ManagedFragment {
+  return {
+    path: [...fragment.path],
+    value: structuredClone(fragment.value),
+  };
+}
+
+/**
+ * Rebuild the key order emitted by the ZCode serializer.
+ *
+ * ZCode persists the provider block after normalizing it and does not retain
+ * the insertion order OpenCodex used. Ownership hashes must therefore compare
+ * the document's meaning, not an incidental JSON key order. Keep this scoped
+ * to ZCode and to the known generated schema: unknown fields remain in their
+ * observed order and are still protected by the fingerprint.
+ */
+function canonicalizeZcodeValue(value: unknown, path: readonly string[] = []): unknown {
+  if (Array.isArray(value)) return value.map(item => canonicalizeZcodeValue(item, path));
+  if (!isObject(value)) return value;
+
+  const keys = Object.keys(value);
+  let orderedKeys = keys;
+  if (path.length === 0) {
+    orderedKeys = orderKnownKeys(keys, ["name", "kind", "enabled", "source", "options", "models"]);
+  } else if (path.length === 1 && path[0] === "options") {
+    orderedKeys = orderKnownKeys(keys, ["apiKey", "baseURL", "apiKeyRequired"]);
+  } else if (path.length === 1 && path[0] === "models") {
+    orderedKeys = [...keys].sort();
+  } else if (path.length === 2 && path[0] === "models") {
+    orderedKeys = orderKnownKeys(keys, ["name", "modalities", "limit"]);
+  } else if (path.length === 3 && path[0] === "models" && path[2] === "modalities") {
+    orderedKeys = orderKnownKeys(keys, ["input", "output"]);
+  } else if (path.length === 3 && path[0] === "models" && path[2] === "limit") {
+    orderedKeys = orderKnownKeys(keys, ["context", "output"]);
+  }
+
+  const result: JsonObject = {};
+  for (const key of orderedKeys) {
+    result[key] = canonicalizeZcodeValue(value[key], [...path, key]);
+  }
+  return result;
+}
+
+function orderKnownKeys(keys: readonly string[], preferred: readonly string[]): string[] {
+  const present = new Set(keys);
+  return [
+    ...preferred.filter(key => present.has(key)),
+    ...keys.filter(key => !preferred.includes(key)),
+  ];
+}
+
+/**
+ * Paths a client is documented to derive after OpenCodex writes its block.
+ *
+ * ZCode 3.8.1 persists reasoning and output defaults for every generated
+ * model. It may also fill a context default when OpenCodex intentionally
+ * omitted one; an authoritative context emitted by OpenCodex remains
+ * protected and is never listed here.
+ */
+export function refreshablePathsOf(
+  contribution: ManagedContribution,
+): readonly (readonly string[])[] {
+  if (contribution.clientId === "cline") return [
+    ["settings", "providers", OPENCODE_PROVIDER_ID, "updatedAt"],
+    ["settings", "providers", OPENCODE_PROVIDER_ID, "settings", "model"],
+  ];
+  if (contribution.clientId !== "zcode") return [];
+  const fragment = contribution.fragments.find(candidate => (
+    candidate.path.length === 2
+    && candidate.path[0] === "provider"
+    && candidate.path[1] === OPENCODE_PROVIDER_ID
+  ));
+  if (!fragment || !isObject(fragment.value) || !isObject(fragment.value.models)) return [];
+
+  const paths: string[][] = [];
+  for (const modelId of Object.keys(fragment.value.models).sort()) {
+    const entry = fragment.value.models[modelId];
+    if (!isObject(entry)) continue;
+    const base = [...fragment.path, "models", modelId];
+    paths.push([...base, "reasoning"]);
+    paths.push([...base, "limit", "output"]);
+    const limit = entry.limit;
+    if (!isObject(limit) || typeof limit.context !== "number") {
+      paths.push([...base, "limit", "context"]);
+    }
+  }
+  return paths;
+}
+
+export function validRefreshablePaths(
+  contribution: ManagedContribution,
+  value: unknown,
+): value is readonly (readonly string[])[] {
+  if (contribution.clientId === "cline") {
+    return JSON.stringify(value) === JSON.stringify(refreshablePathsOf(contribution));
+  }
+  if (contribution.clientId !== "zcode" || !Array.isArray(value) || value.length === 0) {
+    return false;
+  }
+  const fragment = contribution.fragments.find(candidate => (
+    candidate.path.length === 2
+    && candidate.path[0] === "provider"
+    && candidate.path[1] === OPENCODE_PROVIDER_ID
+  ));
+  if (!fragment || !isObject(fragment.value) || !isObject(fragment.value.models)) return false;
+
+  const modelIds = new Set(Object.keys(fragment.value.models));
+  const seen = new Set<string>();
+  return value.every(path => {
+    if (!Array.isArray(path) || !path.every(part => typeof part === "string")) return false;
+    const modelId = path[3];
+    const isReasoning = path.length === 5 && path[4] === "reasoning";
+    const isLimitDefault = path.length === 6
+      && path[4] === "limit"
+      && (path[5] === "output" || path[5] === "context");
+    const key = path.join("\u0000");
+    if (
+      path[0] !== "provider"
+      || path[1] !== OPENCODE_PROVIDER_ID
+      || path[2] !== "models"
+      || typeof modelId !== "string"
+      || !modelIds.has(modelId)
+      || (!isReasoning && !isLimitDefault)
+      || seen.has(key)
+    ) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function contributionWithoutRefreshablePaths(
+  contribution: ManagedContribution,
+  refreshablePaths: readonly (readonly string[])[],
+): ManagedContribution {
+  const fragments = contribution.fragments.map(fragment => {
+    const cloned = cloneFragment(fragment);
+    return contribution.clientId === "zcode"
+      && cloned.path.length === 2 && cloned.path[0] === "provider" && cloned.path[1] === "opencodex"
+      ? { ...cloned, value: canonicalizeZcodeValue(cloned.value) }
+      : cloned;
+  });
+  for (const refreshablePath of refreshablePaths) {
+    for (const fragment of fragments) {
+      if (!pathStartsWith(refreshablePath, fragment.path)) continue;
+      deletePath(fragment.value, refreshablePath.slice(fragment.path.length));
+      break;
+    }
+  }
+  return { ...contribution, fragments };
+}
+
+/** Fingerprint a contribution after removing only its explicitly refreshable paths. */
+export function protectedContributionFingerprint(
+  contribution: ManagedContribution,
+  refreshablePaths: readonly (readonly string[])[],
+): string {
+  return fingerprint(canonicalContribution(
+    contributionWithoutRefreshablePaths(contribution, refreshablePaths),
+  ));
+}
+
+
+/** Semantic protected fingerprint that ignores JSON object-key order only. */
+export function semanticProtectedContributionFingerprint(
+  contribution: ManagedContribution,
+  refreshablePaths: readonly (readonly string[])[],
+): string {
+  return fingerprint(semanticContribution(
+    contributionWithoutRefreshablePaths(contribution, refreshablePaths),
+  ));
+}

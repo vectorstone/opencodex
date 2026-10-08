@@ -22,6 +22,22 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isUnframedTerminalLikeSuffix(block: string): boolean {
+  const payload = sseDataPayload(block);
+  if (payload === "[DONE]") return true;
+  if (!payload) return false;
+  try {
+    const parsed = JSON.parse(payload);
+    if (!isPlainRecord(parsed)) return false;
+    return parsed.type === "response.completed"
+      || parsed.type === "response.failed"
+      || parsed.type === "response.incomplete"
+      || parsed.type === "error";
+  } catch {
+    return false;
+  }
+}
+
 function outputIndex(value: unknown): number | null {
   return Number.isInteger(value) && (value as number) >= 0 ? value as number : null;
 }
@@ -75,6 +91,7 @@ export function relayResponsesSseWithTerminalRepair(
   let maxSequence = -1;
   let buffer = "";
   let bufferBytes = 0;
+  let pendingLineFeed = false;
   let timer: unknown;
   let timerGeneration = 0;
   let realTerminalSeen = false;
@@ -268,6 +285,7 @@ export function relayResponsesSseWithTerminalRepair(
     let emitted = false;
     while ((next = nextSseBlock(buffer))) {
       replaceBuffer(next.rest);
+      pendingLineFeed = next.delimiter.endsWith("\r") && buffer.length === 0;
       const kind = inspectPayload(sseDataPayload(next.block));
       if (kind === "done" && !realTerminalSeen) {
         emitSynthetic(completeCandidate() ? "completed" : "incomplete", controller);
@@ -292,11 +310,16 @@ export function relayResponsesSseWithTerminalRepair(
         if (done) {
           appendBuffer(decoder.decode());
           if (buffer.length > 0) {
-            // A delimiter-less suffix is not a complete SSE event. Preserve the
-            // upstream bytes for passthrough compatibility, but never let a
-            // truncated lifecycle frame establish synthetic success.
+            // A delimiter-less suffix is not a complete SSE event. Preserve an
+            // ordinary suffix for passthrough compatibility, but never promote
+            // a terminal-like suffix by adding the delimiter it did not receive
+            // upstream. The latter must stay tainted and fail closed through the
+            // synthetic incomplete terminal below.
             tainted = true;
-            controller.enqueue(encoder.encode(buffer));
+            if (!isUnframedTerminalLikeSuffix(buffer)) {
+              controller.enqueue(encoder.encode(buffer));
+              controller.enqueue(encoder.encode(buffer.includes("\r\n") ? "\r\n\r\n" : "\n\n"));
+            }
           }
           if (!realTerminalSeen) {
             emitSynthetic(completeCandidate() ? "completed" : "incomplete", controller);
@@ -306,9 +329,20 @@ export function relayResponsesSseWithTerminalRepair(
           controller.close();
           return;
         }
-        appendBuffer(decoder.decode(value, { stream: true }));
+        let fragment = decoder.decode(value, { stream: true });
+        let continuedDelimiter = false;
+        if (pendingLineFeed && fragment.length > 0) {
+          pendingLineFeed = false;
+          if (fragment.startsWith("\n")) {
+            // This byte completes an already-forwarded CR delimiter, not a new EOF suffix.
+            controller.enqueue(encoder.encode("\n"));
+            fragment = fragment.slice(1);
+            continuedDelimiter = true;
+          }
+        }
+        appendBuffer(fragment);
         const result = emitBlocks(controller);
-        if (result.closed || result.emitted) return;
+        if (result.closed || result.emitted || continuedDelimiter) return;
       }
     } catch (error) {
       if (disposed) return;

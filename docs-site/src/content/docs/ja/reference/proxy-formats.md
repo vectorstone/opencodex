@@ -14,6 +14,16 @@ provider events → internal adapter events → client dialect
 
 応答表現はブリッジの中心です。ネイティブ互換ルートは、変換の一部をスキップしてリクエストを通過させる可能性がありますが、認証、ルーティング、アドミッション コントロール、および応答の安全性は依然としてプロキシ境界で発生します。 [構成](/reference/configuration/) でリスナーとアドミッション キーを構成します。 1 つのパブリック モデル ID を複数のターゲットから選択する必要がある場合は、[コンボ](/guides/combos/) を使用します。
 
+## 上流のリダイレクト
+
+認証情報を含むモデル・画像・動画・検索リクエストは、同一オリジンを含む HTTP リダイレクトを自動追跡しません。リダイレクトする別名ではなく、最終的な上流 API URL を設定してください。サーバーはリダイレクト先に認証情報やリクエスト本文を再送しません。各応答処理の既存のエラー処理・中継動作は維持され、native Responses と compact は元の 3xx と `Location` をクライアントへ返す場合があります。クライアントのリダイレクト動作は、このサーバー転送ポリシーとは別です。
+
+## xAI policy refusals
+
+一部の xAI Chat Completions 拒否は、HTTP 200 と `finish_reason: content_filter` ではなく、HTTP 403 と `I can't help with that request.` のような拒否文だけを返します。Codex は 403 を転送失敗として扱うため、ユーザーのターンが記録されず、同じリクエストが再送されます。
+
+コンボではない Responses リクエストでは、OpenCodex はその allowlist 対象の 403 を HTTP 200 の Responses、`status: "incomplete"`、`incomplete_details.reason: "content_filter"` に書き換えます。openai-chat アダプタ経路と openai-responses パススルー（grok-4.6 / grok-4.5 OAuth）の両方です。ストリーミングも同じ incomplete 境界です。空本文の 403 はエラーのままです。サブスクリプション、クレジット、権限、`not allowed to use this model` の 403 はエラーのままです。コンボのフェイルオーバーは元の HTTP 403 を見ます。
+
 ## エンドポイントの概要
 
 |クライアントサーフェス |エンドポイント |非ストリームの結果が成功 |成功したストリームまたはソケットの結果 |
@@ -22,7 +32,7 @@ provider events → internal adapter events → client dialect
 | OpenAI チャットの完了 | `POST /v1/chat/completions` | JSON | `chat.completion` `chat.completion.chunk` SSE で終わる `[DONE]` |
 |人間的なメッセージ | `POST /v1/messages` |人類 `message` JSON |人間的メッセージ SSE |
 |人間トークン数 | `POST /v1/messages/count_tokens` | `{ "input_tokens": number }` |該当なし |
-|モデルの発見 | `GET /v1/models` | 3 つのカタログ契約のうちの 1 つ |該当なし |
+|モデルの発見 | `GET /v1/models` | カタログまたは明示的な Desktop スナップショット |該当なし |
 |音声とリアルタイム | `POST /v1/live`、`POST /v1/realtime/calls` |中継されたコール作成応答 |別のサイドバンド WebSocket がフレームを両方向に中継します。
 |応答の圧縮 | `POST /v1/responses/compact` |置換履歴 JSON |該当なし |
 
@@ -53,7 +63,13 @@ provider events → internal adapter events → client dialect
 
 `stream: false` を指定するか、`stream` を指定しないと、同じアダプター イベントが 1 つの Responses JSON オブジェクトに収集されます。どちらの形式でも、選択したモデル、出力項目、端末の状態、使用状況が保存されます。
 
+canonical ChatGPT Codex ルートではアップストリームが SSE のみを受け付けるため、アップストリームへのリクエストだけを `stream: true` にします。OpenCodex は終端ストリームを制限内で検証し、クライアントが要求した JSON 形式へまとめます。明示された `store` は変更せず、検証に失敗した場合は不完全な JSON を HTTP 200 で返さずエラーにします。上限は 1 フレーム 4 MiB、transcript と再構築入力がそれぞれ 32 MiB、SSE フレーム 100,000 件、再構築される output item 10,000 件です。`stallTimeoutSec` は最初の body byte と以後の無通信時間の両方に適用されます。値が `0`、またはローカル upstream の既定値として無効な場合も即時には失効せず、独立した 15 分の全体上限だけが残ります。ストリーミング クライアントの動作は変わりません。
+
 クライアント向け Responses SSE フレームは、SSE ブロック区切りの前の生バイトで測って 1 フレームあたり 4 MiB に制限されます。HTTP では、区切りなしでこの上限を超えたアップストリーム フレームは、合成 `response.failed` イベントと続く `data: [DONE]` でフェイルクローズします。Responses WebSocket ブリッジでは、同じ条件で 502 `websocket_protocol_error` を送信し、アップストリーム リーダーをキャンセルします。完全な Responses 終端フレームがすでに到着している場合はそれが優先され、その後のサイズ超過または不正なバイトは、完了したターンをトランスポート障害に置き換えず破棄されます。
+
+:::note
+ネイティブ パススルーでは、Responses の終端イベントが優先されます。早すぎる `data: [DONE]` は、そのイベントが届くまで保留されます。通常のネイティブ パスで、解析済みの終端がないまま正常な HTTP 200 EOF に達した場合、プロキシは `incomplete_details.reason: "adapter_eof"` を持つ `response.incomplete` を 1 件、その後に `data: [DONE]` を 1 件送信します。区切りのない終端 JSON が構文的に有効なら 1 回だけ受け入れられ、不正または切り詰められた JSON は incomplete のままです。モデル単位の終端修復を有効にしたプロバイダーでは、フレーム化されていない終端らしい接尾部と EOF 時の早すぎる `data: [DONE]` は、昇格可能な完全なライフサイクル候補がなければ `missing_terminal_event` としてフェイルクローズし、候補が完全なら `response.completed` に昇格します。高信頼度の `cyber_policy` 終端は、セマンティックなログおよび課金集計上は `error.code: "cyber_policy"` を持つ `response.failed`（status 400）に正規化されますが、すでに開始済みのストリーミング HTTP 応答は 200 のままです。このコミット済みリクエストの境界では、再試行も再送も行いません。
+:::
 
 すべての端末応答使用状況オブジェクトには、プロバイダーが詳細を報告しなかった場合でも、両方の詳細オブジェクトが含まれます。
 
@@ -68,6 +84,14 @@ provider events → internal adapter events → client dialect
 ```
 
 利用可能な場合、`input_tokens_details` には `cache_write_tokens` も含めることができます。常に存在する詳細オブジェクトは、厳密な応答クライアントに対する互換性を保証します。ゼロは「報告されていない」ことを意味する場合がありますが、必ずしも「プロバイダーがそのような作業を実行していない」とは限りません。
+
+### 応答とリクエストログの関連付け
+
+アドミッションを通過したすべての HTTP Responses 応答には、プロキシが生成した `ocx-<32 hex>` 形式の ID を格納する `x-opencodex-request-id` ヘッダーが付与されます。この値は、応答をリクエストログおよび使用状況レポート内の対応する行に結び付けるキーです。
+
+プロキシは常にこの値を生成し、呼び出し元が指定した ID やアップストリームが返した ID を上書きします。そのため、このプロキシに固有であり、相関キーとして安全に信頼できます。このヘッダーは `Access-Control-Expose-Headers` に列挙されているため、ブラウザーの JavaScript からクロスオリジンで読み取れます。カスタムの `x-` ヘッダーは、実際にワイヤ上に存在していても、そうしなければ `response.headers.get()` からは見えません。
+
+認証またはオリジンのアドミッションで拒否されたリクエストはこのラッパーに到達せず、ID も付与されません。そのため、ヘッダーがない場合は、リクエストがログに記録される前に拒否されたことを意味します。
 
 ### 同じパスでの WebSocket のアップグレード
 
@@ -119,6 +143,11 @@ WebSocket が無効になっている場合、アップグレード試行では�
 
 これらのエンドポイントは、Claude Code および互換性のあるクライアントによって使用される Anthropic Messages 言語を話します。ほとんどのリクエストはレスポンスに変換され、通常どおりルーティングされてから、Anthropic JSON または Anthropic SSE に変換されます。
 
+変換される Messages リクエストでは、推論の再送もリクエスト共通の変換バジェットを使います。
+この制限にはエンコード・デコード時のコピー分も含まれます。超過時は
+`translation_buffer_limit` を伴う HTTP 413 を返し、署名や不透明な推論データを切り詰めません。
+ネイティブ Anthropic パススルーには、別の本文サイズ制限が適用されます。
+
 ネイティブ Anthropic パススルーは、次のすべてが当てはまる場合にのみ適格です。
 
 - ネイティブ パススルーはクロード コード設定で無効になっていません。
@@ -139,17 +168,51 @@ admission secret も削除され、別の実際の Anthropic 認証情報は維�
 { "input_tokens": 123 }
 ```
 
+解決できない日付形式の Desktop ID は、モデル検出に含まれていない実際のネイティブモデル
+かもしれません。判断材料が足りず ID を解決できない場合、Messages と count-tokens は固定エラー
+`desktop_model_mapping_unavailable`と HTTP 503 を返します。これはモデルが無効だという判定ではありません。
+不明な旧ハッシュ別名は引き続き HTTP 400 で拒否します。どちらも日付を除去したり別ルートへ
+フォールバックしたりしません。既知の ID、登録済みマッピング、正確な `modelMap` 一致、
+認識済みの実ネイティブ ID の処理は変わりません。モデル検出を更新するか接続先ハブの
+プロファイルを再適用してから試してください。再試行だけで解決する保証はありません。
+
 ## `GET /v1/models`
 
-同じルートは、互換性のないカタログ エンベロープを予期する 3 つのクライアントにサービスを提供します。 `client_version` も存在しない限り、人間味が優先されます。
+`format=desktop-config` を指定しない場合、通常のカタログ契約は次のとおりです。
 
-|契約 |トリガー |トップレベルの形状 |モデル ID の動作 |
 | --- | --- | --- | --- |
 |人類モデルのリスト | `anthropic-version` ヘッダーまたは `?flavor=anthropic`、`client_version` なし | Anthropic モデル情報エントリのある `{ "data": [...] }` |クロード コードは読み取り可能な ID を受け取ります。デスクトップはプロファイル固有のエイリアス ファミリを受け取ることができます。
 |Codexカタログ | `client_version` クエリパラメータ | `{ "models": [...] }` |ネイティブおよびルーティングされたエントリには、より豊富な Codex カタログ フィールド、可視性、労力、WebSocket、およびマルチエージェント メタデータが含まれています。
 |プレーンな OpenAI リスト |どちらのトリガーもありません | `{ "object": "list", "data": [...] }` |表示されるネイティブ ID は裸です。ルーティング ID はエイリアスまたは `provider/model` |
 
+### Desktop 設定スナップショット
+
+`GET /v1/models?ids=desktop&format=desktop-config` は user-agent に関係なく Desktop
+スナップショットを明示的に選択します。応答は `{ "version": 1, "models": [...] }` で、
+`Cache-Control: no-store` を含みます。クライアントは `Accept: application/json`、
+`anthropic-version: 2023-06-01` と既存のデータ用認証情報を送ります。管理者トークンや
+プロファイルのアップロードは不要です。項目はハブが発行した Desktop 設定用モデルであり、
+Codex カタログの行ではありません。
+
+この形式に `ids=cli` または `client_version` を併用すると HTTP 400 になります。形式指定が
+なければ上記の通常の契約を維持します。Claude が無効なら `{ "version": 1, "models": [] }`
+を返し、接続中の Desktop apply は利用不可として設定を書き換えません。バージョン 1 ではなく
+通常のカタログを返す古いハブは未対応で、ローカル生成 ID に切り替えることはありません。
+
+スナップショットは読み取り専用のモデル一覧であり、キーローテーションやプロファイル送信の
+API ではありません。Desktop のキー移行・復旧・切断は既存の接続ライフサイクルで処理します。
+ローテーションはモデルと選択を保持し、CLI の `rotation` は `committed` と `rolled_back` を
+区別します。切断は管理設定を復元するか、確認済み旧プロファイルを標準モードへ戻し、
+ユーザーフィールドと後から選んだ有効なプロファイルを保持します。競合や未完了の復旧を完了とは
+報告しません。ファイル変更の反映には Desktop の再起動が必要で、切断はハブのキーを自動失効
+させません。[Desktop ガイド](/ja/guides/claude-code/)を参照してください。thinking 再送と
+キャッシュは別件 [#3719](https://github.com/lidge-jun/opencodex/issues/3719)です。
+
 ## `POST /v1/live` とRealtime サイドバンド
+
+以下のアカウント連携は既存の Codex クライアント向けです。外部 API キーで利用する音声入力と GPT-Live は[英語版の音声 API 仕様](/reference/proxy-formats/#streaming-dictation)を参照してください。
+
+Connections > API keys に音声入力とリアルタイム音声の項目があります。データキーは入力欄のメモリにのみ保持されます。文字起こしは選択したファイルを送信し、音声の接続確認はマイクを使わずセッション応答を待ちます。設定済みの表示は接続成功を意味しません。
 
 `POST /v1/live` は、ChatGPT/Codex アプリのフレームレス通話作成サーフェスを受け入れます。 `POST /v1/realtime/calls` は、OpenAI Realtime 呼び出し作成サーフェスを受け入れます。 opencodex は、適格な OpenAI ファミリ ルートを選択し、アップストリーム認証モードのコール作成リクエストを正規化し、制限付き応答を中継します。
 
@@ -187,14 +250,20 @@ admission secret も削除され、別の実際の Anthropic 認証情報は維�
 
 |表面 |専用 |ベアラー | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP と WebSocket |必須 |代理入場を拒否されました |拒否されました |
-| `/v1/responses/compact` |必須 |代理入場を拒否されました |拒否されました |
-| `/v1/chat/completions` |必須 |代理入場を拒否されました |拒否されました |
+| `/v1/responses` HTTP と WebSocket | 承認済み | 承認済み |拒否されました |
+| `/v1/responses/compact` | 承認済み | 承認済み |拒否されました |
+| `/v1/chat/completions` | 承認済み | 承認済み |拒否されました |
 | `/v1/messages` および `/v1/messages/count_tokens` |承認済み |承認済み |承認済み |
 | `/v1/models` |承認済み |承認済み |承認済み |
 | `/v1/live`、`/v1/realtime/calls`、および側波帯結合 |承認済み |承認済み |承認済み |
 
-Responses-family および Chat リクエストは、プロバイダーまたは Codex Direct パススルー用に `Authorization` を予約するため、リモート プロキシ キーは専用ヘッダーを使用する必要があります。メッセージとリアルタイム サーフェスは、より広範なクライアント互換性を必要とするため、3 つの形式すべてを受け入れます。
+Responses 系列と Chat のリクエストは、専用ヘッダーまたは Bearer フィールドのプロキシキーを受け付けます。ネイティブルートでは選択された保存済み Codex 認証情報が admission bearer を置き換え、他のルートではその bearer を削除します。プロキシキーを upstream の認証情報として使うことはありません。別の provider bearer も渡す場合は、プロキシキーを専用ヘッダーに設定してください。
+
+キーがなく OAuth を使用しない Cursor ルートは、別途指定された呼び出し元 bearer を使用できますが、プロキシ secret や自動補完された ChatGPT main 認証は使用しません。Combo/policy の選択と実際の shadow/thread-spawn ルート変更では、呼び出し元の生の認証情報を新しい対象へ渡しません。正規の OpenAI ルーティングでは、JWT に ChatGPT アカウントの claim が含まれ、明示的なアカウントヘッダーがある場合はその claim と一致するときに限り、内部ルート変更後にプロキシキーではない呼び出し元の単一 bearer を復元できます。 オプションの OpenAI sidecar に呼び出し元の認証を転送するには、単一の JWT とそれに一致する明示的な `chatgpt-account-id` が必要です。Opaque bearer は、明示的なアカウントヘッダーがあっても、ルート変更をまたいで復元されません。 それ以外の最終対象には自身の設定済み・OAuth・保存済み認証情報が必要で、なければローカルで失敗します。ルート変更のない thread-spawn マーカーだけでは認証情報を削除しません。
+
+設定済みキーのない Cursor への Chat リクエストでは、保存済み main 認証による任意の補完を、OpenAI 補助呼び出しが実際に計画され、canonical Direct の候補が利用可能になるまで延期します。無関係な Cursor リクエストはこの経路で native main を占有せず、プロファイル切り替えを遅らせません。補助認証は起動時と切り替え時の保護に従い、Cursor bearer とは分離されます。Pool およびアカウント指定の補助呼び出しは既存のアカウント選択を維持します。
+
+Claude replay は、その turn が所有権を確保した main 認証だけをメモリ内 snapshot に保持し、最終対象が正規の ChatGPT ルートである場合にのみ復元します。
 
 :::caution
 データプレーン キーは管理資格情報ではありません。管理 API は別の管理シークレットを使用します。 [管理 API](/reference/management-api/)を参照してください。 1 つのシークレットを両方のプレーンに再利用しないでください。
@@ -209,7 +278,7 @@ Responses-family および Chat リクエストは、プロバイダーまたは
 | 401 | `authentication_error` |必要なプロキシ アドミッション資格情報が見つからないか無効です。
 | 403 | `origin_rejected` | Responses/OpenAI データプレーン リクエストまたは WebSocket アップグレードが、許可されていないオリジンから送信されました。
 | 503 | `combo_unavailable` |選択したコンボ内のすべてのターゲットは使用不可、クールダウン中、無効、またはその他の理由で不適格です。
-| 400 | `unreadable_encrypted_agent_task` |暗号化された v2 ワーカー タスクには、それを使用できる適格なネイティブ ChatGPT ターゲットがありません。
+| 400 | `unreadable_encrypted_agent_task` | 暗号化された v2 ワーカー タスクには、それを処理できる正規の ChatGPT ターゲットも明示的に信頼された Responses ターゲットもありません。 |
 | 426 | `upgrade_required` |応答 WebSocket トランスポートが無効になっているか、アップグレードが失敗しました。 HTTP を使用する |
 
 Anthropic オリジンの失敗は Anthropic のエラー エンベロープでレンダリングされるため、オリジンの拒否は OpenAI スタイルの `origin_rejected` 本体ではなく、その方言上の 403 `permission_error` になります。
@@ -219,3 +288,9 @@ Anthropic オリジンの失敗は Anthropic のエラー エンベロープで�
 プロキシは、本物のバックエンド暗号文を不透明なものとして扱います。構造的に有効な暗号文はバイト単位で保存されます。opencodex は暗号文を復号したり、その内容を変換したり、別のプロバイダー用に再暗号化したりしません。
 
 一部のエージェント フックはこれまで、プレーンテキストの制御テキストを `encrypted_content` スロットに配置していました。互換性を確保するために、プロキシは、構造的に有効な Fernet の実行を変更せずに保持しながら、プレーンテキストをテキスト部分に分割します。 `agent_message` が修復中にすべての暗号化された部分を失った場合、それは通常のユーザー メッセージになります。現在の v2 タスクが完全に暗号化されたままであるが、選択したルーティングされたターゲットがネイティブ ChatGPT 暗号文を読み取ることができない場合、opencodex は読み取り不能なバイトをそのプロバイダーに送信する代わりに `unreadable_encrypted_agent_task` で失敗します。ワーカー タスクに関するクライアントの動作については、[サブエージェントサーフェス](/guides/sub-agent-surface/) を参照してください。
+
+### 既存の会話でプロバイダーを切り替える場合
+
+再送される推論アイテムの `encrypted_content` は、それを生成したプロバイダーと認証情報でしか読めません。会話を最後に処理したのが別のプロバイダーだと opencodex が把握している場合は、送信前にその blob を取り除き、アイテムの要約は残します。そのプロバイダーのエンドポイントや認証情報も異なっていた場合は、アイテムの `rs_…` ID も取り除きます。新しい送信先はその ID のアイテムを参照できないためです。プロキシの再起動後など opencodex が把握できない場合は、新しい送信先が blob を拒否します。OpenAI と Azure OpenAI は `400 invalid_encrypted_content` を返します。opencodex はそのリクエストを、前のプロバイダーの推論状態（blob と `rs_…` ID）を除いて一度だけ再送します。ID を残すと `Item with id 'rs_…' not found` になるためです。
+
+この復旧は Responses プロトコルを話すすべてのアダプターに適用されるため、`openai-responses` と `azure-openai` は同じ動作になります。復旧が成功すると、その会話の同じ送信先での後続ターンは、以後 5 分間、最初の送信前にこの状態を取り除きます。再送はリクエストの通常の送信予算から差し引かれます。通常の 400 と 429 はこの方法では再送されず、5xx も同様です。例外は一つだけで、暗号化されたツール出力を含むリクエストに対し、本文がその復号失敗の拒否と完全に一致する 502 は同じ一回の再送の対象になります。2 回目の拒否はそのままクライアントに返ります。その場合は送信先のプロバイダーで新しい会話を始めてください。

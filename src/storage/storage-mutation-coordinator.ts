@@ -16,6 +16,12 @@ export type StorageMutationBusyError = "storage_mutation_busy";
 export interface StorageMutationCoordinatorTestHooks {
   /** Block after acquiring the slot, before mutation work (race tests). */
   blockMs?: number;
+  /** Test-only cross-thread handshake after one mutation kind acquires its slot. */
+  pauseAfterAcquire?: {
+    kind: StorageMutationKind;
+    readyPath: string;
+    releasePath: string;
+  };
 }
 
 interface ActiveSlot {
@@ -28,7 +34,23 @@ export const MAX_ACTIVE_STORAGE_HOME_SLOTS = 32;
 const slots = new Map<string, ActiveSlot>();
 const slotGate = createAdmissionGate("storage_home_slots", MAX_ACTIVE_STORAGE_HOME_SLOTS);
 let releaseMisses = 0;
+let mutationEpoch = 0;
 let testHooks: StorageMutationCoordinatorTestHooks | null = null;
+
+/**
+ * Advances whenever a CODEX_HOME storage mutation finishes (coordinated cleanup, restore
+ * and policy runs on lease release; Log Guard maintenance through
+ * {@link noteStorageMutationCompleted}). An in-flight storage scan that started under an
+ * older epoch describes the tree before that mutation and must not answer a later read.
+ */
+export function storageMutationEpoch(): number {
+  return mutationEpoch;
+}
+
+/** Record a CODEX_HOME mutation that does not go through a coordinator slot. */
+export function noteStorageMutationCompleted(): void {
+  mutationEpoch += 1;
+}
 
 function slotKey(codexHome?: string): string {
   return resolve(codexHome ?? resolveCodexHomeDir());
@@ -73,6 +95,7 @@ export function tryBeginStorageMutation(
     release() {
       if (!active) return;
       active = false;
+      mutationEpoch += 1;
       const owner = slots.get(key);
       if (owner?.lease === ownerLease) slots.delete(key);
       lease.release();
@@ -93,7 +116,12 @@ export function endStorageMutation(codexHome?: string): void {
   slot.lease.release();
 }
 
-async function applyCoordinatorBlock(): Promise<void> {
+async function applyCoordinatorBlock(kind: StorageMutationKind): Promise<void> {
+  const pause = testHooks?.pauseAfterAcquire;
+  if (pause?.kind === kind) {
+    await Bun.write(pause.readyPath, "ready\n");
+    while (!Bun.file(pause.releasePath).size) await Bun.sleep(10);
+  }
   const blockMs = testHooks?.blockMs;
   if (typeof blockMs === "number" && Number.isFinite(blockMs) && blockMs > 0) {
     await Bun.sleep(Math.floor(blockMs));
@@ -114,7 +142,7 @@ export async function runPolicyStorageMutation<T>(
     return { ok: false, error: "storage_mutation_busy" };
   }
   try {
-    await applyCoordinatorBlock();
+    await applyCoordinatorBlock("policy");
     return await work();
   } finally {
     gate.lease.release();
@@ -131,7 +159,7 @@ export async function withStorageMutationSlot<T>(
     return { ok: false, error: "storage_mutation_busy" };
   }
   try {
-    await applyCoordinatorBlock();
+    await applyCoordinatorBlock(kind);
     return await work();
   } finally {
     gate.lease.release();

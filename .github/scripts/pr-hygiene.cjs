@@ -1,6 +1,7 @@
 "use strict";
 
 const { assessSponsoredSurface } = require("./pr-sponsored-surface.cjs");
+const { assessCarryAttribution } = require("./pr-carry-attribution.cjs");
 
 const GENERATED_PREFIXES = [
   "gui/dist/",
@@ -86,28 +87,61 @@ function isTestPath(path) {
 // writing tests, weakening the gate everywhere it actually matters.
 //
 // Deliberately narrow: a single non-comment line anywhere in the file's patch
-// makes the whole file count as behavior again. Block-comment CONTINUATION
-// lines are recognized only in the common leading-asterisk form; anything more
-// clever than that reads as code and keeps the requirement.
+// makes the whole file count as behavior again. Block-comment state is tracked
+// line by line so #private fields and *generator methods are not mistaken
+// for comment text; anything ambiguous reads as code and keeps the requirement.
 function isCommentOnlyChange(patch) {
   if (typeof patch !== "string") return false;
-  const changed = patch
-    .split("\n")
-    .filter(
-      (line) =>
-        (line.startsWith("+") && !line.startsWith("+++")) ||
-        (line.startsWith("-") && !line.startsWith("---")),
-    )
-    .map((line) => line.slice(1).trim());
-  if (changed.length === 0) return false;
-  return changed.every(
-    (line) =>
+  let changed = 0;
+  let oldInBlockComment = false;
+  let newInBlockComment = false;
+
+  const isComment = (text, inBlockComment) => {
+    const line = text.trim();
+    const opensBlock = !inBlockComment && line.startsWith("/*");
+    const blockComment = inBlockComment || opensBlock;
+    const blockEnd = blockComment ? line.indexOf("*/", opensBlock ? 2 : 0) : -1;
+    // Only the conventional leading-asterisk continuation counts as comment text.
+    // A bare line after an opener may sit inside a string or template literal
+    // that merely contains "/*", so it stays behavior.
+    const continuation = inBlockComment && line.startsWith("*");
+    const comment =
       line === "" ||
       line.startsWith("//") ||
-      line.startsWith("/*") ||
-      line.startsWith("*") ||
-      line.startsWith("#"),
-  );
+      ((opensBlock || continuation) && (blockEnd === -1 || line.slice(blockEnd + 2).trim() === ""));
+    const nextInBlockComment = blockComment && blockEnd === -1;
+    return { comment, nextInBlockComment };
+  };
+
+  for (const diffLine of patch.split("\n")) {
+    if (diffLine.startsWith("@@")) {
+      oldInBlockComment = false;
+      newInBlockComment = false;
+      continue;
+    }
+    if (diffLine.startsWith("+++") || diffLine.startsWith("---")) continue;
+
+    const marker = diffLine[0];
+    if (marker !== "+" && marker !== "-" && marker !== " ") continue;
+    const text = diffLine.slice(1);
+    if (marker !== "-") {
+      const result = isComment(text, newInBlockComment);
+      newInBlockComment = result.nextInBlockComment;
+      if (marker === "+") {
+        changed += 1;
+        if (!result.comment) return false;
+      }
+    }
+    if (marker !== "+") {
+      const result = isComment(text, oldInBlockComment);
+      oldInBlockComment = result.nextInBlockComment;
+      if (marker === "-") {
+        changed += 1;
+        if (!result.comment) return false;
+      }
+    }
+  }
+  return changed > 0;
 }
 
 function hasEmptyCatch(lines) {
@@ -239,6 +273,8 @@ const HYGIENE_FAILURE_HINTS = {
     "An empty catch block was added. Handle, report, or deliberately propagate the error.",
   unsponsored_surface:
     "This changes an authentication, workflow, release-automation, or dependency surface. `MAINTAINERS.md` requires security review for these; ask a maintainer to apply `maintainer-sponsored` once they have reviewed it.",
+  missing_coauthor_credit:
+    "This pull request says it reimplements, supersedes, carries, or rebases another author's pull request, but no `Co-authored-by` trailer names that author. Prose in a commit body is not read by anything; the trailer is what GitHub counts. Add it to the description or a commit, or obtain `attribution-approved`.",
 };
 
 /**
@@ -253,6 +289,7 @@ const HYGIENE_GATE_LABELS = [
   "suppression-approved",
   "generated-change-approved",
   "dependency-change-approved",
+  "attribution-approved",
 ];
 
 /**
@@ -263,6 +300,11 @@ function collectDeterministicHygieneFailures({
   files = [],
   labels = [],
   authorHasPushPermission = false,
+  prAuthorLogin = "",
+  title = "",
+  body = "",
+  commits = [],
+  referencedAuthors = {},
 }) {
   // Renames must keep the source path: moving a restricted file to a
   // non-restricted destination must not drop the sponsorship requirement.
@@ -280,6 +322,16 @@ function collectDeterministicHygieneFailures({
       authorHasPushPermission,
       changedFiles,
       labels,
+    }),
+    // Reads the pull request's text rather than its diff: a carry declares
+    // itself in prose, and the trailer it needs lives in the same place.
+    ...assessCarryAttribution({
+      prAuthorLogin,
+      title,
+      body,
+      commits,
+      labels,
+      referencedAuthors,
     }),
   ];
 }

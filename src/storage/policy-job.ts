@@ -6,7 +6,9 @@
  * proxy event loop stays responsive.
  */
 import type { CleanupMode, CleanupResult } from "./cleanup";
+import { spawnWorker } from "../lib/worker-embed";
 import { resolveCodexHomeDir } from "../codex/home";
+import { siblingOfLivePort } from "../codex/sibling-start";
 import {
   tryBeginStorageMutation,
 } from "./storage-mutation-coordinator";
@@ -38,6 +40,7 @@ export interface PolicyJobOutcome {
   freedBytes?: number;
   removed?: number;
   trashDir?: string;
+  metadataPersistenceError?: PolicyRunResult["metadataPersistenceError"];
 }
 
 export interface PolicyJobState {
@@ -238,6 +241,7 @@ export async function abortStorageCleanupPolicyJobAsync(): Promise<void> {
   }
 }
 
+/** Project a run result into the bounded management-API job outcome. */
 function outcomeFromResult(result: PolicyRunResult): PolicyJobOutcome {
   return {
     ok: result.ok,
@@ -248,18 +252,26 @@ function outcomeFromResult(result: PolicyRunResult): PolicyJobOutcome {
     ...(result.freedBytes !== undefined ? { freedBytes: result.freedBytes } : {}),
     ...(result.removed !== undefined ? { removed: result.removed } : {}),
     ...(result.trashDir ? { trashDir: result.trashDir } : {}),
+    ...(result.metadataPersistenceError
+      ? { metadataPersistenceError: result.metadataPersistenceError }
+      : {}),
   };
 }
 
+/** Publish one completed evaluation without losing successful cleanup effects. */
 function applyFinished(result: PolicyRunResult): void {
   // Prefer the latest persisted policy over `result.policy`. The worker (or
   // in-process run) already merged run metadata into disk; a concurrent PUT
   // may also have landed after that write. Re-reading avoids applying a stale
   // start-of-job snapshot when the run skipped without saving.
-  try {
-    livePolicyApply?.(readStorageCleanupPolicyFromConfig());
-  } catch {
-    livePolicyApply?.(result.policy);
+  // A best-effort fallback policy may predate concurrent edits; keep the current
+  // live config untouched when the durable metadata write did not land.
+  if (!result.metadataPersistenceError) {
+    try {
+      livePolicyApply?.(readStorageCleanupPolicyFromConfig());
+    } catch {
+      livePolicyApply?.(result.policy);
+    }
   }
   state = {
     status: "idle",
@@ -300,7 +312,7 @@ function runInWorker(opts: RequestPolicyRunOptions & { blockMs?: number }): Prom
     let settled = false;
     let worker: Worker;
     try {
-      worker = new Worker(new URL("./policy-worker.ts", import.meta.url).href);
+      worker = spawnWorker(new URL("./policy-worker.ts", import.meta.url).href, "policy-worker");
       reservation.bind(worker);
     } catch (error) {
       reservation.release();
@@ -441,11 +453,14 @@ export function requestStorageCleanupPolicyRun(
 /**
  * Fire-and-forget entry for startup / schedule ticks.
  * Skips the single-flight slot when disabled or not due so manual runs stay free.
+ * A sibling instance never runs one: the archived sessions belong to the shared CODEX_HOME the
+ * live owner serves (`src/codex/sibling-start.ts`), and the manual run route is refused there too.
  */
 export function maybeRequestStorageCleanupPolicyRun(
   reason: PolicyRunReason,
   opts?: Omit<RequestPolicyRunOptions, "reason">,
 ): void {
+  if (siblingOfLivePort() !== null) return;
   try {
     const policy = readStorageCleanupPolicyFromConfig();
     if (!policy.enabled) return;

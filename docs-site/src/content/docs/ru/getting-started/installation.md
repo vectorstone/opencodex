@@ -45,6 +45,19 @@ ocx --version
 opencodex --version
 ```
 
+## Автономный бинарный файл (без npm)
+
+В релиз входят автономные бинарные файлы `ocx` для поддерживаемых macOS, Linux и Windows.
+Они содержат рантайм Bun и дашборд, поэтому npm, Node и отдельная установка Bun не нужны.
+Скачайте архив для своей платформы, распакуйте его и выполните:
+
+```bash
+./ocx --version
+./ocx start
+```
+
+Чтобы дашборд был доступен, оставьте распакованный каталог `gui/dist` рядом с бинарным файлом.
+
 ### Каналы релизов
 
 Стабильный канал `latest` уже включает поддержку каталога GPT-5.6 Sol/Terra/Luna для маршрутов
@@ -83,7 +96,7 @@ bun run dev:gui     # запускает dev-сервер панели упра�
 | --- | --- |
 | `$OPENCODEX_HOME/config.json` | Ваши провайдеры, провайдер по умолчанию, порт и параметры. |
 | `$OPENCODEX_HOME/ocx.pid` | PID запущенного прокси (защита от повторного запуска). |
-| `$OPENCODEX_HOME/runtime-port.json` | Текущие PID, имя хоста и порт, включая автоматически выбранный запасной порт. |
+| `$OPENCODEX_HOME/runtime-port.json` | Текущие PID, имя хоста и порт, включая порт, назначенный ОС, когда `config.port` равен `0`. |
 | `$OPENCODEX_HOME/auth.json` | Сохранённые учётные данные OAuth (после `ocx login`). |
 | `$OPENCODEX_HOME/catalog-backup*.json` | Резервные копии каталога моделей Codex, создаваемые перед тем, как opencodex его изменит. |
 | `$CODEX_HOME/config.toml` | На loopback-адресе opencodex добавляет корневой `openai_base_url`, отмеченный собственным маркером; при привязке не к loopback используются `model_provider = "opencodex"` и `[model_providers.opencodex]`, чтобы Codex мог отправлять заголовок API-аутентификации. |

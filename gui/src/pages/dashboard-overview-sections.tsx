@@ -15,8 +15,10 @@ import {
   requireJson,
   type SidecarPatch,
   shadowCallModelOptions,
-  sidecarBackendForModel,
+  webSearchSidecarSelectionForModel,
   updateJobLabel,
+  webSearchEnabledPatch,
+  sidecarCodexWritePending,
   visionEnabledPatch,
   visionMaxDescriptionsPatch,
   visionReasoningLadder,
@@ -44,7 +46,7 @@ export function DashboardEffortCapPanel({ apiBase, d }: { apiBase: string; d: Da
   if (!maModeResolved || maMode === "v1") return null;
 
   return (
-    <div className="panel">
+    <div className="panel dash-effort-panel">
       <div className="injection-head">
         <span className="injection-label" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
           {t("dash.effortCapLabel")}
@@ -62,56 +64,58 @@ export function DashboardEffortCapPanel({ apiBase, d }: { apiBase: string; d: Da
             <IconInfo width={13} height={13} aria-hidden="true" />
           </button>
         </span>
-        <Select
-          value={effortCap}
-          options={[
-            { value: "", label: t("dash.effortCapNone") },
-            ...EFFORT_CAP_LEVELS.map(e => ({ value: e, label: e })),
-          ]}
-          onChange={async (v) => {
-            if (effortCapSaving) return;
-            setEffortCapSaving(true);
-            try {
-              const res = await fetch(`${apiBase}/api/effort-caps`, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ effortCap: v || null }),
-              });
-              const data = await requireJson<{ ok: boolean; effortCap?: string | null; subagentEffortCap?: string | null }>(res);
-              setEffortCap(data.effortCap ?? "");
-              setSubagentEffortCap(data.subagentEffortCap ?? "");
-            } catch { /* ignore */ }
-            finally { setEffortCapSaving(false); }
-          }}
-          disabled={effortCapSaving}
-          label={t("dash.effortCapLabel")}
-          align="right"
-        />
-        <Select
-          value={subagentEffortCap}
-          options={[
-            { value: "", label: t("dash.effortCapNone") },
-            ...EFFORT_CAP_LEVELS.map(e => ({ value: e, label: e })),
-          ]}
-          onChange={async (v) => {
-            if (effortCapSaving) return;
-            setEffortCapSaving(true);
-            try {
-              const res = await fetch(`${apiBase}/api/effort-caps`, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ subagentEffortCap: v || null }),
-              });
-              const data = await requireJson<{ ok: boolean; effortCap?: string | null; subagentEffortCap?: string | null }>(res);
-              setEffortCap(data.effortCap ?? "");
-              setSubagentEffortCap(data.subagentEffortCap ?? "");
-            } catch { /* ignore */ }
-            finally { setEffortCapSaving(false); }
-          }}
-          disabled={effortCapSaving}
-          label={t("dash.subagentEffortCapLabel")}
-          align="right"
-        />
+        <div className="dash-effort-controls">
+          <Select
+            value={effortCap}
+            options={[
+              { value: "", label: t("dash.effortCapNone") },
+              ...EFFORT_CAP_LEVELS.map(e => ({ value: e, label: e })),
+            ]}
+            onChange={async (v) => {
+              if (effortCapSaving) return;
+              setEffortCapSaving(true);
+              try {
+                const res = await fetch(`${apiBase}/api/effort-caps`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ effortCap: v || null }),
+                });
+                const data = await requireJson<{ ok: boolean; effortCap?: string | null; subagentEffortCap?: string | null }>(res);
+                setEffortCap(data.effortCap ?? "");
+                setSubagentEffortCap(data.subagentEffortCap ?? "");
+              } catch { /* ignore */ }
+              finally { setEffortCapSaving(false); }
+            }}
+            disabled={effortCapSaving}
+            label={t("dash.effortCapLabel")}
+            align="right"
+          />
+          <Select
+            value={subagentEffortCap}
+            options={[
+              { value: "", label: t("dash.effortCapNone") },
+              ...EFFORT_CAP_LEVELS.map(e => ({ value: e, label: e })),
+            ]}
+            onChange={async (v) => {
+              if (effortCapSaving) return;
+              setEffortCapSaving(true);
+              try {
+                const res = await fetch(`${apiBase}/api/effort-caps`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ subagentEffortCap: v || null }),
+                });
+                const data = await requireJson<{ ok: boolean; effortCap?: string | null; subagentEffortCap?: string | null }>(res);
+                setEffortCap(data.effortCap ?? "");
+                setSubagentEffortCap(data.subagentEffortCap ?? "");
+              } catch { /* ignore */ }
+              finally { setEffortCapSaving(false); }
+            }}
+            disabled={effortCapSaving}
+            label={t("dash.subagentEffortCapLabel")}
+            align="right"
+          />
+        </div>
       </div>
     </div>
   );
@@ -161,7 +165,7 @@ export function DashboardInjectionPanel({ d }: { apiBase: string; d: Dash }) {
 
 export function DashboardMaintenancePanel({ d }: { d: Dash }) {
   const {
-    t, runSync, syncing, updateTriggerRef, openUpdateDialog, updateLoading, updateOpen,
+    t, runSync, syncing, settingsSaving, updateTriggerRef, openUpdateDialog, updateLoading, updateOpen,
     syncResult, syncError, updateJob, reconnecting, clearSyncFeedback,
   } = d;
   const syncHoldsWarning = !!syncResult && (
@@ -209,7 +213,7 @@ export function DashboardMaintenancePanel({ d }: { d: Dash }) {
             <div className="muted text-control dash-sync-hint">{t("dash.syncModelsHint")}</div>
           </div>
           <div className="maintenance-actions">
-            <button type="button" className="btn btn-ghost btn-sm" onClick={handleRunSync} disabled={syncing}>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={handleRunSync} disabled={syncing || settingsSaving}>
               <IconRefresh className={syncing ? "spin-icon" : undefined} /> {syncing ? t("dash.syncing") : t("dash.syncRun")}
             </button>
             <button
@@ -436,17 +440,22 @@ function VisionAdvancedPopover({ t, open, triggerRef, onClose, maxValue, maxInva
 
 export function DashboardSidecarPanels({ d }: { d: Dash }) {
   const {
-    t, settings, settingsSaving, toggleCodexAutoStart,
+    t, settings, settingsSaving, syncing, toggleCodexAutoStart, toggleCodexDesktopAuthless,
+    toggleCodexClientCompaction,
     sidecar, sidecarSaving, sidecarModels, visionModels, models, saveSidecar,
+    sidecarCodexApply,
     shadowCall, shadowCallSaving, shadowCallHelpTriggerRef, shadowCallHelpOpen, setShadowCallHelpOpen, saveShadowCall,
   } = d;
-  const visionEnabled = sidecar?.vision.enabled !== false;
-  const visionModel = visionEnabled ? (sidecar?.vision.model ?? "gpt-5.4-mini") : "";
-  const persistedVisionReasoning = sidecar?.vision.reasoning ?? "low";
+  const visionEnabled = sidecar?.vision?.enabled !== false;
+  const visionModel = visionEnabled ? (sidecar?.vision?.model ?? "gpt-5.6-luna") : "";
+  const webSearchEnabled = sidecar?.webSearch?.enabled !== false;
+  // Same shape as the Vision card: Off is a row in the picker, and choosing a model is the way back.
+  const webSearchModel = webSearchEnabled ? (sidecar?.webSearch?.model ?? "gpt-5.6-luna") : "";
+  const persistedVisionReasoning = sidecar?.vision?.reasoning ?? "low";
   const visionLadder = visionReasoningLadder(models, visionModel);
   const visionReasoning = clampVisionReasoningToLadder(visionLadder, persistedVisionReasoning);
-  const serverMaxDescriptions = String(sidecar?.vision.maxDescriptionsPerTurn ?? VISION_MAX_DESCRIPTIONS_DEFAULT);
-  const serverTimeoutMs = String(sidecar?.vision.timeoutMs ?? VISION_TIMEOUT_MS_DEFAULT);
+  const serverMaxDescriptions = String(sidecar?.vision?.maxDescriptionsPerTurn ?? VISION_MAX_DESCRIPTIONS_DEFAULT);
+  const serverTimeoutMs = String(sidecar?.vision?.timeoutMs ?? VISION_TIMEOUT_MS_DEFAULT);
   const [maxDraft, setMaxDraft] = useState<string | null>(null);
   const [timeoutDraft, setTimeoutDraft] = useState<string | null>(null);
   const [maxInvalid, setMaxInvalid] = useState(false);
@@ -465,7 +474,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
     }
     setMaxInvalid(false);
     setMaxDraft(null);
-    if (parsed === (sidecar?.vision.maxDescriptionsPerTurn ?? VISION_MAX_DESCRIPTIONS_DEFAULT)) return;
+    if (parsed === (sidecar?.vision?.maxDescriptionsPerTurn ?? VISION_MAX_DESCRIPTIONS_DEFAULT)) return;
     void saveSidecar(visionMaxDescriptionsPatch(parsed));
   };
 
@@ -478,7 +487,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
     }
     setTimeoutInvalid(false);
     setTimeoutDraft(null);
-    if (parsed === (sidecar?.vision.timeoutMs ?? VISION_TIMEOUT_MS_DEFAULT)) return;
+    if (parsed === (sidecar?.vision?.timeoutMs ?? VISION_TIMEOUT_MS_DEFAULT)) return;
     void saveSidecar(visionTimeoutPatch(parsed));
   };
 
@@ -494,9 +503,53 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             type="button"
             className={`switch ${settings?.codexAutoStart ?? true ? "on" : ""}`}
             onClick={toggleCodexAutoStart}
-            disabled={!settings || settingsSaving}
+            disabled={!settings || settingsSaving || syncing}
             aria-label={t("dash.codexAutoStart")}
             aria-pressed={settings?.codexAutoStart ?? true}
+          >
+            <span className="knob" />
+          </button>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="spread">
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="font-semibold">{t("dash.codexDesktopAuthless")}</div>
+            <div className="muted setting-hint">{t("dash.codexDesktopAuthlessHint")}</div>
+            {settings?.codexDesktopAuthless && <div className="muted setting-hint">{t("dash.codexRemoteHistoryHint")}</div>}
+            {settings?.catalogRefreshPending && <div className="muted setting-hint" role="status">{t("codexAuth.catalogRefreshPending")}</div>}
+          </div>
+          <button
+            type="button"
+            className={`switch ${settings?.codexDesktopAuthless ?? false ? "on" : ""}`}
+            onClick={toggleCodexDesktopAuthless}
+            disabled={!settings || settingsSaving || syncing}
+            aria-label={t("dash.codexDesktopAuthless")}
+            aria-pressed={settings?.codexDesktopAuthless ?? false}
+          >
+            <span className="knob" />
+          </button>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="spread">
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="font-semibold">{t("dash.codexClientCompaction")}</div>
+            <div className="muted setting-hint">{t("dash.codexClientCompactionHint")}</div>
+            {!settings?.codexDesktopAuthless && settings?.codexClientCompaction && (
+              <div className="muted setting-hint">{t("dash.codexRemoteHistoryHint")}</div>
+            )}
+            {settings?.catalogRefreshPending && <div className="muted setting-hint" role="status">{t("codexAuth.catalogRefreshPending")}</div>}
+          </div>
+          <button
+            type="button"
+            className={`switch ${settings?.codexClientCompaction ?? false ? "on" : ""}`}
+            onClick={toggleCodexClientCompaction}
+            disabled={!settings || settingsSaving || syncing}
+            aria-label={t("dash.codexClientCompaction")}
+            aria-pressed={settings?.codexClientCompaction ?? false}
           >
             <span className="knob" />
           </button>
@@ -510,27 +563,51 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
           <div className="dash-sidecar-copy">
             <div className="font-semibold">{t("dash.webSearchSidecar")}</div>
             <div className="muted setting-hint">{t("dash.webSearchSidecarHint")}</div>
+            {/* The switch is stored even when Codex's own key was not rewritten. Saying nothing
+                here would read as "the native tool is off now", which is exactly the state the
+                operator asked for and may not have. */}
+            {sidecarCodexWritePending(sidecarCodexApply) && (
+              <div className="notice-warn" role="status">
+                <IconAlert />
+                <span>{t("dash.webSearchCodexSync")}</span>
+              </div>
+            )}
           </div>
+          {/* Same two-row shape as the vision card: the model select owns the first row,
+              and the secondary control sits right-aligned on its own row below. Sharing the
+              structure is what keeps the two cards' first rows on one line — the streaming
+              label used to sit beside the select and wrap to three lines in ko/ja/tr. */}
           <div className="dash-delegation-controls">
-            <Select
-              value={sidecar?.webSearch.model ?? "gpt-5.6-luna"}
-              options={sidecarModels}
-              onChange={model => { void saveSidecar({ webSearch: { model, backend: sidecarBackendForModel(models, model) } }); }}
-              disabled={!sidecar || sidecarSaving}
-              label={t("dash.sidecarModel")}
-              align="right"
-            />
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }} title={t("dash.webSearchStreamHint")}>
-              <span className="muted setting-hint">{t("dash.webSearchStream")}</span>
-              <button
-                type="button"
-                className={`switch ${sidecar?.webSearch.streamRoutedModelOutput ? "on" : ""}`}
-                onClick={() => {
-                  void saveSidecar({ webSearch: { streamRoutedModelOutput: !sidecar?.webSearch.streamRoutedModelOutput } });
+            <div className="dash-sidecar-select-row">
+              <Select
+                value={webSearchModel}
+                options={[{ value: "", label: t("dash.webSearchOff") }, ...sidecarModels]}
+                onChange={model => {
+                  if (model === "") {
+                    void saveSidecar(webSearchEnabledPatch(false));
+                    return;
+                  }
+                  const patch: SidecarPatch = { webSearch: webSearchSidecarSelectionForModel(models, sidecarModels, model) };
+                  // Choosing a model is the activation control: turning the sidecar back on from Off.
+                  if (!webSearchEnabled) patch.webSearch = { ...patch.webSearch, enabled: true };
+                  void saveSidecar(patch);
                 }}
                 disabled={!sidecar || sidecarSaving}
+                label={t("dash.sidecarModel")}
+                align="right"
+              />
+            </div>
+            <div className="dash-sidecar-trailing-row" title={t("dash.webSearchStreamHint")}>
+              <span className="muted setting-hint dash-sidecar-toggle-label">{t("dash.webSearchStream")}</span>
+              <button
+                type="button"
+                className={`switch ${sidecar?.webSearch?.streamRoutedModelOutput ? "on" : ""}`}
+                onClick={() => {
+                  void saveSidecar({ webSearch: { streamRoutedModelOutput: !sidecar?.webSearch?.streamRoutedModelOutput } });
+                }}
+                disabled={!webSearchEnabled || !sidecar || sidecarSaving}
                 aria-label={t("dash.webSearchStream")}
-                aria-pressed={sidecar?.webSearch.streamRoutedModelOutput === true}
+                aria-pressed={sidecar?.webSearch?.streamRoutedModelOutput === true}
               >
                 <span className="knob" />
               </button>
@@ -544,7 +621,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             <div className="muted setting-hint">{t("dash.visionSidecarHint")}</div>
           </div>
           <div className="dash-delegation-controls">
-            <div className="dash-vision-select-row">
+            <div className="dash-sidecar-select-row">
               <Select
                 value={visionModel}
                 options={[{ value: "", label: t("dash.visionOff") }, ...visionModels]}
@@ -576,7 +653,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
                 label={`${t("dash.visionSidecar")} — ${t("dash.injectionEffortLabel")}`}
               />
             </div>
-            <div className="dash-vision-advanced-row">
+            <div className="dash-sidecar-trailing-row">
               <button
                 type="button"
                 ref={visionAdvancedTriggerRef}
@@ -617,7 +694,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
 
       <div className="panel" aria-busy={!shadowCall || undefined}>
         <div className="spread" style={{ alignItems: "center" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div className="dash-shadow-label" style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span className="font-semibold">{t("dash.shadowCallIntercept")}</span>
             <button
               ref={shadowCallHelpTriggerRef}
@@ -634,7 +711,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             </button>
             <code className="muted text-caption">{`⚠ ${shadowSourceModelBadge(shadowCall?.sourceModels)}`}</code>
           </div>
-          <div className="setting-controls" style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div className="setting-controls dash-shadow-controls">
             <button
               type="button"
               className={`switch ${shadowCall?.enabled ? "on" : ""}`}
@@ -647,7 +724,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             </button>
             <Select
               value={shadowCall?.model ?? ""}
-              options={shadowCallModelOptions(models, shadowCall?.model).map(option => option.value === "" ? option : { ...option, label: formatNamespacedModelId(option.value, t) })}
+              options={shadowCallModelOptions(models, shadowCall?.model, shadowCall?.sourceModels).map(option => option.value === "" ? option : { ...option, label: formatNamespacedModelId(option.value, t) })}
               onChange={v => { void saveShadowCall({ model: v }); }}
               disabled={!shadowCall || shadowCallSaving || !shadowCall?.enabled}
               label={t("dash.shadowCallModel")}

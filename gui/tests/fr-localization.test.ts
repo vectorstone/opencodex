@@ -13,18 +13,58 @@ import { statusCodeInfo } from "../src/status-codes";
 const FR_CATALOG_URL = new URL("../src/i18n/fr.ts", import.meta.url);
 const PLACEHOLDER_RE = /\{([a-zA-Z0-9_]+)\}/g;
 
+/**
+ * A value carrying no letters once its placeholders are removed has nothing to translate.
+ * An em dash, a unit symbol and "{position} / {total}" are identical in every locale by
+ * construction, so matching English is evidence of nothing. Deriving that from the value
+ * keeps the allowlist below for real words instead of growing it each time the UI gains
+ * another symbol.
+ */
+function carriesTranslatableWords(value: string): boolean {
+  return /\p{L}/u.test(value.replace(/\{[a-zA-Z0-9_]+\}/g, " "));
+}
+
 const INTENTIONAL_ENGLISH = new Set<TKey>([
+  "nav.claude", // Product name.
+  "nav.codexSet", // Product name: the sidebar row reads "Codex" in every locale.
   // Units, symbols, protocol values, machine labels, and product names.
+  "integrations.cursor.noControl",
   "uptime.hour",
   "uptime.second",
+  // "auto" is the same word in French, and it labels a machine-derived alias source rather
+  // than prose. Translating it would invent a difference the UI does not have.
+  "models.aliasAuto",
+  // "Zoom" is the ordinary French word for page zoom too.
+  "zoom.label",
+  // "Actions" is the ordinary French word for a row's action column, read only by screen readers.
+  "api.colActions",
   "common.github",
+  // Product names and ordinary French words whose correct spelling is identical to English.
+  "remote.pairingCommandWindows",
+  "remote.sessions",
+  "remote.prompt",
+  // A filename and a product name. "AGENTS.md" is the literal file Codex reads,
+  // and translating "Plugins" would invent a difference French does not have.
+  "codexSet.layer.agents-md",
+  "codexSet.layer.plugins",
+  // "{position} / {total}" is punctuation and two placeholders - no words to
+  // translate. A French-specific variant would have to invent a difference.
+  "codexSet.custom.navPosition",
+  // Same string, same reason, in the base-variant picker. Listing it here rather
+  // than writing a French spelling of "1 / 2" keeps the check meaningful for keys
+  // that really do carry prose.
+  "codexSet.base.position",
+  // "Instructions" is the same word in French. Inventing a synonym to make this
+  // check happy would be worse copy for a French reader.
+  "codexSet.custom.bodyLabel",
   "common.ok",
   "nav.api",
   "nav.grok",
   "grok.title",
   "claude.pageTitle",
-  "claude.tabCode",
-  "claude.tabDesktop",
+  // A literal Claude Desktop picker model id shown as the input placeholder; model ids are
+  // identical in every locale.
+  "claudeDesktop.firstParty.bindings.pickerPlaceholder",
   "claudeDesktop.title",
   "dash.backendAnthropic",
   "dash.backendOpenAI",
@@ -33,6 +73,7 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "api.protocolMessages",
   "provider.name.commandCodeAuth",
   "provider.name.commandCodeApi",
+  "provider.name.orcaRouterApi",
   "provider.name.volcengine",
   "provider.name.volcengineCodingPlan",
   "provider.name.volcengineAgentPlan",
@@ -47,6 +88,9 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "dash.updateVersionTransition",
   "prov.accountId",
   "models.shadowCallOriginal",
+  // One-glyph marker plus a model id in a narrow column; the meaning lives in the translated
+  // tooltip (`logs.badge.interceptedHelperTitle`), not in the glyph.
+  "logs.badge.interceptedHelper",
   "models.v2Mode_v1",
   "models.v2Mode_default",
   "models.v2Mode_v2",
@@ -66,6 +110,13 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "integrations.tab.codex",
   "integrations.tab.claude",
   "integrations.tab.grok",
+  // Product name for the remote hub; French keeps the same word.
+  "connection.pairing.hub",
+  // Cursor product names and the two field labels Cursor's own gateway form renders in English.
+  "integrations.tab.cursor",
+  "integrations.cursor.title",
+  "integrations.cursor.privateInference",
+  "integrations.cursor.baseUrl",
   "integrations.tab.opencode",
   "integrations.tab.pi",
   "integrations.tab.omp",
@@ -88,8 +139,25 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "api.clientConfig.clientDsh",
   "api.clientConfig.clientMcode",
   "api.clientConfig.clientZcode",
+  "integrations.tab.prime",
+  "api.clientConfig.clientPrime",
+  "integrations.tab.aside",
+  "api.clientConfig.clientAside",
+  "integrations.tab.raycast",
+  "api.clientConfig.clientRaycast",
+  "integrations.tab.omo",
+  "api.clientConfig.clientOmo",
+  // Cline product name and CLI acronym are intentionally preserved.
+  "integrations.tab.cline",
+  "api.clientConfig.clientCline",
+  "integrations.tab.kilo",
+  "api.clientConfig.clientKilo",
+  // Factory Droid is a product name, identical in every locale.
+  "integrations.tab.droid",
+  "api.clientConfig.clientDroid",
   "models.reasoningEffort.minimal",
   "models.reasoningEffort.max",
+  "models.reasoningEffort.ultra",
   "pws.pacingRpmUnit",
   "claudeDesktop.family.opus",
   "claudeDesktop.family.fable",
@@ -98,6 +166,10 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "claudeDesktop.supports1m",
   "claudeDesktop.effort.supported",
   // Correct French words whose spelling is identical to English.
+  // "Code" is the same word in French, and the surrounding device-reauth copy already
+  // uses it ("code appareil", "Code de l'appareil"). Inventing a different label just
+  // to make the strings differ would be worse copy for a French reader.
+  "codexAuth.mainReauthCode",
   "routing.exclusions",
   "routing.score",
   "dash.actions",
@@ -112,6 +184,9 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "debug.streamInjection",
   "storage.trash.col.mode",
   "modal.badge.local",
+  // The catalog tab beside the badge, and the same word in French for the same reason:
+  // a Local tab labelled anything else would not match the Local badge on its own rows.
+  "modal.tab.local",
   "modal.badge.direct",
   "pws.rail.suffixLocal",
   "pws.filterType",
@@ -130,6 +205,11 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "api.colSource",
   "api.testSucceeded",
   "cws.count.total",
+  // Both labels are ordinary French words with the same spelling and meaning.
+  "cws.jev.stats.efforts",
+  "cws.jev.stats.total",
+  // The TypeSafe decision method is a product name, rendered as written in every locale.
+  "cws.jev.backend.typesafe",
   "claudeDesktop.alias",
   "lab.filter.verdict",
   "lab.col.suite",
@@ -137,6 +217,22 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "lab.observationCount",
   "lab.verdictCount",
   "lab.detailObservations",
+  // "Clients" is the same word in French, and it is the plural noun the
+  // Integrations page uses to head its client catalog.
+  "integrations.catalog.title",
+  // Cost cells are a fixed `$0.1401` / `≥$0.1401` in every locale (the column header is the
+  // untranslated `~$`); the templates are pure placeholders on purpose.
+  "logs.cost.approximate",
+  "logs.cost.lowerBound",
+  // Protocol wire names on the Logs protocol path, and the IR acronym beside them.
+  "logs.protocol.wire.responses",
+  "logs.protocol.wire.chat",
+  "logs.protocol.wire.messages",
+  "logs.protocol.hop.ir",
+  // The consolidation phase's name is the ordinary French noun, spelled exactly as in English.
+  // Inventing a synonym would also break the pair with the extract row, whose French label is
+  // "Extraction".
+  "memoryModels.consolidation",
 ]);
 
 function placeholders(value: string): string[] {
@@ -164,7 +260,9 @@ describe("French base catalog", () => {
 
     const french = (await import("../src/i18n/fr")).fr;
     const accidental = (Object.keys(DICTS.en) as TKey[]).filter(key =>
-      french[key] === DICTS.en[key] && !INTENTIONAL_ENGLISH.has(key)
+      french[key] === DICTS.en[key]
+      && !INTENTIONAL_ENGLISH.has(key)
+      && carriesTranslatableWords(String(DICTS.en[key]))
     );
 
     expect(accidental).toEqual([]);

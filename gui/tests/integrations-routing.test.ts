@@ -22,7 +22,6 @@ import { normalizeHashPath, replaceHash } from "../src/hash-routing";
 
 const LEGACY_DESTINATIONS: readonly (readonly [string, string])[] = [
   ["api", "integrations/keys"],
-  ["claude", "integrations/claude"],
   ["grok", "integrations/grok"],
 ];
 
@@ -64,7 +63,7 @@ describe("legacy integration hashes", () => {
 
 describe("registered nested hashes", () => {
   test("every registered tab hash survives untouched", () => {
-    for (const raw of INTEGRATION_TAB_HASHES) {
+    for (const raw of INTEGRATION_TAB_HASHES.filter(hash => !hash.startsWith("integrations/claude"))) {
       expect(readPageFromHash(raw)).toBe("integrations");
       expect(hashBelongsToPage(raw, "integrations")).toBe(true);
       const action = resolveAppHashChange(raw);
@@ -81,7 +80,7 @@ describe("registered nested hashes", () => {
      * read it — the panel would open on Claude Code every time.
      */
     expect(INTEGRATION_TAB_HASHES).toContain("integrations/claude/desktop");
-    expect(resolveAppHashChange("integrations/claude/desktop").replaceTo).toBeNull();
+    expect(resolveAppHashChange("integrations/claude/desktop")).toEqual({ page: "claude", replaceTo: "claude/desktop" });
   });
 
   test("the DSH deep link is registered and survives normalization", () => {
@@ -116,6 +115,30 @@ describe("the collapse disturbs no neighbouring route", () => {
     // Cross-page suffixes stay invalid in both directions.
     expect(hashBelongsToPage("integrations/keys", "dashboard")).toBe(false);
     expect(hashBelongsToPage("logs/debug", "integrations")).toBe(false);
+  });
+});
+
+describe("two-plane integration call routing", () => {
+  test("existing integration descendants stay on the shared base and only machine controls use machineApiBase", async () => {
+    const app = await Bun.file(new URL("../src/App.tsx", import.meta.url)).text();
+    const integrations = await Bun.file(new URL("../src/pages/Integrations.tsx", import.meta.url)).text();
+    const startup = await Bun.file(new URL("../src/pages/Startup.tsx", import.meta.url)).text();
+    expect(app).toContain('<Integrations apiBase={sharedBase} machineApiBase={machineBase} connected={targets.connected} />');
+    expect(app).toContain('<Startup apiBase={sharedBase} machineApiBase={machineBase} connected={targets.connected} />');
+    for (const component of ["ApiKeys", "Grok", "IntegrationsOverview", "FileIntegrationPage"]) {
+      expect(integrations).toContain(`${component}`);
+    }
+    expect(integrations).toContain("<ApiKeys apiBase={apiBase}");
+    expect(integrations).toContain("<Grok apiBase={apiBase}");
+    // Claude is a Connect tab now; it gets Integrations' apiBase, which App sets to sharedBase.
+    expect(integrations).toContain("<Claude apiBase={apiBase} active={active} embedded />");
+    expect(app).toContain('{shellPage === "integrations" && <Integrations apiBase={sharedBase}');
+    expect(integrations).toContain("<IntegrationsOverview apiBase={apiBase}");
+    expect(integrations).toContain("`${machineApiBase}/api/machine/clients`");
+    expect(integrations).toContain("`${machineApiBase}/api/machine/sync`");
+    expect(startup).toContain("`${machineApiBase}/api/machine/shim`");
+    expect(startup).toContain("`${apiBase}/api/settings`");
+    expect(startup).toContain("`${apiBase}/api/startup-health`");
   });
 });
 

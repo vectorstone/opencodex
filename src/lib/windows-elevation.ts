@@ -2,6 +2,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { existsSync } from "node:fs";
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import { dlopen, ptr, type Pointer } from "bun:ffi";
+import { isTestHomeGuardArmed } from "./test-home-guard";
 
 type ElevationSpawn = (
   command: string,
@@ -249,6 +250,24 @@ export const OCX_ELEVATED_PROTOCOL_FAILED = 13;
 /** Windows ERROR_CANCELLED — reserved for UAC denial; never emitted by the elevated script. */
 export const OCX_ELEVATED_UAC_CANCELLED = 1223;
 
+/**
+ * The elevated process could not read a staged payload (#4692).
+ *
+ * The staged ACL grants the staging account plus read for SYSTEM and
+ * BUILTIN\Administrators (#4779), so both a split-token elevation and an
+ * over-the-shoulder one answered with a different administrator's credentials
+ * can open it. A residual read failure means the hardening did not take effect
+ * or the payload was replaced. The elevated side cannot explain that itself: it
+ * runs hidden, so its stderr goes nowhere and only the exit code survives the
+ * boundary. Without a code of its own the operator would be told "exit code 1"
+ * for a cause that names its own remedy — the same undiagnosable failure this
+ * change set exists to remove.
+ *
+ * Deliberately outside OCX_ELEVATED_PROTOCOL_CODES: that list is the create-and-run
+ * transaction's alphabet, and this code belongs to the registration path.
+ */
+export const OCX_ELEVATED_STAGING_UNREADABLE = 14;
+
 export const OCX_ELEVATED_PROTOCOL_CODES = [
   OCX_ELEVATED_SUCCESS,
   OCX_ELEVATED_CREATE_FAILED,
@@ -396,7 +415,7 @@ export function formatWindowsSchtasksError(error: unknown, args: string[]): stri
   const guidance = [
     "Windows access denied while running Task Scheduler.",
     `Command: schtasks ${argsText}`,
-    "Approve the Windows UAC prompt to install the background service, or run `ocx service install` from an elevated PowerShell window.",
+    "The OpenCodex task definition is scoped to the installing account and normally registers without elevation, so this denial is not fixed by approving a UAC prompt. Check `ocx service status`: if an existing `opencodex-proxy` task belongs to a different account, remove it from that account and retry `ocx service install`.",
   ].join(" ");
   if (operation === "create" && ownedCreateAccessDenied) {
     return `${guidance}\n${WINDOWS_SCHTASKS_CREATE_ACCESS_DENIED_MARKER}`;
@@ -530,6 +549,19 @@ export function startPowerShellCommand(commandScript: string): WindowsElevationE
     };
   }
 
+  // HOME isolation cannot contain UAC children or other machine-global effects. Keep the
+  // final process boundary closed while the real launcher is installed; explicitly injected
+  // launchers remain available to tests that exercise the elevation protocol in memory.
+  if (isTestHomeGuardArmed() && elevationSpawn === spawn) {
+    return {
+      launcherPid: null,
+      completion: Promise.reject(new WindowsElevationError(
+        "launch-failed",
+        "Refusing to launch a live Windows elevation process from an armed test process; inject the elevation launcher instead.",
+      )),
+    };
+  }
+
   let child: ChildProcess;
   try {
     child = elevationSpawn(
@@ -631,29 +663,127 @@ export function runWindowsElevated(file: string, args: string[]): Promise<number
 }
 
 /**
- * Register one scheduled-task definition without exposing a mutable XML pathname to
- * the elevated process. The XML bytes are fixed in the encoded PowerShell command
- * before UAC; Register-ScheduledTask receives that string directly after elevation.
+ * A task definition staged for the elevated process.
+ *
+ * Before elevation, the launcher pins the file and every ancestor with non-reparse
+ * handles: payload files deny write/delete sharing, ancestor directories deny delete
+ * sharing only (writes inside them stay possible so the stage can be populated).
+ * The elevated script additionally bounds and
+ * hashes the exact bytes it decodes.
+ */
+export interface StagedWindowsTaskXml {
+  /** Path inside the caller's hardened staging directory. */
+  readonly path: string;
+  /** Exact byte length, checked before the elevated process allocates or reads. */
+  readonly byteLength: number;
+  /** Lowercase hex SHA-256 of the staged bytes (UTF-16LE, no BOM). */
+  readonly sha256: string;
+}
+
+/**
+ * Read a staged payload, prove it is the one that was validated, and decode it.
+ *
+ * One bounded read: the bytes that are hashed are the same array that is decoded and
+ * registered. The unelevated launcher keeps the namespace and files pinned throughout.
+ */
+const READ_STAGED_TASK_XML = "function Read-OcxStagedTaskXml([string]$path, [long]$expectedLength, [string]$expectedHash) {"
+  // An unreadable payload is a diagnosable condition, not a generic throw: a hidden
+  // elevated process has nowhere to print, so the cause has to ride the exit code.
+  + " try { $stream = [IO.File]::Open($path, 'Open', 'Read', 'Read');"
+  + " if ($stream.Length -ne $expectedLength) { throw 'Task Scheduler staged payload has an invalid length.' };"
+  + " $bytes = [byte[]]::new($expectedLength); $offset = 0;"
+  + " while ($offset -lt $bytes.Length) { $read = $stream.Read($bytes, $offset, $bytes.Length - $offset); if ($read -eq 0) { throw 'Task Scheduler staged payload ended early.' }; $offset += $read } }"
+  + " catch [System.UnauthorizedAccessException] { exit " + OCX_ELEVATED_STAGING_UNREADABLE + " }"
+  + " catch [System.Security.SecurityException] { exit " + OCX_ELEVATED_STAGING_UNREADABLE + " } finally { if ($null -ne $stream) { $stream.Dispose() } };"
+  + " $sha = [Security.Cryptography.SHA256]::Create();"
+  + " try { $actual = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() };"
+  + " if ($actual -cne $expectedHash) { throw 'Task Scheduler staged payload failed its integrity check.' };"
+  + " return [Text.Encoding]::Unicode.GetString($bytes) }";
+
+/**
+ * Register one scheduled-task definition from staged, digest-verified bytes.
+ *
+ * The payloads used to be embedded as base64(utf16le) inside an inner PowerShell script
+ * that was itself base64(utf16le)-encoded into `-EncodedCommand`. Two layers of base64
+ * over UTF-16 cost about 14.2 command-line characters per XML character, and a
+ * replacement carries two payloads, so a ~2 KB task definition pushed the outer command
+ * past the Windows limit and the spawn failed with ENAMETOOLONG before UAC ever
+ * appeared (#4692). On a host where the trigger scope exports as an account name the
+ * re-register path runs on every repair, so repair could never succeed.
+ *
+ * The command now carries two paths and two 64-character digests, so its length no
+ * longer depends on the size of the XML at all.
+ *
+ * The unelevated launcher opens every ancestor and payload with OPEN_REPARSE_POINT,
+ * validates its type, and holds them until the elevated process exits: ancestors deny
+ * delete sharing (read/write stay shared, so sibling files can still be staged) and
+ * each payload denies write/delete sharing.
+ * Thus the privileged open cannot be redirected during UAC; the length and digest are
+ * defense in depth for the bytes read from the pinned regular file.
+ *
+ * The replacement precondition is unchanged: the elevated process still re-queries the
+ * live registration and compares it to the captured predecessor before passing -Force.
  */
 export function runWindowsElevatedScheduledTaskRegistration(
   taskName: string,
-  xml: string,
+  xml: StagedWindowsTaskXml,
+  replace = false,
+  expectedExisting?: StagedWindowsTaskXml,
 ): Promise<number> {
-  const xmlBase64 = Buffer.from(xml, "utf16le").toString("base64");
+  if (replace && !expectedExisting) {
+    throw new Error("Elevated Task Scheduler replacement requires a captured existing definition.");
+  }
+  for (const payload of [xml, expectedExisting].filter((value): value is StagedWindowsTaskXml => value !== undefined)) {
+    if (!Number.isSafeInteger(payload.byteLength) || payload.byteLength < 0 || !/^[0-9a-f]{64}$/.test(payload.sha256)) {
+      throw new Error("Elevated Task Scheduler staging metadata is invalid.");
+    }
+  }
   const powerShellPath = windowsPowerShell();
   const powerShellDirectory = powerShellPath.replace(/[\\/][^\\/]+$/, "");
   const scheduledTasksModule = `${powerShellDirectory}\\Modules\\ScheduledTasks\\ScheduledTasks.psd1`;
+  const parentDirectory = (path: string) => path.replace(/[\\/][^\\/]+$/, "");
+  const stageDirectory = parentDirectory(xml.path);
+  // The pin only covers the staging directory itself: a payload nested deeper
+  // would sit inside a folder nobody locked, so each file must name the staging
+  // directory as its immediate parent rather than merely carrying its prefix.
+  // Traversal segments are rejected on either separator before the parent is
+  // compared, and a bare filename has no parent directory at all.
+  const stagedDirectlyInside = (path: string) =>
+    !path.split(/[\\/]+/).includes("..")
+    && parentDirectory(path) === stageDirectory
+    && parentDirectory(path) !== path;
+  if (
+    !stagedDirectlyInside(xml.path)
+    || (expectedExisting && !stagedDirectlyInside(expectedExisting.path))
+  ) {
+    throw new Error("Elevated Task Scheduler payloads must share one staging directory.");
+  }
   const inner = [
     `$taskName = ${psSingleQuote(taskName)}`,
-    `$xmlBase64 = ${psSingleQuote(xmlBase64)}`,
-    "$xml = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($xmlBase64))",
+    READ_STAGED_TASK_XML,
+    `$xml = Read-OcxStagedTaskXml ${psSingleQuote(xml.path)} ${xml.byteLength} ${psSingleQuote(xml.sha256)}`,
     `$module = Microsoft.PowerShell.Core\\Import-Module -Name ${psSingleQuote(scheduledTasksModule)} -PassThru -Force -ErrorAction Stop`,
     "$registerTask = $module.ExportedCommands['Register-ScheduledTask']",
     "if ($null -eq $registerTask) { throw 'Trusted ScheduledTasks module does not export Register-ScheduledTask.' }",
-    "& $registerTask -TaskName $taskName -Xml $xml -Force -ErrorAction Stop | Out-Null",
+    ...(replace ? [
+      `$expectedXml = Read-OcxStagedTaskXml ${psSingleQuote(expectedExisting!.path)} ${expectedExisting!.byteLength} ${psSingleQuote(expectedExisting!.sha256)}`,
+      `$schtasks = ${psSingleQuote(resolveTrustedWindowsSchtasksExe())}`,
+      "$currentXml = & $schtasks /query /tn $taskName /xml 2>$null | Out-String",
+      "if ($LASTEXITCODE -ne 0) { throw 'Task Scheduler replacement precondition could not be read.' }",
+      "function Normalize-OcxTaskXml([string]$value) { return (($value.TrimStart([char]0xFEFF) -replace \"`r`n?\", \"`n\").Trim()) }",
+      "if ((Normalize-OcxTaskXml $currentXml) -cne (Normalize-OcxTaskXml $expectedXml)) { throw 'Task Scheduler replacement precondition changed.' }",
+    ] : []),
+    `& $registerTask -TaskName $taskName -Xml $xml${replace ? " -Force" : ""} -ErrorAction Stop | Out-Null`,
   ].join("; ");
   const encodedCommand = Buffer.from(inner, "utf16le").toString("base64");
   const script = [
+    "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class OcxStageLock { [StructLayout(LayoutKind.Sequential)] public struct TagInfo { public uint Attributes; public uint Tag; } [DllImport(\"kernel32.dll\", CharSet=CharSet.Unicode, SetLastError=true)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string p, uint a, uint s, IntPtr q, uint c, uint f, IntPtr t); [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle h, int c, out TagInfo i, uint n); }';",
+    "$locks = @();",
+    "function Lock-OcxStage([string]$path, [bool]$directory) { $flags = 0x00200000; $share = 1; if ($directory) { $flags = $flags -bor 0x02000000; $share = 3 }; $h = [OcxStageLock]::CreateFile($path, 0x80000000, $share, [IntPtr]::Zero, 3, $flags, [IntPtr]::Zero); if ($h.IsInvalid) { throw 'Task Scheduler staging lock failed.' }; $info = [OcxStageLock+TagInfo]::new(); if (![OcxStageLock]::GetFileInformationByHandleEx($h, 9, [ref]$info, 8) -or (($info.Attributes -band 0x400) -ne 0) -or $directory -ne (($info.Attributes -band 0x10) -ne 0)) { $h.Dispose(); throw 'Task Scheduler staging path is redirected or has the wrong type.' }; $script:locks += $h };",
+    `$dir = [IO.DirectoryInfo]::new(${psSingleQuote(stageDirectory)}); $dirs = @(); while ($null -ne $dir) { $dirs += $dir.FullName; $dir = $dir.Parent }; [array]::Reverse($dirs); $dirs | ForEach-Object { Lock-OcxStage $_ $true };`,
+    `Lock-OcxStage ${psSingleQuote(xml.path)} $false;`,
+    ...(expectedExisting ? [`Lock-OcxStage ${psSingleQuote(expectedExisting.path)} $false;`] : []),
+    "try {",
     `$p = Start-Process -FilePath ${psSingleQuote(powerShellPath)}`,
     ` -ArgumentList ${psSingleQuote(buildWindowsElevatedArgumentList([
       "-NoProfile",
@@ -667,7 +797,7 @@ export function runWindowsElevatedScheduledTaskRegistration(
     `if ($null -eq $p) { exit ${OCX_ELEVATED_UAC_CANCELLED} }`,
     "$null = $p.Handle;",
     `if ($null -eq $p.ExitCode) { exit ${OCX_ELEVATED_PROTOCOL_FAILED} }`,
-    "exit $p.ExitCode",
+    "$code = $p.ExitCode } finally { $locks | ForEach-Object { $_.Dispose() } }; exit $code",
   ].join("");
 
   return startPowerShellCommand(script).completion.then(result => result.exitCode);

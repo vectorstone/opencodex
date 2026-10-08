@@ -4,6 +4,8 @@ import { getConfigPath, mutatePersistedConfig, readConfigDiagnostics, sanitizeMo
 import { VISION_REASONING_EFFORTS, isVisionReasoningEffort } from "../reasoning-effort";
 import type { OcxConfig } from "../types";
 import { normalizeVisionReasoningForModel } from "../vision/reasoning";
+import type { ServiceApiTokenState } from "../lib/service-secrets";
+import { redactUrlForLog } from "../lib/redact";
 import { CliUsageError, printData, rejectArgs, runCliAction, takeFlag } from "./runtime-api";
 
 const USAGE = `Usage:
@@ -12,14 +14,112 @@ const USAGE = `Usage:
   ocx config set <dot.path> <json-or-string> [--json]
   ocx config unset <dot.path> [--json]
   ocx config validate [path|-] [--json]
-  ocx config export <path|->
+  ocx config export <path|-> [--json]
   ocx config import <path|-> --yes [--json]`;
 
-const SECRET_KEYS = /^(apiKey|key|accessToken|refreshToken|idToken|token|password|clientSecret)$/i;
+/**
+ * Keys whose VALUE is a credential and must never be printed by display commands.
+ * `config export` writes the raw config so an export can restore credentials; it does
+ * not call `redact`.
+ *
+ * URL-valued credentials must be named explicitly: `webhookUrl` matches none of the
+ * other patterns, and a proxy URL's userinfo is handled by the `proxy` branch in
+ * `redact` rather than by masking the whole value.
+ */
+const SECRET_KEYS = /^(apiKey|key|accessToken|refreshToken|idToken|token|password|clientSecret|webhookUrl)$/i;
 const BLOCKED_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 
+/**
+ * The synthetic `_remoteHub` note printed by `ocx config show` on a client (#4236).
+ *
+ * `runtimeRole: "client"` and the `client` block were already printed, and were already ignored:
+ * an agent read a client's `config.json`, saw an empty `providers` map and no grok, and concluded
+ * the hub could not serve grok. Naming the situation in the config output costs one key.
+ *
+ * `connected` is OBSERVED, never assumed. It was briefly hardcoded `true` for any config with a
+ * `client` block, which is the same defect in miniature: the presence of configuration is not
+ * evidence that the connection works, and a machine whose data-plane token was revoked, rotated
+ * away or deleted would have been labelled `connected: true` while it could not reach the hub at
+ * all. The read-only projection compares the bounded token file's fingerprint against the
+ * connection record, and passes that answer in so this formatter stays pure and testable.
+ *
+ * Synthetic and NOT persisted, for two reasons. `clientConnectionSchema` is `.strict()`, so a
+ * `client.note` field would not validate; and persisted prose drifts from the behaviour it
+ * describes. The leading underscore marks it as an annotation rather than a setting, and
+ * `config export` emits the real config untouched so round-trips still validate.
+ */
+export function remoteHubConfigNote(
+  config: OcxConfig,
+  readConnection: () => RemoteHubConnectionObservation,
+): { connected: boolean; origin: string; note: string } | null {
+  if (config.runtimeRole !== "client" || !config.client) return null;
+  // A thunk, so a standalone or hub install pays nothing: the guard above returns first and the
+  // connection probe (three file reads) never runs.
+  const connection = readConnection();
+  // Both halves are required: a settled connection record AND the token it recorded. Either one
+  // alone describes a machine that cannot read its hub, and `ocx status` is still the command
+  // that has the facts — so the note points there in every case, connected or not.
+  const connected = connection.state === "connected" && connection.token === "owned";
+  const note = connection.state !== "connected"
+    ? `this machine is configured as a client but its connection is ${connection.state}${connection.reason ? ` (${connection.reason})` : ""}; run ocx connect status`
+    : connection.token !== "owned"
+      ? `this machine is configured as a client but its hub data-plane token is ${connection.token}; run ocx connect status`
+      : "provider credentials and model availability live on the hub; run ocx status";
+  return { connected, origin: config.client.serverUrl, note };
+}
+
+export type RemoteHubConnectionObservation = {
+  state: "disconnected" | "connected" | "invalid" | "mismatched";
+  reason?: string;
+  token: "owned" | "missing" | "changed" | "unsafe";
+};
+
+export function remoteHubConnectionFromTokenState(
+  config: Pick<OcxConfig, "client">,
+  tokenState: ServiceApiTokenState,
+): RemoteHubConnectionObservation {
+  const token = tokenState.kind === "absent"
+    ? "missing"
+    : tokenState.kind === "unsafe"
+      ? "unsafe"
+      : tokenState.fingerprint === config.client?.tokenFingerprint ? "owned" : "changed";
+  return { state: "connected", token };
+}
+
+async function readRemoteHubConfigNote(config: OcxConfig): Promise<ReturnType<typeof remoteHubConfigNote>> {
+  if (config.runtimeRole !== "client" || !config.client) return null;
+  // This display command needs only connection ownership, not lifecycle recovery, catalog
+  // readiness, or any write-capable connect machinery. Keep the read on the bounded token
+  // observer so a cold `config show` never imports the full connect command graph.
+  const { readServiceApiTokenState } = await import("../lib/service-secrets");
+  return remoteHubConfigNote(
+    config,
+    () => remoteHubConnectionFromTokenState(config, readServiceApiTokenState()),
+  );
+}
+
 function redact(value: unknown, key = ""): unknown {
+  if (key === "proxy" && typeof value === "string") {
+    // "direct" and credential-less proxy URLs carry no secret and stay readable; only a
+    // URL with userinfo is masked, and then only its credentials — host and port stay
+    // visible so the output still says WHERE traffic goes. A non-URL value that is not
+    // "direct" cannot be proven credential-free, so it is masked whole.
+    if (!value || value === "direct") return value;
+    try {
+      const parsed = new URL(value);
+      return parsed.username || parsed.password ? redactUrlForLog(value) : value;
+    } catch {
+      return "********";
+    }
+  }
   if (SECRET_KEYS.test(key) && typeof value === "string") return value ? "********" : value;
+  // `client.priorCatalog` is the base64 catalog snapshot connect took before overwriting the
+  // local one — up to 64 MB of it (src/config.ts). Printed in full it buried `runtimeRole` and
+  // the `client` block under a wall of base64, which is how a reader came to miss that this
+  // machine is a client at all. Size only, mirroring sanitizeModelCostsForDisplay.
+  if (key === "priorCatalog" && typeof value === "string") {
+    return value ? `<omitted: ${Buffer.byteLength(value)} bytes>` : value;
+  }
   // modelCosts rows are keyed by model id; a pasted API key in a key position
   // must not be echoed back by config show/get (values are already redacted).
   if (key === "modelCosts") return sanitizeModelCostsForDisplay(value);
@@ -59,14 +159,16 @@ function setPath(root: Record<string, unknown>, path: string, value: unknown, re
   else current[leaf] = value;
 }
 
+/** Interpret config-set input as JSON when valid, otherwise preserve it as a string. */
 function parseValue(raw: string): unknown {
   try { return JSON.parse(raw); }
   catch { return raw; }
 }
 
+/** Accept one UTF-8 BOM from Windows JSON files or piped input. */
 function loadInput(path: string): unknown {
   const raw = path === "-" ? readFileSync(0, "utf8") : readFileSync(path, "utf8");
-  try { return JSON.parse(raw); }
+  try { return JSON.parse(raw.replace(/^\uFEFF/, "")); }
   catch { throw new CliUsageError(`invalid JSON in ${path}`); }
 }
 
@@ -88,8 +190,8 @@ function normalizeVisionConfig(config: OcxConfig): OcxConfig {
   const vision = config.visionSidecar;
   if (!vision || vision.reasoning === undefined) return config;
   // Keep CLI import/set semantics aligned with the execution path: an omitted or blank model means
-  // the bounded OpenAI vision default, gpt-5.4-mini, not the Dashboard's web-search default.
-  const model = vision.model || "gpt-5.4-mini";
+  // the bounded OpenAI vision default, gpt-5.6-luna, not the Dashboard's web-search default.
+  const model = vision.model || "gpt-5.6-luna";
   const normalized = normalizeVisionReasoningForModel(model, vision.reasoning);
   if (normalized === undefined) delete vision.reasoning;
   else vision.reasoning = normalized;
@@ -103,15 +205,28 @@ function validate(value: unknown): OcxConfig {
 }
 
 export async function handleConfigCommand(argv: string[]): Promise<number> {
-  return runCliAction(async () => {
+  let outcome = 0;
+  const status = await runCliAction(async () => {
     const args = [...argv];
-    const action = (args.shift() ?? "show").toLowerCase();
     const wantsJson = takeFlag(args, "--json");
+    const source = takeFlag(args, "--source");
+    if (args.includes("--json") || args.includes("--source")) throw new CliUsageError("config flags may only be specified once", USAGE);
+    const action = (args.shift() ?? "show").toLowerCase();
+    if (source && action !== "show") throw new CliUsageError("--source is only supported for config show", USAGE);
     if (action === "show") {
-      const source = takeFlag(args, "--source");
       rejectArgs(args, USAGE);
       const diagnostics = readConfigDiagnostics();
-      const config = redact(diagnostics.config);
+      if (diagnostics.source === "fallback" || diagnostics.error) {
+        console.error(`Warning: Config at ${getConfigPath()} is invalid or unreadable; defaults are being shown for invalid settings. Run: ocx config validate. Inspect: ocx config show --source.`);
+        if (!source) outcome = 1;
+      }
+      const redacted = redact(diagnostics.config);
+      const note = await readRemoteHubConfigNote(diagnostics.config);
+      // First key, not last: it has to be read before the empty `providers` map that misled a
+      // reader into concluding nothing was configured anywhere.
+      const config = note && redacted && typeof redacted === "object" && !Array.isArray(redacted)
+        ? { _remoteHub: note, ...redacted as Record<string, unknown> }
+        : redacted;
       const result = source ? { config, source: diagnostics.source, error: diagnostics.error, warnings: diagnostics.warnings ?? [] } : config;
       printData(result, true);
       return;
@@ -120,7 +235,12 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
       const path = args.shift();
       if (!path) throw new CliUsageError("config path is required", USAGE);
       rejectArgs(args, USAGE);
-      const value = redact(getPath(readConfigDiagnostics().config, path), path.split(".").at(-1));
+      const diagnostics = readConfigDiagnostics();
+      if (diagnostics.source === "fallback" || diagnostics.error) {
+        console.error(`Warning: Config at ${getConfigPath()} is invalid or unreadable; defaults are being shown for invalid settings. Run: ocx config validate. Inspect: ocx config show --source.`);
+        outcome = 1;
+      }
+      const value = redact(getPath(diagnostics.config, path), pathSegments(path).at(-1));
       if (wantsJson || typeof value === "object") console.log(JSON.stringify(value, null, 2));
       else console.log(String(value));
       return;
@@ -128,7 +248,7 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
     if (action === "set" || action === "unset") {
       const path = args.shift();
       const raw = action === "set" ? args.shift() : undefined;
-      if (!path || (action === "set" && raw === undefined)) throw new CliUsageError("config path and value are required", USAGE);
+      if (!path || (action === "set" && raw === undefined)) throw new CliUsageError(action === "unset" ? "config path is required" : "config path and value are required", USAGE);
       rejectArgs(args, USAGE);
       // #1835/#1838: the read used to happen OUTSIDE the mutation lock, so a concurrent
       // edit landing between it and the save was reverted by this whole-snapshot write.
@@ -166,7 +286,7 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
           ? "config changed while applying this update; retry"
           : `config is ${outcome.reason}`);
       }
-      printData({ ok: true, path, value: redact(savedValue, path.split(".").at(-1)) }, wantsJson,
+      printData({ ok: true, path, value: redact(savedValue, pathSegments(path).at(-1)) }, wantsJson,
         [`${action === "unset" ? "Unset" : "Set"} ${path}.`]);
       return;
     }
@@ -180,7 +300,7 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
       })();
       printData(result.ok ? { ok: true, source: path ?? getConfigPath() } : result, wantsJson,
         [result.ok ? "Config is valid." : `Config is invalid: ${result.error}`]);
-      if (!result.ok) process.exitCode = 1;
+      if (!result.ok) outcome = 1;
       return;
     }
     if (action === "export") {
@@ -189,7 +309,10 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
       rejectArgs(args, USAGE);
       const content = `${JSON.stringify(readConfigDiagnostics().config, null, 2)}\n`;
       if (path === "-") process.stdout.write(content);
-      else { writeFileSync(path, content, { encoding: "utf8", mode: 0o600 }); console.log(`Exported config to ${path}.`); }
+      else {
+        writeFileSync(path, content, { encoding: "utf8", mode: 0o600 });
+        printData({ ok: true, path }, wantsJson, [`Exported config to ${path}.`]);
+      }
       return;
     }
     if (action === "import") {
@@ -204,6 +327,7 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
     }
     throw new CliUsageError(`unknown config command ${action}`, USAGE);
   });
+  return status || outcome;
 }
 
 export const CONFIG_USAGE = USAGE;

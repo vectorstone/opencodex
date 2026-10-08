@@ -1,15 +1,20 @@
 import type { AdapterRequest, IncomingMeta, ProviderAdapter } from "../adapters/base";
-import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxProviderOpaqueToolCallMetadata, OcxThinkingContent, OcxUsage, RateLimitRetryPolicy } from "../types";
+import type { AdapterEvent, OcxConfig, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxProviderOpaqueToolCallMetadata, OcxThinkingContent, OcxUsage, RateLimitRetryPolicy } from "../types";
 import { namespacedToolName, toolChoiceToolPredicate } from "../types";
 import { cloneProviderOpaqueToolCallMetadata } from "../responses/provider-opaque-metadata";
 import type { AttemptRecoveryKind } from "../usage/log";
+import { isTruncatedStopReason } from "../responses/truncated-stop-reason";
 import { bridgeToResponsesSSE } from "../bridge";
 import { runWebSearch, type SidecarOutcome, type SidecarOutcomeRecorder, type SidecarSettings } from "./executor";
 import { runAnthropicWebSearch } from "./anthropic-executor";
-import { clearableDeadline } from "../lib/abort";
+import { runXaiWebSearch, type XaiSearchOptions } from "./xai-executor";
+import { runGeminiWebSearch } from "./gemini-executor";
+import { runExaWebSearch } from "./exa-executor";
+import type { WebSearchBackendId } from "./index";
+import { pacingHeaderDeadline } from "./header-deadline";
 import { redactSecretString } from "../lib/redact";
 import { readBoundedResponseBody } from "../lib/bounded-body";
-import { fetchWithResetRetry, prepareSameTarget429Wait } from "../lib/upstream-retry";
+import { applyUpstreamRecoveryInit, fetchWithResetRetry, prepareSameTarget429Wait } from "../lib/upstream-retry";
 import { rateLimitRetryDelayMs } from "../providers/key-failover";
 import {
   isTranslatorBudgetExceededError,
@@ -226,6 +231,24 @@ function forcedAnswerNudge(): OcxMessage {
   };
 }
 
+/**
+ * Transient developer-role nudge for the ONE recovery pass after a forced answer came back empty.
+ * The recovery also removes every tool, so the model has nothing to call and can only return text;
+ * this turn says so explicitly rather than relying on the removal alone. Like {@link forcedAnswerNudge}
+ * it is iteration-local and never touches the persisted `messages`.
+ */
+function forcedAnswerRetryNudge(): OcxMessage {
+  return {
+    role: "developer",
+    content:
+      "Your previous response contained no usable answer. Web search has finished for this turn and " +
+      "no tools are available for this response. Answer the user's question now in assistant text, " +
+      "using the web search results already gathered above. If those results are insufficient, say " +
+      "what is missing instead of returning an empty response.",
+    timestamp: Date.now(),
+  };
+}
+
 function jsonError(status: number, message: string): Response {
   return new Response(JSON.stringify({ error: { message, type: "upstream_error", code: null } }), {
     status,
@@ -250,12 +273,24 @@ export interface WebSearchLoopDeps {
   parsed: OcxParsedRequest;
   adapter: ProviderAdapter;
   incomingMeta: IncomingMeta;
-  /** Which executor runs searches. Defaults to "openai" so existing callers keep the ChatGPT path (audit F4). */
-  backend?: "openai" | "anthropic";
+  /**
+   * Which executor runs searches. Defaults to "openai" so existing callers keep the ChatGPT path
+   * (audit F4). The widened ids (xai/gemini/exa) cannot reach the loop yet: planWebSearch returns
+   * no plan for them (inert 060 arms), and the dispatch below only branches on "anthropic".
+   */
+  backend?: WebSearchBackendId;
   /** Required for the openai backend; unused (and typically undefined) for the anthropic backend. */
   forwardProvider?: OcxProviderConfig;
   /** Required for the anthropic backend: the stored-OAuth provider that runs web_search_20250305. */
-  anthropicSidecar?: { providerName: string; provider: OcxProviderConfig };
+  anthropicSidecar?: { providerName: string; provider: OcxProviderConfig; config: OcxConfig };
+  /** Required for the xai backend: the stored Grok OAuth provider (L7). */
+  xaiSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Required for the gemini backend: the stored Antigravity CCA provider (L8). */
+  geminiSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Required for the exa backend: the operator key, read from config at plan unpack (L9). */
+  exaApiKey?: string;
+  /** Opt-in x_search options for the xai backend. */
+  xaiSearchOptions?: XaiSearchOptions;
   hostedTool: Record<string, unknown>;
   selectedForwardHeaders: Headers;
   settings: SidecarSettings;
@@ -263,6 +298,7 @@ export interface WebSearchLoopDeps {
   forceEmptyResponseId?: boolean;
   abortSignal?: AbortSignal;
   recordSidecarOutcome?: SidecarOutcomeRecorder;
+  beforeSidecarDispatch?: () => void;
   /** Cumulative per-iteration deadline for DNS/TCP/TLS and final response headers only. */
   connectTimeoutMs?: number;
   /** Continuous routed-model response-body raw-byte inactivity deadline. Default 200000ms. */
@@ -285,15 +321,42 @@ export interface WebSearchLoopDeps {
   onUsage?: (usage: OcxUsage | undefined) => void;
   /** Observe the exact adapter request selected for each routed-model iteration. */
   onRequestBuilt?: (request: AdapterRequest) => void;
+  /** Request-scoped executor retains the core's selection binding across loop retries. */
+  fetchForRequest?: (request: AdapterRequest, parsed: OcxParsedRequest) => typeof globalThis.fetch;
   /** Called before each routed-model dispatch in the loop, for attempt telemetry. Same-target 429 replays pass the `rate-limit-429` recovery kind. */
   onAttemptSend?: (recovery?: AttemptRecoveryKind) => void;
   /**
-   * 429 key-failover hook: rotate the provider's active pool key and return a rebuilt adapter,
-   * or null when the pool is exhausted (same semantics as the normal routed path).
+   * Account/key failover hook (429, plus provider-classified pre-output refusals): rotate the provider's active credential and return a rebuilt adapter,
+   * or null when the pool is exhausted. Async hooks support OAuth refresh; existing synchronous
+   * key-pool hooks remain valid.
+   *
+   * `responseHeaders` carries the whole refusal, not just Retry-After, because an Anthropic
+   * 429 states the window's reset epoch even when it omits Retry-After -- and a rotation that
+   * cannot see it cools the drained account for the short default instead of until the window
+   * actually reopens. Optional so existing callers keep compiling.
+   *
+   * `retryParsed` is the exact iteration-local request the retry will be built from. The loop
+   * sends a shallow copy of the outer parsed request, so a rotation that rebinds only the outer
+   * object never reaches the wire. Optional so existing callers keep compiling.
+   *
+   * A rotation may cross ACCOUNTS, not just keys, and the attempt row is where an operator reads
+   * which one happened. A rotator that knows which kind it performed returns it alongside the
+   * adapter -- the same `{ adapter, recoveryKind }` shape `onCredentialError` already uses below.
    */
-  on429?: (retryAfterHeader: string | null) => ProviderAdapter | null;
+  on429?: (
+    retryAfterHeader: string | null,
+    responseHeaders?: Headers,
+    retryParsed?: OcxParsedRequest,
+    // A 403 requires this complete response; status-only callbacks retain 429 semantics.
+    originalResponse?: Response,
+  ) =>
+    | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
+    | null
+    | Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null>;
   /** Opt-in same-target 429 policy (key-auth providers). When present, 429 replays on the SAME key before on429 rotation. */
   retryOn429Policy?: Required<RateLimitRetryPolicy> | null;
+  /** Called only when the final bridged Responses stream reaches completed or incomplete. */
+  onCompletedResponse?: (response: Record<string, unknown>) => void;
 }
 
 /**
@@ -304,6 +367,7 @@ export interface WebSearchLoopDeps {
  */
 export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Response> {
   const translatorBudget = deps.incomingMeta.translatorBudget;
+  const routedProviderFetch = deps.incomingMeta.providerFetch ?? globalThis.fetch;
   const { parsed, selectedForwardHeaders, forwardProvider, hostedTool, settings, maxSearches, abortSignal, recordSidecarOutcome } = deps;
   const backend = deps.backend ?? "openai";
   const anthropicSidecar = deps.anthropicSidecar;
@@ -319,9 +383,6 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
   const messages: OcxMessage[] = [...parsed.context.messages];
   const loopT0 = Date.now();
   const allTools = parsed.context.tools ?? [];
-  // For the forced-answer pass we drop the synthetic web_search tool so the model MUST answer from the
-  // results already in `messages` (can't search again) — this guarantees a non-empty final answer.
-  const toolsNoWebSearch = allTools.filter(t => !t.webSearch);
   let searchesExecuted = 0;
   let executedSearchCount = 0;
   // Queries whose search already failed this turn — repeats are short-circuited so a model that keeps
@@ -340,7 +401,10 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
   const signal = internalAbort.signal;
 
   // Hard iteration bound (termination safety net); forceAnswer normally ends the loop sooner.
-  const HARD_CAP = maxSearches + 2;
+  // One iteration beyond the forced answer is reserved for its empty-answer recovery below.
+  const HARD_CAP = maxSearches + 3;
+  let emptyAnswerRetries = 0;
+  let accountRefusalOutputStarted = false;
   const connectTimeoutMs = deps.connectTimeoutMs ?? 200_000;
   const routedModelStallTimeoutMs = deps.routedModelStallTimeoutMs ?? 200_000;
 
@@ -372,22 +436,29 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
    * restart) before the `on429` key rotation.
    */
   const prepareIterationEvents = async function* (forceAnswer: boolean): AsyncGenerator<AdapterEvent, IterationResponse> {
-    // On the forced-answer pass the synthetic web_search tool is gone, so the model MUST answer
-    // from the results already in `messages`. A weak model can still produce a thin answer that
+    // On the forced-answer pass the model is asked to answer from the results already in
+    // `messages`. A weak model can still produce a thin answer that
     // ignores what the search found, which reads to the user as "the search did nothing". Nudge it
     // (iteration-locally — never mutate the shared `messages`) to actually use the gathered results.
     // Only when a REAL search ran (executedSearchCount, not empty-query/limit/repeat placeholders).
-    const iterMessages: OcxMessage[] = forceAnswer && executedSearchCount > 0
+    let iterMessages: OcxMessage[] = forceAnswer && executedSearchCount > 0
       ? [...messages, forcedAnswerNudge()]
       : messages;
+    // #1001 follow-up: the recovery pass for an empty forced answer. Removing every tool leaves the
+    // model nothing to call, and the extra developer turn asks it for the text it just failed to
+    // produce. `toolChoice: "none"` is what drops those definitions in the adapter, so the retry
+    // cannot repeat the same empty or tool-shaped response.
+    const recoveringEmptyAnswer = forceAnswer && emptyAnswerRetries > 0;
+    if (recoveringEmptyAnswer) iterMessages = [...iterMessages, forcedAnswerRetryNudge()];
     const iterParsed: OcxParsedRequest = {
       ...parsed, stream: true,
-      context: { ...parsed.context, messages: iterMessages, tools: forceAnswer ? toolsNoWebSearch : allTools },
+      ...(recoveringEmptyAnswer ? { options: { ...parsed.options, toolChoice: "none" as const } } : {}),
+      context: { ...parsed.context, messages: iterMessages, tools: recoveringEmptyAnswer ? [] : allTools },
     };
-    // One cumulative header deadline spans every pool-key 429 rotation in this model iteration.
+    // One cumulative header deadline spans key rotations and reset sends, excluding local pacing.
     // clear() stops only its timer after final headers; the direct turn signal remains attached to
     // the returned response body through AbortSignal.any().
-    let headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+    let headerDeadline = pacingHeaderDeadline(connectTimeoutMs, signal);
     try {
       /**
        * Build and fetch one web-search iteration on the given adapter, under the iteration
@@ -407,6 +478,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           request = cachedRequest;
         } else {
           request = await requestAdapter.buildRequest(iterParsed, {
+            ...deps.incomingMeta,
             headers: selectedForwardHeaders,
             abortSignal: headerDeadline.signal,
             translatorBudget,
@@ -419,6 +491,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           cachedRequest = request;
           cachedAdapter = requestAdapter;
         }
+        const requestFetch = headerDeadline.pacedFetch(deps.fetchForRequest?.(request, iterParsed) ?? routedProviderFetch);
         let response: Response;
         try {
           if (requestAdapter.fetchResponse) {
@@ -428,6 +501,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
               timeoutMs: connectTimeoutMs,
               returnRawErrors: true,
               stream: true,
+              executor: requestFetch,
             });
           } else {
             response = await fetchWithResetRetry(
@@ -438,14 +512,20 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
                 deps.onAttemptSend?.(retryRecovery ?? recovery);
                 const h = new Headers(request.headers);
                 if (!h.has("accept-encoding")) h.set("accept-encoding", "identity");
-                return fetch(request.url, {
+                // A connection-reset replay must leave the half-closed pooled socket, not just
+                // ask politely: Bun has ignored a bare `Connection: close` (oven-sh/bun#20492),
+                // so the transport-level `keepalive: false` this helper adds is what actually
+                // opens a new connection. Spending `retryRecovery` on telemetry alone left every
+                // replay on this leg eligible for the same dead socket the reset came from.
+                return requestFetch(request.url, applyUpstreamRecoveryInit({
                   method: request.method,
+                  redirect: "manual",
                   headers: h,
                   body: request.body,
                   signal: headerDeadline.signal,
-                });
+                }, retryRecovery));
               },
-              { abortSignal: headerDeadline.signal, label: "web-search-loop" },
+              { replaySafe: true, abortSignal: headerDeadline.signal, label: "web-search-loop" },
             );
           }
         } finally {
@@ -483,23 +563,26 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         // The deliberate backoff must not consume the cumulative response-header deadline:
         // start a fresh one so the replay gets a new connect budget (504 stays reserved for real
         // upstream latency).
-        headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+        headerDeadline = pacingHeaderDeadline(connectTimeoutMs, signal);
         // Stall-watchdog seam between bounded retry fetches.
         yield { type: "heartbeat" };
         prepared = await fetchOnce(adapter, "rate-limit-429");
       }
       // 429 key-failover parity with the normal routed path: rotate pool keys until one responds
       // or the pool is exhausted (deps.on429 returns null — cooldown map guarantees termination).
-      while (prepared.response.status === 429 && deps.on429) {
-        const rotated = deps.on429(prepared.response.headers.get("retry-after"));
+      while ((prepared.response.status === 429
+        || (prepared.response.status === 403 && deps.incomingMeta?.providerName === "anthropic" && !accountRefusalOutputStarted)
+        || (iterParsed._kiroAuthContext && (prepared.response.status === 400 || prepared.response.status === 403))) && deps.on429) {
+        const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers,
+          iterParsed, prepared.response);
         if (!rotated) break;
         // Never let a broken body's cancel promise outlive the cumulative header deadline. Observe
         // it, but proceed immediately to the rotated fetch under the SAME deadline signal.
         try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
-        adapter = rotated;
+        adapter = rotated.adapter;
         // Stall-watchdog seam between bounded retry fetches (audit 011 B3).
         yield { type: "heartbeat" };
-        prepared = await fetchOnce(adapter, "key-429");
+        prepared = await fetchOnce(adapter, rotated.recoveryKind);
       }
 
       // Final headers have arrived. Clear only the deadline timer before ANY body read.
@@ -581,10 +664,11 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         // Codex show only `Working` until both Kiro attempts had finished (often 30-40 seconds).
         // Tool events remain buffered below, so the decision to invoke the hosted sidecar is still
         // atomic and no search call can escape before its stream has validated successfully.
-        else if (event.type === "text_delta" && event.phase === "commentary") yield event;
+        else if (event.type === "text_delta" && event.phase === "commentary") { accountRefusalOutputStarted = true; yield event; }
         else if (liveWindowOpen && LIVE_STREAMABLE.has(event.type)) {
           // Live events are ALSO buffered: the scanner still needs them for thinking extraction
           // and the forced-answer output check; only the terminal replay skips them (by count).
+          accountRefusalOutputStarted = true;
           yield event;
           streamedPassthroughCount++;
           events.push(event);
@@ -656,9 +740,30 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         // signal.aborted both after the await and in the catch (a fulfilled {error} on an aborted
         // signal would otherwise look like an ordinary degradable failure).
         try {
-          outcome = backend === "anthropic" && anthropicSidecar
-            ? await runAnthropicWebSearch(query, anthropicSidecar.providerName, anthropicSidecar.provider, settings, signal)
-            : await runWebSearch(query, hostedTool, forwardProvider!, selectedForwardHeaders, settings, signal, recordSidecarOutcome);
+          if (backend === "anthropic" && anthropicSidecar) {
+            outcome = await runAnthropicWebSearch(query, anthropicSidecar.providerName, anthropicSidecar.provider, settings, signal, anthropicSidecar.config);
+          } else if (backend === "xai") {
+            // L7: stored Grok OAuth to the pinned api.x.ai Responses endpoint; same
+            // never-throws contract and no Codex/OpenAI pool outcome recording (F5 parity).
+            // A missing xaiSidecar is an invariant violation — fail CLOSED with an error
+            // outcome rather than falling through to the forward-header OpenAI executor
+            // (review High: that fallthrough would be credential-sensitive).
+            outcome = deps.xaiSidecar
+              ? await runXaiWebSearch(query, deps.xaiSidecar.providerName, deps.xaiSidecar.provider, settings, deps.xaiSearchOptions ?? {}, signal)
+              : { text: "", sources: [], error: "xai backend selected without a resolved Grok OAuth provider" };
+          } else if (backend === "gemini") {
+            // L8: Antigravity CCA grounding; same fail-closed invariant stance as xai.
+            outcome = deps.geminiSidecar
+              ? await runGeminiWebSearch(query, deps.geminiSidecar.providerName, deps.geminiSidecar.provider, settings, signal)
+              : { text: "", sources: [], error: "gemini backend selected without a resolved Antigravity provider" };
+          } else if (backend === "exa") {
+            // L9: non-LLM lane; key comes from the loop deps, never the plan. Fail closed.
+            outcome = deps.exaApiKey
+              ? await runExaWebSearch(query, deps.exaApiKey, settings, signal)
+              : { text: "", sources: [], error: "exa backend selected without an exaApiKey" };
+          } else {
+            outcome = await runWebSearch(query, hostedTool, forwardProvider!, selectedForwardHeaders, settings, signal, recordSidecarOutcome, deps.beforeSidecarDispatch);
+          }
           if (signal.aborted) throw new LoopError(499, "client closed request during web-search");
         } catch (e) {
           if (e instanceof LoopError) throw e;
@@ -778,8 +883,13 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
 
           // Loop (search + re-ask) ONLY when the model's actionable output is purely web_search. A real
           // tool call (e.g. shell/apply_patch) means this turn is terminal for Codex — finalize so those
-          // calls reach Codex. forceAnswer also finalizes.
-          const shouldLoop = split.calls.length > 0 && !split.hasRealToolCall && !forceAnswer;
+          // calls reach Codex.
+          // The budget check happens per query inside runSearchCall, so a
+          // forced pass that emits one more web_search call is served the
+          // limit-reached result instead of failing the turn (#6464: stripping
+          // the declaration makes some models emit the raw call as visible
+          // text).
+          const shouldLoop = split.calls.length > 0 && !split.hasRealToolCall;
           if (!shouldLoop) {
             // #1001: a forced-answer pass that ends `done` must have produced
             // usable output — never a malformed tool call, and never silence.
@@ -787,9 +897,34 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
               // An unterminated call flushes AFTER the terminal event, so find
               // the terminal rather than assuming it is last (#1001).
               const terminalEvent = split.passthrough.find(event => event.type === "done");
+              if (terminalEvent?.type === "done" && !split.hasMalformedToolCall
+                && isTruncatedStopReason(terminalEvent.stopReason)) {
+                // A provider refusal or truncation is authoritative, even without text.
+                // Preserve it once; neither an empty-answer retry nor a generic 502 applies.
+                yield* replay(split.passthrough.slice(split.streamedPassthroughCount));
+                return;
+              }
               if (terminalEvent?.type === "done"
                 && (split.hasMalformedToolCall
                   || (!split.hasRealToolCall && !hasVisibleAssistantText(split.passthrough)))) {
+                // #1001 fixed the silent success by failing here. A malformed call still fails: it
+                // reports a protocol problem, and replaying it would only re-ask an unwell upstream.
+                // Silence is different — it is recoverable, so retry exactly once with the results
+                // already gathered before failing the turn.
+                console.warn("[web-search-loop] unusable forced answer", JSON.stringify({
+                  model: parsed.modelId,
+                  recoveryAttempt: emptyAnswerRetries,
+                  searchCalls: split.calls.length,
+                  malformed: split.hasMalformedToolCall,
+                  stopReason: terminalEvent.stopReason,
+                  eventTypes: [...new Set(split.passthrough.map(event => event.type))],
+                }));
+                if (!split.hasMalformedToolCall && !split.hasRealToolCall && emptyAnswerRetries === 0) {
+                  emptyAnswerRetries++;
+                  console.warn("[web-search-loop] empty forced answer — retrying once without tools");
+                  yield { type: "heartbeat" };
+                  continue;
+                }
                 throw new LoopError(502, "forced-answer pass produced no usable assistant output");
               }
             }
@@ -809,6 +944,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           // The thinking that led to the search belongs to the FIRST call's assistant replay turn.
           const iterationThinking = extractIterationThinking(split.passthrough);
           for (const [callIndex, call] of split.calls.entries()) {
+            accountRefusalOutputStarted = true;
             yield* runSearchCall(call, callIndex === 0 ? iterationThinking : []);
           }
         } catch (e) {
@@ -826,6 +962,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           return;
         }
       }
+      yield { type: "error", message: "web-search loop exceeded its iteration cap" };
     } finally {
       if (abortSignal) abortSignal.removeEventListener("abort", linkAbort);
     }
@@ -844,9 +981,11 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       replayCacheScope: parsed._reasoningReplayScope,
       ...(deps.forceEmptyResponseId ? { responseId: "" } : {}),
       hideThinkingSummary: parsed.options.hideThinkingSummary,
+      hideRawReasoning: parsed.options.hideRawReasoning,
       ...(deps.stallTimeoutSec !== undefined ? { stallTimeoutSec: deps.stallTimeoutSec } : {}),
       ...(deps.onFirstOutput ? { onFirstOutput: deps.onFirstOutput } : {}),
       ...(deps.onUsage ? { onUsage: deps.onUsage } : {}),
+      ...(deps.onCompletedResponse ? { onCompletedResponse: deps.onCompletedResponse } : {}),
     },
   );
   return new Response(sse, { headers: SSE_HEADERS });

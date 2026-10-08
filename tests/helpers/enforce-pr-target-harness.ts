@@ -59,6 +59,8 @@ export type PullRequestState = {
   body?: string;
   draft?: boolean;
   base?: { ref: string };
+  head?: { sha: string };
+  updated_at?: string;
   user?: { login: string };
   /** `pulls.get` changed_files; omit to default to listed file count in harness. */
   changed_files?: number;
@@ -68,6 +70,7 @@ export type Comment = {
   id: number;
   user?: { login: string };
   body?: string;
+  updated_at?: string;
   /** GitHub's per-comment association; used for the GUI-screenshot waiver. */
   author_association?: string;
 };
@@ -83,6 +86,18 @@ export type IssueEvent = {
 export type RunOptions = {
   /** The PR as `pulls.get` will report it — the live, authoritative state. */
   pr: PullRequestState;
+  /** Per-read authoritative changes, independent of webhook payload snapshots. */
+  pullSnapshots?: PullRequestState[];
+  /** Previous body carried by a real body-edited webhook. */
+  previousBody?: string;
+  /** Server time on successful bot comment writes. */
+  commentUpdatedAt?: string;
+  /** Distinct server times on each successful comment write. */
+  commentUpdatedAts?: string[];
+  /** One-based comment-write attempt to fail after an earlier checkpoint succeeds. */
+  failCommentWrite?: number;
+  /** Late authoritative comment override for pre-ready revalidation. */
+  finalComment?: Comment;
   /**
    * What the webhook delivered, if it differs from `pr`.
    *
@@ -243,6 +258,15 @@ export type RunOptions = {
     }>
   >;
   /**
+   * Commit messages on the pull request branch, read by the carry-attribution
+   * assessor. The squash body is assembled from the description and these, so
+   * a `Co-authored-by` trailer can legitimately live in either.
+   *
+   * Defaults to one commit carrying the PR title, which is what a
+   * single-commit branch looks like.
+   */
+  commitMessages?: string[];
+  /**
    * GraphQL query fragments that should reject. Unlike `failOn: ["graphql"]`,
    * which fails the review-threads read, this lets a test fail a specific
    * mutation (e.g. `markPullRequestReadyForReview`) while the threads read
@@ -274,7 +298,7 @@ const DEFAULT_BODY = [
   "",
   "## Test plan",
   "",
-  "- [x] Run `bun test tests/ci-workflows.test.ts`",
+  "- [x] Run `bun test tests/ci-workflows/ci-workflows.test.ts`",
   "- [x] Confirm enforce-pr-target behaviour locally",
 ].join("\n");
 
@@ -664,6 +688,8 @@ export async function runEnforcePrTarget(
     options.filePages ??
     (options.files && options.files.length > 0 ? [options.files] : [[]]);
   const listedFileCount = filePages.flat().length;
+  const commitMessages =
+    options.commitMessages ?? [String((options.pr as { title?: string })?.title ?? "")];
   const prInput = options.pr as Record<string, unknown>;
   if (Object.prototype.hasOwnProperty.call(prInput, "changed_files")) {
     (pr as Record<string, unknown>).changed_files = prInput.changed_files;
@@ -769,9 +795,29 @@ export async function runEnforcePrTarget(
     return { ahead_by: 0, behind_by: 0 };
   }
 
+  let pullReadIndex = 0;
+  let snapshotPr = structuredClone(pr);
+  let currentGateComment = structuredClone(pages.flat().find(comment =>
+    comment.user?.login === "github-actions[bot]" && comment.body?.includes("<!-- opencodex-pr-gate -->")));
+  let commentWriteIndex = 0;
+  const savedComment = (args: unknown, id: number) => {
+    const index = commentWriteIndex++;
+    return { id, body: String((args as { body?: string }).body ?? ""),
+      user: { login: "github-actions[bot]" },
+      updated_at: options.commentUpdatedAts?.[index] ?? options.commentUpdatedAt };
+  };
+
   const rest = {
     pulls: {
-      get: (args: unknown) => respond("pulls.get", args, pr),
+      get: (args: unknown) => {
+        if (!options.pullSnapshots) return respond("pulls.get", args, pr);
+        const delta = options.pullSnapshots[pullReadIndex++] ?? {};
+        snapshotPr = { ...snapshotPr, ...delta,
+          base: { ...snapshotPr.base, ...delta.base },
+          head: { ...snapshotPr.head, ...delta.head },
+          user: { ...snapshotPr.user, ...delta.user } };
+        return respond("pulls.get", args, structuredClone(snapshotPr));
+      },
       update: (args: unknown) => respond("pulls.update", args, { ...pr }),
       // Page-specific open-PR fixtures; missing pages are empty so paginate ends.
       list: (args: unknown) => {
@@ -782,6 +828,14 @@ export async function runEnforcePrTarget(
       listFiles: (args: unknown) => {
         const page = Number((args as { page?: number })?.page ?? 1);
         return respond("pulls.listFiles", args, filePages[page - 1] ?? []);
+      },
+      listCommits: (args: unknown) => {
+        const page = Number((args as { page?: number })?.page ?? 1);
+        return respond(
+          "pulls.listCommits",
+          args,
+          page === 1 ? commitMessages.map(message => ({ commit: { message } })) : [],
+        );
       },
     },
     issues: {
@@ -795,8 +849,21 @@ export async function runEnforcePrTarget(
         const page = Number((args as { page?: number })?.page ?? 1);
         return respond("issues.listEvents", args, issueEventPages[page - 1] ?? []);
       },
-      createComment: (args: unknown) => respond("issues.createComment", args, { id: 99 }),
-      updateComment: (args: unknown) => respond("issues.updateComment", args, { id: 7 }),
+      getComment: (args: unknown) => respond("issues.getComment", args, options.finalComment ?? currentGateComment),
+      createComment: async (args: unknown) => {
+        const saved = savedComment(args, 99);
+        if (options.failCommentWrite === commentWriteIndex) throw octokitError("issues.createComment", 500);
+        const response = await respond("issues.createComment", args, saved);
+        currentGateComment = saved;
+        return response;
+      },
+      updateComment: async (args: unknown) => {
+        const saved = savedComment(args, Number((args as { comment_id?: number }).comment_id ?? 7));
+        if (options.failCommentWrite === commentWriteIndex) throw octokitError("issues.updateComment", 500);
+        const response = await respond("issues.updateComment", args, saved);
+        currentGateComment = saved;
+        return response;
+      },
       deleteComment: (args: unknown) => respond("issues.deleteComment", args, {}),
       addLabels: (args: unknown) => respond("issues.addLabels", args, {}),
       removeLabel: (args: unknown) => respond("issues.removeLabel", args, {}),
@@ -985,6 +1052,7 @@ export async function runEnforcePrTarget(
      */
     payload = {
       action: options.eventAction ?? (options.eventName === "issue_comment" ? "created" : "opened"),
+      ...(options.previousBody === undefined ? {} : { changes: { body: { from: options.previousBody } } }),
       number: eventPr.number,
       // An issue comment on a PR is delivered with `issue` + `comment`, never
       // `pull_request`. The gate resolves the PR number from whichever object

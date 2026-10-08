@@ -1,20 +1,81 @@
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { codexAutoStartEnabled } from "../config";
-import { deriveStartupHealth, type StartupHealth } from "../codex/autostart-health";
+import { deriveStartupHealth, startupHealthProbeBudgetMs, type StartupHealth } from "../codex/autostart-health";
 import { getCodexRoutingKind } from "../codex/inject";
 import { diagnoseCodexShim } from "../codex/shim";
 import { durableBunPath } from "../lib/bun-runtime";
+import { selfLaunchArgv } from "../lib/self-launch-argv";
+import { desktopStartupOwnership } from "../service/desktop-startup";
 import type { OcxConfig } from "../types";
 import { truncateRetainedUtf8 } from "../lib/admission";
 
 const CACHE_TTL_MS = 30_000;
-const PROBE_TIMEOUT_MS = 5_000;
-const INITIAL_PROBE_WAIT_MS = 5_500;
+const PROBE_TIMEOUT_MS = startupHealthProbeBudgetMs();
+const INITIAL_PROBE_WAIT_MS = PROBE_TIMEOUT_MS + 500;
 const MAX_DIAGNOSTIC_VALUE_BYTES = 8 * 1024;
+
+/**
+ * How long the isolated probe child gets before its reading is abandoned.
+ *
+ * The child is a full Bun CLI start that then runs `diagnoseService()`, and on
+ * Windows that means shelling out to `sc.exe` / `schtasks.exe` — external
+ * processes whose latency is set by the service-control manager, not by us.
+ * Under load those overran the flat 5s, the probe was abandoned, and the
+ * endpoint answered `diagnosticStale: true` for a machine it could have read.
+ * That is a real dashboard regression, not only a test failure: it downgrades a
+ * `protected` host to `at-risk` and recommends a repair command for a healthy
+ * service.
+ *
+ * Raising it only on Windows keeps the tighter bound everywhere else. It stays a
+ * bound in both cases: a wedged probe is still abandoned, and the caller still
+ * receives the previous reading rather than waiting on it.
+ */
+/** The probe bound, so a test's own budget cannot fall below what it must wait for. */
+export function startupHealthProbeTimeoutMs(): number {
+  return PROBE_TIMEOUT_MS;
+}
 let cached: { timestamp: number; value: StartupHealth } | null = null;
+/**
+ * Last completed reading, kept across invalidation. Invalidation only means "no longer
+ * fresh": a settings write clears `cached` so the next fresh read re-probes, but answering
+ * the snapshot with the synthetic not-installed fallback meanwhile turned a healthy service
+ * into `at-risk` on the dashboard until the probe finished (up to 15s on Windows). The
+ * fallback is kept for a process that has never completed a reading.
+ */
+let lastReading: StartupHealth | null = null;
 let inflight: Promise<StartupHealth> | null = null;
 let generation = 0;
+
+export interface StartupHealthCacheDeps {
+  now?: () => number;
+  probe?: (config: Pick<OcxConfig, "codexAutoStart">) => Promise<StartupHealth>;
+  waitForProbe?: (
+    probe: Promise<StartupHealth>,
+    timeoutMs: number,
+  ) => Promise<StartupHealth | null>;
+}
+
+/**
+ * Return the last completed probe immediately and refresh it in the background.
+ *
+ * Settings are consumed by several dashboard controls. They must not block on a
+ * Windows service-manager probe; the dedicated /api/startup-health route owns
+ * the fresh, bounded diagnostic read.
+ */
+export function getStartupHealthSnapshot(
+  config: Pick<OcxConfig, "codexAutoStart">,
+  deps: StartupHealthCacheDeps = {},
+): StartupHealth {
+  const now = deps.now ?? Date.now;
+  if (cached && now() - cached.timestamp < CACHE_TTL_MS) return cached.value;
+  refreshInBackground(config, deps);
+  return staleOrFallback(config);
+}
+
+function staleOrFallback(config: Pick<OcxConfig, "codexAutoStart">): StartupHealth {
+  return lastReading ? markStartupHealthDiagnosticStale(lastReading) : conservativeFallback(config);
+}
 
 export function markStartupHealthDiagnosticStale(value: StartupHealth): StartupHealth {
   if (!value.localRoutingDependency) return { ...value, diagnosticStale: true };
@@ -27,7 +88,9 @@ export function markStartupHealthDiagnosticStale(value: StartupHealth): StartupH
     // Mirror deriveStartupHealth's choice: an already-registered service is refreshed in
     // place. Hardcoding installService here silently undid that for every stale-cache
     // read, which is the path the dashboard hits while a probe is revalidating.
-    recommendedCommand: value.routingKind === "custom-local" || value.routingKind === "unknown"
+    recommendedCommand: value.routingKind === "opencodex-local" && value.desktop?.owned
+      ? null
+      : value.routingKind === "custom-local" || value.routingKind === "unknown"
       ? value.commands.restoreNative
       : value.serviceInstalled && !value.serviceConflict
         ? value.commands.repairService
@@ -38,6 +101,7 @@ export function markStartupHealthDiagnosticStale(value: StartupHealth): StartupH
 function conservativeFallback(config: Pick<OcxConfig, "codexAutoStart">): StartupHealth {
   const shim = diagnoseCodexShim();
   return deriveStartupHealth({
+    desktop: desktopStartupOwnership(),
     routingKind: getCodexRoutingKind(),
     autostartEnabled: codexAutoStartEnabled(config),
     serviceInstalled: false,
@@ -58,7 +122,7 @@ function runProbe(config: Pick<OcxConfig, "codexAutoStart">): Promise<StartupHea
   const bun = durableBunPath();
   const cli = join(import.meta.dir, "..", "cli", "index.ts");
   return new Promise(resolve => {
-    execFile(bun, [cli, "__startup-health"], {
+    execFile(bun, selfLaunchArgv(["__startup-health"], { sourceEntrypoint: cli }), {
       encoding: "utf8",
       env: process.env,
       timeout: PROBE_TIMEOUT_MS,
@@ -89,43 +153,67 @@ function runProbe(config: Pick<OcxConfig, "codexAutoStart">): Promise<StartupHea
           } catch { /* scan earlier output; config repair messages may precede JSON */ }
         }
       }
-      resolve(cached ? markStartupHealthDiagnosticStale(cached.value) : conservativeFallback(config));
+      resolve(staleOrFallback(config));
     });
   });
 }
 
-function refreshInBackground(config: Pick<OcxConfig, "codexAutoStart">): void {
+function refreshInBackground(
+  config: Pick<OcxConfig, "codexAutoStart">,
+  deps: StartupHealthCacheDeps,
+): void {
   if (inflight) return;
   const startedGeneration = generation;
-  const probe = runProbe(config).then(value => {
-    if (startedGeneration === generation) cached = { timestamp: Date.now(), value };
-    return value;
-  });
-  inflight = probe.finally(() => {
-    if (inflight === probe || startedGeneration === generation) inflight = null;
-  });
+  const probe: Promise<StartupHealth> = Promise.resolve()
+    .then(() => (deps.probe ?? runProbe)(config))
+    .then(value => {
+      if (startedGeneration === generation) {
+        cached = { timestamp: (deps.now ?? Date.now)(), value };
+        if (!value.diagnosticStale) lastReading = value;
+      }
+      return value;
+    })
+    .catch(() => staleOrFallback(config))
+    .finally(() => {
+      // An invalidated probe must never clear the newer generation's flight.
+      if (inflight === probe) inflight = null;
+    });
+  inflight = probe;
 }
 
 /** Stale-while-revalidate: service-manager probes never hold open a model/UI request. */
-export async function getCachedStartupHealth(config: Pick<OcxConfig, "codexAutoStart">): Promise<StartupHealth> {
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) return cached.value;
-  refreshInBackground(config);
+export async function getCachedStartupHealth(
+  config: Pick<OcxConfig, "codexAutoStart">,
+  deps: StartupHealthCacheDeps = {},
+): Promise<StartupHealth> {
+  const now = deps.now ?? Date.now;
+  if (cached && now() - cached.timestamp < CACHE_TTL_MS) return cached.value;
+  refreshInBackground(config, deps);
   // An expired or empty read is an explicit protection check. Wait for the
   // isolated probe instead of presenting a synthetic failure while that probe
   // is still running. The probe remains child-process isolated and hard-capped
-  // at 5s; stale state is returned only if that bounded probe cannot settle.
+  // by the platform-specific deadline; stale state is returned only if that
+  // bounded probe cannot settle.
   if (inflight) {
-    const settled = await Promise.race([
-      inflight,
-      new Promise<null>(resolve => setTimeout(() => resolve(null), INITIAL_PROBE_WAIT_MS)),
-    ]);
+    const settled = await (deps.waitForProbe
+      ? deps.waitForProbe(inflight, INITIAL_PROBE_WAIT_MS)
+      : Promise.race([
+          inflight,
+          new Promise<null>(resolve => setTimeout(() => resolve(null), INITIAL_PROBE_WAIT_MS)),
+        ]));
     if (settled) return settled;
   }
-  return cached ? markStartupHealthDiagnosticStale(cached.value) : conservativeFallback(config);
+  return staleOrFallback(config);
 }
 
 export function invalidateStartupHealthCache(): void {
   generation += 1;
   cached = null;
   inflight = null;
+}
+
+/** Test-only: also forget the last reading, returning to the never-probed state. */
+export function resetStartupHealthCacheForTests(): void {
+  invalidateStartupHealthCache();
+  lastReading = null;
 }

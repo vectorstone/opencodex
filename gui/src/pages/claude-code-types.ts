@@ -29,6 +29,16 @@ export function newClientId(): string {
 
 export interface ClaudeCodeState {
   enabled: boolean;
+  cliFirstParty: boolean;
+  cliFirstPartyApplied: boolean;
+  desktopFirstParty: boolean;
+  interceptReason?: string | null;
+  pickerReason?: string | null;
+  pickerFailurePort?: number;
+  interceptFailurePort?: number;
+  interceptRunning: boolean;
+  interceptEligible: boolean;
+  sharedProxy: "none" | "live" | "stopped" | "disabled" | "broken" | "foreign" | "local" | "unknown";
   /** Three-state intent. "auto" resolves from detected Claude auth on every launch. */
   authMode: "auto" | "subscription" | "proxy";
   /** Resolved: does the opencodex dummy marker get injected. Not a native-auth claim. */

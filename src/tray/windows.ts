@@ -2,7 +2,7 @@ import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, win32 as win32Path } from "node:path";
 import { expandUserPath, getConfigDir } from "../config";
 import { durableBunRuntime } from "../lib/bun-runtime";
 import type { BunRuntimeSource } from "../lib/bun-runtime";
@@ -19,6 +19,9 @@ const TRAY_ICON_FILES = [
   "opencodex-tray-online.ico",
   "opencodex-tray-warning.ico",
   "opencodex-tray-offline.ico",
+  "opencodex-tray-online-update.ico",
+  "opencodex-tray-warning-update.ico",
+  "opencodex-tray-offline-update.ico",
 ] as const;
 
 export interface WindowsTrayEntry {
@@ -46,6 +49,12 @@ export interface WindowsTrayStatus {
   summary: string;
 }
 
+export type WindowsTrayLaunchRunner = (
+  file: string,
+  args: readonly string[],
+  options: { stdio: "ignore"; windowsHide: true; timeout: number },
+) => void;
+
 function trayStatePath(): string {
   return join(getConfigDir(), "tray-state.json");
 }
@@ -60,6 +69,25 @@ function installedTrayScriptPath(): string {
 
 function installedTrayIconPaths(): string[] {
   return TRAY_ICON_FILES.map(name => join(getConfigDir(), name));
+}
+
+/**
+ * Files an installed tray must still have for its registration to count as ours.
+ *
+ * The dotted update icons arrived after the tray shipped, so an install made by an older
+ * release has only the three base icons. Requiring all six here classified that install as
+ * stale, and the updater then stopped the tray without reinstalling it (trayWasInstalled was
+ * false). The dotted icons stay in the install, rollback and uninstall lists; the tray script
+ * falls back to the base icon when one is missing, and the next `tray install` adds them.
+ */
+export function windowsTrayRequiredFilesPresent(
+  state: Pick<WindowsTrayEntry, "bun" | "cli" | "script"> & { launcherPath?: string },
+  iconPaths: readonly string[],
+  exists: (path: string) => boolean = existsSync,
+): boolean {
+  const baseIcons = iconPaths.filter(path => !/-update\.ico$/i.test(path));
+  return [state.bun, state.cli, state.script, ...(state.launcherPath ? [state.launcherPath] : []), ...baseIcons]
+    .every(path => exists(path));
 }
 
 export function windowsTrayStatePathsOwned(
@@ -463,8 +491,7 @@ function trayStatusFrom(registered: string | null): WindowsTrayStatus {
   const running = heartbeatProcessAlive(heartbeat);
   const registrationOwned = state !== null
     && registered === state.runCommand
-    && [state.bun, state.cli, state.script, ...(state.launcherPath ? [state.launcherPath] : []), ...installedTrayIconPaths()]
-      .every(path => existsSync(path));
+    && windowsTrayRequiredFilesPresent(state, installedTrayIconPaths());
   const stale = windowsTrayRegistrationIsStale({
     registered: registered !== null,
     registrationOwned,
@@ -506,8 +533,10 @@ const DETACHED_TRAY_HOST_LAUNCHER = [
   "$startInfo = New-Object System.Diagnostics.ProcessStartInfo",
   "$startInfo.FileName = $env:OCX_TRAY_HOST_BUN",
   "$startInfo.Arguments = $env:OCX_TRAY_HOST_ARGS",
-  "$startInfo.UseShellExecute = $true",
+  "$startInfo.UseShellExecute = $false",
+  "$startInfo.CreateNoWindow = $true",
   "$startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden",
+  "$startInfo.EnvironmentVariables['OCX_TRAY_ENTRY_B64'] = $env:OCX_TRAY_ENTRY_B64",
   "$child = [System.Diagnostics.Process]::Start($startInfo)",
   "if ($null -eq $child) { throw 'Windows tray host did not start.' }",
   "$child.Dispose()",
@@ -537,7 +566,27 @@ export function launchWindowsTrayHost(state: WindowsTrayEntry): void {
   });
 }
 
+export function launchInstalledWindowsTray(
+  launcherPath: string,
+  deps: { systemRoot?: string; run?: WindowsTrayLaunchRunner } = {},
+): void {
+  const wscript = win32Path.join(deps.systemRoot ?? process.env.SystemRoot ?? "C:\\Windows", "System32", "wscript.exe");
+  const run = deps.run ?? ((file, args, options) => {
+    execFileSync(file, [...args], options);
+  });
+  run(wscript, ["//B", "//NoLogo", safePath(launcherPath)], {
+    stdio: "ignore",
+    windowsHide: true,
+    timeout: 15_000,
+  });
+}
+
 function spawnTray(state: WindowsTrayEntry): void {
+  const launcher = installedTrayLauncherPath();
+  if (existsSync(launcher)) {
+    launchInstalledWindowsTray(launcher);
+    return;
+  }
   launchWindowsTrayHost(state);
 }
 

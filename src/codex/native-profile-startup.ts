@@ -1,8 +1,12 @@
 import { NativeProfileManager } from "./native-profile-manager";
+import { loadConfig } from "../config";
+import { initializeMainAccountPolicyBinding } from "./account-lifecycle";
+import { isMainAccountHardLockEnabled } from "./main-account-hard-lock";
 import { clearAccountNeedsReauth } from "./account-runtime-state";
 import { MAIN_CODEX_ACCOUNT_ID } from "./main-account";
 import {
   probeNativeProfileRecoveryState,
+  resolveNativeProfileContext,
   type NativeProfileRecoveryState,
 } from "./native-profile-store";
 import {
@@ -43,12 +47,19 @@ export interface NativeMainStartupGateDeps {
   probeRecoveryState?: typeof probeNativeProfileRecoveryState;
   owner?: NativeMainOwnerOptions;
   stageSweepIntervalMs?: number;
+  /** Test seam / activation-time revalidation for the ambient physical auth home. */
+  currentHomeId?: () => string | null;
 }
 
 export interface NativeMainStartupLifecycle {
   readonly homeId: string | null;
   readonly settled: Promise<NativeMainStartupGateSnapshot>;
   release(): Promise<void>;
+}
+
+export interface PreparedNativeMainStartupLifecycle {
+  readonly homeId: string;
+  start(): NativeMainStartupLifecycle;
 }
 
 let epoch = 0;
@@ -65,7 +76,10 @@ interface StartupEntry {
   owner: NativeMainOwnerReference;
   unsubscribe: () => void;
   recoveryStarted: boolean;
+  policyBindingPending: boolean;
   settled: Promise<NativeMainStartupGateSnapshot>;
+  /** Publication provenance only; never substitutes for the live convergence drain. */
+  snapshotSettled?: Promise<NativeMainStartupGateSnapshot>;
   resolveAcquisition?: (value: NativeMainStartupGateSnapshot) => void;
   deps: NativeMainStartupGateDeps;
   manager: NativeProfileManager;
@@ -75,6 +89,7 @@ interface StartupEntry {
 }
 const startupEntries = new Map<string, StartupEntry>();
 const serverLifecycles = new WeakMap<object, NativeMainStartupLifecycle>();
+const serverLifecycleReleases = new WeakMap<object, Promise<void>>();
 
 function ready(homeId: string | null): NativeMainStartupGateSnapshot {
   return { status: "ready", homeId };
@@ -163,17 +178,21 @@ async function runOwnedStageSweep(entry: StartupEntry): Promise<boolean> {
 }
 
 function scheduleStageSweep(entry: StartupEntry): void {
-  if (entry.sweepStopping || entry.sweepTimer || startupEntries.get(entry.homeId) !== entry) return;
+  if (entry.sweepStopping || entry.sweepTimer || entry.sweepInFlight || entry.policyBindingPending
+    || startupEntries.get(entry.homeId) !== entry) return;
   const intervalMs = Math.max(10, entry.deps.stageSweepIntervalMs ?? NATIVE_STAGE_SWEEP_INTERVAL_MS);
   entry.sweepTimer = setTimeout(() => {
     entry.sweepTimer = undefined;
     if (entry.sweepStopping || startupEntries.get(entry.homeId) !== entry) return;
+    const sweepEpoch = entry.epoch;
     entry.sweepInFlight = (async () => {
       const safe = await runOwnedStageSweep(entry);
-      if (entry.sweepStopping || startupEntries.get(entry.homeId) !== entry) return;
+      if (entry.sweepStopping || startupEntries.get(entry.homeId) !== entry
+        || entry.epoch !== sweepEpoch || entry.policyBindingPending) return;
       if (!safe) snapshot = { status: "blocked", homeId: entry.homeId, reason: "stage-cleanup-required" };
       else if (snapshot.homeId === entry.homeId && snapshot.status === "blocked" && snapshot.reason === "stage-cleanup-required") {
-        snapshot = ready(entry.homeId);
+        if (isMainAccountHardLockEnabled(loadConfig())) rearmOwnedMainPolicyBinding(entry);
+        else snapshot = ready(entry.homeId);
       }
     })().finally(() => {
       entry.sweepInFlight = undefined;
@@ -184,7 +203,9 @@ function scheduleStageSweep(entry: StartupEntry): void {
 }
 
 function convergeOwnedStartup(entry: StartupEntry): void {
-  if (entry.recoveryStarted) return;
+  // The map entry is the gate's owner of record. A released one has been deleted, and every
+  // write below belongs to a generation nothing is waiting for any more.
+  if (entry.recoveryStarted || startupEntries.get(entry.homeId) !== entry) return;
   entry.recoveryStarted = true;
   const currentEpoch = entry.epoch;
   snapshot = { status: "blocked", homeId: entry.homeId, reason: "recovery-pending" };
@@ -209,8 +230,29 @@ function convergeOwnedStartup(entry: StartupEntry): void {
       ));
       const stageSweepSafe = recoveryState === "none" ? await runOwnedStageSweep(entry) : false;
       if (startupEntries.get(entry.homeId) === entry && entry.epoch === currentEpoch && recoveryState === "none" && stageSweepSafe) {
-        clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
-        snapshot = ready(entry.homeId);
+        if (isMainAccountHardLockEnabled(loadConfig())) {
+          await withNativeMainOwnerOperation(entry.manager.context, () => withNativeMainExclusiveClaim(
+            entry.manager.context,
+            async () => {
+              if (startupEntries.get(entry.homeId) !== entry || entry.epoch !== currentEpoch) return;
+              if (probe(entry.manager.context) !== "none") {
+                snapshot = { status: "blocked", homeId: entry.homeId, reason: "manual-recovery" };
+                return;
+              }
+              // The HMAC is deliberately not persisted. Bind only the pinned owned home,
+              // after recovery/cleanup, and before caller-owned admission can observe ready.
+              if (isMainAccountHardLockEnabled(loadConfig())) {
+                initializeMainAccountPolicyBinding(entry.manager.context.authPath);
+              }
+              clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+              snapshot = ready(entry.homeId);
+            },
+            { waitMs: 10_000 },
+          ));
+        } else {
+          clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+          snapshot = ready(entry.homeId);
+        }
       } else if (startupEntries.get(entry.homeId) === entry && entry.epoch === currentEpoch && recoveryState === "none") {
         snapshot = { status: "blocked", homeId: entry.homeId, reason: "stage-cleanup-required" };
       } else if (startupEntries.get(entry.homeId) === entry && entry.epoch === currentEpoch) {
@@ -221,10 +263,33 @@ function convergeOwnedStartup(entry: StartupEntry): void {
         snapshot = { status: "blocked", homeId: entry.homeId, reason: "manual-recovery" };
       }
     }
+    entry.policyBindingPending = false;
     if (startupEntries.get(entry.homeId) === entry && entry.epoch === currentEpoch) scheduleStageSweep(entry);
     return snapshot;
   })();
   if (acquisitionWaiter) void entry.settled.then(acquisitionWaiter);
+}
+
+/** Join an active startup, or rearm its held owner before publishing another ready transition. */
+function rearmOwnedMainPolicyBinding(entry: StartupEntry): boolean {
+  if (entry.sweepStopping || startupEntries.get(entry.homeId) !== entry) return false;
+  const owner = entry.owner.snapshot();
+  if (entry.policyBindingPending && (owner.status === "held" || owner.status === "acquiring")) {
+    snapshot = { status: "blocked", homeId: entry.homeId, reason: "recovery-pending" };
+    settled = entry.settled;
+    return true;
+  }
+  if (owner.status !== "held") {
+    snapshot = { status: "blocked", homeId: entry.homeId, reason: ownerBlockedReason(owner) };
+    return false;
+  }
+  if (entry.sweepTimer) clearTimeout(entry.sweepTimer);
+  entry.sweepTimer = undefined;
+  entry.epoch = ++epoch;
+  entry.policyBindingPending = true;
+  entry.recoveryStarted = false;
+  convergeOwnedStartup(entry);
+  return true;
 }
 
 function observeOwner(entry: StartupEntry, owner: NativeMainOwnerSnapshot): void {
@@ -248,6 +313,47 @@ function observeOwner(entry: StartupEntry, owner: NativeMainOwnerSnapshot): void
  * Retain process ownership for one live server. The first reference acquires the
  * canonical-home SQLite lease and owns recovery; later same-process references share it.
  */
+/**
+ * Releases nobody is awaiting.
+ *
+ * A release closes the native-main owner's SQLite lease and its stable lock file, both of which
+ * live under CODEX_HOME. The normal shutdown path awaits it: `server.stop` goes through
+ * `releaseNativeMainStartupLifecycle`, which awaits the flight. The FAILED-start path does not —
+ * `startServer` must stay synchronous, so its rollback can only fire `void lifecycle.release()`
+ * and rethrow. Nothing could then wait for those handles to close, and on Windows an open handle
+ * does not delay an unlink, it refuses it outright with EPERM.
+ *
+ * That is invisible in production, where a failed start is followed by exit rather than by
+ * deleting the home. It is not invisible to a test whose cleanup removes the home it just used:
+ * `tests/server/server-management-auth.test.ts` binds a management ingress on the fixed port
+ * 10101, which nine other test files also use, so a collision on the six-shard Windows leg turns
+ * a passing start into the rollback path. The failure followed that collision across shards 1, 2
+ * and 3 while staying on the same file and line, which is what a shard-independent trigger looks
+ * like.
+ *
+ * Tracking the flight here rather than at the call site keeps `startServer` synchronous and
+ * unchanged, and gives anyone who needs the handles closed something to await.
+ */
+const pendingStartupReleases = new Set<Promise<void>>();
+
+function trackStartupRelease(release: Promise<void>): Promise<void> {
+  const tracked = release.finally(() => { pendingStartupReleases.delete(tracked); });
+  pendingStartupReleases.add(tracked);
+  return tracked;
+}
+
+/**
+ * Settle every native-main startup release still in flight, including ones nobody awaited.
+ *
+ * Loops rather than awaiting a single snapshot: a release can retire an owner whose own teardown
+ * starts another, and draining only the first batch would return with handles still open.
+ */
+export async function flushNativeMainStartupReleases(): Promise<void> {
+  while (pendingStartupReleases.size > 0) {
+    await Promise.allSettled([...pendingStartupReleases]);
+  }
+}
+
 export function startNativeMainStartupLifecycle(
   deps: NativeMainStartupGateDeps = {},
 ): NativeMainStartupLifecycle {
@@ -274,6 +380,7 @@ export function startNativeMainStartupLifecycle(
       owner,
       unsubscribe: () => {},
       recoveryStarted: false,
+      policyBindingPending: true,
       settled: acquisition,
       resolveAcquisition,
       deps,
@@ -282,31 +389,95 @@ export function startNativeMainStartupLifecycle(
     };
     startupEntries.set(homeId, entry);
     entry.unsubscribe = owner.subscribe(ownerState => observeOwner(entry!, ownerState));
+  } else if (!entry.policyBindingPending
+    && snapshot.status === "ready" && snapshot.homeId === homeId
+    && isMainAccountHardLockEnabled(loadConfig())) {
+    // A new same-process listener can enable protection or follow a credential replacement.
+    // Re-read its pinned home through the held owner before admitting caller-owned main.
+    rearmOwnedMainPolicyBinding(entry);
   }
   entry.refs += 1;
   let released = false;
+  const performRelease = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    entry!.refs = Math.max(0, entry!.refs - 1);
+    if (entry!.refs !== 0) return;
+    const releasedEpoch = entry!.epoch;
+    entry!.epoch += 1;
+    entry!.sweepStopping = true;
+    if (entry!.sweepTimer) clearTimeout(entry!.sweepTimer);
+    entry!.sweepTimer = undefined;
+    entry!.unsubscribe();
+    startupEntries.delete(homeId);
+    // A released owner cannot leave the process fenced. Convergence runs in the background, and
+    // its only guard is this entry, so a server that stops mid-convergence used to keep the
+    // "recovery-pending" snapshot the entry armed: every later native request answered 503 until
+    // the process exited, because a server whose config does not sync Codex installs a no-op
+    // lifecycle that never touches the gate.
+    //
+    // Reset only a snapshot published by this startup generation. A profile transaction can
+    // independently replace it with a same-home recovery fence, which must survive this release.
+    // The epoch provenance misses one case: that fence advances the global epoch while this
+    // generation's convergence is still in flight, and `completeNativeMainRecovery` then rebinds
+    // the shared `settled` to this entry's own pending chain without re-stamping either epoch.
+    // The pending snapshot is again this generation's own, so `settled` identity proves it too.
+    // Do this synchronously and before the first await: a NEW entry created for the same home
+    // afterwards re-arms its own gate and cannot be clobbered by this release. The epoch bump
+    // retires any in-flight convergence write from the released generation.
+    if (snapshot.homeId === homeId && !startupEntries.has(homeId)
+      && (epoch === releasedEpoch || settled === entry!.settled || settled === entry!.snapshotSettled)) {
+      epoch += 1;
+      snapshot = ready(null);
+      settled = Promise.resolve(snapshot);
+    }
+    entry!.resolveAcquisition?.(snapshot);
+    entry!.resolveAcquisition = undefined;
+    // Startup convergence can transition from the exclusive recovery claim
+    // into a stage sweep. Keep the owner registered until that entire chain
+    // settles so no cleanup transaction starts untracked after owner detach.
+    await Promise.allSettled([entry!.settled]);
+    if (entry!.sweepInFlight) await Promise.allSettled([entry!.sweepInFlight]);
+    await entry!.owner.release();
+  };
   return {
     homeId,
     get settled() { return entry!.settled; },
-    async release() {
-      if (released) return;
-      released = true;
-      entry!.refs = Math.max(0, entry!.refs - 1);
-      if (entry!.refs !== 0) return;
-      entry!.epoch += 1;
-      entry!.sweepStopping = true;
-      if (entry!.sweepTimer) clearTimeout(entry!.sweepTimer);
-      entry!.sweepTimer = undefined;
-      entry!.unsubscribe();
-      startupEntries.delete(homeId);
-      entry!.resolveAcquisition?.(snapshot);
-      entry!.resolveAcquisition = undefined;
-      // Startup convergence can transition from the exclusive recovery claim
-      // into a stage sweep. Keep the owner registered until that entire chain
-      // settles so no cleanup transaction starts untracked after owner detach.
-      await Promise.allSettled([entry!.settled]);
-      if (entry!.sweepInFlight) await Promise.allSettled([entry!.sweepInFlight]);
-      await entry!.owner.release();
+    // Tracked so a caller that cannot await -- the synchronous rollback in `startServer` -- still
+    // leaves the flight drainable through `flushNativeMainStartupReleases`.
+    release: () => trackStartupRelease(performRelease()),
+  };
+}
+
+/** Resolve and pin the owned lifecycle target without acquiring ownership or creating artifacts. */
+export function prepareNativeMainStartupLifecycle(
+  deps: NativeMainStartupGateDeps = {},
+  homes?: { codexHome: string; configDir: string },
+): PreparedNativeMainStartupLifecycle | null {
+  let manager: NativeProfileManager;
+  try {
+    manager = deps.manager ?? new NativeProfileManager(homes);
+    if (homes) {
+      const expected = resolveNativeProfileContext(homes);
+      if (
+        manager.context.homeId !== expected.homeId
+        || manager.context.instanceId !== expected.instanceId
+      ) return null;
+    }
+  } catch {
+    return null;
+  }
+  const currentHomeId = deps.currentHomeId ?? (() => {
+      try { return resolveNativeProfileContext().homeId; } catch { return null; }
+    });
+  const pinnedDeps = { ...deps, manager };
+  return {
+    homeId: manager.context.homeId,
+    start: () => {
+      if (currentHomeId() !== manager.context.homeId) {
+        throw new Error("The native-main startup home changed after ownership inspection.");
+      }
+      return startNativeMainStartupLifecycle(pinnedDeps);
     },
   };
 }
@@ -316,9 +487,10 @@ export function startNativeMainStartupLifecycle(
  *
  * A host that is permanently unaskable must not re-probe on every request forever, and a
  * host that recovers usually does so within the first few. The budget belongs to the
- * REASON, not to an individual fence: raising a second fence deliberately does not hand
- * out a fresh allowance, or a caller looping over fences could spin the probe forever.
- * It is dropped when the last fence for that reason releases.
+ * live hook owner, not to an individual fence: raising a second fence deliberately does
+ * not hand out a fresh allowance, or a caller looping over fences could spin the probe
+ * forever. Spending or releasing that hook owner ends its budget generation; a later
+ * fence can install a new owner even if an older hookless fence is still draining.
  */
 export const NATIVE_MAIN_OWNERSHIP_RETRY_LIMIT = 5;
 
@@ -327,11 +499,20 @@ const serviceOwnershipReprobes = new Map<NativeMainServiceOwnershipBlockReason, 
 
 interface ServiceOwnershipReprobe {
   readonly probe: () => NativeCodexOwnership;
+  readonly expectedHomeId: () => string | null;
+  readonly activate: () => NativeMainStartupLifecycle;
+  readonly adopt: (lifecycle: NativeMainStartupLifecycle) => boolean;
+  readonly discard: (lifecycle: NativeMainStartupLifecycle) => void;
+  activating: boolean;
   attempts: number;
   /** The fence that installed this hook; only its own release may drop the entry. */
   readonly owner: NativeMainStartupLifecycle;
   /** Releases the fence that installed this hook, exactly once. */
   readonly spend: () => void;
+}
+
+function releaseUnadoptedLifecycle(lifecycle: NativeMainStartupLifecycle): Promise<void> {
+  try { return Promise.resolve(lifecycle.release()).catch(() => {}); } catch { return Promise.resolve(); }
 }
 
 /** Test-only: the retry budget is module state and would otherwise leak across tests. */
@@ -359,23 +540,53 @@ function reprobeServiceOwnership(reason: NativeMainServiceOwnershipBlockReason):
   if (reason !== "ownership-unknown") return false;
   const entry = serviceOwnershipReprobes.get(reason);
   if (!entry) return false;
+  if (entry.activating) return false;
   if (entry.attempts >= NATIVE_MAIN_OWNERSHIP_RETRY_LIMIT) return false;
   entry.attempts += 1;
-  let answer: NativeCodexOwnership;
+  let activated: NativeMainStartupLifecycle | undefined;
+  let expectedHomeId: string | null = null;
+  entry.activating = true;
   try {
-    answer = entry.probe();
+    const answer = entry.probe();
+    if (answer !== "owned") return false;
+    expectedHomeId = entry.expectedHomeId();
+    if (expectedHomeId === null) return false;
+    // Ownership becoming knowable is not itself startup completion. Install the
+    // normal owner/recovery lifecycle while this fence is still held, so native
+    // traffic cannot get ahead of owner registration, journal recovery, auth-temp
+    // scrubbing, or the initial stage sweep.
+    activated = entry.activate();
   } catch {
-    // An inspection that throws is not evidence the host became ownable.
+    // Neither a failed inspection nor a failed activation is evidence that
+    // native-main is safe to admit. Keep the fence and retry hook intact.
+    return false;
+  } finally {
+    entry.activating = false;
+  }
+  if (
+    !activated
+    || activated.homeId === null
+    || activated.homeId !== expectedHomeId
+    || typeof activated.release !== "function"
+  ) {
+    if (activated && typeof activated.release === "function") entry.discard(activated);
     return false;
   }
-  if (answer !== "owned") return false;
+  if (serviceOwnershipReprobes.get(reason) !== entry || !entry.adopt(activated)) {
+    // Shutdown or a re-entrant release can retire this fence while activation
+    // runs. A lifecycle that was never attached to the server must not retain
+    // another owner reference in the background.
+    entry.discard(activated);
+    return false;
+  }
   // Release through the fence that installed this hook, and only that one.
   //
   // Several servers can hold a fence for the same reason while only one carries a hook, so
   // clearing the shared refcount here would unblock fences this probe never spoke for.
   // Decrementing here directly is just as wrong the other way: that fence's own release()
-  // would then pay a second time for one fence, leaving the count short. Delegating to the
-  // fence's idempotent release keeps exactly one payment per fence.
+  // would then pay a second time for one fence, leaving the count short. The
+  // fence's idempotent spend hook keeps exactly one payment per fence while the
+  // transitioned owned lifecycle remains attached until server shutdown.
   entry.spend();
   return true;
 }
@@ -395,22 +606,44 @@ function serviceOwnershipSnapshot(
 /** Close native-main admission without resolving or creating any CODEX_HOME artifacts. */
 export function blockNativeMainStartupForUnownedServiceHome(
   reason: NativeMainServiceOwnershipBlockReason,
-  options?: { reprobe?: () => NativeCodexOwnership },
+  options?: {
+    reprobe: () => NativeCodexOwnership;
+    expectedHomeId: string | (() => string | null);
+    startOwnedLifecycle: () => NativeMainStartupLifecycle;
+  },
 ): NativeMainStartupLifecycle {
   serviceOwnershipRefs.set(reason, (serviceOwnershipRefs.get(reason) ?? 0) + 1);
-  let released = false;
-  const lifecycle: NativeMainStartupLifecycle = {
-    homeId: null,
-    settled: Promise.resolve(serviceOwnershipSnapshot(reason)),
-    async release() {
-      if (released) return;
-      released = true;
-      const remaining = Math.max(0, (serviceOwnershipRefs.get(reason) ?? 0) - 1);
-      if (remaining === 0) serviceOwnershipRefs.delete(reason);
-      else serviceOwnershipRefs.set(reason, remaining);
-      if (serviceOwnershipReprobes.get(reason)?.owner === lifecycle) {
-        serviceOwnershipReprobes.delete(reason);
-      }
+  let fenceSpent = false;
+  let ownedLifecycle: NativeMainStartupLifecycle | undefined;
+  let releaseFlight: Promise<void> | undefined;
+  const orphanReleaseFlights = new Set<Promise<void>>();
+  let lifecycle!: NativeMainStartupLifecycle;
+  const blockedSettled = Promise.resolve(serviceOwnershipSnapshot(reason));
+  const spendFence = () => {
+    if (fenceSpent) return;
+    fenceSpent = true;
+    const remaining = Math.max(0, (serviceOwnershipRefs.get(reason) ?? 0) - 1);
+    if (remaining === 0) serviceOwnershipRefs.delete(reason);
+    else serviceOwnershipRefs.set(reason, remaining);
+    if (serviceOwnershipReprobes.get(reason)?.owner === lifecycle) {
+      serviceOwnershipReprobes.delete(reason);
+    }
+  };
+  lifecycle = {
+    get homeId() { return ownedLifecycle?.homeId ?? null; },
+    get settled() { return ownedLifecycle?.settled ?? blockedSettled; },
+    release() {
+      return releaseFlight ??= (async () => {
+        spendFence();
+        // A synchronous activator can re-enter release before its returned
+        // lifecycle is adopted or discarded. Let that call stack finish so the
+        // cleanup set is complete before this shared release flight drains it.
+        await Promise.resolve();
+        await ownedLifecycle?.release();
+        if (orphanReleaseFlights.size > 0) {
+          await Promise.allSettled([...orphanReleaseFlights]);
+        }
+      })();
     },
   };
   // Do NOT reset an existing budget: keying the reprobe by reason means a caller raising
@@ -418,12 +651,28 @@ export function blockNativeMainStartupForUnownedServiceHome(
   // the probe forever. But once the holder is gone its entry is removed above, so a LATER
   // fence installs its own hook — a server started after an earlier probe must not be left
   // needing `ocx restart`, which is the very symptom this exists to remove.
-  if (options?.reprobe && reason === "ownership-unknown" && !serviceOwnershipReprobes.has(reason)) {
+  if (options && reason === "ownership-unknown" && !serviceOwnershipReprobes.has(reason)) {
+    const expectedHomeId = options.expectedHomeId;
     serviceOwnershipReprobes.set(reason, {
       probe: options.reprobe,
+      expectedHomeId: typeof expectedHomeId === "function"
+        ? expectedHomeId
+        : () => expectedHomeId,
+      activate: options.startOwnedLifecycle,
+      adopt: activated => {
+        if (releaseFlight !== undefined || fenceSpent || ownedLifecycle !== undefined) return false;
+        ownedLifecycle = activated;
+        return true;
+      },
+      discard: activated => {
+        const flight = releaseUnadoptedLifecycle(activated);
+        orphanReleaseFlights.add(flight);
+        void flight.finally(() => orphanReleaseFlights.delete(flight));
+      },
+      activating: false,
       attempts: 0,
       owner: lifecycle,
-      spend: () => { void lifecycle.release(); },
+      spend: spendFence,
     });
   }
   return lifecycle;
@@ -434,10 +683,20 @@ export function bindNativeMainStartupLifecycle(server: object, lifecycle: Native
 }
 
 export async function releaseNativeMainStartupLifecycle(server: object): Promise<void> {
+  const existing = serverLifecycleReleases.get(server);
+  if (existing) return existing;
   const lifecycle = serverLifecycles.get(server);
   if (!lifecycle) return;
-  serverLifecycles.delete(server);
-  await lifecycle.release();
+  const flight = Promise.resolve().then(() => lifecycle.release());
+  serverLifecycleReleases.set(server, flight);
+  try {
+    await flight;
+  } finally {
+    if (serverLifecycleReleases.get(server) === flight) {
+      serverLifecycleReleases.delete(server);
+      serverLifecycles.delete(server);
+    }
+  }
 }
 
 export function isNativeMainTrafficBlocked(): boolean {
@@ -472,10 +731,15 @@ export function blockNativeMainRecovery(
 
 export function completeNativeMainRecovery(homeId: string): boolean {
   if (snapshot.status !== "blocked" || snapshot.homeId !== homeId) return false;
+  const entry = startupEntries.get(homeId);
+  if (entry && isMainAccountHardLockEnabled(loadConfig())) return rearmOwnedMainPolicyBinding(entry);
   epoch += 1;
   clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
   snapshot = ready(homeId);
   settled = Promise.resolve(snapshot);
+  // Remember who published this snapshot without replacing an in-flight recovery/sweep
+  // promise: last-reference release must still drain that original convergence chain.
+  if (entry) entry.snapshotSettled = settled;
   return true;
 }
 
@@ -483,6 +747,13 @@ export function nativeMainStartupGateSnapshot(): NativeMainStartupGateSnapshot {
   const reason = activeServiceOwnershipBlockReason();
   if (reason) return serviceOwnershipSnapshot(reason);
   return { ...snapshot };
+}
+
+/** Read-only: caller-owned credentials must not trigger physical-main ownership reprobes. */
+export function isMainAccountPolicyBindingPending(): boolean {
+  const current = nativeMainStartupGateSnapshot();
+  return current.status === "blocked" && current.reason === "recovery-pending"
+    && current.homeId !== null && startupEntries.get(current.homeId)?.policyBindingPending === true;
 }
 
 export function waitForNativeMainStartupGate(): Promise<NativeMainStartupGateSnapshot> {

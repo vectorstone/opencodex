@@ -15,8 +15,9 @@
  * further: it is the proxy's previous_response_id continuation store, so a
  * growing responseState.totalBytes under rising observed memory points at
  * conversation retention rather than the runtime allocator. Spill counts,
- * payload-byte totals, tombstones, and failure counters remain finite scalars;
- * response ids, filenames, digests, paths, and payload content never leave the owner.
+ * payload-byte totals, tombstones, failure counters, fixed health/error enums,
+ * and event timestamps remain finite scalars; response ids, raw errors,
+ * filenames, digests, paths, and payload content never leave the owner.
  *
  * `activeTurnCount` / `isDraining` are scalar lifecycle counters for the
  * dashboard drain-and-restart confirm UX — never request bodies or IDs.
@@ -25,7 +26,7 @@ import { selectEagerPath } from "../../lib/bun-stream-caps";
 import { reportedBunRuntimeSource } from "../../lib/bun-runtime";
 import { getActiveTurnCount, isDraining } from "../lifecycle";
 import { getActiveMemoryWatchdog, observedMemoryCounter } from "../memory-watchdog";
-import { responseStateMetrics } from "../../responses/state";
+import { inspectResponseSpillStorage, responseStateMetrics, type ResponseSpillDirInspection } from "../../responses/state";
 import { appOwnedBytesSnapshot } from "../../lib/app-owned-memory";
 import { readWindowsReplaceRetryCounters } from "../../lib/windows-atomic-replace";
 import {
@@ -38,6 +39,7 @@ import {
 } from "../../lib/codex-restart-contract";
 import { jsonResponse } from "../auth-cors";
 import { getInspectionCounters } from "../relay";
+import { spendLedgerDiagnosticsSnapshot } from "../../lib/spend-reservation-ledger";
 import type {
   performCodexRestart,
   readCodexAppServerState,
@@ -46,9 +48,34 @@ import type { ManagementContext } from "./context";
 import { acceptSystemRestart } from "./system-restart";
 
 const ENDPOINT_SAMPLE_LIMIT = 60;
+// The spill report reads the snapshot and walks the spill directory synchronously,
+// so a polled memory endpoint reuses one result per window instead of rescanning.
+const RESPONSE_SPILL_REPORT_TTL_MS = 30_000;
+let responseSpillReport: { at: number; value: ResponseSpillDirInspection } | null = null;
+
+function cachedResponseSpillReport(): ResponseSpillDirInspection {
+  const now = Date.now();
+  if (!responseSpillReport || now - responseSpillReport.at >= RESPONSE_SPILL_REPORT_TTL_MS) {
+    responseSpillReport = { at: now, value: inspectResponseSpillStorage() };
+  }
+  return responseSpillReport.value;
+}
 
 export async function handleSystemRoutes(ctx: ManagementContext): Promise<Response | null> {
-  const { req, url, config } = ctx;
+  const { req, url, config, version } = ctx;
+  if (url.pathname === "/api/system/health" && req.method === "GET") {
+    // Authenticated management counterpart to /healthz. Remote Hub deliberately keeps the
+    // unauthenticated liveness route off its management ingress, while the connected dashboard
+    // still needs bounded process identity and PID replacement evidence (#3158).
+    return jsonResponse({
+      status: "ok",
+      service: "opencodex",
+      version,
+      uptime: process.uptime(),
+      pid: process.pid,
+      spendLedger: spendLedgerDiagnosticsSnapshot(),
+    });
+  }
   if (url.pathname === "/api/system/memory" && req.method === "GET") {
     const usage = process.memoryUsage();
     let jscHeap: { heapSize: number; heapCapacity: number; objectCount: number } | null = null;
@@ -106,6 +133,11 @@ export async function handleSystemRoutes(ctx: ManagementContext): Promise<Respon
 	      observedMetric: observed.observedMetric,
 	      jscHeap,
       responseState: responseStateMetrics(),
+      // Dry-run spill-directory counters: owned vs orphan-candidate bytes, same
+      // predicate the startup reclaim uses. Sibling of responseState, not a field
+      // in it — that block's key count is pinned. Still scalar-only. Cached for
+      // RESPONSE_SPILL_REPORT_TTL_MS.
+      responseSpill: cachedResponseSpillReport(),
       appOwnedBytes: appOwnedBytesSnapshot(),
       inspectionCounters: getInspectionCounters(),
       streamMode,
@@ -185,7 +217,7 @@ export async function handleSystemRoutes(ctx: ManagementContext): Promise<Respon
       };
     }
     if (req.method === "GET") {
-      return jsonResponse(service.readState(), 200, req, config);
+      return jsonResponse(await service.readState(), 200, req, config);
     }
     return jsonResponse(await service.performRestart(), 200, req, config);
   }

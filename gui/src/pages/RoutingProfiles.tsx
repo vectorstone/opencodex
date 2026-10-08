@@ -18,6 +18,7 @@ import {
 } from "../routing-profile-editor-data";
 import { readJsonIfOk } from "../fetch-json";
 import { Notice } from "../ui";
+import { confirmAction } from "../action-dialogs";
 import { useI18n, useT } from "../i18n/shared";
 import { ROUTING_COMPATIBILITY_FIELD_LABELS } from "../i18n/routing-compatibility-labels";
 
@@ -486,7 +487,7 @@ export default function RoutingProfiles({
 
   const removeProfile = async () => {
     if (!selected || saving) return;
-    if (!window.confirm(t("routing.removeConfirm", { id: selected.id }))) return;
+    if (!(await confirmAction({ message: t("routing.removeConfirm", { id: selected.id }), confirmLabel: t("common.remove"), tone: "danger" }))) return;
     setSaving(true);
     setStatus(null);
     try {
@@ -1012,6 +1013,8 @@ export default function RoutingProfiles({
         </form>
       ) : null}
 
+      {/* A dry-run form is dead weight until an existing profile is selected to evaluate. */}
+      {selected && (
       <div className="panel" style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
         <h3>{t("routing.dryRun")}</h3>
         <label className="field-label" htmlFor="routing-context">
@@ -1094,6 +1097,8 @@ export default function RoutingProfiles({
         ) : null}
       </div>
 
+      )}
+      {profiles.length > 0 && (
       <div className="panel" style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
         <h3>{t("routing.analytics")}</h3>
         {analytics ? (
@@ -1134,6 +1139,7 @@ export default function RoutingProfiles({
           <p className="muted">{t("routing.analyticsEmpty")}</p>
         )}
       </div>
+      )}
     </div>
   );
 }

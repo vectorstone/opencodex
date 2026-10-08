@@ -48,7 +48,7 @@ visibility = "list"
 
 ## 現在の安定したモデルの範囲
 
-ネイティブ フォールバック セットには、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex-spark`、および GPT-5.6 Sol/Terra/Luna が含まれます。 GPT-5.5/5.4 ファミリの場合、opencodex は、インストールされている Codex カタログの豊富なライブ エントリを保存し、欠落しているエントリのみを合成します。バンドルされたアップストリーム スナップショットは GPT-5.6 でのみ使用され、古いテンプレートの近似値の代わりに実際のモデルごとの ID とメタデータが提供されます。
+ネイティブ フォールバック セットには、`gpt-5.5` および GPT-5.6 Sol/Terra/Luna が含まれます。 GPT-5.5 ファミリの場合、opencodex は、インストールされている Codex カタログの豊富なライブ エントリを保存し、欠落しているエントリのみを合成します。バンドルされたアップストリーム スナップショットは GPT-5.6 でのみ使用され、古いテンプレートの近似値の代わりに実際のモデルごとの ID とメタデータが提供されます。
 
 |ルート |ピッカー ID とカタログのメタデータ |
 | --- | --- |
@@ -56,8 +56,8 @@ visibility = "list"
 | Codex ログイン (account-qualified 行が有効で、有効な selector あり) | 有効な selector とサポート対象 native model の各組み合わせに `<selector>/<native-openai-model>` 行を表示します。各行は対応付けられたアカウントだけを使用し、bare native 行はピッカーで非表示になります。Native metadata と context window は保持されます。 |
 | OpenAI (API キー) |正確に 8 つの名前空間行: `gpt-5.5`、`gpt-5.6`、Sol/Terra/Luna、および 3 つの `*-pro` 仮想 ID (コンテキスト 922,000、8 つすべての最大入力 922,000) |
 |オープンルーター | `openrouter/openai/gpt-5.6-sol`、`openrouter/openai/gpt-5.6-terra`、`openrouter/openai/gpt-5.6-luna` (922,000) |
-| Cursor | 静的フォールバックには `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna` (1,000,000) と、Grok 4.5 / 4.6 の通常・Fast 行 (500,000) が含まれます。4.6 は `xhigh` も公開し、ライブアカウントの検出によって表示される行が決まります。 |
-|かおるライブディスカバリーには信頼性があります。フォールバック カタログのデフォルトは、500,000 トークン ウィンドウと `low` / `medium` / `high` 推論制御を備えた `xai/grok-4.5` です。 |
+| Cursor | 静的フォールバックには `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna` (1,000,000) と、Grok 4.5 / 4.6 / 4.7 の通常・Fast 行 (500,000) が含まれます。4.6 と 4.7 は `xhigh` も公開し、ライブアカウントの検出によって表示される行が決まります。 |
+| xAI | xAI のライブ検出が優先されます。フォールバックには `xai/grok-4.6` と `xai/grok-4.7` が含まれ、デフォルトは `xai/grok-4.5` です。3 モデルともコンテキストは 500,000 トークンです。Grok 4.6 と 4.7 は `low` / `medium` / `high` / `xhigh`（上流のデフォルトは `high`）を提供し、Grok 4.5 は `high` までです。 |
 
 固定された GPT-5.6 エントリは、正確な上流ラダーを保存します。 Sol と Terra は `low` から `ultra` を公開します。ルナは`max`で止まります。 Sol のデフォルトは `low`、Terra と Luna のデフォルトは `medium` です。 `ultra` は、最大限の推論とプロアクティブな委任を目的としたクライアント向けの選択肢であり、`max` としてバックエンドに到達します。ピッカーのエントリは、カタログの準備ができていることを意味するだけです。接続されたアカウントまたは API キーには、そのモデルを使用する資格がまだある必要があります。
 
@@ -118,6 +118,26 @@ Desktop が許可リストの制御を提供するまでは:
 - Desktop ピッカーの代わりに Codex CLI または TUI を使用します。これらは許可リストを適用せず、ルーティングモデルを通常どおり一覧表示します。
 
 ## モデルの状態を更新しています
+## ネイティブクォータのフォールバック制限
+
+Codex アプリがネイティブの 5 時間クォータを使い切ると、リザーブのフォールバックモデルに切り替わり、ピッカーの他の行がグレーアウトすることがあります。[#2813](https://github.com/lidge-jun/opencodex/issues/2813) で報告されたこの制御は、opencodex がルーティングした行も隠します。これらは無関係なプロバイダー資格情報を使い、ChatGPT のクォータを一切消費しません。
+
+この制御はリクエストがプロキシに届く前にクライアント側で適用されるため、opencodex では解除できません。ルーティング行は `visibility: "list"` で書き込まれ、カタログのフィルタリングは `disabledModels` と各プロバイダーの `selectedModels` だけを参照し、クォータ値はルーティング行の可視性に一切関与しません。
+
+ルーティングモデルを明示的に選ぶ経路はピッカーを通りません。`config.toml` でモデルを指定します。
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+または直接送信します。
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+どちらの経路も **リクエストがプロキシに届いた後は** 正しくルーティングされ、これはテストで確認済みです。ただし Codex デスクトップアプリは、リザーブモード中は設定したモデルを送りません。アプリは自身の `wham/usage` ポーリング（`luna_reserve` アップセルと許可状態の `gpt-reserve` 追加上限）でリザーブを判定し、リクエストが出る前にモデル設定を `gpt-reserve` に強制するため、`config.toml` 経路はアプリ内で上書きされます。ウィンドウがリセットされるまでは `ocx access test`、プロキシ経由の Claude Code（`ocx claude`）、または直接の `/v1` クライアントを使ってください。[Codex リザーブモード中のルーティングモデル](/guides/codex-integration/#routed-models-during-codex-reserve-mode) も参照してください。
+
 
 ピッカーに古いエントリがまだ表示されている場合は、カタログを更新し、ターゲットの Codex サーフェスを再起動します。
 

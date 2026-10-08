@@ -35,25 +35,28 @@ import {
 } from "./gen/agent_pb";
 import { errorText, execBytes, lineCount, textDecoder, textEncoder } from "./native-exec-common";
 
+import { CURSOR_TOOL_CALL_CONTINUATION } from "./tool-wording";
+
 const MAX_GREP_FILES = 500;
 const MAX_GREP_RESULTS = 200;
 const MAX_FILE_BYTES = 1_000_000;
 
-function codexNativeMutationRefusal(operation: "write" | "delete", structuredEditAvailable: boolean): string {
+function codexNativeMutationRefusal(operation: "write" | "delete", structuredEditAvailable: boolean, plainToolWording = false): string {
   const structuredHint = structuredEditAvailable
     ? " Use the structured edit tools (`edit_file` / `multi_edit`) or the `apply_patch` tool for file edits so Codex can approve the change, enforce sandbox policy, show diffs, and record rollout."
     : " Use the `apply_patch` tool for file edits so Codex can approve the change, enforce sandbox policy, show diffs, and record rollout.";
-  return `Cursor-native ${operation} is disabled for this Codex request because apply_patch is available.${structuredHint} No file was changed.`;
+  if (plainToolWording) return `Cursor-native ${operation} is not available for this request.${structuredHint} No file was changed. ${CURSOR_TOOL_CALL_CONTINUATION}`;
+  return `Make this ${operation} through the Codex edit path instead.${structuredHint} No file was changed. Do NOT narrate this redirect or comment on tool availability — just make the edit call.`;
 }
 
 const NATIVE_LOCAL_EXEC_DISABLED =
-  "Cursor-native filesystem tools are not executed locally. Use a catalog tool for this work: `shell_command` / `exec_command` (or the listed `mcp_opencodex-responses_*` display alias) with host-shell-safe equivalents: POSIX (`cat`, `head`, `ls`, `rg`, `grep`) or Windows PowerShell (`Get-Content`, `Get-ChildItem`, `Select-String`); use `apply_patch` for file edits.";
+  "Re-issue this operation NOW through the catalog shell tool (`shell_command` / `exec_command`, or the listed `mcp_opencodex-responses_*` display alias) with the host-shell-safe equivalent: POSIX (`cat`, `head`, `ls`, `rg`, `grep`) or Windows PowerShell (`Get-Content`, `Get-ChildItem`, `Select-String`); use `apply_patch` for file edits. Do NOT narrate this redirect, do NOT comment on tool availability, and do NOT re-announce the task — just make the bridge call.";
 
-export function rejectReadExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
+export function rejectReadExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
   if (execMsg.message.case !== "readArgs") throw new Error("invalid read exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "readResult", create(ReadResultSchema, {
-    result: { case: "error", value: create(ReadErrorSchema, { path, error: NATIVE_LOCAL_EXEC_DISABLED }) },
+    result: { case: "error", value: create(ReadErrorSchema, { path, error: hint ?? NATIVE_LOCAL_EXEC_DISABLED }) },
   }));
 }
 
@@ -87,24 +90,24 @@ export function readExec(execMsg: ExecServerMessage): Uint8Array {
   }
 }
 
-export function rejectWriteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false): Uint8Array {
+export function rejectWriteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "writeArgs") throw new Error("invalid write exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "writeResult", create(WriteResultSchema, {
     result: {
       case: "rejected",
-      value: create(WriteRejectedSchema, { path, reason: codexNativeMutationRefusal("write", structuredEditAvailable) }),
+      value: create(WriteRejectedSchema, { path, reason: codexNativeMutationRefusal("write", structuredEditAvailable, plainToolWording) }),
     },
   }));
 }
 
-export function rejectWriteExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
+export function rejectWriteExecForPolicy(execMsg: ExecServerMessage, hint?: string, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "writeArgs") throw new Error("invalid write exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "writeResult", create(WriteResultSchema, {
     result: {
       case: "rejected",
-      value: create(WriteRejectedSchema, { path, reason: `${NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
+      value: create(WriteRejectedSchema, { path, reason: plainToolWording ? `No file was changed. ${hint ?? NATIVE_LOCAL_EXEC_DISABLED}` : `${hint ?? NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
     },
   }));
 }
@@ -136,24 +139,24 @@ export function writeExec(execMsg: ExecServerMessage): Uint8Array {
   }
 }
 
-export function rejectDeleteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false): Uint8Array {
+export function rejectDeleteExecForApplyPatch(execMsg: ExecServerMessage, structuredEditAvailable = false, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "deleteArgs") throw new Error("invalid delete exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "deleteResult", create(DeleteResultSchema, {
     result: {
       case: "rejected",
-      value: create(DeleteRejectedSchema, { path, reason: codexNativeMutationRefusal("delete", structuredEditAvailable) }),
+      value: create(DeleteRejectedSchema, { path, reason: codexNativeMutationRefusal("delete", structuredEditAvailable, plainToolWording) }),
     },
   }));
 }
 
-export function rejectDeleteExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
+export function rejectDeleteExecForPolicy(execMsg: ExecServerMessage, hint?: string, plainToolWording = false): Uint8Array {
   if (execMsg.message.case !== "deleteArgs") throw new Error("invalid delete exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "deleteResult", create(DeleteResultSchema, {
     result: {
       case: "rejected",
-      value: create(DeleteRejectedSchema, { path, reason: `${NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
+      value: create(DeleteRejectedSchema, { path, reason: plainToolWording ? `No file was changed. ${hint ?? NATIVE_LOCAL_EXEC_DISABLED}` : `${hint ?? NATIVE_LOCAL_EXEC_DISABLED} No file was changed.` }),
     },
   }));
 }
@@ -188,11 +191,11 @@ export function deleteExec(execMsg: ExecServerMessage): Uint8Array {
   }
 }
 
-export function rejectLsExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
+export function rejectLsExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
   if (execMsg.message.case !== "lsArgs") throw new Error("invalid ls exec");
   const path = resolve(execMsg.message.value.path);
   return execBytes(execMsg, "lsResult", create(LsResultSchema, {
-    result: { case: "error", value: create(LsErrorSchema, { path, error: NATIVE_LOCAL_EXEC_DISABLED }) },
+    result: { case: "error", value: create(LsErrorSchema, { path, error: hint ?? NATIVE_LOCAL_EXEC_DISABLED }) },
   }));
 }
 
@@ -256,8 +259,8 @@ function grepError(execMsg: ExecServerMessage, error: string): Uint8Array {
   }));
 }
 
-export function rejectGrepExecForPolicy(execMsg: ExecServerMessage): Uint8Array {
-  return grepError(execMsg, NATIVE_LOCAL_EXEC_DISABLED);
+export function rejectGrepExecForPolicy(execMsg: ExecServerMessage, hint?: string): Uint8Array {
+  return grepError(execMsg, hint ?? NATIVE_LOCAL_EXEC_DISABLED);
 }
 
 export function grepExec(execMsg: ExecServerMessage): Uint8Array {

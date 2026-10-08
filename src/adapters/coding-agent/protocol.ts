@@ -1,0 +1,815 @@
+import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxUsage } from "../../types";
+import type { TranslatorBudget } from "../../lib/translator-budget";
+
+/**
+ * Shared stream-json protocol for official coding-agent CLIs (CodeBuddy Code and Qoder CLI).
+ *
+ * The vendor speaks the Anthropic/Claude-Code `stream-json` protocol ("the naming and protocol
+ * align with Anthropic Claude Code v2.1.88"). A headless turn is a newline-delimited JSON stream on stdout:
+ *
+ *   {"type":"system","subtype":"init", ...}
+ *   {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta",...}}}   (with --include-partial-messages)
+ *   {"type":"assistant","message":{"role":"assistant","content":[{"type":"text"|"thinking"|"tool_use",...}]}}
+ *   {"type":"result","subtype":"success","is_error":false,"usage":{...},"total_cost_usd":...,"session_id":...}
+ *
+ * Diagnostics ride stderr and are NOT protocol data. This module is pure: it never spawns a process
+ * and never touches the network, so it is unit-testable against captured fixtures.
+ */
+
+/** Hard ceiling on a single buffered stdout line, so a runaway frame cannot exhaust memory. */
+export const MAX_STREAM_LINE_BYTES = 8 * 1024 * 1024;
+/** Hard ceiling on the total stdout bytes consumed for one turn. */
+export const MAX_STREAM_TOTAL_BYTES = 64 * 1024 * 1024;
+/** Shared ceiling for upstream tool starts, including turns without a capture bridge. */
+export const MAX_TOOL_BLOCK_STARTS = 16;
+/** Hard ceiling on projected conversation history text (characters) to prevent runaway memory. */
+export const MAX_PROJECTED_HISTORY_CHARS = 200_000;
+/**
+ * Chars-per-token ratio for deriving the projected-history ceiling from the model context
+ * window. Sits between the English/code (~4 chars per token) and CJK (~1.5) extremes: the
+ * ceiling is a runaway-memory bound and a coarse guard against cutting history the window can
+ * hold, not a token accounting - the caller-side compaction line stays the token authority.
+ */
+const PROJECTED_HISTORY_CHARS_PER_TOKEN = 3;
+/** Absolute ceiling on a window-derived history cap, so runaway metadata cannot unbound stdin. */
+const MAX_PROJECTED_HISTORY_DERIVED_CHARS = 4_000_000;
+
+/**
+ * Projected-history character ceiling for a turn, derived from the declared model context
+ * window. A missing or non-finite window keeps the legacy flat cap, and the derivation never
+ * lowers the cap below it: small windows change nothing, while large windows scale (a 1M-token
+ * model keeps 3M characters) until the hard ceiling. The flat 200k cap predates window
+ * metadata and cut long replays to roughly 50k-130k tokens of content regardless of the model.
+ */
+export function projectedHistoryCharLimit(contextWindowTokens: number | undefined): number {
+  if (typeof contextWindowTokens !== "number" || !Number.isFinite(contextWindowTokens) || contextWindowTokens <= 0) {
+    return MAX_PROJECTED_HISTORY_CHARS;
+  }
+  const derived = contextWindowTokens * PROJECTED_HISTORY_CHARS_PER_TOKEN;
+  return Math.min(Math.max(derived, MAX_PROJECTED_HISTORY_CHARS), MAX_PROJECTED_HISTORY_DERIVED_CHARS);
+}
+
+export class CodingAgentStreamLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodingAgentStreamLimitError";
+  }
+}
+
+export class CodingAgentProtocolError extends Error {
+  readonly code: string = "protocol_error";
+  readonly status: number = 502;
+  constructor(message: string) {
+    super(message);
+    this.name = "CodingAgentProtocolError";
+  }
+}
+
+/** A parsed protocol frame. */
+export type StreamMessage = Record<string, unknown>;
+
+/**
+ * Split an async byte stream into JSONL frames.
+ *
+ * Handles the streaming hazards the task calls out (§二十五): fragmented JSON across chunks, split
+ * multi-byte UTF-8 (via the decoder's `stream` mode), partial trailing lines, and multiple frames in
+ * one chunk. A non-empty frame that does not parse to a JSON record fails closed so corrupted
+ * protocol output cannot be mistaken for a successful response.
+ */
+export async function* readJsonLines(
+  chunks: AsyncIterable<Uint8Array>,
+  limits: { maxLineBytes?: number; maxTotalBytes?: number } = {},
+): AsyncGenerator<StreamMessage> {
+  const maxLineBytes = limits.maxLineBytes ?? MAX_STREAM_LINE_BYTES;
+  const maxTotalBytes = limits.maxTotalBytes ?? MAX_STREAM_TOTAL_BYTES;
+  const decoder = new TextDecoder();
+  let parts: string[] = [];
+  let lineBytes = 0;
+  let totalBytes = 0;
+
+  const flushLine = function* (line: string): Generator<StreamMessage> {
+    const trimmed = line.trim();
+    if (!trimmed) return; // Blank lines and whitespace-only lines are ignored as padding.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      const snippet = trimmed.slice(0, 64).replace(/[\r\n]+/g, " ");
+      throw new CodingAgentProtocolError(
+        `Malformed stream-json frame received from coding-agent CLI: ${snippet}`,
+      );
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      const snippet = trimmed.slice(0, 64).replace(/[\r\n]+/g, " ");
+      throw new CodingAgentProtocolError(
+        `Non-object stream-json frame received from coding-agent CLI: ${snippet}`,
+      );
+    }
+    yield parsed as StreamMessage;
+  };
+
+  // Decode continuously for split UTF-8/BOM semantics, but search and measure only new
+  // decoded segments. Joining once per frame avoids repeatedly flattening a growing rope.
+  const consume = function* (text: string): Generator<StreamMessage> {
+    let start = 0;
+    while (start < text.length) {
+      const newline = text.indexOf("\n", start);
+      const end = newline < 0 ? text.length : newline;
+      const part = text.slice(start, end);
+      lineBytes += Buffer.byteLength(part);
+      if (lineBytes > maxLineBytes) {
+        throw new CodingAgentStreamLimitError("Coding-agent stream line exceeded the byte ceiling");
+      }
+      if (part) parts.push(part);
+      if (newline < 0) break;
+      const line = parts.join("");
+      parts = [];
+      lineBytes = 0;
+      yield* flushLine(line);
+      start = newline + 1;
+    }
+  };
+
+  for await (const chunk of chunks) {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxTotalBytes) {
+      throw new CodingAgentStreamLimitError("Coding-agent stream exceeded the total byte ceiling");
+    }
+    yield* consume(decoder.decode(chunk, { stream: true }));
+  }
+  // Flush incomplete UTF-8 through the same decoded-byte accounting before parsing EOF.
+  yield* consume(decoder.decode());
+  const finalLine = parts.join("");
+  if (finalLine.trim()) yield* flushLine(finalLine);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+/** Extract OpenCodex usage from the Anthropic-shaped usage record shared by frames and deltas. */
+function usageFromAnthropicShape(usage: Record<string, unknown>): OcxUsage | undefined {
+  const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
+  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+  const cachedInputTokens = typeof usage.cache_read_input_tokens === "number" ? usage.cache_read_input_tokens : undefined;
+  const cacheCreationInputTokens =
+    typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : undefined;
+  // A snapshot is zero-only when every counter is absent or zero. Testing only the cache-read
+  // field dropped a cache-creation-only snapshot (input/output 0 with, say, 200 cache-creation
+  // tokens), and a capture-only tool leg terminated at message_stop never sees a result frame
+  // that could carry those tokens instead, so the turn under-reported usage and cost.
+  const cacheReadTotal = cachedInputTokens ?? 0;
+  const cacheCreationTotal = cacheCreationInputTokens ?? 0;
+  if (inputTokens === 0 && outputTokens === 0 && cacheReadTotal === 0 && cacheCreationTotal === 0) {
+    return undefined;
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    ...(cacheReadTotal > 0 ? { cachedInputTokens: cacheReadTotal, cacheReadInputTokens: cacheReadTotal } : {}),
+    ...(cacheCreationTotal > 0 ? { cacheCreationInputTokens: cacheCreationTotal } : {}),
+  };
+}
+
+/** Extract OpenCodex usage from a `result` frame's Anthropic-shaped usage object. */
+export function usageFromResult(message: StreamMessage): OcxUsage | undefined {
+  const usage = asRecord(message.usage);
+  return usage ? usageFromAnthropicShape(usage) : undefined;
+}
+
+/**
+ * Fold a pre-result usage snapshot into the running partial usage.
+ *
+ * `message_delta` and assistant-frame snapshots are cumulative per message, but a later snapshot
+ * can repeat or extend an earlier one, so each field keeps its maximum. The `result` frame stays
+ * authoritative for a text-only turn; partial state exists so a capture-only tool-bridge turn —
+ * which is terminated at `message_stop` before any result frame can arrive — still reports real
+ * token usage instead of zero.
+ */
+function mergePartialUsage(previous: OcxUsage | undefined, next: OcxUsage): OcxUsage {
+  if (!previous) return next;
+  const inputTokens = Math.max(previous.inputTokens, next.inputTokens);
+  const outputTokens = Math.max(previous.outputTokens, next.outputTokens);
+  const cacheRead = Math.max(
+    previous.cacheReadInputTokens ?? previous.cachedInputTokens ?? 0,
+    next.cacheReadInputTokens ?? next.cachedInputTokens ?? 0,
+  );
+  const cacheCreation = Math.max(previous.cacheCreationInputTokens ?? 0, next.cacheCreationInputTokens ?? 0);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    ...(cacheRead > 0 ? { cachedInputTokens: cacheRead, cacheReadInputTokens: cacheRead } : {}),
+    ...(cacheCreation > 0 ? { cacheCreationInputTokens: cacheCreation } : {}),
+  };
+}
+
+/** Record one usage snapshot; absent, malformed, or zero-only snapshots leave state untouched. */
+function observePartialUsage(state: StreamParseState, value: unknown): void {
+  const usage = asRecord(value);
+  if (!usage) return;
+  const next = usageFromAnthropicShape(usage);
+  if (next) state.partialUsage = mergePartialUsage(state.partialUsage, next);
+}
+
+/**
+ * Mutable per-turn parse state shared across frames of one stream (§十二).
+ * Thinking and text states are strictly decoupled.
+ */
+export interface StreamParseState {
+  sawPartialText: boolean;
+  sawPartialThinking: boolean;
+  sawTerminalResult: boolean;
+  /** A `message_stop` stream event arrived: the assistant message is complete. */
+  sawMessageStop?: boolean;
+  /**
+   * Open tool_use blocks keyed by content-block index. CodeBuddy parallel tool calls arrive
+   * as several tool_use blocks on ONE shared content-block index — intermediate blocks never
+   * receive a stop and only the final block does — while deltas for different indices (for
+   * example a long thinking block) interleave freely (observed 2026-09-25/26: four parallel
+   * calls, one counted stop, "incomplete tool call" 502 at message_stop). A single open-call
+   * slot both mis-attributes argument fragments and miscounts completions. Downstream
+   * assembly keeps a single open call, so each block is buffered and emitted atomically:
+   * when its own stop arrives, or when a new tool_use start reuses its index.
+   */
+  openToolBlocks?: Map<number, OpenToolBlock>;
+  /** Shared request budget for tool identity and buffered argument fragments. */
+  translatorBudget?: TranslatorBudget;
+  /** A capture bridge may impose a tighter ceiling than the shared parser limit. */
+  maxToolBlockStarts?: number;
+  /** Set before an over-limit block can be allocated or emitted. */
+  toolCallLimitExceeded?: boolean;
+  /** Synthetic decreasing keys for tool_use start frames that omit the block index. */
+  nextSyntheticToolBlockKey?: number;
+  /** Tool_use blocks opened in this stream, whether or not they have closed yet. */
+  toolBlockStarts?: number;
+  /** Completed tool_use content blocks observed in this stream. */
+  completedToolCalls?: number;
+  /** CodeBuddy's capture-only bridge requires complete JSON and matching block indices. */
+  strictToolBlockCapture?: boolean;
+  /** Tool IDs already captured through partial events, for complete-assistant deduplication. */
+  partialToolCallIds?: Set<string>;
+  /** One budget lease per ID retained by complete-assistant deduplication, released at turn cleanup. */
+  partialToolCallBudgetIds?: string[];
+  /** A complete assistant tool block had no matching partial capture. */
+  uncapturedToolUse?: boolean;
+  /** Highest-seen usage snapshot from `message_delta`/assistant frames before a terminal result. */
+  partialUsage?: OcxUsage;
+}
+
+/**
+ * Map ONE protocol frame to zero or more AdapterEvents.
+ *
+ * Token-level streaming comes from `stream_event` frames (enabled by `--include-partial-messages`);
+ * the complete `assistant` frame is only used as a fallback when no partial deltas were seen, so text
+ * and thinking are never emitted twice.
+ */
+export function mapStreamMessageToEvents(message: StreamMessage, state: StreamParseState): AdapterEvent[] {
+  const type = asString(message.type);
+  const events: AdapterEvent[] = [];
+
+  if (type === "stream_event") {
+    const event = asRecord(message.event);
+    if (event) events.push(...mapRawStreamEvent(event, state));
+    return events;
+  }
+
+  if (type === "assistant") {
+    // Fallback path: a complete assistant message. Surface text and thinking independently
+    // only when the partial delta stream did not already carry them (§十二).
+    const messageRecord = asRecord(message.message);
+    const content = messageRecord?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        const part = asRecord(block);
+        if (!part) continue;
+        const blockType = asString(part.type);
+        if (blockType === "text" && !state.sawPartialText) {
+          const text = asString(part.text);
+          if (text) events.push({ type: "text_delta", text });
+        } else if (blockType === "thinking" && !state.sawPartialThinking) {
+          const thinking = asString(part.thinking);
+          if (thinking) events.push({ type: "thinking_delta", thinking });
+        } else if (blockType === "tool_use") {
+          const id = asString(part.id);
+          if (!id || !state.partialToolCallIds?.has(id)) state.uncapturedToolUse = true;
+        }
+      }
+    }
+    observePartialUsage(state, messageRecord?.usage);
+    return events;
+  }
+
+  if (type === "result") {
+    const isError = message.is_error === true || asString(message.subtype) === "error_during_execution";
+    const usage = usageFromResult(message);
+    if (isError) {
+      const errors = Array.isArray(message.errors)
+        ? message.errors.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        : [];
+      const detail = asString(message.result) || errors[0] || "Coding-agent CLI ended the turn with an execution error";
+      const vendorCode = typeof message.error_code === "number" ? message.error_code : undefined;
+      // Qoder documents code 118 and emits the "credit usage limit" wording. Keep the
+      // match deliberately narrow so other coding-agent CLIs retain their established
+      // generic-upstream handling for ambiguous text such as "insufficient credits".
+      const insufficientQuota = vendorCode === 118 || /credit usage limit/i.test(detail);
+      // Anchor to credential verdicts. A bare "authentication" substring also matches upstream
+      // service-degradation text, and a false 401 drives reauth messaging and key-pool rotation.
+      const authentication = /not logged in|invalid (?:personal access )?token|authentication (?:failed|error|required)|unauthorized/i.test(detail);
+      const rateLimited = !insufficientQuota && /rate limit|too many requests/i.test(detail);
+      const modelUnavailable = /model (?:is )?(?:not found|unavailable|unsupported)|invalid model/i.test(detail);
+      events.push({
+        type: "error",
+        message: detail,
+        status: insufficientQuota || rateLimited ? 429 : authentication ? 401 : modelUnavailable ? 400 : 502,
+        errorType: insufficientQuota
+          ? "insufficient_quota"
+          : rateLimited
+            ? "rate_limit_error"
+            : authentication
+              ? "authentication_error"
+              : modelUnavailable
+                ? "invalid_request_error"
+                : "upstream_error",
+        code: insufficientQuota
+          ? "insufficient_quota"
+          : rateLimited
+            ? "rate_limit_exceeded"
+            : authentication
+              ? "invalid_api_key"
+              : modelUnavailable
+                ? "model_not_found"
+                : "upstream_error",
+        retryable: rateLimited,
+        ...(usage ? { usage } : {}),
+      });
+      return events;
+    }
+    state.sawTerminalResult = true;
+    events.push({ type: "done", ...(usage ? { usage } : {}), stopReason: "stop" });
+    return events;
+  }
+
+  // system/init, user echoes, task_* background events: not client-visible output.
+  return events;
+}
+
+/** One in-flight tool_use block: identity plus its buffered argument fragments. */
+export interface OpenToolBlock {
+  id: string;
+  name: string;
+  argParts: string[];
+  indexed: boolean;
+  /** Unique budget identity even when upstream reuses a public tool-call ID. */
+  budgetCallId?: string;
+}
+
+let nextBudgetCallOrdinal = 0;
+
+/** Key a tool_use start frame by content-block index, falling back to a synthetic key. */
+function toolBlockKey(state: StreamParseState, event: StreamMessage): number {
+  const index = event.index;
+  if (typeof index === "number" && Number.isInteger(index)) return index;
+  const key = state.nextSyntheticToolBlockKey ?? -1;
+  state.nextSyntheticToolBlockKey = key - 1;
+  return key;
+}
+
+/**
+ * Resolve a delta/stop frame to an open tool block. An indexed frame only matches a block
+ * opened under the same index — CodeBuddy skips stop frames for thinking blocks, and such a
+ * stop must not close a tool block that happens to be open. An index-less frame resolves
+ * only when exactly one block is open. Ambiguous argument deltas with multiple open blocks
+ * fail the turn. On the CodeBuddy capture path, a missing-index delta or stop cannot match
+ * an indexed block; an unmatched stop leaves the block open for terminal accounting.
+ */
+function resolveToolBlockKey(state: StreamParseState, event: StreamMessage): number | undefined {
+  const index = event.index;
+  if (typeof index === "number" && Number.isInteger(index)) {
+    return state.openToolBlocks?.has(index) ? index : undefined;
+  }
+  const blocks = state.openToolBlocks;
+  if (!blocks || blocks.size !== 1) return undefined;
+  const [key, block] = blocks.entries().next().value!;
+  return state.strictToolBlockCapture && block.indexed ? undefined : key;
+}
+
+/**
+ * Emit a closed block atomically — start, the buffered fragments in arrival order, end —
+ * so the strictly sequential downstream bridge never sees two calls open at once.
+ */
+function closeToolBlock(state: StreamParseState, key: number, events: AdapterEvent[], implicit = false): void {
+  const block = state.openToolBlocks?.get(key);
+  if (!block || !state.openToolBlocks) return;
+  if (state.strictToolBlockCapture && (implicit || block.argParts.length > 0)) {
+    // A second start on this index is an implicit stop only when the previous call's
+    // arguments are already complete. Otherwise a later delta could be assigned to the
+    // wrong call and still produce a superficially successful tool-use turn. An explicit
+    // stop with no deltas retains the CLI's existing empty-arguments representation.
+    const argumentsJson = block.argParts.join("");
+    let parsedArguments: unknown;
+    try {
+      parsedArguments = JSON.parse(argumentsJson);
+    } catch {
+      throw new CodingAgentProtocolError("Coding-agent CLI ended a tool call with incomplete JSON arguments.");
+    }
+    if (!asRecord(parsedArguments)) {
+      throw new CodingAgentProtocolError("Coding-agent CLI ended a tool call with non-object JSON arguments.");
+    }
+  }
+  state.openToolBlocks.delete(key);
+  if (block.budgetCallId) state.translatorBudget?.closeCall(block.budgetCallId);
+  events.push({ type: "tool_call_start", id: block.id, name: block.name });
+  for (const part of block.argParts) events.push({ type: "tool_call_delta", arguments: part });
+  events.push({ type: "tool_call_end" });
+  state.completedToolCalls = (state.completedToolCalls ?? 0) + 1;
+}
+
+/** Release reservations left by EOF, failed decode, protocol error, or abort. */
+export function releaseOpenToolBlocks(state: StreamParseState): void {
+  for (const block of state.openToolBlocks?.values() ?? []) {
+    if (block.budgetCallId) state.translatorBudget?.closeCall(block.budgetCallId);
+  }
+  state.openToolBlocks?.clear();
+  for (const leaseId of state.partialToolCallBudgetIds ?? []) state.translatorBudget?.closeCall(leaseId);
+  state.partialToolCallBudgetIds = undefined;
+}
+
+/** Map a raw Anthropic SSE event (carried inside a `stream_event` frame) to AdapterEvents. */
+function mapRawStreamEvent(event: StreamMessage, state: StreamParseState): AdapterEvent[] {
+  const events: AdapterEvent[] = [];
+  const eventType = asString(event.type);
+
+  if (eventType === "content_block_delta") {
+    const delta = asRecord(event.delta);
+    const deltaType = asString(delta?.type);
+    if (deltaType === "text_delta") {
+      const text = asString(delta?.text);
+      if (text) {
+        state.sawPartialText = true;
+        events.push({ type: "text_delta", text });
+      }
+    } else if (deltaType === "thinking_delta") {
+      const thinking = asString(delta?.thinking);
+      if (thinking) {
+        state.sawPartialThinking = true;
+        events.push({ type: "thinking_delta", thinking });
+      }
+    } else if (deltaType === "input_json_delta") {
+      // Tool-input streaming. Fragments are buffered under their own block index because
+      // CodeBuddy alternates deltas across interleaved parallel blocks; parsed
+      // unconditionally so a stray frame on a tools-disabled turn is ignored rather than
+      // crashing.
+      if (
+        (state.openToolBlocks?.size ?? 0) > 1
+        && (typeof event.index !== "number" || !Number.isInteger(event.index))
+      ) {
+        throw new CodingAgentProtocolError("Coding-agent CLI sent an unindexed tool argument delta with multiple tool blocks open.");
+      }
+      const partial = asString(delta?.partial_json);
+      if (partial) {
+        const key = resolveToolBlockKey(state, event);
+        const block = key === undefined ? undefined : state.openToolBlocks?.get(key);
+        if (state.strictToolBlockCapture && !block) {
+          throw new CodingAgentProtocolError(
+            "Coding-agent CLI sent a tool argument delta that cannot be attributed to an open tool block.",
+          );
+        }
+        if (block) {
+          state.translatorBudget?.chargeRetained(Buffer.byteLength(partial), {
+            kind: "tool_args", callId: block.budgetCallId,
+          });
+          block.argParts.push(partial);
+        }
+      }
+    }
+    return events;
+  }
+
+  if (eventType === "content_block_start") {
+    const block = asRecord(event.content_block);
+    if (asString(block?.type) === "tool_use") {
+      const id = asString(block?.id) ?? "";
+      const name = asString(block?.name) ?? "tool";
+      if (id) {
+        const limit = Math.min(MAX_TOOL_BLOCK_STARTS, state.maxToolBlockStarts ?? MAX_TOOL_BLOCK_STARTS);
+        if ((state.toolBlockStarts ?? 0) >= limit) {
+          state.toolCallLimitExceeded = true;
+          return events;
+        }
+        const key = toolBlockKey(state, event);
+        if (state.openToolBlocks?.has(key)) {
+          // CodeBuddy reuses one content-block index for a parallel batch: every call in the
+          // batch starts on the same index, intermediate blocks never receive a stop, and only
+          // the final block does (observed 2026-09-26: START 2 alpha, A's complete args, START 2
+          // beta, B's complete args, one STOP 2). A new start implicitly closes the previous
+          // block only after the capture path verifies its arguments form a complete object.
+          closeToolBlock(state, key, events, true);
+        }
+        const budget = state.translatorBudget;
+        const budgetCallId = budget ? `coding-agent:${++nextBudgetCallOrdinal}` : undefined;
+        if (budget && budgetCallId) {
+          budget.openCall(budgetCallId);
+          try {
+            // Bridge deduplication keeps the ID on the turn lease after this block closes.
+            budget.chargeRetained(Buffer.byteLength(name) + (state.partialToolCallIds ? 0 : Buffer.byteLength(id)), {
+              kind: "tool_args", callId: budgetCallId,
+            });
+          } catch (error) {
+            budget.closeCall(budgetCallId);
+            throw error;
+          }
+        }
+        (state.openToolBlocks ??= new Map()).set(key, {
+          id,
+          name,
+          argParts: [],
+          indexed: typeof event.index === "number" && Number.isInteger(event.index),
+          budgetCallId,
+        });
+        state.toolBlockStarts = (state.toolBlockStarts ?? 0) + 1;
+        if (state.partialToolCallIds && !state.partialToolCallIds.has(id)) {
+          if (budget) {
+            // A lease per ID: the per-call byte limit must not pool IDs from different calls.
+            const leaseId = `coding-agent-id:${++nextBudgetCallOrdinal}`;
+            budget.openCall(leaseId);
+            try {
+              budget.chargeRetained(Buffer.byteLength(id), { kind: "tool_args", callId: leaseId });
+            } catch (error) {
+              budget.closeCall(leaseId);
+              throw error;
+            }
+            (state.partialToolCallBudgetIds ??= []).push(leaseId);
+          }
+          state.partialToolCallIds.add(id);
+        }
+      }
+    }
+    return events;
+  }
+
+  if (eventType === "content_block_stop") {
+    const key = resolveToolBlockKey(state, event);
+    if (key !== undefined) closeToolBlock(state, key, events);
+    return events;
+  }
+
+  if (eventType === "message_stop") {
+    state.sawMessageStop = true;
+    return events;
+  }
+
+  if (eventType === "message_start") {
+    // Anthropic-shaped streams report input tokens on `message_start.message.usage` and output
+    // tokens later on `message_delta.usage`. A capture-only tool leg is terminated at
+    // `message_stop`, so without this branch the synthesized done(tool_use) undercounts input
+    // tokens whenever the CLI puts them here (and `message_stop` arrives before any assistant
+    // fallback frame that would otherwise carry them).
+    const messageRecord = asRecord(event.message);
+    observePartialUsage(state, messageRecord?.usage);
+    return events;
+  }
+
+  if (eventType === "message_delta") {
+    // Pre-result usage snapshots: a capture-only tool-bridge turn ends at message_stop with no
+    // result frame, so these snapshots are the only token accounting that leg will ever see.
+    observePartialUsage(state, event.usage);
+    return events;
+  }
+
+  return events;
+}
+
+/**
+ * Validate a `system/init` frame against an active capture-only tool bridge.
+ *
+ * With the bridge armed, the CLI must report exactly the bridge's MCP server as connected: a
+ * missing or failed server means the model never saw the advertised catalog, so the turn fails
+ * closed instead of silently degrading to a text-only answer.
+ */
+export function toolBridgeInitError(message: StreamMessage, serverName: string): string | undefined {
+  if (message.type !== "system" || message.subtype !== "init") return undefined;
+  const servers = message.mcp_servers;
+  if (!Array.isArray(servers) || servers.length !== 1) {
+    return "Coding-agent system/init reported an unexpected MCP server set for the tool bridge.";
+  }
+  const server = servers[0];
+  if (
+    !server
+    || typeof server !== "object"
+    || server.name !== serverName
+    || server.status !== "connected"
+  ) {
+    return `Coding-agent system/init did not report the ${serverName} MCP server as connected.`;
+  }
+  return undefined;
+}
+
+/** One content part on the stream-json input wire (Anthropic message shape). */
+type WireContentPart = Record<string, unknown>;
+
+function textPart(text: string): WireContentPart {
+  return { type: "text", text };
+}
+
+/** Encode an OpenCodex image content part as an Anthropic base64/url image block; never drop it. */
+function imagePart(imageUrl: string): WireContentPart | undefined {
+  const match = /^data:([^;]+);base64,(.+)$/s.exec(imageUrl);
+  if (match) return { type: "image", source: { type: "base64", media_type: match[1], data: match[2] } };
+  if (/^https?:\/\//i.test(imageUrl)) return { type: "image", source: { type: "url", url: imageUrl } };
+  return undefined;
+}
+
+function formatMessageForHistory(message: OcxMessage): string {
+  if (message.role === "user") {
+    const text = typeof message.content === "string"
+      ? message.content
+      : message.content.map(p => (p.type === "text" || p.type === "document" ? p.text : `[${p.type}]`)).join("\n");
+    return `USER:\n${text}`;
+  }
+  if (message.role === "assistant") {
+    const parts: string[] = [];
+    for (const part of message.content) {
+      if (part.type === "text" && part.text.trim()) {
+        parts.push(part.text.trim());
+      } else if (part.type === "thinking" && part.thinking.trim()) {
+        parts.push(`[Thinking: ${part.thinking.trim()}]`);
+      } else if (part.type === "toolCall") {
+        const args = JSON.stringify(part.arguments ?? {});
+        parts.push(`[Tool call: ${part.name} (call_id: ${part.id}) with args: ${args}]`);
+      }
+    }
+    return `ASSISTANT:\n${parts.join("\n") || "(empty response)"}`;
+  }
+  if (message.role === "toolResult") {
+    const text = typeof message.content === "string"
+      ? message.content
+      : message.content.map(p => (p.type === "text" || p.type === "document" ? p.text : "[image]")).join("");
+    const status = message.isError ? " (error)" : "";
+    return `TOOL RESULT (call_id: ${message.toolCallId})${status}:\n${text}`;
+  }
+  return "";
+}
+
+/**
+ * Format an isolated OpenCodex message into stream-json user message input lines.
+ *
+ * In stream-json mode, the official CLI stdin parser (`StreamJsonUtils.parseUserMessage`) only
+ * accepts `type: "user"` frames. Writing undocumented `type: "assistant"` frames is rejected.
+ * Non-user messages are therefore projected into valid user frames.
+ */
+export function buildInputLines(message: OcxMessage): string[] {
+  if (message.role === "developer") return [];
+
+  const content: WireContentPart[] = [];
+  if (message.role === "user") {
+    if (typeof message.content === "string") {
+      content.push(textPart(message.content));
+    } else {
+      for (const part of message.content) {
+        if (part.type === "text") content.push(textPart(part.text));
+        else if (part.type === "image") {
+          const image = imagePart(part.imageUrl);
+          if (image) content.push(image);
+        } else if (part.type === "document") {
+          content.push(textPart(part.text));
+        } else {
+          content.push(textPart("[video]"));
+        }
+      }
+    }
+  } else {
+    const formatted = formatMessageForHistory(message);
+    if (formatted) content.push(textPart(formatted));
+  }
+
+  return content.length > 0 ? [JSON.stringify({ type: "user", message: { role: "user", content } })] : [];
+}
+
+/** Fold the request's system + developer prompts into one system-prompt string. */
+export function buildSystemPrompt(parsed: OcxParsedRequest): string | undefined {
+  const parts: string[] = [];
+  for (const line of parsed.context.systemPrompt ?? []) {
+    if (line && line.trim()) parts.push(line);
+  }
+  for (const message of parsed.context.messages) {
+    if (message.role !== "developer") continue;
+    const text = typeof message.content === "string"
+      ? message.content
+      : message.content.map(part => (part.type === "text" || part.type === "document" ? part.text : "")).join("");
+    if (text.trim()) parts.push(text);
+  }
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
+/**
+ * Build the ordered stream-json input lines for a turn (Strategy C: Legal user-message projection).
+ *
+ * In stream-json mode, the vendor CLI stdin parser strictly accepts `type: "user"` frames
+ * (`{"type":"user","message":{"role":"user","content":...}}`).
+ * Undocumented `{"type":"assistant",...}` frames are dropped by the vendor parser.
+ *
+ * Multi-turn history (user, assistant, tool results) is projected into a legal user message:
+ * prior conversation turns are structured as bounded context text with tool results as text,
+ * clearly demarcated from the current user request. Codex retains tool control; vendor tools are never invoked.
+ */
+export function buildConversationInput(parsed: OcxParsedRequest, options: { maxHistoryChars?: number } = {}): string[] {
+  const nonDev = parsed.context.messages.filter(m => m.role !== "developer");
+  if (nonDev.length === 0) {
+    return [JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: "" }] } })];
+  }
+
+  if (nonDev.length === 1 && nonDev[0]!.role === "user") {
+    return buildInputLines(nonDev[0]!);
+  }
+
+  // Multi-turn conversation or history with tool results:
+  const historyMessages = nonDev.slice(0, -1);
+  const currentMessage = nonDev[nonDev.length - 1]!;
+
+  // History images are collected BEFORE the current message's so the attached blocks
+  // follow conversation order. The projected prose says "Prior conversation context"
+  // then "Current user request", so emitting current-turn images first contradicted
+  // the text the model reads alongside them.
+  const historyImageBlocks: WireContentPart[] = [];
+  for (const msg of historyMessages) {
+    if (!Array.isArray(msg.content)) continue;
+    // Tool results carry images too — a screenshot returned by a tool was previously
+    // flattened to the literal text "[image]" and the carrier discarded.
+    if (msg.role !== "user" && msg.role !== "toolResult") continue;
+    for (const part of msg.content) {
+      if (part.type !== "image") continue;
+      const img = imagePart(part.imageUrl);
+      if (img) historyImageBlocks.push(img);
+    }
+  }
+
+  const currentImageBlocks: WireContentPart[] = [];
+  let currentRequestText = "";
+
+  if (currentMessage.role === "user") {
+    if (typeof currentMessage.content === "string") {
+      currentRequestText = currentMessage.content;
+    } else {
+      const textParts: string[] = [];
+      for (const part of currentMessage.content) {
+        if (part.type === "text") textParts.push(part.text);
+        else if (part.type === "image") {
+          const image = imagePart(part.imageUrl);
+          if (image) currentImageBlocks.push(image);
+          else textParts.push("[image omitted: unsupported reference]");
+        } else if (part.type === "document") {
+          textParts.push(part.text);
+        } else {
+          textParts.push("[video]");
+        }
+      }
+      currentRequestText = textParts.join("\n");
+    }
+  } else if (currentMessage.role === "toolResult") {
+    let text: string;
+    if (typeof currentMessage.content === "string") {
+      text = currentMessage.content;
+    } else {
+      const segments: string[] = [];
+      for (const part of currentMessage.content) {
+        if (part.type === "text") { segments.push(part.text); continue; }
+        if (part.type === "image") {
+          // Carry the real image instead of flattening it to a marker. The provenance
+          // note stays so the prose still reads coherently and the model can tell which
+          // attachment the tool produced; the bytes travel as an image block, never as text.
+          const image = imagePart(part.imageUrl);
+          if (image) { currentImageBlocks.push(image); segments.push("[image attached below]"); }
+          else segments.push("[image omitted: unsupported reference]");
+          continue;
+        }
+        if (part.type === "document") { segments.push(part.text); continue; }
+        segments.push("[video]");
+      }
+      text = segments.join("");
+    }
+    const status = currentMessage.isError ? " (error)" : "";
+    currentRequestText = `TOOL RESULT (call_id: ${currentMessage.toolCallId})${status}:\n${text}\n\nPlease proceed based on the above tool result.`;
+  } else {
+    currentRequestText = formatMessageForHistory(currentMessage);
+  }
+
+  const imageBlocks: WireContentPart[] = [...historyImageBlocks, ...currentImageBlocks];
+
+  const maxHistoryChars = options.maxHistoryChars ?? MAX_PROJECTED_HISTORY_CHARS;
+  let historyText = historyMessages.map(formatMessageForHistory).filter(Boolean).join("\n\n");
+  if (historyText.length > maxHistoryChars) {
+    historyText = `[Earlier conversation history truncated for length...]\n\n` +
+      historyText.slice(historyText.length - maxHistoryChars);
+  }
+
+  const combinedText = `Prior conversation context:\n\n${historyText}\n\nCurrent user request:\n\n${currentRequestText}`;
+
+  const content: WireContentPart[] = [{ type: "text", text: combinedText }, ...imageBlocks];
+  return [JSON.stringify({ type: "user", message: { role: "user", content } })];
+}

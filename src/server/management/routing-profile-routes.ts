@@ -20,13 +20,14 @@ import { assemblePolicyCandidateEvidence } from "../../routing/compatibility/ass
 import { activateLab, labActivationRequired } from "../../lib/lab-activation";
 import { quotaEvidenceForCandidate } from "../../routing/quota";
 import { routedProviderConfig } from "../../router";
-import { saveConfigPreservingClaudeCode, getConfigDir } from "../../config";
+import { deleteConfigTopLevelKey, saveConfigPreservingClaudeCode, getConfigDir } from "../../config";
 import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
 import { isPlainRecord } from "./shared";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 import { jsonResponse } from "../auth-cors";
 import type { ManagementContext } from "./context";
 import type { OcxConfig, OcxRoutingProfileConfig } from "../../types";
+import { shadowCallTargetError } from "./shadow-call-validation";
 
 function profileDto(config: Parameters<typeof getRoutingProfile>[0], id: string): Record<string, unknown> | null {
   const profile = getRoutingProfile(config, id);
@@ -206,6 +207,15 @@ function migrateProfileModelReferences(
         ]),
       );
     }
+    if (claudeCode.intercept?.modelMap) {
+      // First-party picker bindings: keys are Anthropic picker ids, only the route follows the rename.
+      claudeCode.intercept = {
+        ...claudeCode.intercept,
+        modelMap: Object.fromEntries(
+          Object.entries(claudeCode.intercept.modelMap).map(([pickerId, route]) => [pickerId, migrateAgentReference(route)]),
+        ),
+      };
+    }
     config.claudeCode = claudeCode;
   }
   return shouldSyncClaudeAgentDefs;
@@ -276,10 +286,12 @@ export async function handleRoutingProfileRoutes(ctx: ManagementContext): Promis
     }
 
     const previousProfile = mode === "update" ? getRoutingProfile(config, id) : undefined;
+    let aliasMigration: { oldPublicModel: string; newPublicModel: string } | undefined;
     if (mode === "update" && previousProfile) {
       const oldPublicModel = policyPublicModelId(id, previousProfile);
       const newProfile = normalizeRoutingProfile(id, body.profile as OcxRoutingProfileConfig);
       const newPublicModel = policyPublicModelId(id, newProfile);
+      aliasMigration = { oldPublicModel, newPublicModel };
       const collision = modelMapMigrationCollision(config, oldPublicModel, newPublicModel);
       if (collision) {
         return jsonResponse({
@@ -289,6 +301,18 @@ export async function handleRoutingProfileRoutes(ctx: ManagementContext): Promis
     }
     const nextProfiles = { ...(config.routingProfiles ?? {}) };
     nextProfiles[id] = storedProfile(id, body.profile as OcxRoutingProfileConfig);
+    const currentShadowTarget = config.shadowCallIntercept?.model;
+    if (aliasMigration && currentShadowTarget === aliasMigration.oldPublicModel) {
+      const targetError = shadowCallTargetError(
+        { ...config, routingProfiles: nextProfiles },
+        aliasMigration.newPublicModel,
+      );
+      if (targetError) {
+        return jsonResponse({
+          error: { code: "invalid_shadow_call_target", message: targetError },
+        }, 400, req, config);
+      }
+    }
     config.routingProfiles = nextProfiles;
     // Creating the first profile on a process started profile-less must install the
     // compatibility provider now; activation is synchronous and idempotent per configDir.
@@ -329,7 +353,7 @@ export async function handleRoutingProfileRoutes(ctx: ManagementContext): Promis
     const nextProfiles = { ...(config.routingProfiles ?? {}) };
     delete nextProfiles[id];
     if (Object.keys(nextProfiles).length > 0) config.routingProfiles = nextProfiles;
-    else delete config.routingProfiles;
+    else deleteConfigTopLevelKey(config, "routingProfiles");
     const saveConfigPreservingClaudeCodeSafe = deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode;
     saveConfigPreservingClaudeCodeSafe(config);
     reconcileLiveStateStores();

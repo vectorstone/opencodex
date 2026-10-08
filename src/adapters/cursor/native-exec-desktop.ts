@@ -17,24 +17,11 @@ import {
 } from "./gen/agent_pb";
 import { errorText } from "./native-exec-common";
 import type { CursorNativeToolDeps } from "./native-exec-tools";
+import type { DesktopExecutorConfig } from "./desktop-executor-contract";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 30_000;
 
-/**
- * Opt-in external executor for computer-use / record-screen. opencodex is a headless proxy and
- * cannot drive a screen itself; set these commands only when running on a host that can. Each
- * command receives the request as JSON on stdin and must print a JSON result on stdout.
- */
-export interface DesktopExecutorConfig {
-  /** Command (run via the platform shell) handling computer-use. Receives `{toolCallId, actions}` on stdin. */
-  computerUseCommand?: string;
-  /** Command handling record-screen. Receives `{mode, toolCallId, saveAsFilename?}` on stdin. */
-  recordScreenCommand?: string;
-  cwd?: string;
-  env?: Record<string, string>;
-  /** Max time to wait for the external process. Default 30s. */
-  timeoutMs?: number;
-}
+export type { DesktopExecutorConfig } from "./desktop-executor-contract";
 
 /**
  * Build `computerUse` / `recordScreen` deps from external executor commands. Returns `{}` when no
@@ -170,10 +157,33 @@ function runExternalJson(command: string, payload: unknown, config: DesktopExecu
       }
     });
 
+    // A command that never reads stdin - `echo`, a script that exits on a bad flag,
+    // anything that fails before its first read - closes the pipe while we are still
+    // writing to it. The write then fails with EPIPE, and on Linux that surfaces as an
+    // ASYNCHRONOUS 'error' event on the stream rather than a throw, so the try/catch
+    // below never saw it and the rejection escaped as an unhandled stream error. On
+    // macOS the same command usually drains the small payload first, which is why this
+    // only ever went red on the Linux shard.
+    //
+    // EPIPE here is not a failure of the executor CONTRACT: the child's exit code and
+    // stdout are what decide the result, and both are handled in 'close' above. So the
+    // pipe error is swallowed deliberately and the outcome is left to the child, which
+    // is what makes "bad output maps to failure" reachable instead of exploding.
+    child.stdin.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") return;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
     try {
       child.stdin.write(JSON.stringify(payload));
       child.stdin.end();
     } catch (err) {
+      // Kept for the synchronous half: a stream already destroyed when we reach this
+      // line throws immediately instead of emitting.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") return;
       if (!settled) {
         settled = true;
         clearTimeout(timer);

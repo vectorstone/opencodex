@@ -1,5 +1,32 @@
 import { createServer } from "node:net";
 
+/** An auxiliary bind cannot be repaired by selecting a different public port. */
+export class AuxiliaryListenerBindError extends Error {
+  constructor(
+    readonly listener: "unauthenticatedLoopbackListener" | "hub.managementIngress",
+    readonly port: number,
+    readonly hostname: string,
+    cause: unknown,
+  ) {
+    super(
+      `Could not bind ${listener} at ${hostname}:${port}. `
+      + `Check that listener's address and port; the public proxy port was not retried.`,
+      { cause },
+    );
+    this.name = "AuxiliaryListenerBindError";
+  }
+}
+
+/** Temporary bind probes must not let accepted peers hold server.close() open. */
+function createProbeServer(): ReturnType<typeof createServer> {
+  const server = createServer();
+  server.on("connection", socket => {
+    socket.on("error", () => socket.destroy());
+    socket.destroy();
+  });
+  return server;
+}
+
 /**
  * True when an error means "this port/address is already bound" — the only bind failure
  * that is safe to answer with a retry on another port. Bun/Node surface it as
@@ -15,7 +42,7 @@ export function isAddrInUse(err: unknown): boolean {
 
 export async function isPortAvailable(port: number, hostname = "127.0.0.1"): Promise<boolean> {
   return await new Promise(resolve => {
-    const server = createServer();
+    const server = createProbeServer();
     // Fail closed: EACCES / EADDRNOTAVAIL / EPERM / unknown listen errors mean the
     // requested bind is not available. Only the listening event reports free.
     server.once("error", () => resolve(false));
@@ -133,7 +160,7 @@ export function setEphemeralPortAllocatorForTests(
 async function allocateEphemeralPort(hostname: string): Promise<number> {
   if (ephemeralAllocator) return ephemeralAllocator(hostname);
   return await new Promise<number>((resolve, reject) => {
-    const server = createServer();
+    const server = createProbeServer();
     server.once("error", reject);
     server.once("listening", () => {
       const address = server.address();
@@ -151,6 +178,13 @@ export function shouldPersistSelectedPort(
   configPort: number | undefined,
   selectedPort: number,
   preferredPort: number,
+  options: { sibling?: boolean } = {},
 ): boolean {
+  // A sibling start (`--port X` beside a live proxy on the configured port) is a
+  // second instance, not a new home for this config. Persisting its port rewrote
+  // config.port under the still-running configured-port proxy, and the next
+  // `ocx service` install then baked the sibling's port into the service and
+  // re-pointed every client at a listener that no longer existed.
+  if (options.sibling) return false;
   return selectedPort === preferredPort && configPort !== selectedPort;
 }
