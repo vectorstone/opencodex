@@ -12,6 +12,7 @@ import { buildClaudeDesktopState } from "../../src/server/management/shared";
 import * as systemEnv from "../../src/server/system-env";
 import type { OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
+import { installIsolatedCodexRuntime } from "../helpers/isolated-codex-runtime";
 import { MANAGEMENT_JSON_BODY_MAX_BYTES } from "../../src/server/management/body";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { desktopFirstPartyTarget } from "../../src/claude/desktop-first-party";
@@ -25,6 +26,7 @@ let previousHome: string | undefined;
 let previousClaudeConfigDir: string | undefined;
 let previousDesktopConfigDir: string | undefined;
 let isolatedCodexHome: IsolatedCodexHome | null = null;
+let isolatedRuntime: ReturnType<typeof installIsolatedCodexRuntime> | null = null;
 
 // Keep the production SQLite kernel while each fixture owns its lock namespace.
 function startServer(port?: number, deps: NonNullable<Parameters<typeof startServerImpl>[1]> = {}) {
@@ -46,6 +48,7 @@ beforeEach(() => {
   isolatedCodexHome = installIsolatedCodexHome("ocx-claude-mgmt-");
   testDir = mkdtempSync(join(tmpdir(), "ocx-claude-mgmt-"));
   process.env.OPENCODEX_HOME = testDir;
+  isolatedRuntime = installIsolatedCodexRuntime(testDir);
   // These API tests intentionally toggle agent injection off. Never let that
   // prune the developer's real ~/.claude/agents directory.
   process.env.CLAUDE_CONFIG_DIR = join(testDir, "claude");
@@ -60,6 +63,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  isolatedRuntime?.restore();
+  isolatedRuntime = null;
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   if (previousClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
