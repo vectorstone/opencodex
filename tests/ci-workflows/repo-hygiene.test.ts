@@ -16,7 +16,14 @@ const repoRoot = resolveRepoRoot();
  * This test closes that gap by asserting against the real index instead of the
  * ignore file, so a forced add fails CI on the commit that introduces it.
  */
-const FORBIDDEN_TRACKED_DIRS = [".codexclaw", ".omo", ".omc", ".claude", "node_modules", ".tmp"];
+const FORBIDDEN_TRACKED_DIRS = [".codexclaw", ".omo", ".omc", ".claude", ".agents", "node_modules", ".tmp"];
+
+// The fork's reviewed sync runbook is code guidance, not per-machine agent state.
+const REVIEWED_FORK_RUNBOOK = ".agents/skills/opencodex-upstream-sync/SKILL.md";
+function isForbiddenAgentState(path: string): boolean {
+  return path !== REVIEWED_FORK_RUNBOOK
+    && path.split("/").some(segment => FORBIDDEN_TRACKED_DIRS.includes(segment));
+}
 
 const FORBIDDEN_TRACKED_FILENAMES = [".DS_Store", "Thumbs.db"];
 
@@ -91,11 +98,16 @@ function trackedEntries(): { mode: string; path: string }[] {
 
 describe("repository hygiene", () => {
   test("no local agent or session state is tracked", () => {
-    const offenders = trackedFiles().filter((path) =>
-      path.split("/").some((segment) => FORBIDDEN_TRACKED_DIRS.includes(segment)),
-    );
+    const offenders = trackedFiles().filter(isForbiddenAgentState);
 
     expect(offenders).toEqual([]);
+  });
+
+  test("the fork runbook exemption cannot admit other local agent state", () => {
+    expect(isForbiddenAgentState(REVIEWED_FORK_RUNBOOK)).toBe(false);
+    for (const path of [".agents/session.json", ".agents/skills/other/SKILL.md", "child/.agents/skills/opencodex-upstream-sync/SKILL.md", ".omc/project-memory.json"]) {
+      expect(isForbiddenAgentState(path)).toBe(true);
+    }
   });
 
   test("no OS metadata files are tracked", () => {
