@@ -1,4 +1,11 @@
 import { capturePoolQuotaWriter } from "../../codex/account-store";
+import { previewXaiOauthWireModel } from "./core-normalize";
+import {
+  admissionModelDeniedResponse,
+  AdmissionModelDeniedError,
+  assertRouteAllowedByScope,
+  resolveAdmissionModelScope,
+} from "../admission-model-scope";
 import type { Server } from "bun";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse, type ResponsesTerminalStatus } from "../../bridge";
 import {
@@ -45,7 +52,8 @@ import { describeImagesInPlace, planVisionSidecar, shouldResolveOpenAiVisionSide
 import { createAdapterEventQueue, preflightAdapterEvents } from "../../adapters/run-turn-queue";
 import {
   applyCodexAuthContextToProvider,
-  createCodexReserveDispatchGuard,
+  callerCodexWorkspaceAccountId,
+  createCodexAuthDispatchGuard,
   unwrapUpstreamRetryEvidenceError,
   CodexMainProfileDrainingError,
   headersForCodexAuthContext,
@@ -147,7 +155,8 @@ import { codexAccountSelectionForTurn, registerTurn, trackStreamLifetime, unregi
 import type { AdmissionLease } from "../../lib/admission";
 import { redactSecretString } from "../../lib/redact";
 import { readBoundedResponseBytes } from "../../lib/bounded-body";
-import { resolveStallTimeoutSec } from "../../stall-timeout";
+import { resolveStallTimeoutMs } from "../../stall-timeout";
+import { isLocalUpstream } from "../../lib/local-upstream";
 import { isRateLimitOrQuotaFailureMessage } from "../../lib/errors";
 import { supportedLadderFor } from "../effort-policy";
 import {
@@ -173,6 +182,8 @@ import {
 import { hasResponsesItemIdRepair, relaySseWithResponsesItemIdRepair } from "../responses-item-id-repair";
 import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/catalog";
 import { codexAuthContextLogLabel } from "../../codex/account-label";
+import { rebindPoolCreditPolicy } from "../../codex/pool-credit-policy";
+import { clientCancelledResponse } from "./core-errors";
 
 import {
   codexAccountGatedCanonicalWireModel,
@@ -180,6 +191,7 @@ import {
   handleResponses,
   preAuthUpstreamHostCircuitKey,
   poolCredentialRefreshIncompleteResponse,
+  shouldRetryCodexScopedQuotaOnAlternate,
   upstreamHostCircuitOpenResponse,
   usesCodexForwardPoolAuth,
 } from "./core";
@@ -187,6 +199,7 @@ import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel }
 import { mapCodexAuthContextErrorToResponse, nativeMainRefreshFailureResponse } from "./codex-auth-error";
 import { linkRequestSessionLane, sessionLaneIdFromRequest } from "../request-log-conversation";
 import { recallComboForLane } from "./combo-session-recall";
+import { redactHostedImageDisplayPaths } from "../responses-hosted-image-display";
 
 export const COMPACT_RESPONSE_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -424,6 +437,9 @@ async function refreshPoolCompactContext(args: {
       generation: refreshed.generation,
       poolQuotaWriter: capturePoolQuotaWriter(authCtx.accountId, refreshed),
     };
+    // See the core counterpart: the spread dropped the WeakMap-bound credit policy, so a hold
+    // or opt-out landing during the refresh await would go unchecked on the copy.
+    rebindPoolCreditPolicy(authCtx, refreshedAuthCtx);
     const refreshedProvider = applyCodexAuthContextToProvider(
       stripCodexRuntimeProviderFields(provider),
       refreshedAuthCtx,
@@ -452,6 +468,16 @@ async function refreshPoolCompactContext(args: {
     if (isTerminalCompactPoolRefreshFailure(error)) {
       return { ok: false, quarantine: true, response: reauthResponse() };
     }
+    if (req.signal.aborted) {
+      return { ok: false, quarantine: false, response: clientCancelledResponse() };
+    }
+    // See the core counterpart: a policy refusal raised after a successful refresh maps like
+    // the admission path — a reset-bound 429, never a 503 mislabeled as a refresh failure.
+    const policyResponse = mapCodexAuthContextErrorToResponse(error, {
+      now: Date.now(),
+      accountSelector: args.codexAccountNamespace,
+    });
+    if (policyResponse) return { ok: false, quarantine: false, response: policyResponse };
     return {
       ok: false,
       quarantine: false,
@@ -554,6 +580,7 @@ export async function bufferCompactResponse(
   upstream: Response,
   signal: AbortSignal,
   stallTimeoutSec?: number,
+  localUpstream?: boolean,
 ): Promise<Response> {
   const headers = compactResponseHeaders(upstream);
   try {
@@ -573,7 +600,9 @@ export async function bufferCompactResponse(
     const result = await readBoundedResponseBytes(upstream, {
       signal,
       maxBytes: COMPACT_RESPONSE_MAX_BYTES,
-      inactivityTimeoutMs: resolveStallTimeoutSec(stallTimeoutSec) * 1_000,
+      // Compaction buffers the complete body while holding an active-turn lease. Keep its
+      // default bounded even for local destinations so silent bodies cannot exhaust that gate.
+      inactivityTimeoutMs: resolveStallTimeoutMs(stallTimeoutSec),
     });
     if (signal.aborted) return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
     if (result.oversized) return compactResponseTooLargeError();
@@ -610,6 +639,8 @@ export async function handleResponsesCompact(
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return formatErrorResponse(400, "invalid_request_error", "Invalid compaction request body");
   }
+  // Compaction forwards client history upstream too; keep local artifact paths out of it.
+  redactHostedImageDisplayPaths(body);
   if (!options.compactionRoutingOverride) {
     options = { ...options, compactionRoutingOverride: applyCompactionRoutingOverride(body, req.headers, config, { endpoint: "compact" }) };
   }
@@ -655,7 +686,20 @@ export async function handleResponsesCompact(
     // routes ordinary turns elsewhere (#2901); the compaction-scoped router
     // may land that on the configured default provider instead of 404.
     route = routeCompactionModel(config, compactModel, evidenceFromBody(raw));
+    // A compaction override picks the model, not the caller, so the key's scope
+    // is applied to what the override resolved to rather than to the selector
+    // the client sent.
+    // Routed xAI OAuth compaction must preview its Fast wire model here;
+    // native compact keeps checking the destination it dispatches directly.
+    const callerTier = (raw as Record<string, unknown>).service_tier;
+    assertRouteAllowedByScope(resolveAdmissionModelScope(config, admission), compactRequestedModel, {
+      providerName: route.providerName,
+      modelId: previewXaiOauthWireModel({ options: {
+        serviceTier: compactFastRow ? "priority" : typeof callerTier === "string" ? callerTier : undefined,
+      } }, route, config, "responses"),
+    });
   } catch (err) {
+    if (err instanceof AdmissionModelDeniedError) return admissionModelDeniedResponse(err);
     if (err instanceof NoEligiblePolicyCandidateError) {
       // Persist the evaluation trace (per-candidate exclusions + the
       // no-eligible reason) so a failed compact policy request stays
@@ -674,6 +718,7 @@ export async function handleResponsesCompact(
   logCtx.requestedModel = compactRequestedModel;
   logCtx.model = selectedModelId;
   logCtx.routeDecision = route.routeDecision;
+  logCtx.policyEligibility = route.policyEligibility;
   logCtx.provider = route.codexAccountNamespace
     ? `${route.providerName}-${route.codexAccountNamespace}`
     : route.providerName;
@@ -698,6 +743,7 @@ export async function handleResponsesCompact(
     captureOpenAiVirtualWirePolicy(route, virtual);
     logCtx.model = virtual.selectedModelId;
     logCtx.resolvedModel = virtual.wireModelId;
+    logCtx.wireModel = virtual.wireModelId;
   } else {
     logCtx.resolvedModel = route.modelId;
   }
@@ -1011,7 +1057,7 @@ export async function handleResponsesCompact(
           providerName: route.providerName,
           modelId: route.modelId,
           beforeDispatch: isCanonicalOpenAiForwardProvider(sendProvider)
-            ? createCodexReserveDispatchGuard(sendAuthCtx, config, selectedModelId, admission) : undefined,
+            ? createCodexAuthDispatchGuard(sendAuthCtx, config, selectedModelId, admission) : undefined,
         }),
         // Every credential-bearing forward send gets manual redirects, not only
         // pool sends: direct mode carries the caller's credential too (#914).
@@ -1200,9 +1246,36 @@ export async function handleResponsesCompact(
       if (alternate && req.signal.aborted) {
         releaseCodexAuthContextProbeLease(alternate.authCtx);
         recordCompactPoolOutcome(outcomeCtx, 499);
+        void upstream.body?.cancel(req.signal.reason).catch(() => undefined);
         return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
       }
-      if (alternate) {
+      // The same scope binding the regular path applies: an organization-scoped
+      // exhaustion refuses every credential in that workspace, so a proven
+      // same-workspace alternate pays a cold prompt prefix for no new capacity.
+      // Suppression is not silence — the buffered recorder below still attributes
+      // the 429/402 to the account that produced it.
+      const sharedWorkspaceScope = alternate != null
+        && !await shouldRetryCodexScopedQuotaOnAlternate(
+          upstream,
+          authCtx.chatgptAccountId,
+          alternate.authCtx.kind === "pool" || alternate.authCtx.kind === "main-pool"
+            ? alternate.authCtx.chatgptAccountId
+            : callerCodexWorkspaceAccountId(req.headers),
+          req.signal,
+        );
+      // The scope check reads the rejection body asynchronously — the same window the
+      // comment above covers. Re-check before the branch below records A, cancels its
+      // body, and sends B for a caller that is gone.
+      if (alternate && req.signal.aborted) {
+        releaseCodexAuthContextProbeLease(alternate.authCtx);
+        recordCompactPoolOutcome(outcomeCtx, 499);
+        void upstream.body?.cancel(req.signal.reason).catch(() => undefined);
+        return formatErrorResponse(499, "client_cancelled", "Client cancelled compact request");
+      }
+      if (alternate && sharedWorkspaceScope) {
+        releaseCodexAuthContextProbeLease(alternate.authCtx);
+      }
+      if (alternate && !sharedWorkspaceScope) {
         // Same order the regular path uses (core.ts:349-357): a 429/402 carries the
         // quota snapshot that produced it, so refresh A's cache before recording its
         // rejection. Skipping this leaves quota-strategy routing and the dashboard
@@ -1214,7 +1287,8 @@ export async function handleResponsesCompact(
             upstream.headers,
             authCtx.writerGeneration,
             authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined,
-            { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined },
+            { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined,
+              poolResponse: authCtx.kind === "pool" },
           );
         }
         recordCompactPoolOutcome(authCtx, upstream.status, {
@@ -1283,7 +1357,7 @@ export async function handleResponsesCompact(
     if (outcomeCtx.kind === "pool") {
       const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/quota");
       applyAccountQuotaFromUpstreamHeaders(outcomeCtx.accountId, upstream.headers, outcomeCtx.writerGeneration,
-        undefined, { modelId: route.modelId, poolWriter: outcomeCtx.poolQuotaWriter });
+        undefined, { modelId: route.modelId, poolWriter: outcomeCtx.poolQuotaWriter, poolResponse: true });
     }
     const retryAfter = upstream.headers.get("retry-after");
     const resetAt = [
@@ -1291,7 +1365,7 @@ export async function handleResponsesCompact(
       upstream.headers.get("x-codex-secondary-reset-at"),
       upstream.headers.get("x-codex-tertiary-reset-at"),
     ].filter(Boolean);
-    const buffered = await bufferCompactResponse(upstream, req.signal, config.stallTimeoutSec);
+    const buffered = await bufferCompactResponse(upstream, req.signal, config.stallTimeoutSec, isLocalUpstream(compactUrl));
     const bufferedErrorText = buffered.ok
       ? ""
       : await buffered.clone().text().catch(() => "");
@@ -1390,7 +1464,7 @@ export async function handleResponsesCompact(
   // The routed compaction turn is a handoff inside the same logical request, so it draws the
   // REMAINDER. Minting here is what let a native attempt spend three sends and the routed
   // fallback spend four more.
-  const response = await handleResponses(internalReq, config, logCtx, { abortSignal: req.signal, turnAdmissionLease, sendBudget, compactionRoutingOverride: options.compactionRoutingOverride, ...(admission ? { admission } : {}) });
+  const response = await handleResponses(internalReq, config, logCtx, { abortSignal: req.signal, turnAdmissionLease, sendBudget, compactionRecoveryKind: "compaction-v1", compactionRoutingOverride: options.compactionRoutingOverride, ...(admission ? { admission } : {}) });
   if (!response.ok) return response;
   let json: { output?: unknown[]; status?: unknown; error?: unknown };
   if (response.headers.get("content-type")?.includes("text/event-stream")) {

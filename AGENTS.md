@@ -14,8 +14,9 @@ Bun-native TypeScript with no separate server compile step.
 - `src/` — proxy runtime: routing, provider adapters, config, management API.
 - `tests/` — Bun tests in domain directories that mirror `src/`
   (`tests/<domain>/*.test.ts`; `providers/` and `adapters/` have one more
-  level for the larger vendors). The map is `scripts/test-layout/layout.json`
-  and `tests/test-layout.test.ts` enforces it: every file resolves to a
+  level for the larger vendors). The explicit map is
+  `scripts/test-layout/layout.json`, with regex seeds and migration state in
+  `scripts/test-layout/seeds.json`; `tests/test-layout.test.ts` enforces that every file resolves to a
   domain and sits in it, and only the two layout guards live at the root.
   Shared helpers in `tests/helpers/`, fixtures in `tests/fixtures/`, broader
   scenarios in `tests/e2e-style/`. Source-oracle tests resolve the repository
@@ -24,9 +25,13 @@ Bun-native TypeScript with no separate server compile step.
   test file lands in its domain directory and needs an entry in both
   `layout.json` `explicit` and `tests/fixtures/test-layout-expected.json`
   (`tests/test-layout-tooling.test.ts` names the missing one); the regex
-  seeds in `layout.json` place a conventionally named file until then.
+  seeds in `seeds.json` place a conventionally named file until then.
   History: `devlog/_fin/260905_test_modularization_and_windows/`.
 - `gui/` — React + Vite dashboard; packaged output is served from `gui/dist`.
+- `app/` — native macOS WidgetKit extension bundled into the Tauri desktop app;
+  `MenuBarCore` is its snapshot model/formatting layer. Its tests are
+  executables, not XCTest bundles — Command Line Tools ships neither a usable
+  XCTest module nor the swift-testing runtime.
 - `docs-site/` — public docs (Astro + Starlight), deployed to GitHub Pages.
 - `go/` — retired Go native-runtime experiment; kept only where the TypeScript
   runtime still references it. New work does not go here.
@@ -41,6 +46,7 @@ Bun-native TypeScript with no separate server compile step.
   gone, and on a new `src/` area nobody claimed.
 - `scripts/` — release and maintenance tooling; `scripts/release.ts` is the
   release authority.
+- `desktop/` — Tauri v2 desktop shell, bootstrap UI, and compiled proxy sidecar preparation.
 - `devlog/` — planning and investigation notes, tracked in this repository. See
   "The `devlog` directory" below for what may and may not go there.
 
@@ -234,13 +240,13 @@ most expensive kind of fork delta, because it re-conflicts every time.
   `tests/codex-integration/native-codex-toggle.test.ts`,
   `gui/tests/integrations-api.test.ts`, and
   `gui/tests/integrations-overview-rows.test.ts`.
-- Known semantic conflict to re-check each sync: `GET /api/native-integrations`
-  deliberately reads `loadConfig()` for the Codex row (a mode change committed by
-  `mutatePersistedConfig` writes disk only, so the startup snapshot would report
-  the previous mode) while the sibling claude/grok/desktop rows read the passed
-  `config`. Upstream calls `codexStatus(config, ...)`. Keep the fresh read, and
-  keep it scoped to Codex; do not "unify" it onto `config`.
-- Disposition: **fork-only** as of upstream v2.56.0 (`e4a8539b9`). Upstream may
+- Known semantic conflict to re-check each sync: a mode change writes disk independently
+  of the startup snapshot. Upstream v2.80.0 now refreshes only `clientIntegrations` through
+  `persistedIntentConfig` for Codex, Grok and Desktop; retain that upstream reader and its
+  missing/unreadable-file fallback. Other fields and the Claude row stay snapshot-owned.
+  The Codex last-toggle outcome must be keyed by the exact mode, not enabled/disabled,
+  so a failed full apply cannot contaminate catalog-only status.
+- Disposition: **fork-only** as of upstream v2.80.0 (`250f17afd`). Upstream may
   contain other internal operations described as catalog-only; they are not
   equivalent unless the durable config, ownership boundary, management API, and
   GUI contract above all remain true.
@@ -271,38 +277,13 @@ most expensive kind of fork delta, because it re-conflicts every time.
   the regression sentinel is `tests/codex-integration/codex-metadata-integrity.test.ts`
   (API-key forwarding, no-wider-allowlist, case-insensitive configured value, no
   invented identity).
-- Disposition: **absorbed** by upstream `45cfb04e9` (#4702), reachable in the
-  upstream `dev` line; not yet in the v2.56.0 release tag (`e4a8539b9`). The
-  local implementation is upstream's `applyCallerUserAgentFallback`, adopted
-  verbatim during the 2026-09-16 audit. Keep the contract and the sentinels;
-  prefer upstream's implementation whenever this file conflicts.
+- Disposition: **absorbed** by upstream `45cfb04e9` (#4702), verified in stable
+  v2.80.0 (`250f17afd`). Use upstream's `applyCallerUserAgentFallback`; keep the
+  credential-boundary sentinels. Upstream's separate opt-in `forwardClientHeaders`
+  allows only four non-credential headers on Responses inference; it does not expand
+  this default fallback or the shared forwarding allowlist.
 - Original fork implementation: `0ac0d028` and `960e2b59`. This is a credential
   boundary: changes require explicit security review and `bun run privacy:scan`.
-
-#### F-003 — OpenCode catalog authentication
-
-- `ocx opencode` fetches the management `/api/models` catalog with the configured
-  OpenCodex admin token, not with the data-plane admission key. If the management
-  token is unavailable, fail explicitly instead of producing a partial or
-  misleading model catalog.
-- The user-visible failure is a message on stderr and exit status `1`. Upstream
-  achieves the same outcome inline in `cmdOpencode`; the fork's former
-  `requireOpencodeManagementToken()` helper was a refactor of that same behavior
-  and was removed during the 2026-09-16 audit. Do not reintroduce a helper whose
-  sentinel tests the helper rather than the CLI contract.
-- The key path is `src/cli/opencode.ts`; the regression sentinel is
-  `tests/providers/opencode-cli.test.ts`, which drives `cmdOpencode` and asserts
-  both the admin-token fetch and the loud failure without one.
-- Modality export is **not** part of this entry: upstream `ad09340d7` (#4300,
-  tagged v2.52.0) implements the same propagation plus `attachment`, and covers
-  it in `tests/providers/opencode-cli.test.ts` and
-  `tests/config/client-config-export.test.ts`. The fork's duplicate pair was
-  removed during the 2026-09-16 audit.
-- Disposition: **absorbed** as of upstream v2.56.0 (`e4a8539b9`) — the fork's
-  remaining delta is zero beyond the error-message wording. Delete this entry
-  entirely once a sync confirms the upstream message is acceptable.
-- Original fork implementation: `41dfada4` and `0a558755`. Authentication changes
-  are security-boundary changes and require explicit security review.
 
 #### F-004 — Authoritative client-export output-token limits
 
@@ -312,14 +293,15 @@ most expensive kind of fork delta, because it re-conflicts every time.
 - Never reinterpret `defaultMaxOutputTokens` or `modelMaxOutputTokens` as catalog
   capability: those fields remain request defaults used by the OpenAI Chat adapter. Never
   restore the retired uniform `32000` schema stand-in.
-- OpenCode emits `limit` only when authoritative context and output values are both known.
+- OpenCode and Kilo emit `limit` only when authoritative context and output values are both known.
   Pi, OMP, Prime, and Gajae preserve either known field independently; ZCode emits optional
   `limit.output`. Combo output capability is the minimum only when every target is known.
 - Key paths include `src/types/config.ts`, `src/codex/catalog/routed-gather.ts`,
   `src/codex/catalog/aggregation.ts`, `src/server/management/model-rows.ts`,
   `src/server/management/model-routes.ts`, `src/clients/config-export.ts`,
+  `src/server/management/model-row-export-metadata.ts`,
   `src/clients/config-export/model-metadata.ts`, `src/clients/config-export/contracts.ts`,
-  `src/clients/config-export/omp.ts`, `src/clients/config-export/zcode.ts`,
+  `src/clients/config-export/omp.ts`, `src/clients/config-export/zcode.ts`, `src/clients/config-export/kilo.ts`,
   `src/cli/export-command.ts`, `src/cli/opencode.ts`, and the Models GUI/API/i18n files.
   (`src/codex/catalog/parsing.ts` and `src/codex/catalog/model-hints.ts` were listed before the
   2026-09-16 audit and carry no fork delta: upstream owns `CatalogModel.maxOutputTokens` and the
@@ -334,20 +316,20 @@ most expensive kind of fork delta, because it re-conflicts every time.
 - `summarize*` functions that report `modelsWithoutLimits` count a row as limited only when its
   **output** capability is known too. That is a user-visible number in `ocx export` output; keep it
   consistent with what the serializers actually emit.
-- Upstream v2.56.0 split `config-export.ts` and `catalog/provider-fetch.ts` into leaf modules and
-  reintroduced a uniform `SCHEMA_REQUIRED_OUTPUT_BUDGET` (32,000) for opencode's paired `limit`.
-  This fork keeps the authoritative rule instead and does not ship that constant; the
-  `maxOutputTokens` field must be restored on `ExportModel` and `OpencodeCatalogModel` whenever a
-  serializer is added.
+- Upstream v2.80.0 projects authoritative output to `ExportModel.maxTokens` and effective
+  export metadata, including exact generated provider metadata and input budgets. Retain that
+  architecture, not a parallel projection. The fork also accepts legacy `maxOutputTokens`,
+  preserves explicit custom overrides even without a gathered row, and removes the remaining
+  `SCHEMA_REQUIRED_OUTPUT_BUDGET` fallback. Every new serializer must omit unknown output.
 - Regression sentinels include `tests/codex-integration/codex-catalog.test.ts`,
   `tests/codex-integration/catalog-input-modality-enum.test.ts`,
   `tests/config/client-config-export.test.ts`, `tests/providers/opencode-cli.test.ts`,
   `tests/server/management-client-config-route.test.ts`, `tests/cli/cli-export-command.test.ts`,
   `tests/clients/client-export-modality-enum.test.ts`, and the relevant GUI model tests.
-- Disposition: **fork-only** as of upstream v2.56.0 (`e4a8539b9`) **and still fork-only on the
-  upstream `dev` line**, where `outputBudgetFor` and `SCHEMA_REQUIRED_OUTPUT_BUDGET` both survive.
-  This is the highest-conflict entry in the register: expect the stand-in to be reintroduced on
-  every sync and re-remove it.
+  Kilo's unknown-output case is covered by `tests/clients/kilo-client.test.ts`.
+- Disposition: **partially overlapping** as of upstream v2.80.0 (`250f17afd`): exact
+  capability projection is upstream-owned; unknown omission, independent optional limits,
+  durable custom output overrides and compatibility with the old field remain fork-owned.
 - Original fork implementation: `6272fc3f4`.
 
 #### F-005 — ZCode semantic ownership canonicalization
@@ -359,7 +341,8 @@ most expensive kind of fork delta, because it re-conflicts every time.
   or model catalog update to refresh the block instead of becoming a permanent
   `conflict` that requires deleting `~/.zcode/v2/config.json`.
 - Canonicalization is scoped to ZCode's protected ownership fingerprint and the
-  known generated schema. It must not weaken protection for provider identity,
+  known legacy generated schema (`provider.opencodex` fragment only); it does not normalize
+  the new `provider_config.json` store. It must not weaken protection for provider identity,
   connection options (including `options.baseURL`), model membership, names,
   modalities, or authoritative context limits. The whole-file fingerprint stays
   byte-exact for restore and unrelated clients retain their existing semantics.
@@ -380,7 +363,7 @@ most expensive kind of fork delta, because it re-conflicts every time.
   companion — that is true only for records written after v2.35.0.
 - Disposition: **fork-only**. Upstream `63941b583` absorbed only the generic
   semantic fingerprint; the ZCode-specific `canonicalizeZcodeValue` has no upstream
-  equivalent at either v2.56.0 (`e4a8539b9`) or on the upstream `dev` line.
+  equivalent in stable v2.80.0 (`250f17afd`).
 - Original fork implementation: `2780fc291`. Note for accuracy: at that commit the
   fork tree did not yet contain `semanticContribution` or
   `semanticProtectedBlockFingerprint` — the v2.35.0 merge (`58703ee6a`) brought them
@@ -407,7 +390,7 @@ most expensive kind of fork delta, because it re-conflicts every time.
   `tests/responses/namespace-tool-compat.test.ts` and
   `tests/server/server-xai-responses-streaming.test.ts`, covering both streaming and JSON
   Responses output.
-- Disposition: **partially overlapping**. Upstream `src/responses/plaintext-v2-agent-messages.ts`
+- Disposition: **partially overlapping**, re-verified at v2.80.0 (`250f17afd`). Upstream `src/responses/plaintext-v2-agent-messages.ts`
   performs the *same* `message.encrypted` strip over the *same* three tool names
   (`hasAgentMessageEncryptionMarker` / `rewriteAgentMessageToolDeclaration`), and
   `src/server/responses/passthrough-dispatch.ts` already calls
@@ -430,10 +413,9 @@ most expensive kind of fork delta, because it re-conflicts every time.
 - Key path is `gui/src/pages/Models.tsx`; covered by the existing Models GUI
   tests (`gui/tests/models-status-toast.test.tsx` locates the button by that
   label), so there is no separate sentinel.
-- Disposition: **absorbed**. Upstream independently added the same attribute
-  (`gui/src/pages/Models.tsx` on the upstream `dev` line). Because both sides
-  changed the same line, this is a guaranteed textual conflict on every sync for
-  a one-attribute change; on conflict, take upstream's line and drop this entry.
+- Disposition: **fork-only attribute** at stable v2.80.0 (`250f17afd`): upstream now uses
+  a decorative aria-hidden icon plus visible label, but no explicit aria-label. Retain the
+  fork's explicit stable accessible name alongside upstream's current button content.
 - Original fork implementation: `23906fe99`.
 
 ### Registering future fork-only changes
@@ -514,7 +496,7 @@ do not silently widen the synchronization scope.
 bun install
 bun run typecheck      # bun x tsc --noEmit (strict)
 bun run test:changed   # import-graph tests against the resolved `dev` merge base
-bun run test           # full tests/ suite (PR-ready / explicit ask only)
+bun run test           # full tests/ suite (default before review)
 bun run lint:gui       # GUI eslint
 bun run privacy:scan   # credential/privacy scan used by CI
 bun run structure:check # structure/ doc-map, ownership, and invariant-binding gate
@@ -535,23 +517,29 @@ bun run skill:surface:check  # what CI asserts
 also if the hand-written pages name a command the registry does not have. That second check is not
 hypothetical: it caught a documented `ocx request-history` that never existed.
 
-During implementation, use the smallest focused checks that directly cover the
-changed subsystem. Prefer `bun test tests/<domain>/<name>.test.ts` for a known
-file, `bun test tests/<domain>` for one subsystem, or
-`bun run test:changed` when the touch set is broader than one file. Do **not**
-run repository-wide `bun run test` or a bare `bun test` with no file arguments
-for a scoped change by default. `bun run test:changed` follows Bun's parsed module graph: it
-selects test files that import changed modules, but it cannot see dependencies
-expressed through subprocesses, source files read as data, or golden/derived
-files. Run the relevant focused tests explicitly for those paths; if no reliable
-focused set covers them, the full suite is required even for a scoped change.
-That indirect-dependency case is the explicit exception to the scoped-change
-default. The full suite is ~850 files, so otherwise reserve it for a failed or
-ambiguous focused result, an explicit user request, or the PR-ready gate below.
+Run the test suite for a change; `bun run test` is the default before a
+non-trivial PR is marked review-ready or approved. During implementation, use
+focused files or `bun run test:changed` for faster feedback.
 
-Before creating or updating a non-trivial PR as review-ready, or before
-approving such a PR, run `bun run typecheck` and `bun run test`. CI runs these
-on Linux, Windows, and macOS.
+If a full local run is disproportionately expensive for the task or available
+resources, including contention across concurrent worktrees, run at least the
+focused regression tests that exercise the changed behavior. This is a scope
+exception, not permission to skip testing or ignore a failing test. Record why
+the full run was impractical, the exact commands and results, and the coverage
+left to CI in the PR's Verification section. Never describe an unrun suite as
+passing. Run `bun run typecheck` before review readiness as well.
+
+`bun run test:changed` follows Bun's parsed module graph, so it cannot discover
+dependencies expressed through subprocesses, source files read as data, or
+golden/derived files. Run those relevant regression files explicitly. If a
+focused set cannot reliably cover the change, keep the PR in draft until the
+broader validation is available.
+
+After pushing, inspect the required CI for the current PR head. Missing,
+awaiting-approval, skipped, cancelled, or older-head results are not passing
+evidence. Required checks must actually complete successfully before merge.
+The repository does not install an automatic pre-push validation hook;
+`bun run prepush` remains available as an explicit comprehensive check.
 
 Do not rerun passing checks on unchanged code merely for additional confidence.
 
@@ -651,9 +639,16 @@ than nudged.
   issues, so there is no freeform fallback).
 - **Opening a pull request:** fill every section of
   `.github/PULL_REQUEST_TEMPLATE.md` (Summary, Verification, Checklist).
-  `enforce-target` rejects empty, thin, or malformed descriptions, and a PR
-  whose title or description mentions `gui` must include a screenshot of the
-  UI change in the description. When the PR resolves an issue, add
+  `enforce-target` rejects empty, thin, or malformed descriptions. If the PR
+  changes files under `gui/`, include a screenshot of the UI change in the
+  description; the check re-runs on description edits until the screenshot is
+  present. Drag the image into the description editor rather than committing it:
+  an image on your branch rides the squash merge into `dev`. Maintainers
+  uploading from the command line use the `pr-assets` branch and link by commit
+  SHA. Never commit screenshot evidence to the PR branch — the squash merge carries
+  it into `dev`, which is how `docs/pr-assets/` and its siblings grew until
+  they were deleted; `tests/ci-workflows/repo-hygiene.test.ts` now rejects
+  those folders. When the PR resolves an issue, add
   `Closes #<number>` to link it. GitHub auto-closes the linked issue only
   when the PR merges into the default branch (`main`); PRs here target
   `dev`, so close the issue manually once the change is on `dev`.
@@ -691,12 +686,16 @@ commits in the description.
 
 The **`enforce-target`** CI check rejects pull requests whose head
 ancestry sits on the **`main`** tip while far behind **`dev`**, and rejects
-empty, thin, or malformed descriptions; PRs whose title or description
-mentions `gui` must include a screenshot of the UI change in the description.
+empty, thin, or malformed descriptions. If changed paths include files under
+`gui/`, include a screenshot of the UI change in the description; the check
+re-runs on description edits until the screenshot is present. Drag the image
+into the description editor rather than committing it, or, when uploading from
+the command line, use the `pr-assets` branch and link by commit SHA.
 Contributor PRs (authors without repository push permission) open in draft and
 stay there until a four-box review-readiness checklist in the description is
-complete: local CI green, branch on the latest `dev` commit, all correct Codex
-and CodeRabbit findings fixed, and the ready-for-review confirmation. When all
+complete: required local validation passed with its scope documented, branch
+on the latest `dev` commit, all correct Codex and CodeRabbit findings fixed,
+and the ready-for-review confirmation. When all
 four boxes are ticked the gate marks the PR ready and notifies the maintainers
 listed in `MAINTAINERS.md` (excluding the author). Completion is bound to the
 exact commit the PR head pointed at: if new commits are pushed afterwards, the
@@ -705,7 +704,7 @@ and asks the author to test and tick the boxes again against the latest code.
 Before a completion is accepted, the gate verifies the checklist claims it
 can check itself: the branch must be on the latest `dev` commit or at most
 10 commits behind it, and Codex/CodeRabbit findings must be resolved. The
-local-CI box is an author attestation only — fork contributors cannot start
+local-validation box is an author attestation only — fork contributors cannot start
 repository CI; a maintainer has to — so the gate never disproves it; a new
 push still resets every box. A disproved claim unticks the matching box and
 keeps the PR a draft.
@@ -718,7 +717,7 @@ explicitly integrate through a PR without another maintainer approval, including
 their own PR, under the policy in `MAINTAINERS.md`. Record the decision and exact-head
 CI evidence; keep outstanding maintainer objections and security review separate.
 The bypass is PR-only, so a direct push to `dev` remains rejected regardless of
-`--no-verify`. Contributor review and `main`/`preview` rules remain unchanged.
+local hook settings. Contributor review and `main`/`preview` rules remain unchanged.
 
 [`MAINTAINERS.md`](./MAINTAINERS.md) is authoritative for review and merge
 policy (approvals, CI requirements, security review, promotion). This file
@@ -748,7 +747,8 @@ reviewers (Codex, CodeRabbit).
 - **Tests:** behavior changes in `src/` need a focused regression test near
   the existing tests for that subsystem. During implementation, run the relevant
   focused files and use `bun run test:changed` for import-connected coverage as
-  described above; the full suite is the PR-ready gate.
+  described above. Full-suite validation is the default before review readiness;
+  the documented resource exception still requires focused regression tests.
 - **Docs sync:** user-facing behavior changes should update `docs-site/` (and
   keep translated locales from contradicting the English source).
 - **Privacy:** `bun run privacy:scan` must stay green; never introduce logging

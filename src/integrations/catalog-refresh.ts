@@ -1,3 +1,4 @@
+import { siblingOfLivePort } from "../codex/sibling-start";
 import { redactSecretString } from "../lib/redact";
 import type { ExportModel } from "../clients/config-export";
 import type { IntegrationClientId } from "./registry";
@@ -10,8 +11,11 @@ import {
 /** Refresh only previously connected clients; a refused file never blocks its peers. */
 export async function refreshOwnedCatalogIntegrations(
   input: Omit<OwnedIntegrationRefreshInput, "clientId">,
-  clientIds: readonly IntegrationClientId[] = ["pi", "aside", "raycast", "omo"],
+  clientIds: readonly IntegrationClientId[] = ["pi", "aside", "raycast", "omo", "droid", "opencode", "kilo"],
 ): Promise<OwnedIntegrationRefreshOutcome[]> {
+  // Client files are shared with the live proxy a sibling instance runs beside; their entries
+  // point at the owner's port, and refreshing them here would re-point them at this one.
+  if (siblingOfLivePort() !== null) return [];
   let models: Promise<readonly ExportModel[]> | undefined;
   const loadModels = () => models ??= Promise.resolve().then(() =>
     typeof input.models === "function" ? input.models() : input.models);

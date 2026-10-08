@@ -1,12 +1,16 @@
+import type { CodexMainAccountPolicyHealth } from "../oauth/health";
 import { durableBunRuntime } from "../lib/bun-runtime";
+import { existsSync, readFileSync } from "node:fs";
 import { codexAutoStartEnabled, getConfigPath, readConfigDiagnostics } from "../config";
 import { getPidPath, readPid, readRuntimePort, type RuntimePortState } from "../config/process-state";
 import { diagnoseCodexBundledPlugins, type CodexPluginsDiagnostic } from "../codex/plugins-doctor";
 import { findLiveProxy, probeHostname } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 import { diagnoseService, serviceLogPath } from "../service";
-import { collectStartupHealth, type StartupHealth } from "../codex/autostart-health";
+import { collectStartupHealth, startupHealthReadBudgetMs, type StartupHealth } from "../codex/autostart-health";
 import { getCodexRoutingKind } from "../codex/inject";
+import { missingOwnedCatalogPath } from "../codex/inject/config-toml";
+import { CODEX_CONFIG_PATH } from "../codex/paths";
 import { diagnoseCodexShim } from "../codex/shim";
 import { displayCodexRuntimePath, effortClampAppliesToRuntime, liveRemovedEfforts, loadLastEffortClamp, resolveCodexRuntime } from "../codex/runtime";
 import { packageVersion } from "./help";
@@ -15,6 +19,8 @@ import { redactSecretString, redactUserPath } from "../lib/redact";
 import { collectOrcaCodexHomeDiagnostic, type OrcaCodexHomeDiagnostic } from "../codex/home";
 import { grokFenceEndpointDrift, readGrokStatus } from "../grok/status";
 import { effectiveLoopbackListenerPort } from "../codex/loopback-target";
+import { journaledInjectedOpenaiBaseUrl, journaledInjectedRealtimeWsBaseUrl } from "../codex/journal";
+import { detectCodexRoutingDrift, type JournaledCodexRouting } from "../codex/routing-drift";
 import { claudeDesktopIntegrationEnabled } from "../codex/desired-state";
 import { claudeDesktopPolicyHealth, probeClaudeDesktopPolicy, type ClaudeDesktopPolicyHealth } from "../claude/desktop-policy";
 import { collectClientConnectionStatus, type ClientConnectionStatus } from "./connect";
@@ -26,6 +32,8 @@ import { tokenCollidesWithAdmin } from "../lib/admin-secrets";
 export { proxyHealthFailureReason, isConnectionRefused, isUncleanExitEvidence, probeUncleanExitState } from "./status-probes";
 export type { ListenTarget } from "./status-probes";
 import { checkProxyHealth, probeUncleanExitState, type ListenTarget } from "./status-probes";
+import { LOCAL_MANAGEMENT_READ_PATHS } from "../lib/local-management-capability";
+import { fetchBoundLocalManagementRead } from "../server/local-management-read-client";
 
 /**
  * The state of the data-plane admission secret the SERVICE will use. State only -- never the value.
@@ -97,6 +105,7 @@ export type CliRemoteHubStatus = {
 };
 
 export type CliStatusJson = {
+  mainAccountHardLock?: CodexMainAccountPolicyHealth;
   schemaVersion: 1;
   /**
    * This machine's topology role, named rather than inferred (#4236).
@@ -228,6 +237,84 @@ function statusDashboardUrl(config: StatusListenConfig, hostname: string | undef
     ? "localhost"
     : reachableHostname;
   return `http://${dashboardHostname}:${port}/`;
+}
+
+const STARTUP_HEALTH_BOOLEAN_FIELDS = [
+  "routingInjected", "localRoutingDependency", "autostartEnabled", "rebootSafe",
+  "serviceInstalled", "serviceViable", "serviceEnabled", "serviceRunning",
+  "serviceStale", "serviceConflict", "shimInstalled", "shimHealthy",
+  "serviceSupported", "diagnosticStale",
+] as const;
+
+export async function fetchLiveStartupHealth(
+  live: NonNullable<Awaited<ReturnType<typeof findLiveProxy>>>,
+  deps: Parameters<typeof fetchBoundLocalManagementRead>[2] = {},
+): Promise<StartupHealth | null> {
+  const result = await fetchBoundLocalManagementRead(
+    live, LOCAL_MANAGEMENT_READ_PATHS.startupHealth, { timeoutMs: startupHealthReadBudgetMs(), ...deps, requireResponseProof: true },
+  );
+  if (result.kind !== "response" || !result.response.ok) return null;
+  let payload: unknown;
+  try { payload = await result.response.json(); } catch { return null; }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const row = payload as Record<string, unknown>;
+  if (row.status !== "native" && row.status !== "protected" && row.status !== "at-risk") return null;
+  if (row.protection !== "service" && row.protection !== "shim" && row.protection !== "none") return null;
+  if (row.routingKind !== "native" && row.routingKind !== "opencodex-local"
+    && row.routingKind !== "custom-local" && row.routingKind !== "custom-remote" && row.routingKind !== "unknown") return null;
+  if (row.shimCoverage !== "full" && row.shimCoverage !== "cli-only" && row.shimCoverage !== "none") return null;
+  if (typeof row.platform !== "string") return null;
+  if (row.recommendedCommand !== null && typeof row.recommendedCommand !== "string") return null;
+  if (!row.commands || typeof row.commands !== "object" || Array.isArray(row.commands)) return null;
+  for (const key of ["installService", "repairService", "installShim", "restoreNative"] as const) {
+    if (typeof (row.commands as Record<string, unknown>)[key] !== "string") return null;
+  }
+  if (row.routingAdoption !== undefined) {
+    if (!row.routingAdoption || typeof row.routingAdoption !== "object" || Array.isArray(row.routingAdoption)) return null;
+    const adoption = row.routingAdoption as Record<string, unknown>;
+    if (adoption.adoption !== "not-applicable" && adoption.adoption !== "adopted"
+      && adoption.adoption !== "pending-client-restart" && adoption.adoption !== "unknown") return null;
+    if (adoption.injectedAtMs !== null && typeof adoption.injectedAtMs !== "number") return null;
+    if (typeof adoption.observedClients !== "number" || !Array.isArray(adoption.staleClients)) return null;
+    for (const client of adoption.staleClients) {
+      if (!client || typeof client !== "object" || Array.isArray(client)) return null;
+      const row = client as Record<string, unknown>;
+      if (typeof row.pid !== "number" || typeof row.startedAtMs !== "number") return null;
+    }
+  }
+  for (const key of STARTUP_HEALTH_BOOLEAN_FIELDS) if (typeof row[key] !== "boolean") return null;
+  return payload as StartupHealth;
+}
+
+/** Prefer an attested live verdict and evaluate the local fallback only when live state is absent. */
+export function selectStatusStartupHealth(
+  liveStartup: StartupHealth | null,
+  fallback: () => StartupHealth,
+): StartupHealth {
+  return liveStartup ?? fallback();
+}
+
+/** Build the service summary from the same startup source that `ocx status` selected. */
+export function statusServiceSummary(
+  liveStartup: StartupHealth | null,
+  service: Pick<ReturnType<typeof diagnoseService>, "installed" | "summary">,
+  live: boolean,
+): string {
+  if (liveStartup) {
+    if (liveStartup.protection === "service" && liveStartup.serviceViable) {
+      return `running under the live managed service (logs: ${serviceLogPath()})`;
+    }
+    const state = [
+      liveStartup.serviceInstalled ? "installed" : "absent",
+      liveStartup.serviceRunning ? "running" : "not running",
+      liveStartup.serviceViable ? "viable" : "not viable",
+    ].join(", ");
+    const action = liveStartup.recommendedCommand ? `; run '${liveStartup.recommendedCommand}'` : "";
+    return `live startup reports service ${state}${action} (logs: ${serviceLogPath()})`;
+  }
+  return service.installed && !live
+    ? `${service.summary} — registered but NOT serving; see ${serviceLogPath()} and re-run 'ocx service repair'`
+    : service.summary;
 }
 
 /**
@@ -502,7 +589,97 @@ export function unusedProxyWarningLines(input: {
   ];
 }
 
-export async function collectStatus(): Promise<CliStatusView> {
+/**
+ * The mirror case: routing is ours and nothing is answering it.
+ *
+ * #5261: this state does not merely fail model calls. The root `openai_base_url` we inject
+ * is the base URL of Codex's own built-in openai provider, so with the proxy down a user can
+ * be stopped at Codex sign-in with no mention of opencodex anywhere on the screen. The
+ * injection is on disk and survives reboot, so it does not clear itself.
+ *
+ * The rest of the not-running report offers only ways to bring the proxy BACK, which is the
+ * wrong half of the choice for someone who wants their editor working again now. `ocx restore`
+ * needs no proxy, no management API and no network, so name it here — this report is the
+ * surface such a user is most likely to reach before the config file itself.
+ *
+ * Restricted to routing opencodex owns. `custom-local` is somebody else's gateway, and
+ * `ocx restore` would not remove it.
+ */
+export function deadProxyRoutingAdviceLines(input: {
+  proxyUp: boolean;
+  routingKind: StartupHealth["routingKind"];
+}): string[] {
+  if (input.proxyUp || input.routingKind !== "opencodex-local") return [];
+  return [
+    "Codex is still pointed at this proxy, so sign-in and model requests both fail while it is down.",
+    "To hand Codex back to its own account and endpoints without starting anything: ocx restore",
+  ];
+}
+
+/**
+ * Read the live Codex config and report an opencodex catalog pointer whose file is gone.
+ *
+ * Unreadable or absent config is reported as no finding rather than as a problem: this is a
+ * diagnostic line, and inventing one from missing evidence is worse than staying quiet.
+ */
+export function detectMissingCodexCatalogPath(): string | null {
+  try {
+    if (!existsSync(CODEX_CONFIG_PATH)) return null;
+    return missingOwnedCatalogPath(readFileSync(CODEX_CONFIG_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Owned Codex routing that names a local port the live proxy does not serve.
+ *
+ * `classifyCodexRouting` calls that "opencodex-local" whatever the port, so without this line the
+ * state behind a killed second instance was invisible here. Detection is `routing-drift.ts`, the
+ * same rule the owner's healer uses; this only reports and reads the journal without side effects.
+ * A sibling's report says nothing: its routing correctly names the owner it runs beside. Whether a
+ * healer runs, or is gated or paused, is not visible from here, so the line promises only `ocx sync`.
+ */
+export function codexRoutingDriftWarning(input: {
+  content: string | null;
+  livePort: number | undefined;
+  loopbackPort: number | null;
+  /** `siblingOfPort` from this home's runtime record. */
+  siblingOfPort: number | undefined;
+  journaled: () => JournaledCodexRouting;
+}): string | null {
+  const { content, livePort, loopbackPort } = input;
+  if (content === null || livePort === undefined || input.siblingOfPort !== undefined) return null;
+  const drift = detectCodexRoutingDrift(content, {
+    ownPorts: loopbackPort === null ? [livePort] : [livePort, loopbackPort],
+    journaled: input.journaled,
+  });
+  if (drift.kind !== "foreign") return null;
+  const ports = [...new Set(drift.targets.map(target => target.port))].join(", ");
+  return `Codex routing points at port ${ports}, but the proxy is on ${livePort}; if nothing serves that port, `
+    + "new Codex threads fail with \"Connection refused\". Run 'ocx sync' to re-point it now; a running "
+    + "owner proxy may also do that on its own once the port stays dead.";
+}
+
+/**
+ * The one state in this report where Codex is broken independently of the proxy (#5261).
+ *
+ * A `model_catalog_json` naming a file that is gone stops Codex loading its configuration at
+ * all, so it presents as the same blank wall as dead routing while having a different cause and
+ * a different fix. Both are named, because restarting the proxy rewrites the catalog and
+ * restoring removes the pointer, and which one the user wants is their choice, not ours.
+ */
+export function missingCodexCatalogLines(missingCatalogPath: string | null): string[] {
+  if (!missingCatalogPath) return [];
+  return [
+    "⚠️  Codex is pointed at a model catalog that is no longer on disk, so Codex cannot load its config:",
+    `   ${missingCatalogPath}`,
+    "   Regenerate it with 'ocx start', or remove opencodex from Codex with 'ocx restore'.",
+  ];
+}
+
+/** `mainAccountPolicy`: only `--json` asks; the human report reads the same accounts once via OAuth health. */
+export async function collectStatus(options: { mainAccountPolicy?: boolean } = {}): Promise<CliStatusView> {
   const configDiagnostics = readConfigDiagnostics();
   const config = configDiagnostics.config;
   const claudeDesktop = {
@@ -540,6 +717,9 @@ export async function collectStatus(): Promise<CliStatusView> {
   const live = await findLiveProxy({
     configFn: () => ({ port: config.port, hostname: config.hostname }),
   });
+  const mainAccountHardLock = options.mainAccountPolicy && live
+    ? (await (await import("../oauth/health")).fetchCodexHealthFromLiveProxy(undefined, async () => live)).mainAccountHardLock
+    : undefined;
   const pidFile = readPid();
   // Preserve an authoritative null from orphan/legacy liveness — do not restore pidFile.
   const pid = resolveStatusPid(live, pidFile);
@@ -572,20 +752,19 @@ export async function collectStatus(): Promise<CliStatusView> {
     hostname: config.hostname,
   });
   const bunRuntime = durableBunRuntime();
+  const liveStartup = live ? await fetchLiveStartupHealth(live) : null;
   const service = diagnoseService();
   // A service can be registered and still not serve: the manager reports the job
-  // either way. `live` was already identity-probed a few lines above, so cross-check
-  // rather than print registration as if it were service.
-  const serviceSummary = service.installed && !live
-    ? `${service.summary} — registered but NOT serving; see ${serviceLogPath()} and re-run 'ocx service repair'`
-    : service.summary;
+  // either way. When the identity-probed live proxy provides an attested startup verdict,
+  // prefer it over a shell-local service-manager probe that lacks the service environment.
+  const serviceSummary = statusServiceSummary(liveStartup, service, Boolean(live));
   const codexShim = diagnoseCodexShim();
   const codexShimSummary = codexShim.summary;
-  const startup = collectStartupHealth(config, {
+  const startup = selectStatusStartupHealth(liveStartup, () => collectStartupHealth(config, {
     service,
     shim: codexShim,
     routingKind: getCodexRoutingKind(),
-  });
+  }));
   const codexPlugins = diagnoseCodexBundledPlugins();
   const lastClamp = loadLastEffortClamp();
   const clampActive = effortClampAppliesToRuntime(lastClamp, resolvedRuntime.runtime);
@@ -640,6 +819,25 @@ export async function collectStatus(): Promise<CliStatusView> {
       + `${grokDrift.livePort}; grok turns will retry against a closed port. Run 'ocx ensure' to repoint it.`,
     );
   }
+  const codexDrift = (() => {
+    if (!health.ok) return null;
+    try {
+      const siblingOfPort = readRuntimePort()?.siblingOfPort;
+      return codexRoutingDriftWarning({
+        content: siblingOfPort === undefined ? readFileSync(CODEX_CONFIG_PATH, "utf8") : null,
+        livePort: listen.port,
+        loopbackPort: effectiveLoopbackListenerPort(config, listen.port),
+        siblingOfPort,
+        journaled: () => ({
+          openaiBaseUrl: journaledInjectedOpenaiBaseUrl({ readOnly: true }),
+          realtimeWsBaseUrl: journaledInjectedRealtimeWsBaseUrl({ readOnly: true }),
+        }),
+      });
+    } catch {
+      return null; // an absent or unreadable config.toml must never break `ocx status`
+    }
+  })();
+  if (codexDrift) warningParts.push(codexDrift);
   const codexRuntime = {
     path: displayCodexRuntimePath(resolvedRuntime.runtime.command),
     version: resolvedRuntime.runtime.version,
@@ -673,6 +871,7 @@ export async function collectStatus(): Promise<CliStatusView> {
     proxyLabel,
     healthLabel: health.label,
     json: {
+      ...(mainAccountHardLock ? { mainAccountHardLock } : {}),
       schemaVersion: 1,
       runtimeRole: config.runtimeRole ?? "standalone",
       proxy: {

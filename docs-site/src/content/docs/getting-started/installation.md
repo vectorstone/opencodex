@@ -49,6 +49,26 @@ ocx --version
 opencodex --version
 ```
 
+If you install the background service from a shell using fnm, nvm, mise, asdf, or volta,
+OpenCodex leaves shell-local multishell directories out of the service PATH. On Linux it
+selects a durable `ocx` launcher when available; otherwise it uses the package's Bun
+runtime. Run `ocx service repair` after an older service was installed from a temporary
+multishell directory. On macOS, repair reloads launchd when it changes the saved plist.
+
+## Standalone binary (no npm)
+
+Release downloads also include a standalone `ocx` binary for supported macOS, Linux, and Windows
+targets. It includes the Bun runtime and dashboard, so npm, Node, and a separate Bun installation
+are not required. Download the archive for your platform, extract it, and run:
+
+```bash
+./ocx --version
+./ocx start
+```
+
+The extracted `gui/dist` and `keyring` directories must stay beside the binary. The first serves
+the dashboard; the second carries the platform-native OS credential-store binding.
+
 ### Release channels
 
 The stable `latest` channel already includes GPT-5.6 Sol/Terra/Luna catalog support for ChatGPT,

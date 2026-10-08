@@ -15,6 +15,7 @@ import { withUpstreamHttpVersion } from "../lib/upstream-http-version";
 import { parseSidecarSSE, type WebSearchResult } from "./parse";
 import type { CodexUpstreamOutcome } from "../codex/routing";
 import { NATIVE_RESERVE_MODEL } from "../codex/catalog/native-models";
+import { openAiSidecarCreditRefusal } from "../providers/openai-sidecar-credit";
 
 export interface SidecarSettings {
   model: string;
@@ -48,13 +49,17 @@ export type SidecarOutcome = WebSearchResult & { error?: string };
  *
  * The forward backend throttles burst sidecar traffic, and without a replay the 429 becomes a
  * failed tool result that poisons the query for the whole turn (see failedQueries in loop.ts).
- * 1 initial send + 2 replays; Retry-After is honored as a lower bound and capped by
- * RETRY_AFTER_CEILING_MS (an instruction past the ceiling ends with the 429 instead of
- * parking the search). Each wait releases the unread 429 body first so sockets do not
- * accumulate under a rate-limit storm. Abort or timeout ends the wait through the existing
- * catch, exactly like an abort during the SSE parse.
+ * 1 initial send + 2 replays, counted as physical sends: connection-reset recovery inside each
+ * send draws from the same SIDECAR_MAX_SENDS budget, so the two layers cannot multiply into nine
+ * paid requests during a degraded period. Retry-After is honored as a lower bound and capped by
+ * RETRY_AFTER_CEILING_MS and the remaining sidecar deadline (an instruction past either
+ * ends with the 429 instead of parking the search). Each wait releases the unread 429 body first so sockets do not
+ * accumulate under a rate-limit storm. The release itself may take up to a second, so a
+ * deadline landing during release or backoff ends with the 429 already in hand rather than
+ * a timeout; a caller abort still ends the wait through the shared catch, exactly like an
+ * abort during the SSE parse. An exhausted budget likewise ends with the 429 in hand.
  */
-const SIDECAR_429_MAX_ATTEMPTS = 3;
+const SIDECAR_MAX_SENDS = 3;
 const SIDECAR_429_BASE_DELAY_MS = 1_000;
 const SIDECAR_429_MAX_DELAY_MS = 10_000;
 
@@ -74,6 +79,7 @@ export async function runWebSearch(
   settings: SidecarSettings,
   abortSignal?: AbortSignal,
   recordOutcome?: SidecarOutcomeRecorder,
+  beforeDispatch?: () => void,
 ): Promise<SidecarOutcome> {
   if (settings.reserveCompatibility && settings.model === NATIVE_RESERVE_MODEL) {
     return { text: "", sources: [], error: "Luna Reserve compatibility is only available as a conversation model, not a search helper. Choose another search helper model." };
@@ -98,29 +104,44 @@ export async function runWebSearch(
     stream: true,
   };
   const url = `${forwardProvider.baseUrl}/responses`;
+  // t0 precedes the deadline timer's start so the remaining-time check stays conservative.
+  const t0 = Date.now();
   const linkedSignal = signalWithTimeout(settings.timeoutMs, abortSignal);
   const sidecarExit = sidecarEnter("web-search");
-  const t0 = Date.now();
   try {
+    // One physical-send budget for the whole search. Each helper call receives only what is left
+    // and reports every send it makes, reset retries included.
+    let sendsLeft = SIDECAR_MAX_SENDS;
     const sendOnce = () => fetchWithResetRetry(
       // Recovery nests INSIDE the version helper: applyUpstreamRecoveryInit then always receives a
       // defined init, and withUpstreamHttpVersion spreads the result, so `protocol` and the
       // recovery fields (`connection: close` + Bun's transport-level `keepalive: false`) survive
       // together. The reverse order needs a `?? init` fallback to type-check at all.
-      recovery => fetch(url, withUpstreamHttpVersion(url, applyUpstreamRecoveryInit({
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: linkedSignal.signal,
-        // Credential-bearing: do not follow a cross-origin 3xx. Bun strips `Authorization`
-        // across origins but forwards nonstandard headers such as `chatgpt-account-id`,
-        // `session_id`, and `x-codex-turn-metadata` to the redirect target.
-        redirect: "manual",
-      }, recovery), forwardProvider)),
-      { replaySafe: true, abortSignal: linkedSignal.signal, label: "web-search-sidecar" },
+      recovery => {
+        beforeDispatch?.();
+        return fetch(url, withUpstreamHttpVersion(url, applyUpstreamRecoveryInit({
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: linkedSignal.signal,
+          // Credential-bearing: do not follow a cross-origin 3xx. Bun strips `Authorization`
+          // across origins but forwards nonstandard headers such as `chatgpt-account-id`,
+          // `session_id`, and `x-codex-turn-metadata` to the redirect target.
+          redirect: "manual",
+        }, recovery), forwardProvider));
+      },
+      {
+        replaySafe: true,
+        abortSignal: linkedSignal.signal,
+        label: "web-search-sidecar",
+        attempts: sendsLeft,
+        onSendsConsumed: sends => { sendsLeft -= sends; },
+      },
     );
     let res = await sendOnce();
-    for (let attempt = 0; res.status === 429 && attempt + 1 < SIDECAR_429_MAX_ATTEMPTS; attempt++) {
+    // Checked before the 429 body is released: a budget found spent after the release could only
+    // end in a send-budget error, recorded as a connection failure instead of the quota evidence.
+    for (let attempt = 0; res.status === 429 && sendsLeft > 0; attempt++) {
       const delay = retryBackoffDelayMs(attempt, {
         baseDelayMs: SIDECAR_429_BASE_DELAY_MS,
         maxDelayMs: SIDECAR_429_MAX_DELAY_MS,
@@ -129,10 +150,19 @@ export async function runWebSearch(
       });
       // A deadline, not a clamp: an instruction past the ceiling ends the search with the
       // 429 instead of parking it at a provider that already said it would refuse.
-      if (delay > RETRY_AFTER_CEILING_MS) break;
-      console.warn(`[web-search] sidecar HTTP 429 — retrying (${attempt + 2}/${SIDECAR_429_MAX_ATTEMPTS}) after ${delay}ms`);
-      await releaseResponseBodyBestEffort(res.body, linkedSignal.signal);
-      await sleepWithAbort(delay, linkedSignal.signal);
+      if (delay > RETRY_AFTER_CEILING_MS || delay >= settings.timeoutMs - (Date.now() - t0)) break;
+      console.warn(`[web-search] sidecar HTTP 429 — retrying (send ${SIDECAR_MAX_SENDS - sendsLeft + 1}/${SIDECAR_MAX_SENDS}) after ${delay}ms`);
+      try {
+        await releaseResponseBodyBestEffort(res.body, linkedSignal.signal);
+        await sleepWithAbort(delay, linkedSignal.signal);
+      } catch (e) {
+        // The release above may consume up to 1s, so the sidecar deadline can land during
+        // cleanup or mid-backoff — before the replay is dispatched. The observed 429 is
+        // already in hand: end with it rather than laundering it into a timeout. A caller
+        // abort (or a non-deadline throw) still propagates to the shared catch below.
+        if (!linkedSignal.signal.aborted || linkedSignal.signal.reason === abortSignal?.reason) throw e;
+        break;
+      }
       res = await sendOnce();
     }
     // Attach the body guard before ANY branch reads it. The success path guarded itself below,
@@ -155,6 +185,8 @@ export async function runWebSearch(
       detachBodyGuard();
     }
   } catch (e) {
+    const policyRefusal = openAiSidecarCreditRefusal(e);
+    if (policyRefusal) return { text: "", sources: [], error: policyRefusal.message };
     const kind = e instanceof Error && e.name === "TimeoutError" ? "timeout" : "connect_error";
     const callerAborted = abortSignal?.aborted === true
       && linkedSignal.signal.aborted

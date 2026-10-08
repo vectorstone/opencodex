@@ -13,13 +13,15 @@ import {
   MAIN_CODEX_ACCOUNT_ID,
   type NativeMainRefreshDependencies,
 } from "./main-account";
+import { withNativeMainCredentialAdmission } from "./native-main-admission";
 import {
   ACCOUNT_GATED_NATIVE_OPENAI_MODELS,
   NATIVE_GPT6_ASTRA_MODEL,
 } from "./catalog/native-models";
 import { loadPersistedCodexRuntime } from "./runtime";
 import { codexRuntimeStateEpoch } from "./runtime";
-import upstreamModelsSnapshot from "./data/upstream-models.json";
+import { recordDiscoveredNativeModels, validateDiscoveredNativeRows } from "./catalog/discovered-natives";
+import { pinnedNativeModelRows } from "./catalog/pinned-models";
 import { codexCredentialMutationEpoch } from "./credential-mutation-epoch";
 import {
   clearObservedCodexModelDenial,
@@ -89,9 +91,10 @@ export function deriveGatedClientVersionFloor(
 /**
  * Lowest `client_version` MEASURED to actually return the account-gated rows.
  *
- * The bundled snapshot is not sufficient on its own. It records `0.142.2` for the gpt-5.6
- * rows, and `0.142.2` is a version upstream answers with 200 and five models, none of them
- * gpt-5.6; `0.144.0` and above answer with the gated rows present
+ * The bundled snapshot was not sufficient on its own. Until the 2026-09-23 re-pin it recorded
+ * `0.142.2` for the gpt-5.6 rows (upstream now records `0.144.0`), and `0.142.2` is a version
+ * upstream answers with 200 and five models, none of them gpt-5.6; `0.144.0` and above answer
+ * with the gated rows present
  * (devlog/_fin/260817_native_gpt56_1m_context/001_measurement_evidence.md, independently
  * reproduced by the #2886 and #3022 reporters). So a floor derived from the snapshot alone
  * asks a question whose honest answer is an empty gated set — and the fail-closed gate then
@@ -106,9 +109,9 @@ const MEASURED_GATED_CLIENT_VERSION_MINIMUM = "0.144.0";
 /**
  * Lowest versions measured to return each account-gated model when the account owns it.
  *
- * This is deliberately independent of the bundled upstream snapshot. The snapshot still
- * records 0.142.2 for sol/terra/luna, while live measurements show that upstream omits them
- * below 0.144.0. Daybreak has no snapshot row or independent minimum, so its omission remains
+ * This is deliberately independent of the bundled upstream snapshot, which can lag or lead the
+ * live roster: live measurements show that upstream omits sol/terra/luna below 0.144.0.
+ * Daybreak's shipped row records 0.142.2 and has no independent measured minimum, so its omission remains
  * authoritative instead of inheriting a guessed floor from another model.
  */
 export const ACCOUNT_GATED_NATIVE_MODEL_MINIMUM_CLIENT_VERSIONS: ReadonlyMap<string, string> = new Map([
@@ -120,8 +123,8 @@ export const ACCOUNT_GATED_NATIVE_MODEL_MINIMUM_CLIENT_VERSIONS: ReadonlyMap<str
 /**
  * Fallback when the snapshot records no usable gated floor.
  *
- * Not every gated slug carries a `minimal_client_version` — `gpt-daybreak-blue-latest` has no
- * row in the current snapshot at all — so the derivation can legitimately come back empty as the
+ * Not every gated slug is guaranteed a `minimal_client_version` — `gpt-daybreak-blue-latest` had
+ * no row until the 2026-09-23 re-pin — so the derivation can legitimately come back empty as the
  * gated set changes. This is the last resort behind it, and it is still a version upstream can
  * filter on rather than the placeholder that caused #2886.
  */
@@ -146,8 +149,11 @@ function composeGatedClientVersionFloor(
     : MEASURED_GATED_CLIENT_VERSION_MINIMUM;
 }
 
+// Reads every pinned row (codex-rs snapshot plus roster-captured rows), so a gated slug whose row
+// arrives through roster-pinned-models.json still contributes its floor. None does today:
+// gpt-6-sol/luna and gpt-6.1-sol are ungated, and gpt-6-astra-minor has no row and no measured minimum.
 export const GATED_MODEL_CLIENT_VERSION_FLOOR: string = composeGatedClientVersionFloor(
-  (upstreamModelsSnapshot as { models?: Array<Record<string, unknown>> }).models ?? [],
+  pinnedNativeModelRows(),
 );
 
 /** Test-only seam: the composition on synthetic rows, so both directions can be proven. */
@@ -402,16 +408,22 @@ interface CachedAccountModels {
   readonly clientVersion: string;
   readonly expiresAt: number;
   readonly models: ReadonlySet<string>;
+  readonly accessProgramsByModel?: ReadonlyMap<string, CodexAvailableAccessPrograms>;
+  readonly availabilityNuxByModel?: ReadonlyMap<string, { message: string }>;
   readonly confirmed: boolean;
   readonly provenance?: CodexModelEntitlementProvenance;
 }
 
 export interface CodexModelEntitlementSnapshot {
   readonly modelsByAccount: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly accessProgramsByAccount?: ReadonlyMap<string, ReadonlyMap<string, CodexAvailableAccessPrograms>>;
+  readonly availabilityNuxByAccount?: ReadonlyMap<string, ReadonlyMap<string, { message: string }>>;
   readonly clientVersionByAccount: ReadonlyMap<string, string>;
   readonly confirmedAccountIds: ReadonlySet<string>;
   readonly credentialIdentities: ReadonlyMap<string, string>;
 }
+
+export type CodexAvailableAccessPrograms = Readonly<Record<string, readonly string[]>> | null;
 
 export type CodexModelEntitlementState = "granted" | "denied" | "unknown";
 
@@ -439,6 +451,12 @@ export interface CodexModelEntitlementResolveOptions {
   readonly excludeAccountIds?: ReadonlySet<string>;
   /** Ensure-only fence; ordinary request resolvers retain their established flight identity. */
   readonly credentialMutationEpoch?: number;
+  /**
+   * Internal plumbing from `withNativeMainCredentialAdmission`: releases the
+   * native-main lifecycle lease once the credential phase settles, before any
+   * upstream roster fetch, so a profile drain never waits on network work.
+   */
+  readonly releaseNativeMainCredentialLease?: () => void;
 }
 
 export interface CodexEntitlementFreshnessOptions extends Pick<
@@ -452,6 +470,8 @@ export interface CodexEntitlementFreshnessOptions extends Pick<
   | "signal"
 > {
   readonly waitMs?: number;
+  /** Test seam for the native-main admission fence around the refresh workset. */
+  readonly nativeMainCredentialAdmission?: typeof withNativeMainCredentialAdmission;
 }
 
 const accountModelsCache = new Map<string, CachedAccountModels>();
@@ -581,21 +601,31 @@ function currentCredentialIdentity(accountId: string): string | undefined {
 
 async function accountCredentialSnapshot(
   accountId: string,
-  options: Pick<CodexModelEntitlementResolveOptions, "nativeMainRefreshDependencies" | "signal"> = {},
+  options: Pick<
+    CodexModelEntitlementResolveOptions,
+    "nativeMainRefreshDependencies" | "releaseNativeMainCredentialLease" | "signal"
+  > = {},
 ): Promise<CodexModelEntitlementCredentialSnapshot | null> {
   if (accountId === MAIN_CODEX_ACCOUNT_ID) {
-    const token = await getValidMainAccountToken({
-      signal: options.signal,
-      ...(options.nativeMainRefreshDependencies ?? {}),
-    });
-    return token
-      ? {
-        accountId,
-        accessToken: token.accessToken,
-        chatgptAccountId: token.chatgptAccountId,
-        credentialIdentity: `main:${token.chatgptAccountId}`,
-      }
-      : null;
+    try {
+      const token = await getValidMainAccountToken({
+        signal: options.signal,
+        ...(options.nativeMainRefreshDependencies ?? {}),
+      });
+      return token
+        ? {
+          accountId,
+          accessToken: token.accessToken,
+          chatgptAccountId: token.chatgptAccountId,
+          credentialIdentity: `main:${token.chatgptAccountId}`,
+        }
+        : null;
+    } finally {
+      // The lifecycle lease fences only this credential read; releasing here —
+      // on success and on a credential-ownership failure alike — keeps a
+      // profile drain from waiting on the roster fetches that follow.
+      options.releaseNativeMainCredentialLease?.();
+    }
   }
   try {
     const token = await getValidCodexToken(accountId);
@@ -610,17 +640,51 @@ async function accountCredentialSnapshot(
   }
 }
 
-function parseAccountModels(text: string): ReadonlySet<string> | null {
+const AVAILABILITY_MESSAGE_MAX_CODE_UNITS = 2_000;
+// Codex parses the catalog with a strict JSON reader that rejects a lone surrogate escape.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** Trim and cap a prompt without leaving half of a surrogate pair at the cut or anywhere else. */
+function boundedAvailabilityMessage(message: string): string {
+  return message.trim().slice(0, AVAILABILITY_MESSAGE_MAX_CODE_UNITS).replace(LONE_SURROGATE, "").trim();
+}
+
+/** Keep valid roster slugs while dropping malformed program and availability metadata. */
+function parseAccountModels(text: string): {
+  discoveredRows: Record<string, unknown>[];
+  models: ReadonlySet<string>;
+  accessProgramsByModel: ReadonlyMap<string, CodexAvailableAccessPrograms>;
+  availabilityNuxByModel: ReadonlyMap<string, { message: string }>;
+} | null {
   try {
     const payload = JSON.parse(text) as { models?: unknown };
     if (!Array.isArray(payload.models)) return null;
+    const accessProgramsByModel = new Map<string, CodexAvailableAccessPrograms>();
+    const availabilityNuxByModel = new Map<string, { message: string }>();
     const models = payload.models.flatMap(entry => {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
-      const row = entry as { slug?: unknown; supported_in_api?: unknown; visibility?: unknown };
+      const row = entry as { slug?: unknown; supported_in_api?: unknown; visibility?: unknown; available_access_programs?: unknown; availability_nux?: unknown };
       if (typeof row.slug !== "string" || row.supported_in_api !== true || row.visibility === "hide") return [];
+      const nux = row.availability_nux;
+      if (nux && typeof nux === "object" && !Array.isArray(nux)) {
+        const message = (nux as { message?: unknown }).message;
+        const bounded = typeof message === "string" ? boundedAvailabilityMessage(message) : "";
+        if (bounded) availabilityNuxByModel.set(row.slug, { message: bounded });
+      }
+      const programs = row.available_access_programs;
+      if (programs === null) accessProgramsByModel.set(row.slug, null);
+      else if (programs && typeof programs === "object" && !Array.isArray(programs)) {
+        const record = programs as Record<string, unknown>;
+        if (Array.isArray(record.cyber) && record.cyber.every(item => typeof item === "string")) {
+          const validPrograms = Object.fromEntries(Object.entries(record).filter(([, value]) =>
+            Array.isArray(value) && value.every(item => typeof item === "string"))) as Record<string, string[]>;
+          accessProgramsByModel.set(row.slug, validPrograms);
+        }
+      }
       return [row.slug];
     });
-    return new Set(models);
+    return { models: new Set(models), accessProgramsByModel, availabilityNuxByModel,
+      discoveredRows: validateDiscoveredNativeRows(payload.models) };
   } catch {
     return null;
   }
@@ -646,6 +710,7 @@ function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && error.name === "TimeoutError";
 }
 
+/** Fetch one bounded, version-scoped roster; failures and empty results remain unconfirmed for a short retry. */
 async function fetchAccountModels(
   credential: CodexModelEntitlementCredentialSnapshot,
   fetcher: typeof fetch,
@@ -679,8 +744,8 @@ async function fetchAccountModels(
     if (!body.displaySafe || body.truncated) {
       return unconfirmedAccountModels(credential, clientVersion, now, { kind: "unparseable" });
     }
-    const models = parseAccountModels(body.text);
-    if (models === null) {
+    const parsed = parseAccountModels(body.text);
+    if (parsed === null) {
       return unconfirmedAccountModels(credential, clientVersion, now, { kind: "unparseable" });
     }
     // A roster is a confirmation only when it lists something usable. `models` is a Set, and an
@@ -690,10 +755,12 @@ async function fetchAccountModels(
     // account asked under too old a client version answers with no gated rows, and treating
     // that as authoritative is exactly how 2.36.0 denied sol/terra/luna to accounts that own
     // them (#3022). No usable rows means unconfirmed, on the 15s failure TTL, asked again.
+    const { models, accessProgramsByModel, availabilityNuxByModel } = parsed;
     const usable = models.size > 0;
     if (!usable) {
       return unconfirmedAccountModels(credential, clientVersion, now, { kind: "parsed-empty" });
     }
+    recordDiscoveredNativeModels(parsed.discoveredRows, clientVersion, now);
     const hasUnknownGatedAbsence = [...ACCOUNT_GATED_NATIVE_MODEL_MINIMUM_CLIENT_VERSIONS]
       // Reachable only through tier 1, an inbound client_version below the floor. Every other
       // resolution is now structurally >= every recorded minimum, because the floor is the max
@@ -712,6 +779,8 @@ async function fetchAccountModels(
         ? MODEL_ROSTER_TTL_MS
         : MODEL_ROSTER_FAILURE_TTL_MS),
       models,
+      accessProgramsByModel,
+      availabilityNuxByModel,
       confirmed: true,
     };
   } catch (error) {
@@ -722,6 +791,123 @@ async function fetchAccountModels(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Client version the discovery-only roster request claims.
+ *
+ * Upstream filters `/models` by client version AND by a rollout gate the row's own
+ * `minimal_client_version` does not describe: on 2026-09-30 `gpt-6.1-sol` carried
+ * `minimal_client_version: "0.153.0"` yet was served only to `client_version >= 0.159.0`, while the
+ * installed Codex was 0.158.0-alpha. Asking under the installed version (what the entitlement path
+ * must do, #2886) therefore could not see the model at all. Discovery asks as a client newer than
+ * any release so it sees the whole roster; this proxy already serves pinned rows to older
+ * clients, so the version only widens what we learn, never what an account may call.
+ */
+export const CODEX_ROSTER_DISCOVERY_CLIENT_VERSION = "99.0.0";
+
+export type CodexNativeRosterDiscoveryOutcome = "recorded" | "not-modified" | "unavailable";
+
+export interface CodexNativeRosterDiscoveryOptions extends Pick<
+  CodexModelEntitlementResolveOptions,
+  "credentials" | "fetcher" | "signal" | "now" | "nativeMainRefreshDependencies"
+> {
+  /** Checked right before publication; false means the caller's scheduler generation is gone. */
+  readonly isCurrent?: () => boolean;
+}
+
+/**
+ * Last ETag per credential identity, so an unchanged roster costs a 304 when upstream honours it.
+ * A 304 carries no rows and so cannot renew a discovery's last-seen time; a model visible only
+ * under the discovery version would then expire after its retention while still being served.
+ * The ETag is therefore used only within a day of the full fetch that earned it.
+ */
+const discoveryEtags = new Map<string, { etag: string; fetchedAt: number }>();
+const DISCOVERY_ETAG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Background discovery of native rows this build does not pin, independent of entitlement.
+ *
+ * It never writes the entitlement cache: a roster fetched under the discovery version answers a
+ * different question than "may this client call this model", and letting it satisfy entitlement
+ * reads would reintroduce the cross-version leak #2548/#2886 closed. The first account that
+ * answers is enough to learn a row; whether a given account may call it stays with the
+ * entitlement path and, for ungated rows, with the upstream status the request receives.
+ */
+export async function discoverCodexNativeRoster(
+  config: Pick<OcxConfig, "codexAccounts">,
+  options: CodexNativeRosterDiscoveryOptions = {},
+): Promise<CodexNativeRosterDiscoveryOutcome> {
+  const fetcher = options.fetcher ?? fetch;
+  const run = async (excluded: ReadonlySet<string>, releaseMainLease?: () => void) => {
+    const credentials: CodexModelEntitlementCredentialSnapshot[] = [...(options.credentials ?? [])];
+    for (const accountId of options.credentials ? [] : normalizedCandidateAccountIds(config)) {
+      if (excluded.has(accountId)) continue;
+      const credential = await accountCredentialSnapshot(accountId, {
+        nativeMainRefreshDependencies: options.nativeMainRefreshDependencies,
+        signal: options.signal,
+      }).catch(() => null);
+      if (credential) credentials.push(credential);
+    }
+    releaseMainLease?.();
+    for (const credential of credentials) {
+      const outcome = await fetchDiscoveryRoster(credential, fetcher, options).catch(() => "unavailable" as const);
+      if (outcome !== "unavailable") return outcome;
+    }
+    return "unavailable" as const;
+  };
+  try {
+    return await withNativeMainCredentialAdmission(run);
+  } catch {
+    return "unavailable";
+  }
+}
+
+async function fetchDiscoveryRoster(
+  credential: CodexModelEntitlementCredentialSnapshot,
+  fetcher: typeof fetch,
+  options: Pick<CodexNativeRosterDiscoveryOptions, "signal" | "now" | "isCurrent">,
+): Promise<CodexNativeRosterDiscoveryOutcome> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(options.signal?.reason);
+  options.signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new DOMException("Codex model discovery timed out", "TimeoutError")), MODEL_ROSTER_TIMEOUT_MS);
+  try {
+    const headers = new Headers({ Authorization: `Bearer ${credential.accessToken}`, Accept: "application/json" });
+    if (credential.chatgptAccountId) headers.set("ChatGPT-Account-Id", credential.chatgptAccountId);
+    const now = options.now ?? Date.now();
+    const cached = discoveryEtags.get(credential.credentialIdentity);
+    if (cached && now - cached.fetchedAt < DISCOVERY_ETAG_MAX_AGE_MS) headers.set("If-None-Match", cached.etag);
+    const response = await fetcher(codexModelsUrl(CODEX_ROSTER_DISCOVERY_CLIENT_VERSION), {
+      headers,
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (response.status === 304) return "not-modified";
+    if (!response.ok) return "unavailable";
+    const body = await readBoundedResponseBody(response, {
+      signal: controller.signal,
+      maxBytes: MODEL_ROSTER_MAX_BYTES,
+      fatalUtf8: true,
+    });
+    if (!body.displaySafe || body.truncated) return "unavailable";
+    const parsed = parseAccountModels(body.text);
+    if (parsed === null || parsed.models.size === 0) return "unavailable";
+    if (controller.signal.aborted || options.isCurrent?.() === false) return "unavailable";
+    recordDiscoveredNativeModels(parsed.discoveredRows, CODEX_ROSTER_DISCOVERY_CLIENT_VERSION, now);
+    const nextEtag = response.headers.get("etag");
+    if (nextEtag && nextEtag.length <= 256) discoveryEtags.set(credential.credentialIdentity, { etag: nextEtag, fetchedAt: now });
+    else discoveryEtags.delete(credential.credentialIdentity);
+    if (discoveryEtags.size > 64) discoveryEtags.delete(discoveryEtags.keys().next().value!);
+    return "recorded";
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", abort);
+  }
+}
+
+export function resetCodexNativeRosterDiscoveryForTests(): void {
+  discoveryEtags.clear();
 }
 
 function directCallerCredential(headers: Headers): CodexModelEntitlementCredentialSnapshot | null {
@@ -911,38 +1097,58 @@ async function refreshCodexEntitlementWorkset(
   mutationEpoch: number,
   options: CodexEntitlementFreshnessOptions,
 ): Promise<void> {
-  const credentialSnapshot = options.credentialSnapshot ?? accountCredentialSnapshot;
-  const observations = await Promise.all(workset.map(async accountId => {
-    const credential = await credentialSnapshot(accountId, options);
-    return {
-      accountId,
-      credential,
-      absenceObservedAt: options.now ?? Date.now(),
-    };
-  }));
-  const credentials = observations.flatMap(observation => observation.credential
-    ? [observation.credential]
-    : []);
-  if (credentials.length > 0) {
-    await resolveCodexModelEntitlements(config, {
-      ...options,
-      clientVersion,
-      credentialMutationEpoch: mutationEpoch,
-      credentials,
-    });
-  }
+  const run = async (
+    excludedAccountIds: ReadonlySet<string>,
+    releaseMainLease?: () => void,
+  ): Promise<void> => {
+    // An excluded main is filtered before the snapshot phase, not just before the
+    // roster fetch: it never produces an absence observation, so a denied
+    // admission cannot memoize a credential read that never happened.
+    const admittedWorkset = excludedAccountIds.size === 0
+      ? workset
+      : workset.filter(accountId => !excludedAccountIds.has(accountId));
+    const credentialSnapshot = options.credentialSnapshot ?? accountCredentialSnapshot;
+    const observations = await Promise.all(admittedWorkset.map(async accountId => {
+      const credential = await credentialSnapshot(accountId, {
+        ...options,
+        releaseNativeMainCredentialLease: releaseMainLease,
+      });
+      return {
+        accountId,
+        credential,
+        absenceObservedAt: options.now ?? Date.now(),
+      };
+    }));
+    // The lease fences only the credential phase; release before roster fetches
+    // so a profile drain never waits on upstream network work.
+    releaseMainLease?.();
+    const credentials = observations.flatMap(observation => observation.credential
+      ? [observation.credential]
+      : []);
+    if (credentials.length > 0) {
+      await resolveCodexModelEntitlements(config, {
+        ...options,
+        clientVersion,
+        credentialMutationEpoch: mutationEpoch,
+        credentials,
+      });
+    }
 
-  for (const observation of observations) {
-    if (observation.credential) continue;
-    const capturedIdentity = identityVector.get(observation.accountId) ?? null;
-    if (codexCredentialMutationEpoch() !== mutationEpoch) continue;
-    if ((currentCredentialIdentity(observation.accountId) ?? null) !== capturedIdentity) continue;
-    boundedNegativeCredentialMemoSet(observation.accountId, {
-      credentialIdentity: capturedIdentity,
-      mutationEpoch,
-      expiresAt: observation.absenceObservedAt + MODEL_ROSTER_NEGATIVE_CREDENTIAL_TTL_MS,
-    });
-  }
+    for (const observation of observations) {
+      if (observation.credential) continue;
+      const capturedIdentity = identityVector.get(observation.accountId) ?? null;
+      if (codexCredentialMutationEpoch() !== mutationEpoch) continue;
+      if ((currentCredentialIdentity(observation.accountId) ?? null) !== capturedIdentity) continue;
+      boundedNegativeCredentialMemoSet(observation.accountId, {
+        credentialIdentity: capturedIdentity,
+        mutationEpoch,
+        expiresAt: observation.absenceObservedAt + MODEL_ROSTER_NEGATIVE_CREDENTIAL_TTL_MS,
+      });
+    }
+  };
+  if (!workset.includes(MAIN_CODEX_ACCOUNT_ID)) return run(new Set<string>());
+  const admission = options.nativeMainCredentialAdmission ?? withNativeMainCredentialAdmission;
+  return admission(run);
 }
 
 function waitForEntitlementEnsureFlight(
@@ -1110,6 +1316,10 @@ export async function resolveCodexModelEntitlements(
     ? [...options.credentials].filter(credential => !options.excludeAccountIds?.has(credential.accountId))
     : (await Promise.all(allowedAccountIds.map(accountId => credentialSnapshot(accountId, options))))
       .filter((value): value is CodexModelEntitlementCredentialSnapshot => value !== null);
+  // The credential phase is the only part the native-main lease fences. The
+  // real snapshot releases it as soon as the main token settles; this boundary
+  // release keeps the guarantee when a seam snapshot never invokes it.
+  options.releaseNativeMainCredentialLease?.();
   const results = await Promise.all(credentials.map(async credential => ({
     credential,
     result: await modelsForCredential(
@@ -1126,6 +1336,14 @@ export async function resolveCodexModelEntitlements(
   })));
   return {
     modelsByAccount: new Map(results.map(({ credential, result }) => [credential.accountId, result.models])),
+    accessProgramsByAccount: new Map(results.flatMap(({ credential, result }) => (
+      result.confirmed && result.accessProgramsByModel
+        ? [[credential.accountId, result.accessProgramsByModel] as const] : []
+    ))),
+    availabilityNuxByAccount: new Map(results.flatMap(({ credential, result }) => (
+      result.confirmed && result.availabilityNuxByModel
+        ? [[credential.accountId, result.availabilityNuxByModel] as const] : []
+    ))),
     clientVersionByAccount: new Map(results.map(({ credential, result }) => (
       [credential.accountId, result.clientVersion]
     ))),

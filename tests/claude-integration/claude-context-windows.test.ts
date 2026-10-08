@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AUTO_COMPACT_WINDOW_DEFAULT, boundedContextWindows, buildClaudeContextWindows, effectiveModelEnv, resolveAutoContext, shouldMarkOneMillion, withOneMillionMarker } from "../../src/claude/context-windows";
+import { AUTO_COMPACT_WINDOW_DEFAULT, boundedContextWindows, buildClaudeContextWindows, effectiveModelEnv, nativeClaudePassthroughFor, resolveAutoContext, shouldMarkOneMillion, withOneMillionMarker } from "../../src/claude/context-windows";
 import { desktop3pAlias } from "../../src/claude/desktop-3p";
 import type { CatalogModel } from "../../src/codex/catalog";
 
@@ -15,9 +15,17 @@ describe("claude context-window map (devlog 260712 B2)", () => {
     const map = buildClaudeContextWindows([], routed);
     expect(map["cursor/gpt-5.6-luna"]).toBe(1_000_000);
     expect(map[desktop3pAlias("cursor", "gpt-5.6-luna")]).toBe(1_000_000);
+    expect(map["ocx-claude-cursor--gpt-5.6-luna"]).toBe(1_000_000);
+    // A selector saved under the legacy spelling keeps its window until it is re-picked.
     expect(map["claude-ocx-cursor--gpt-5.6-luna"]).toBe(1_000_000);
     expect(map["mock/small-model"]).toBe(128_000);
     expect(map["mock/no-window"]).toBeUndefined();
+  });
+
+  test("a saved escaped legacy selector keeps its window next to the current one", () => {
+    const map = buildClaudeContextWindows([], [{ provider: "openrouter", id: "anthropic/x-model", contextWindow: 400_000 }]);
+    expect(map["ocx-claude2-openrouter--anthropic~sx-model"]).toBe(400_000);
+    expect(map["claude-ocx2-openrouter--anthropic~sx-model"]).toBe(400_000);
   });
 
   test("registers native slugs (bare + desktop alias + legacy alias)", () => {
@@ -27,6 +35,7 @@ describe("claude context-window map (devlog 260712 B2)", () => {
     // slug passed here does not register.
     expect(map["gpt-5.6-sol"]).toBe(272_000);
     expect(map[desktop3pAlias("native", "gpt-5.6-sol")]).toBe(272_000);
+    expect(map["ocx-claude-native--gpt-5.6-sol"]).toBe(272_000);
     expect(map["claude-ocx-native--gpt-5.6-sol"]).toBe(272_000);
     expect(map["gpt-5.5"]).toBe(272_000);
     expect(map["gpt-5.3-codex-spark"]).toBeUndefined();
@@ -179,7 +188,10 @@ describe("auto-context (devlog 260712 020 + audit 021)", () => {
     // Default 272k sits under the 829,800 compact window, so the marker stays off.
     expect(env.ANTHROPIC_MODEL).toBe("gpt-5.6-sol");
     const readable = effectiveModelEnv({ model: "claude-ocx-native--gpt-5.6-sol" }, windows);
-    expect(readable.ANTHROPIC_MODEL).toBe("claude-ocx-native--gpt-5.6-sol");
+    // A legacy slot is emitted in the current spelling so Claude Code applies its window.
+    expect(readable.ANTHROPIC_MODEL).toBe("ocx-claude-native--gpt-5.6-sol");
+    const escaped = effectiveModelEnv({ tierModels: { opus: "claude-ocx2-openrouter--a~sb[1m]" } }, windows);
+    expect(escaped.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("ocx-claude2-openrouter--a~sb[1m]");
     // Opting into the measured 922k ceiling clears the compact window and marks [1m].
     const opted = buildClaudeContextWindows(["gpt-5.6-sol"], [], 922_000);
     expect(effectiveModelEnv({ model: "gpt-5.6-sol" }, opted).ANTHROPIC_MODEL).toBe("gpt-5.6-sol[1m]");
@@ -194,5 +206,56 @@ describe("auto-context (devlog 260712 020 + audit 021)", () => {
     const windows = { "cursor/gpt-5.6-luna": 1_000_000 };
     expect(withOneMillionMarker("cursor/gpt-5.6-luna[1M]", windows)).toBe("cursor/gpt-5.6-luna[1M]");
     expect(shouldMarkOneMillion(windows["cursor/gpt-5.6-luna"], { enabled: false, compactWindow: 350_000 })).toBe(true);
+  });
+});
+
+// Behind a gateway Claude Code accounts an id without `[1m]` at 200k. A native Claude id only got
+// its 1M window from a configured `anthropic` provider row, so `--model sonnet` stayed at 200k on
+// installs that reach Claude through the Claude Code login alone (#5755).
+describe("native Claude tiers on the passthrough (#5755)", () => {
+  const passthrough = {};
+
+  test("an empty config marks the Opus, Sonnet and Fable tiers and leaves Haiku unset", () => {
+    expect(effectiveModelEnv(undefined, buildClaudeContextWindows([], [], undefined, passthrough))).toEqual({
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5-5[1m]",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5[1m]",
+      ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5-1[1m]",
+    });
+  });
+
+  test("another provider's row for the same id only counts when the router decides", () => {
+    const kiro = [{ provider: "kiro", id: "claude-sonnet-5", contextWindow: 200_000 }];
+    const native = buildClaudeContextWindows([], kiro, undefined, passthrough);
+    expect(native["claude-sonnet-5"]).toBe(1_000_000);
+    expect(effectiveModelEnv(undefined, native).ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5[1m]");
+    const routed = buildClaudeContextWindows([], kiro);
+    expect(routed["claude-sonnet-5"]).toBe(200_000);
+    expect(effectiveModelEnv(undefined, routed)).toEqual({});
+  });
+
+  test("configured tiers win, and a native id in one is marked from the registry", () => {
+    const windows = buildClaudeContextWindows([], [{ provider: "mock", id: "small-model", contextWindow: 128_000 }], undefined, passthrough);
+    const env = effectiveModelEnv({
+      tierModels: { opus: "mock/small-model", sonnet: "claude-sonnet-5", haiku: "claude-haiku-4-5" },
+    }, windows);
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("mock/small-model");
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5[1m]");
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe("claude-fable-5-1[1m]");
+    // Haiku 4.5 is a 200k model.
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("claude-haiku-4-5");
+  });
+
+  test("an anthropic row capped under 1M and a modelMap entry keep their ids unmarked", () => {
+    const capped = buildClaudeContextWindows([], [{ provider: "anthropic", id: "claude-sonnet-5", contextWindow: 200_000 }], undefined, passthrough);
+    expect(effectiveModelEnv(undefined, capped).ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
+    const mapped = buildClaudeContextWindows([], [], undefined, { modelMap: { "claude-sonnet-5": "kiro/claude-sonnet-5" } });
+    expect(effectiveModelEnv(undefined, mapped).ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
+    expect(effectiveModelEnv(undefined, mapped).ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("claude-opus-5-5[1m]");
+  });
+
+  test("only a local subscription launch with passthrough on takes the native path", () => {
+    expect(nativeClaudePassthroughFor(undefined, "subscription")).toEqual({ modelMap: undefined });
+    expect(nativeClaudePassthroughFor({ nativePassthrough: false }, "subscription")).toBeUndefined();
+    expect(nativeClaudePassthroughFor(undefined, "proxy")).toBeUndefined();
   });
 });

@@ -71,8 +71,8 @@ describe("ZCode client config", () => {
     expect(models["anthropic/claude-opus-5"]).toEqual({
       name: "claude-opus-5 (anthropic)",
       modalities: { input: ["text", "image"], output: ["text"] },
-      // No guessed output budget: only the authoritative context window.
-      limit: { context: 200_000 },
+      // Exact generated provider/model metadata is authoritative, never a stand-in.
+      limit: { context: 200_000, output: 128_000 },
     });
     // Undeclared modalities fall back to the text floor.
     expect(models["xai/grok-5"]!.modalities).toEqual({ input: ["text"], output: ["text"] });
@@ -130,7 +130,7 @@ describe("ZCode reasoning export", () => {
     expect(models["google-antigravity/gemini-3.8-flash"]).toEqual({
       name: "gemini-3.8-flash (google-antigravity)",
       modalities: { input: ["text", "image"], output: ["text"] },
-      limit: { context: 1_048_576 },
+      limit: { context: 1_048_576, output: 65_536 },
       reasoning: { enabled: true, variants: ["low", "medium", "high", "max"], defaultVariant: "medium" },
     });
     expect(models["CommandCode/meituan-LongCat-2.0:free"]).not.toHaveProperty("reasoning");

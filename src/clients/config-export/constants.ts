@@ -14,6 +14,14 @@ export const OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json";
  */
 export const OPENCODE_API_KEY_ENV = "OPENCODEX_OPENCODE_API_KEY";
 
+/**
+ * Env var carrying the proxy admission key to Kilo. Independent of OpenCode's
+ * so the two clients can keep distinct credentials.
+ */
+export const KILO_API_KEY_ENV = "OPENCODEX_KILO_API_KEY";
+export const KILO_API_KEY_ENV_REF = `{env:${KILO_API_KEY_ENV}}`;
+export const KILO_CONFIG_SCHEMA = "https://app.kilo.ai/config.json";
+
 /** Env reference shared by apiKey and the dedicated proxy admission header. */
 export const OPENCODE_API_KEY_ENV_REF = `{env:${OPENCODE_API_KEY_ENV}}`;
 
@@ -44,6 +52,7 @@ export const GAJAE_API_KEY_ENV = "OPENCODEX_GAJAE_API_KEY";
 
 /** Pi's wire-dialect selector for an OpenAI-compatible endpoint. */
 export const PI_API_DIALECT = "openai-completions";
+
 
 /** Deterministic loopback default for exported provider-block helpers in tests. */
 export const OPENCODE_PROVIDER_BLOCK_DEFAULT_CONFIG: OcxConfig = {

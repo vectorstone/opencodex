@@ -1,5 +1,7 @@
 # Subagents And Multi-Agent Surface
 
+Subagent quota priming remains separate from automatic activation scheduling. See the [quota activation contract](providers/openai-tiers.md#public-provider-contract).
+
 Native result continuations and function-result injection follow [the mode-specific result and control contract](transports/streaming-health.md#experimental-native-function-result-injection); this surface does not infer upstream support or alter its defaults.
 Explicit Codex CLI installation observation does not attest the runtime used by a subagent or change agent selection. See the [read-only observation contract](runtime.md#explicit-codex-cli-installation-observation).
 
@@ -7,6 +9,9 @@ Native steering follows [the shared WebSocket contract](transports/streaming-hea
 
 Encrypted-task and fallback request handling follow the Responses
 [core module ownership](transports/responses.md#core-module-ownership). This surface retains its existing behavior.
+For policy-selected turns, both subagent selection and the post-recovery selection retain the
+[original policy authorization](transports/policy-fallback.md);
+ordinary subagent fallback configuration does not authorize a destination outside that evaluation.
 
 Catalog HTTP acquisition follows the [proxy-routing contract](catalog.md#remote-catalog-http-proxy-routing).
 
@@ -19,7 +24,10 @@ CLI installation inspection reason codes, including Windows deferral, follow the
 `src/responses/plaintext-v2-agent-messages.ts` owns the experimental, configuration-only
 `plaintextV2AgentMessages` request compiler and response restoration. The default is unset;
 only explicit true on Responses ingress to the final canonical ChatGPT forward route activates it.
-A default top-level collaboration catalog is required. The compiler preserves caller objects,
+A default collaboration catalog is required: top-level `tools`, or, when that field is absent,
+the first input item's developer `additional_tools` catalog used by Responses Lite. Explicit
+top-level catalogs take precedence; user-role and later historical catalogs do not opt in.
+The compiler preserves caller objects,
 aliases the namespace and three message functions, and removes only their true encryption marker.
 Declaration/reference collisions refuse the whole rewrite without changing the request.
 
@@ -29,6 +37,13 @@ snapshot repair. Malformed, conflicting, unsupported or over-limit responses fai
 retrying the model. Raw stream inspection cannot publish plaintext continuation state: only
 restored client blocks reach its dedicated bounded collector. Foreign namespaces and opaque
 argument/metadata values remain unchanged; the empty encrypted-function-args marker is preserved.
+For a streamed response whose content type is missing or is neither `application/json` nor a
+recognizable event stream, the native passthrough reads at most the first 4 KiB to confirm a
+Responses SSE event before restoring aliases; an `application/json` body takes the bounded JSON
+path instead. That probe is bounded by the request's `stallTimeoutSec`: one total budget for the
+prefix, plus a per-read inactivity window the arrival of a chunk restarts, so a drip-fed or silent
+upstream fails closed instead of holding the turn open. A body that does not match still fails
+closed, and its bytes never reach Codex as a successful response.
 
 Startup warns that task text can remain in Codex history, selected-provider requests and local
 response/debug state. This is application-level plaintext over HTTPS, depends on undocumented
@@ -55,7 +70,7 @@ never added to other collaboration tools or custom calls, and non-empty `encrypt
 preserved verbatim. The marker is stripped again from replay, and the `unreadable_encrypted_agent_task`
 guard remains the fail-closed boundary for genuine ciphertext.
 
-Shared parsing and streaming follow the [request-copy](transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](transports/responses.md#passthrough-sse-stream-shapes-314).
+Shared parsing and streaming follow the [request-copy](transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](transports/responses-wire-shapes.md#passthrough-sse-stream-shapes-314).
 
 Pool credentials used by subagent routes can be
 [linked to Orca-managed homes](codex-home.md#orca-source-owned-account-import). The account-store
@@ -76,6 +91,13 @@ The override is applied as a final pass in both `buildCatalogEntries` (live `/v1
 ensures `normalizeRoutedCatalogEntry` (which deletes `multi_agent_version` from routed entries) does
 not clobber the forced value.
 
+A forced pass records each row's pre-override value once, in `opencodex_multi_agent_version_origin`
+(a string pin, or null for none); repeated forced passes never replace it. Returning to `"default"`
+consumes the record. Pristine baseline and native pins still win; the record only decides a native
+row the baseline predates, which previously kept the forced stamp because an absent baseline entry
+cannot tell a stale forced value from a genuine pin (issue 5636). Rows written before the record
+existed keep that non-destructive read.
+
 `getDefaultConfig()` (`src/config/proxy-env.ts`) writes `multiAgentMode: "v1"` explicitly, using the version
 constant from `src/config/multi-agent-surface.ts`, so v1 is the install default while a v2
 native-to-routed child task is undeliverable ciphertext. The repair and salvage merges in
@@ -94,6 +116,11 @@ with `multiAgentMode` field.
 The `multi_agent_v2` feature flag and the logical maximum thread count are separate from
 `multiAgentMode` (`src/codex/features.ts`): the mode decides which surface Codex advertises, while
 the flag and thread count decide what the native runtime allows.
+Because the global feature has precedence over catalog pins, Codex config injection reconciles it
+to disabled whenever persisted OpenCodex mode explicitly selects v1. This includes a fresh install
+on a Codex home that had previously enabled v2; external-provider ownership and read-only injection
+preflight still prohibit that write. The transition runs inside the same write lock and preimage as
+the rest of injection, so a later refusal rolls the flag back with the files.
 
 `keepNativeChatGptOnV1` makes mode `v2` a catalog-driven hybrid: OpenCodex disables the global
 `multi_agent_v2` override because codex-rs resolves that override before a model row's explicit
@@ -179,10 +206,19 @@ Full derivation with per-line citations: `devlog/_plan/260816_codexrs_multiagent
 
 `src/server/responses/agent-task-recovery.ts` admits at most 32 consecutive, individually complete
 Fernet-shaped parts with a combined 2 MiB ciphertext limit. Every encrypted slot must belong to
-that run. The existing credential admission precedes cache access; the cache key includes an
-unambiguous ordered sequence. One fixed-endpoint request forwards separate parts, and assignment
+that run. The existing credential admission precedes cache access; the cache key is a JSON-encoded
+fixed-order tuple of every addressing field (scope, parent thread, message type, task name,
+recipient, sender, ciphertexts) rather than a delimiter-joined string, so no field content can shift
+a boundary. One fixed-endpoint request forwards separate parts, and assignment
 replacement compares the complete original item snapshot before splicing the run. Recovery output
-is model-transcribed plaintext, not cryptographic fidelity proof, and no internal outage retry is added.
+is model-transcribed plaintext, not cryptographic fidelity proof. An opt-in `retries` bound — off
+by default and capped at two extra sends — re-issues the same admitted request only on a transient
+upstream status or a transport failure, inside the same deadline and shared flight; terminal
+statuses, invalid output, and budget exhaustion keep the bounded refusal reasons unchanged.
+Recovery recognises all four codex-rs message types (NEW_TASK, MESSAGE, FOLLOWUP_TASK,
+FINAL_ANSWER); a FINAL_ANSWER envelope may omit the Task name line, in which case the
+structured recipient is not cross-checked because the envelope names no recipient, and
+admission remains the trust boundary.
 
 `src/server/responses/encrypted-payload.ts` uses bounded concatenation only to recognize otherwise
 unreadable split-token shapes. The sanitizer preserves just those fragment objects and continues
@@ -242,7 +278,8 @@ target its own `structuredClone` and its own concrete route, so a sibling's repa
 them and a target resolving to a routed Responses wire would otherwise send what the parent's own
 dispatch no longer does.
 
-Nothing here decrypts, and the tail NEW_TASK envelope keeps `unreadable_encrypted_agent_task` and
+Nothing here decrypts, and the tail agent_message envelope (any of the four codex-rs
+message types) keeps `unreadable_encrypted_agent_task` and
 its opt-in recovery unchanged: an unreadable current task still fails closed rather than reaching a
 child with a marker where its assignment should be. An `agent_message` carrying unknown parts but
 no ciphertext still reaches the wire unchanged and still draws the destination's own 422, which is
@@ -276,11 +313,16 @@ by that retirement. Quota fallback retains independent shared/Reserve evidence.
 
 When account selectors are active, one featured bare native id expands into a complete selector row
 group. Catalog priorities use the selector count as a stride so each group stays together without
-widening Codex's five-row advertisement window. Fresh defaults are Astra, Sol, Terra, Luna, 5.5.
-Startup upgrades unmarked rosters once: prepend `gpt-6-astra`, retain the first four unique
+widening Codex's five-row advertisement window. Fresh defaults are Astra, GPT-6.1 Sol and Luna
+(`DEFAULT_SUBAGENT_MODELS`). Startup upgrades unmarked rosters once: prepend `gpt-6-astra`, retain the first four unique
 non-Astra choices, then move retained bare `gpt-5.5` last. The old fifth choice is dropped;
 an unmarked empty list becomes Astra only, and an unset list receives the fresh defaults.
-`subagentModelsVersion: 1` records completion, so later user edits (including an empty list or
+A second one-time step rewrites bare `gpt-5.6-sol`/`gpt-5.6-luna` to their GPT-6 rows in place
+and drops every other bare `gpt-5.5`/`gpt-5.6` id; ids with a `/` are untouched, and a list left
+empty by the cleanup receives the defaults.
+A third one-time step (version 3) rewrites bare `gpt-6-sol` to `gpt-6.1-sol` in place without
+duplicating it; routed and account-qualified ids keep their spelling, and GPT-6 Sol re-added later
+stays. `subagentModelsVersion: 3` records completion, so later user edits (including an empty list or
 removing Astra) persist. The migration rebases on the latest disk config under the existing
 mutation lock; failed persistence degrades to an in-memory roster for that run without a stale
 whole-config overwrite. Existing disabled-model visibility rules remain unchanged.
@@ -289,6 +331,86 @@ Quota-aware fallback walks a configured chain when the featured model is exhaust
 availability on a bounded interval (default 60 s, `src/codex/subagent-model-fallback.ts`). It rewrites
 the requested model id only; effort remains owned by the caps described under
 [Ultra reasoning level](catalog.md#ultra-reasoning-level).
+
+### Per-role model pins
+
+Codex overrides a child's spawn-time model with the root `model` key of
+`$CODEX_HOME/agents/<role>.toml`, so that pin decides which model a role runs on.
+`src/codex/agent-role-models.ts` is opencodex's only writer into those files, and it writes only
+that one key, only when a user picks a role's model in the dashboard's omo (Codex / LazyCodex)
+section on the Codex tab (`PUT /api/codex-agent-roles/{role}`) or with `ocx agent roles set`,
+and only while LazyCodex is detected. No sync, startup, or
+catalog path calls it, and opencodex never creates, repairs, or removes a role file.
+
+- The key is located by the same TOML-aware scan the pin reader uses
+  (`locateTomlModelKey` in `src/codex/subagent-model-fallback.ts`), so a `model =` line inside
+  the instructions multiline string is never read or edited. A key under a table header is not
+  the root pin.
+- An existing one-line string value is replaced inside its span; every other byte, including
+  quote style when the new value allows it, trailing comments, line endings, and a leading BOM,
+  is kept. A missing key is inserted after the leading comment block. A non-string value is
+  refused rather than duplicated.
+- The original file and the edited result must both parse as TOML; otherwise the write is
+  refused with `invalid_role_file` and the file keeps its bytes, so an edit can never turn a
+  role Codex rejects into one it loads. Other write failures answer a fixed `write_failed`
+  message without the filesystem path or owner details.
+- The role name must equal a listed `*.toml` stem, which is also the path-traversal check. The
+  target must be a regular file owned by the running user; the replacement is atomic and does
+  not follow a symbolic link.
+- The same pick is mirrored into LazyCodex's `codex.agents.<role>.model`; that half belongs to
+  [client integrations](clients/integrations.md#omo-codex-lazycodex-role-models). The role file is written first
+  and stands even when the mirror is skipped.
+
+Sibling instances refuse the write, because it reaches the shared `CODEX_HOME`.
+
+### Role model auto-assign
+
+`POST /api/codex-agent-roles/auto-assign` (dashboard Auto-assign, `ocx agent roles suggest`) proposes a
+model for every role and writes nothing. It belongs to omo (Codex / LazyCodex): without
+`detectLazyCodex()` it answers 409 `lazycodex_not_detected` before reading the body or calling a model,
+the same refusal as the PUT. Applying a proposal is the ordinary
+`PUT /api/codex-agent-roles/{role}`, now with an optional `effort`. The work splits in two on purpose:
+
+- **Sizing is one model call.** `src/codex/role-sizing.ts` holds the rubric (ported from the MIT-licensed
+  modelchk skill, cited in the file) as the system prompt, the neutral vocabulary
+  (`fast|standard|frontier`, `glance|measured|thorough|exhaustive`), and the validator. Each role sends its
+  name and the first 1500 characters of `description` plus `developer_instructions`; a role with neither
+  is not sent. The call goes through the proxy's own `/v1/chat/completions` via
+  `postLocalChatCompletion` (`src/lib/local-chat-completion.ts`, shared with the routed vision describer), on
+  the root `model` of Codex `config.toml` unless the caller names one. An answer that is not the strict JSON
+  shape, a missing role, or a field outside the vocabulary leaves that role **unsized** with the reason;
+  nothing is guessed. Keys beyond the five answer fields are ignored, and all five stay required. The
+  sizing model never names a model.
+- **Mapping is deterministic code.** `src/codex/role-auto-assign.ts` draws candidates from
+  `subagentSelectableModels` (the same list the role picker renders) and tiers them: `codexRoleTiers` in the
+  opencodex config first, then price rank (input plus output per 1M tokens). Three or more priced models
+  split evenly across the three tiers. Fewer are anchored at the top, the dearest frontier and each cheaper
+  one a tier lower, so one is frontier and two are standard and frontier; fast is the tier left empty,
+  which keeps a standard role on the cheaper model. Unpriced, unmapped models are never proposed. A role
+  gets the lowest sufficient tier, then the lowest price. Effort binds to ladder positions of the chosen
+  model (floor, default or middle, the rung above, ceiling), collapsing inside the range; it is proposed
+  only for a role whose file already sets `model_reasoning_effort`, and written by the same span-preserving
+  editor as `model`, located by the same TOML-aware scan.
+
+The sizing call is injectable (`completeCodexRoleSizing` on the management deps), so route tests answer it
+without a provider. Sibling instances refuse the preview too: it sits under the refused
+`/api/codex-agent-roles` prefix, and its proposals could not be applied there anyway.
+
+### Delegation model suggest
+
+`POST /api/injection-model/suggest` (Subagents page **Suggest**, `ocx agent injection suggest`) applies the
+same sizing to the delegation default. The caller describes the work Codex usually hands off (nonblank, at
+most 1500 characters, the role excerpt limit); `proposeDelegationModel` in
+`src/server/management/codex-role-auto-assign.ts` sends it as one role named `delegated-work` with the same
+parser and the role rubric followed by a short addendum (`DELEGATED_WORK_SIZING_SYSTEM_PROMPT`) that has the
+sizer size the described one-shot work rather than a standing role; the role rubric's own text is unchanged.
+It maps the answer with the same `buildRoleProposals`. Two things differ from roles in the mapping,
+both at the call site: candidates are the `available` list `GET /api/injection-model` offers (one helper
+builds both), with effort ladders cut to the Codex levels `PUT /api/injection-model` accepts, and
+`alwaysProposeEffort` proposes an effort even when none is set, because the delegation effort is a
+picker of its own. The route writes nothing; the page shows tier, effort, rationale and move triggers,
+and **Use this** goes through the page's ordinary `PUT /api/injection-model` save. It is not
+sibling-refused, like the `PUT` it feeds, since both touch only this instance's config.
 
 `injectionModel` and `injectionEffort` are shared selections with two independent consumers.
 `multiAgentGuidanceEnabled` controls only OpenCodex-authored delegation guidance.
@@ -357,9 +479,9 @@ Native Codex advertisements still follow display priority; private guidance rank
 Codex display-cache expiry, retained blocking main-policy evidence, and reset history follow the
 [quota cache contract](providers/openai-tiers.md#quota-cache-and-short-window-history).
 
-Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](gui-and-management-api.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](gui-and-management-api.md#upstream-key-account-attribution), independently of subscription quota observations.
+Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](dashboard-and-usage.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
 
-Connected CLI usage follows the [client-scoped hub usage contract](gui-and-management-api.md#usage-accounting); local management and account data remain separate.
+Connected CLI usage follows the [client-scoped hub usage contract](dashboard-and-usage.md#usage-accounting); local management and account data remain separate.
 
 Remote Workspace uses a separate, explicitly enabled server surface with structural WebSocket callbacks and awaited per-server cleanup; [its contract](remote-workspace.md) owns that integration.
 
@@ -368,12 +490,12 @@ Chat helper admission in `src/server/responses/core.ts` follows the
 [deferred stored-main contract](providers/openai-tiers.md): only a needed Direct OpenAI helper
 claims stored main, after terminal vision, routed vision and search exclusions.
 
-Subagent automatic pool preview returns no candidate when all pool plans are excluded; explicit account-qualified models retain the [selection-policy distinction](providers/openai-tiers.md#automatic-pool-plan-exclusions).
+Subagent automatic pool preview returns no candidate when all pool plans are excluded; explicit account-qualified models retain the [selection-policy distinction](providers/openai-accounts.md#automatic-pool-plan-exclusions).
 
 Provider-level Combo eligibility uses explicit inference evidence for the current single credential; account-specific admission remains separate. See [scoped provider quota](runtime.md#scoped-provider-quota-for-combo-selection).
 
 The management quota DTO keeps Combo editing aligned with scoped inference evidence;
-see [Combo editor routing quota](gui-and-management-api.md#combo-editor-routing-quota).
+see [Combo editor routing quota](dashboard-and-usage.md#combo-editor-routing-quota).
 
 Optional Codex transport-hint suppression is scoped to canonical Responses client output;
 its defaults and exclusions are owned by [Responses transport](transports/responses.md).
@@ -382,18 +504,18 @@ Final-route summary visibility is recomputed after fallback from the original Re
 
 Paginated and migration-capable history follows the [authoritative writer contract](codex-home.md#paginated-history-writer-boundary); this document adds no independent writer guarantee.
 
-Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback, preserved affinity, strategy-specific threshold summaries, and shared short-observation freshness for switch warnings.
+Codex pool settings and their consumers follow the [reset-first ordering contract](providers/openai-accounts.md#reset-first-account-ordering), including independent-quota fallback, preserved affinity, strategy-specific threshold summaries, and shared short-observation freshness for switch warnings.
 
 Claude replay carries [Go conversation affinity](data-planes/inbound-compat.md#claude-affinity-at-final-go-dispatch)
 privately to final dispatch; preliminary route selection does not inject Go-only headers.
 
 Native Chat applies qualifying effort ceilings independently of model pins; pin selection precedes the cap and only pins or cap rewrites enter wire mapping. The [catalog effort contract](catalog.md#ultra-reasoning-level) records the V1/compaction exemptions and caller-preservation boundary.
 
-Private pool credential metadata follows the [quota-history publication identity contract](providers/openai-tiers.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
+Private pool credential metadata follows the [quota-history publication identity contract](providers/openai-accounts.md#quota-history-publication-identity); credential-only and account DTO projections omit it.
 
-Pool quota producers and account commands follow the [bounded raw-observation contract](providers/openai-tiers.md#bounded-pool-quota-observations), separate from the latest display snapshot and capacity estimates.
+Pool quota producers and account commands follow the [bounded raw-observation contract](providers/openai-accounts.md#bounded-pool-quota-observations), separate from the latest display snapshot and capacity estimates.
 
-The account history response can include a [low-confidence effective capacity estimate](providers/openai-tiers.md#observed-effective-token-capacity); usage normalization retains local-answer provenance so local responses cannot supply samples.
+The account history response can include a [low-confidence effective capacity estimate](providers/openai-accounts.md#observed-effective-token-capacity); usage normalization retains local-answer provenance so local responses cannot supply samples.
 
 Account quota surfaces use [safe probe diagnostics](transports/inventory.md#account-quota-failure-diagnostics) separately from quota validity, credential health and routing authority.
 
@@ -429,4 +551,14 @@ Startup provider-id migration preserves the account binding between configuratio
 
 Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](gui-and-management-api.md#fast-selector-rows-setting).
 
-The [compaction routing override](transports/responses.md#compaction-routing-overrides) uses explicit request-kind and trigger metadata, independently of spawned-child markers.
+The [compaction routing override](transports/responses-failover.md#compaction-routing-overrides) uses explicit request-kind and trigger metadata, independently of spawned-child markers.
+
+Ongoing priority failback keeps model-detour and independent-quota affinity isolated; preview remains read-only and no child changes an unrelated shared cursor. The routing details live in [OpenAI account operations](providers/openai-accounts.md#ongoing-priority-failback).
+
+Automatic account exhaustion and recovery use the [spendable Codex credit evidence contract](providers/openai-tiers.md#spendable-codex-credits), including independent freshness, upstream refusal, and reset-ticket separation.
+
+### Forced Claude Code subagent model
+
+`src/claude/subagent-model.ts` shares the roster alias and authoritative context-marker resolver with routed launch force. `claudeCode.subagentModelForce` is opt-in and default-off. Force availability excludes retained unavailable roster entries. Caller-added `[1m]` suffixes require finite authoritative million-token capacity or an exact advertised marked identity; exact upstream ids remain literal, while legacy roster marker handling is unchanged. The generated-agent legacy directive cannot replace a wire selector matching the configured forced alias. `src/claude/subagent-force-status.ts` performs bounded, read-only server-local version and settings-key inspection; unknown is not supported.
+
+Explicit gateway selectors outrank generated-agent `ocx-route` fallback independently of saved force state. `src/claude/inbound-model-options.ts` shares this precedence across Messages and count-tokens; bare Claude fallback and requests without directives retain their existing behavior. Native Claude force targets use reversible native aliases, restored before existing credential/model-map checks. Connected launch exposure comes from fresh authenticated gateway rows, not cached context-window keys; acquisition is independent of cache-write success.

@@ -1,7 +1,7 @@
 // Oh My Pi config export.
 import type { PiModelEntry, ExportModel, ExportContext, ManagedContribution } from "./contracts";
 import { PI_API_DIALECT, OPENCODE_PROVIDER_ID, LOOPBACK_API_KEY_PLACEHOLDER } from "./constants";
-import { normalizeExportModels, inputModalitiesForClient, exportModelLabel, authoritativeContextWindow, authoritativeMaxOutputTokens, singleFragment } from "./model-metadata";
+import { normalizeExportModels, inputModalitiesForClient, exportModelLabel, authoritativeContextWindow, outputBudgetFor, singleFragment } from "./model-metadata";
 
 
 /**
@@ -66,7 +66,7 @@ export function buildOmpClientConfig(ctx: ExportContext): OmpGeneratedConfig {
     };
     const context = authoritativeContextWindow(model.contextWindow);
     // Fork F-004: an authoritative output capability is the only thing that may become maxTokens.
-    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    const output = outputBudgetFor(context, model);
     if (context !== undefined) entry.contextWindow = context;
     if (output !== undefined) entry.maxTokens = output;
     const efforts = ompEfforts(model);

@@ -13,7 +13,7 @@ is scoped to canonical ChatGPT Responses forwarding; other source-area behavior 
 Service startup and restore use the [catalog retirement policy](../catalog.md#shared-catalog);
 retirement does not itself change service registration or user-selected model configuration.
 
-Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](../transports/responses.md#passthrough-sse-stream-shapes-314).
+Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](../transports/responses-wire-shapes.md#passthrough-sse-stream-shapes-314).
 
 ## Background service command selection
 
@@ -24,7 +24,36 @@ Only proven absence enters registration. A query failure refuses the bare comman
 guidance, because treating `unknown` as absent can rerun elevated `schtasks /create` against an
 existing task. Explicit `ocx service install` remains the operator-owned registration request.
 
+`src/config/serving-runtimes.ts` records successfully serving installs and lets only a
+non-sibling managed-service start defer to a verified strictly newer recorded command. The
+census gate recognizes launchd, systemd, and current or repaired WinSW definitions through
+`OCX_SERVICE_MANAGED=1`; the Windows Task Scheduler wrapper uses `OCX_SERVICE=1` with its
+wrapper-protocol marker. Legacy WinSW definitions carrying only `OCX_SERVICE=1` do not
+delegate until `ocx service repair` rewrites the XML. The census update uses the shared
+cross-process config mutation lock; recorded paths must resolve to files owned
+by the current user without group/world write permission on POSIX. Candidate
+execution additionally requires a live service-manager registration whose generated
+definition names the current homes; environment markers alone never authorize a census
+probe because Bun can load them from a project dotenv file. For WinSW, whose SCM
+registration is machine-wide, the gate also requires trusted `sc.exe qc` to report that
+definition's own executable as the registered `BINARY_PATH_NAME`, and refuses on any query
+failure or mismatch. Candidate probes are
+newest-recorded first, capped at four three-second attempts; a failed probe
+falls through within that cap, and a failed launch or any pre-bind child exit (0 and the
+stay-out code included) leaves this install serving: its own lease-held bind fence then
+re-applies every stay-out condition, so a deliberate stand-down is still honored. A one-hop
+marker prevents recursive delegation; post-bind exits
+propagate to the manager. The
+foreground parent forwards SIGINT, SIGTERM and SIGHUP until the child exits, shares one
+five-second SIGKILL escalation timer across repeated signals, and clears that timer and
+its handlers on settlement. Signal exits preserve `128 + signalNumber`. A parent killed
+without running handlers is not covered by this forwarding mechanism.
+
 > Decision record: [ADR-0028](../decisions/ADR-0028-background-service-command-selection.md)
+
+## Windows npm tray update badge
+
+The npm Windows tray owns six installed ICOs: online, warning, and offline base safety glyphs plus one blue-dot variant of each. Its hidden `ocx __update-badge` child reads the package cache without refreshing or writing it. The tray samples no more often than every 60 seconds, caps stdout and stderr at 16 KiB each, requests termination after 12 seconds or a pipe overflow, and reaps the child on later Windows Forms ticks before allowing another launch. A successful badge observation expires after 180 seconds; failed reads do not extend it. The **Update available** item opens the dashboard and never installs a package. Shutdown requests child termination, waits at most 500 ms, and disposes the probe before tray UI disposal.
 
 ## Windows startup ownership listing reuse
 
@@ -36,23 +65,136 @@ enumeration twice made a measured 12.3-second fallback cost roughly 25 seconds b
 
 > Decision record: [ADR-0029](../decisions/ADR-0029-windows-startup-ownership-listing-reuse.md)
 
+## Windows config-directory handle release
+
+`src/server/index.ts` resolves `server.stop(true)` only after the config-directory hardening flight
+and any `icacls.exe` child that outlived its deadline have reaped. `src/config/paths.ts` owns the
+barrier: a timeout verdict alone does not make the home removable. The contract is exercised by
+`tests/server/server-stop-config-hardening.test.ts`.
+
+## Service-manager probe
+
+CLI status and doctor give the attested startup-health read the isolated probe budget plus
+1.5 seconds (6.5 seconds on POSIX, 16.5 seconds on Windows), covering the endpoint's child
+settlement grace. The read client passes the same deadline to the direct local transport, so its
+default 10-second exchange bound does not cut the Windows read short. Identity/proof validation
+and local fallback on timeout remain mandatory.
+
+`src/service-manager-probe.ts` (`inspectServiceManagerInstallation`) reports what the platform
+service manager has installed for opencodex, read-only and fail-closed. It reads the service
+definition itself and parses the `CODEX_HOME` and `OPENCODEX_HOME` values embedded in it, because
+installation writes the definition before the state file: an interrupted reinstall can leave the
+two naming different homes, and on macOS a logged-out user can have the plist on disk with no GUI
+domain to query. The probe returns what it saw and does not decide ownership; callers such as
+`src/integrations/native/ownership-preflight.ts` compare the homes. Every command it runs is
+read-only and time-bounded, so it is safe while the proxy runs under that same manager.
+Systemd home parsing in `src/service/systemd-env.ts` decodes the generated quoted escapes and
+doubled percent signs, with legacy simple bare assignments retained. Unknown escapes, unresolved
+specifiers, malformed quotes, resets and duplicate home assignments make the whole definition
+unknown in both online and offline probes; they never become omitted homes for ownership comparison.
+Non-comment physical line continuations also make the definition unknown before directive matching;
+the generated format uses single physical lines, while systemd otherwise folds continuations first.
+Directive names are matched literally like systemd's parser: only an exact `Environment` is
+decoded, while env-bearing siblings (`EnvironmentFile=`, `PassEnvironment=`, `UnsetEnvironment=`),
+escaped or malformed directive names, and `.include` all invalidate the definition instead of
+being skipped, because a directive the parser ignored could still change the environment the
+unit applies.
+On Windows, the generated-wrapper check accepts package installs that invoke the source CLI.
+A standalone wrapper that invokes `start` directly must carry the generated protocol and runtime
+markers, one quoted `OCX_BUN` assignment, and no `OCX_CLI` assignment in either quoting form.
+Its executable lines and control-flow order must match the standalone script emitted by
+`src/service/windows-taskxml.ts` or exact prior forms retained for read-only upgrade recognition:
+the preceding backup-log variant and the forms before the Bun-placeholder size gate, with either
+old or fixed backup logging. The generator never emits those legacy variants. Added jumps, exits, calls,
+labels, altered logging commands, or partially combined variants make the probe unknown.
+When Task Scheduler reports a registered task, the probe also requires its action to contain exactly
+one Exec with the generated `wscript.exe` command and exact `/b /nologo` launcher arguments.
+A foreign command or additional action makes ownership unknown even if the wrapper and homes agree.
+Its executable must be absolute, end in `.exe`, and agree with `bunPath` in every readable service
+state record for the scheduler backend with `cliPath: null`. Missing, malformed, or contradictory
+state leaves the probe unknown; it cannot authorize unattended native Codex writes.
+The state records a lexical executable path, not an install-time file identity or digest. A
+retargeted junction or replacement at the same path is therefore outside this probe's evidence;
+resolving the path only at probe time cannot establish which file the installer recorded.
+
 ## Stable service launcher (launchd and systemd)
 
-Launchd and systemd installation resolve the first absolute `ocx` PATH candidate that is both a regular file
+Systemd installation resolves the first absolute `ocx` PATH candidate that is both a regular file
 and executable, keeps that path lexical so a version-manager shim remains an indirection, and
 records the same single resolution in the service definition and service state. Definition
-construction (`buildPlist`, `buildUnit`) never performs PATH discovery itself: callers provide either the resolved launcher or an explicit direct Bun/CLI
-fallback, keeping diagnostics and tests independent of the host PATH.
+construction (`buildUnit`) never performs PATH discovery itself: callers provide either the resolved launcher or an explicit direct Bun/CLI
+fallback, keeping diagnostics and tests independent of the host PATH. Launchd always uses the
+package-local Bun and CLI pair selected by the trusted install or repair invocation; it never hands
+credential-bearing service state to a mutable PATH launcher, and a `launcherPath` recorded by an
+older install is reported stale so `ocx service repair` re-bakes the trusted package paths.
+
+Service launchers reject recorded and newly discovered paths inside shell-local `fnm`, `nvm`,
+`mise`, `asdf`, or `volta` multishell directories. Systemd, launchd, Windows Task Scheduler,
+and native WinSW definitions remove those entries from their rendered PATH while keeping other
+environment values. WinSW uses the same pure filter in `src/lib/transient-service-path.ts`
+without importing the service state module. Launchd
+repair compares the full plist after normalizing its previous PATH: a PATH cleanup or any other
+definition change reloads the live job through the guarded eviction and bootstrap path.
 
 Launcher mode omits the package-local Bun provenance pair because an upgrade may delete that
 versioned tree. The only runtime path carried through the launcher is a pre-Bun, proof-bound
 `OPENCODEX_BUN_PATH` whose durable runtime source is `override`; bundled and process fallbacks are
 rediscovered by the current launcher. The API-auth token remains file-backed and is loaded only by
 the service shell at start. On macOS, `start` and detailed `status` compare the live launchd job
-against `expectedLaunchdCommand`, which follows the recorded `launcherPath` rather than re-walking
-PATH, so a launcher-backed job is never misreported as an older plist (#3464).
+against `expectedLaunchdCommand`, which still follows a `launcherPath` recorded by a pre-pinning
+install rather than re-walking PATH, so such a job is never misreported as an older plist (#3464).
 
 > Decision record: [ADR-0030](../decisions/ADR-0030-stable-service-launcher-launchd-and-systemd.md)
+> Decision record: [ADR-0100](../decisions/ADR-0100-stable-service-launcher-launchd-and-systemd.md)
+
+## Service child ownership gate
+
+The verbs are only reachable through `ocx service`, but the process managers spawn
+`start` directly, so `handleStart` in `src/cli/index.ts` asks the same question through
+`src/service/service-child-ownership.ts` before startup work and again inside the
+ownership mutation lease held by `bindAndPublishStartOwnership`, before port selection or
+listener bind. The supervised-child classification is kept from the first check; the
+recorded owner is read fresh under the lease, so a desktop claim committed between checks
+cannot be overwritten by PID or runtime publication. Before either runtime branch,
+`recoverStartStateUnderOwnershipLease` (`src/cli/start-owner-fence.ts`) holds that same
+lease and rechecks the owner before stale PID cleanup, cross-home sibling detection, or startup journal recovery;
+an owner claim committed during the early probe cannot be followed by shared Codex writes.
+When that lease is still busy after its wait, `acquireOwnershipMutationLease`
+(`src/service/ownership-mutation-lease.mjs`) names the holder in its error and on the error's
+`holder` field. That means the owner's PID, whether it is alive, a live holder's executable name
+when `tasklist`/`ps` answers within a second, and the owner's age on the clock stale recovery
+uses, plus the 30-second reclaim rule. `ocx service status` prints the same holder line whenever
+the lease directory exists. That read never reclaims.
+The connected-client branch, which returns into `startClientRuntime` before the server path,
+takes the same lease through `startClientRuntimeUnderOwnershipLease`
+(`src/cli/client-start-fence.ts`), rechecks there, and releases once the client runtime has
+published its PID and runtime records (`afterPublish`). A child carrying
+`OCX_SERVICE_MANAGED` or `OCX_WINDOWS_WRAPPER_PROTOCOL` resolves the recorded owner and
+exits the supervisor's stand-down code on a foreign or unknown answer: `42` inside the
+marker-protocol Windows wrapper, `0` elsewhere — the legacy `ERRORLEVEL NEQ 0` loop reads
+`0` as a clean stop; systemd's `on-failure` and launchd's `SuccessfulExit=false`
+keepalive do not restart it. The launchd plist restarts on an unsuccessful exit or signal,
+including the exit-1 supervised restart handoff described below. A handled SIGTERM, SIGINT or
+SIGHUP would otherwise end in a clean exit and be left down, so the launchd-managed job (macOS
+with `OCX_SERVICE_MANAGED=1`) exits `128 + signal` from both the server and client-runtime
+signal shutdowns (`src/lib/handled-signal-exit.ts`); every other run keeps exit 0.
+`launchctl bootout` and `ocx service stop` unload the job first, so that cannot resurrect a
+deliberate stop. Existing launchd jobs retain
+their old keepalive definition until `ocx service repair` rewrites and reloads the changed plist.
+New WinSW XML stamps `OCX_SERVICE_MANAGED=1`; parent command-line inference applies only to
+legacy registrations whose XML lacks that marker. Bare `OCX_SERVICE=1`
+is never the marker because `ocx claude` and `ocx opencode` companions carry it too; a
+marker-less Windows registration is still recognised by the parent's command line naming
+this install's wrapper script, launcher or WinSW host as a complete token in any position,
+and an unreadable parent command line is no evidence and proceeds. POSIX keeps the
+explicit-marker path: a companion reparented to init can look service-spawned, and
+`systemd --user` children are not init's, so a ppid check would refuse some companions
+while still missing user units. Known limits: a legacy POSIX registration written before the
+marker, and a Windows child whose parent command line cannot be read, are not classified as
+supervised, so until `ocx service repair` rewrites their definition they can still start
+over a desktop claim. `detachedStartEnvironment` strips `OCX_SERVICE` and both
+supervisor markers before spawning ensure/tray children, because a marker inherited from the
+service child's own environment would otherwise answer the gate as a managed job.
 
 ## Sidecars
 
@@ -72,6 +214,14 @@ Anthropic from credentials alone.
 
 On the OpenAI path there is one deterministic `openai` sidecar candidate and its current account mode
 owns credential selection; API-key OpenAI is not a ChatGPT forward sidecar candidate.
+
+`src/sidecar/` holds what both sidecars share. `src/sidecar/auth.ts` decides whether ChatGPT or
+Anthropic auth is present for sidecar purposes, from config and stored account state and never from
+request headers; per-request usability stays with the executors. `src/sidecar/candidates.ts` builds
+the candidate set both sidecars start from: a model may be offered as a sidecar backend only when
+the management model picker would show it, except the fixed slot model of a logged-in side. Vision
+then removes provably text-only models, and web search keeps only models whose probed backend has an
+executor (`src/web-search/backends.ts`).
 
 Sidecar failures must degrade to text markers or skipped capability, not abort the main request.
 
@@ -149,9 +299,9 @@ so the flag does not identify the peer responsible for corruption. Existing diag
 not rewritten. Audio devices, WebRTC media negotiation, captions and spoken handoff delivery remain
 client responsibilities.
 
-Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../gui-and-management-api.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](../gui-and-management-api.md#upstream-key-account-attribution), independently of subscription quota observations.
+Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../dashboard-and-usage.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](../dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
 
-Connected CLI usage follows the [client-scoped hub usage contract](../gui-and-management-api.md#usage-accounting); local management and account data remain separate.
+Connected CLI usage follows the [client-scoped hub usage contract](../dashboard-and-usage.md#usage-accounting); local management and account data remain separate.
 
 Remote Workspace uses a separate, explicitly enabled server surface with structural WebSocket callbacks and awaited per-server cleanup; [its contract](../remote-workspace.md) owns that integration.
 
@@ -161,9 +311,9 @@ Chat helper admission in `src/server/responses/core.ts` follows the
 claims stored main, after terminal vision, routed vision and search exclusions.
 
 The management quota DTO keeps Combo editing aligned with scoped inference evidence;
-see [Combo editor routing quota](../gui-and-management-api.md#combo-editor-routing-quota).
+see [Combo editor routing quota](../dashboard-and-usage.md#combo-editor-routing-quota).
 
-Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-tiers.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
+Codex pool settings and their consumers follow the [reset-first ordering contract](../providers/openai-accounts.md#reset-first-account-ordering), including independent-quota fallback and preserved affinity.
 
 Optional Codex transport-hint suppression is scoped to canonical Responses client output;
 its defaults and exclusions are owned by [Responses transport](../transports/responses.md).
@@ -175,7 +325,7 @@ privately to final dispatch; preliminary route selection does not inject Go-only
 
 Native Chat applies qualifying effort ceilings independently of model pins; pin selection precedes the cap and only pins or cap rewrites enter wire mapping. The [catalog effort contract](../catalog.md#ultra-reasoning-level) records the V1/compaction exemptions and caller-preservation boundary.
 
-Pool quota producers and account commands follow the [bounded raw-observation contract](../providers/openai-tiers.md#bounded-pool-quota-observations), separate from the latest display snapshot and capacity estimates.
+Pool quota producers and account commands follow the [bounded raw-observation contract](../providers/openai-accounts.md#bounded-pool-quota-observations), separate from the latest display snapshot and capacity estimates.
 
 Account quota surfaces use [safe probe diagnostics](../transports/inventory.md#account-quota-failure-diagnostics) separately from quota validity, credential health and routing authority.
 
@@ -196,5 +346,181 @@ Native steering generation overrides, explicit public-API eligibility and the co
 Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](../gui-and-management-api.md#fast-selector-rows-setting).
 
 The service loads the optional `compactionRouting` block from persisted configuration.
-[Responses ingress](../transports/responses.md#compaction-routing-overrides) applies it to individual compaction
+[Responses ingress](../transports/responses-failover.md#compaction-routing-overrides) applies it to individual compaction
 requests whose trigger the block names.
+
+Standalone binaries use `src/lib/standalone.ts` to recognize hostless `file:` module URLs
+whose decoded pathname begins at Bun's `$bunfs` or Windows `~BUN` virtual root. The helper
+decodes one URL layer, so encoded Windows tildes work while network-host and nested source
+paths do not impersonate a bundled module. `src/service/state.ts` composes durable service
+commands as `<execPath> start`, without a source-tree CLI path. The copied `gui/dist`
+directory is located by `src/server/gui-static.ts`;
+`OPENCODEX_GUI_DIST` remains an explicit override.
+
+## Bun updater ownership transaction
+
+`src/update/ownership-transaction.ts` holds one mutation lease across the Bun updater's awaited
+stop, package replacement and recovery work. The parent never puts its token in the global
+environment. Fixed stop/service/direct-recovery children can join it; package-manager and
+ancillary children receive environments without the capability. Refusals return through the
+lease boundary before exiting, and thrown failures release it after owner-aware recovery.
+Replacement and recovery inspect both the captured endpoint and the freshly read runtime record.
+Malformed or unreadable records remain unknown. Recovery requires the same complete owner
+identity and proven-dead liveness; unknown or transferred ownership never starts another proxy.
+The lease is released before any service-manager-mediated start (`service repair` in recovery
+or the post-install refresh): the manager's `ocx start` child cannot join it, and holding it
+through the repair's health wait keeps that proxy from starting (#5760). The recovery decision
+is made again after the release, and the lease is re-acquired before each fallback's ownership
+re-read so a claim landing in the unleased window is vetoed rather than killed unleased.
+Direct recovery retains the lease until readiness or its bounded deadline. The normal successful manual-runtime update still prints the existing
+restart hint.
+
+Every updater lane makes the same exception where the service manager starts the proxy outside
+the updater's process tree, so that proxy has to take the lease itself; held through the
+repair's health wait, the lease kept it from starting, and recovery fell through to a second,
+directly started proxy (#5760). The npm launcher in `bin/ocx.mjs` releases the lease before a
+post-failure service recovery, as a successful update does, and makes the recovery decision
+again after the release. The Bun updater releases before `service repair` in both the recovery
+branch and the post-install refresh — the port reclaim that authorizes kills already ran under
+the lease — and re-acquires before each fallback's ownership re-read, so the re-read and any
+direct start stay serialized with a claim that landed in the unleased window; after the package
+swap, a lease that stays claimed is reported with manual recovery steps and a non-zero exit. The
+dashboard restart worker in `src/update/job.ts` releases the lease immediately before `ocx
+service repair` and re-acquires it at the direct-start fallthrough, waiting long enough to
+outlast one service-wrapper respawn, then re-runs the recorded-owner veto under it before
+mutating the port, because a claim could have landed during the now-unleased refresh window. A
+lease that stays claimed fails closed: nothing is started, and the job is marked failed, since
+the refresh before it produced no serving proxy; an ownership veto still ends as succeeded.
+
+On Windows, `src/update/npm-invocation.mjs` admits only the exact
+`%USERPROFILE%\scoop\apps\nodejs{,-lts}\current` and `current\bin` PATH entries
+from outside that Node installation. It resolves the home, junction, PATH entry, npm candidate,
+and cwd to physical paths; `current` must remain within its Scoop app directory and
+the npm candidate within the admitted entry. `current\bin` may point to the default
+`%USERPROFILE%\scoop\persist\nodejs{,-lts}\bin`; cwd inside that persistent bin
+is excluded too. The fixed persist suffix is appended to the physical home, accepting 8.3 home
+aliases without trusting a redirected persist subtree. Unreadable paths fail closed. Other Scoop apps, version-directory
+PATH entries (`NO_JUNCTION`), custom home-root Scoop installs, arbitrary descendants,
+and cwd inside the resolved Node installation are not admitted.
+
+The npm transaction creates each staging directory exclusively and may clean that fresh path
+while the creating process still owns it. On POSIX it also creates the stage's `lib` directory,
+because npm's strict script policy plans the global tree before it creates the prefix layout
+(#5760). A later update only reports staging leftovers. It does not recursively delete them
+from a marker: the marker is not an authorization secret, and a neighbouring writer could
+replace a previously checked pathname with a link before traversal.
+
+Before any tray or proxy stop, `src/update/npm-cache-preflight.mjs` checks npm's cache on every
+platform (#6288). The cache root, or the nearest existing folder npm would create it under, must
+resolve to a directory. A file in its place is `cache_root_not_directory`, and a link or Windows
+junction whose target is gone is `cache_root_dangling_link`; both abort with fixed guidance that
+names neither the path nor npm output. Windows runs only this root check, because it has no uid
+or Unix owner bits, while POSIX also runs the bounded ownership/mode walk. Windows skipped the
+gate entirely before #6288, so there only those two root reasons block; an unresolvable npm cache
+path, a worker timeout or any other inconclusive result returns `windows_skip` and the update
+proceeds unpinned as before. POSIX keeps failing closed on them. The npm launcher
+resolves `npm config get cache --global` once, from the home directory and with the environment
+staging uses, checks that path and passes it to the stage as `--cache`. Global mode and the home
+directory keep a project `.npmrc` in the caller's cwd from choosing the pinned cache, matching the
+`npm install -g` stage that never reads project config. On Windows a resolved path containing
+`" % ! ^ & | < >` is refused rather than escaped, because `npm.cmd` re-parses `%*` after our
+cmd.exe quoting; the update then proceeds unpinned. The pin is required: `--prefix <stage>` moves npm's
+globalconfig to `<stage>/etc/npmrc`, so a `cache=` from the operator's global npmrc would
+otherwise be dropped and staging would use npm's default root, which the pre-flight never
+checked (`tests/update/update-npm-cache-preflight.test.ts`,
+`tests/update/update-transactional.test.ts`).
+
+The probe ceilings are module-load constants in `src/server/proxy-liveness.ts`: 750 ms for the
+shared default and 1500 ms (three attempts) for `SERVICE_STOP_LIVENESS` and
+`START_OWNERSHIP_LIVENESS`. `OCX_PROBE_TIMEOUT_MS` (whole milliseconds, 1 to 30000) only raises
+them for hosts whose loopback connects are slowed by a security layer; each ceiling keeps its floor,
+so an override can never shorten the budgets that prevent a duplicate proxy, and a value above the
+30 s ceiling is ignored so the single-shot stop deadline (`timeoutMs * attempts + 250` in
+`src/service/orchestration.ts`) stays bounded. `tests/server/probe-timeout-env.test.ts` reads the
+constants in child processes.
+
+The npm and Bun updaters confirm the stop with the plain-ESM tri-state probe
+`src/update/proxy-liveness-probe.mjs`, decided by
+`src/update/stop-decision.mjs`. A refused dial is `dead`. A dial that is only dropped or times
+out, which is what a listener bound to a tailnet address produces once it is gone, falls back to
+one transient exclusive bind of the same host and port, only when the host is a literal IP address
+(a name can resolve differently for the dial and the bind, so it stays `unknown`): success is `dead`,
+any failed bind (`EADDRINUSE`, `EADDRNOTAVAIL`) is `unknown` and still aborts the update. The probe's ceiling is
+its dial timeout plus a 1500 ms child-spawn limit, after which the answer is `unknown`. A
+successful bind records that nothing held the port at that instant; it does not claim the
+endpoint can never restart. Focused coverage is `tests/update/update-stop-classification.test.ts`.
+
+`src/update/install-detection.mjs` examines both lexical and resolved package paths. An enclosing mise installation owns its nested npm/aube package only when the adjacent `.mise.backend.toml` identifies the containing tool alias and the canonical `npm:@bitkyc08/opencodex` backend. That verified outer owner takes precedence over the inner npm layout. Two verified owners whose tool roots differ only by a symlinked ancestor (macOS `/var` -> `/private/var`) are compared by canonical directory and count as one install. An unreadable or contradictory ownership boundary on either path takes precedence over a verified owner on the other path, refusing mutation without inventing a tool name or recovery command. One boundary is not OpenCodex's at all: on Windows, npm -g under a mise-managed Node puts the package directly in `<mise>/installs/node/<version>/node_modules`, whose adjacent record is Node's own (`short = "node"`, `full = "core:node"`). That exact record with the package directly in the runtime's global `node_modules` is an npm install and falls through to npm detection; any other backend, alias or deeper layout stays fail-closed (`tests/update/update-mise-node-runtime.test.ts`). `ocx update`, dashboard update checks, and update workers expose `installer: "mise"`; checks remain read-only, while mutation is refused with `mise upgrade <verified-alias>` before any proxy stop, package write, or worker creation. The package-tree integrity guard remains active for mise packages, and the managed Linux service additionally follows its mise package launcher onto an upgraded version ([package-tree integrity fence](docs-and-release.md#package-tree-integrity-fence)).
+
+## Restart handoff
+
+During drain, `src/server/index.ts` rejects new data-plane work with HTTP 503 and
+an explicit JSON envelope: `error.type` is `server_error`, `error.code` is
+`server_restarting`, and `error.message` is "OpenCodex is restarting; retry this request."
+The response keeps `Content-Type: application/json`, `Retry-After: 5`, and the
+receiving listener's CORS policy, including on the unauthenticated loopback listener.
+Codex maps a 503 with `server_is_overloaded` to `ServerOverloaded` ("Selected model is at
+capacity"); current Codex retries it only when retry advice survives mapping, and older
+clients do not retry it at all. `server_restarting` falls through to retryable
+`UnexpectedStatus` in either case and never reports a restart as model capacity. This drain-only
+response bypasses the shared provider-overload mapping in `src/lib/errors.ts`.
+`tests/codex-integration/issue-452-empty-503.test.ts` pins its body and both listeners' CORS.
+
+A dashboard drain-and-restart (`src/server/management/system-restart.ts`, which is also the restart
+after a join into a Child) and the client runtime's standalone recycle (`src/client/runtime.ts`)
+replace their process through `src/server/restart-replacement.ts`. Every replacement `ocx start`
+carries `OCX_RESTART_PARENT_PID`. `handleStart` consumes the marker before its first probe and
+honors it only when it names the process's real parent. When the live owner that probe finds is
+exactly that pid, `decideStartWithLiveOwner` answers `await-parent`, and `src/cli/restart-handoff.ts`
+waits up to 30 seconds for the parent to exit or stop answering (re-probing once a second) before it
+probes again; a parent that outlives the wait is refused like any live proxy. An ordinary start
+carries no marker and probes once.
+
+Only a handoff that waits for health (the drain completed) respawns a replacement that exits before
+it answers, at most twice, inside the one 70-second readiness budget. A spawn error is not retried.
+A parent-exit handoff (drain deadline, failed or rejected drain, listener-stop fallback) resolves as
+soon as the child spawned: the parent must exit to release what the replacement waits for, so it
+cannot watch for an early exit. The replacement's `await-parent` wait and the link-mode port reclaim
+cover the known transient causes there. Any other early exit on that path is a residual: no proxy
+serves the port until something runs `ocx start` again, and Codex keeps pointing at that port.
+
+The replacement's stdout and stderr go to `<configDir>/restart-handoff.log`: mode 0600, opened
+without following a symlink, recorded as an owned config path, and bounded at 256 KiB on both sides.
+A handoff empties the file before it opens it. The replacement keeps writing to it for its whole
+life, so the parent hands it `OCX_RESTART_HANDOFF_LOG=1` along with the file; `handleStart` consumes
+the flag and arms one unref'd 60-second timer (`armRestartHandoffLogCap`) that lstats the file and
+empties it at the cap through a fresh descriptor. A start without the flag arms nothing. The parent
+writes only timestamps, pids, ports, attempt counts, exit codes and errno labels, never an
+environment value.
+
+When every attempt fails while client state is `connected` (a join has committed), the parent marks
+recycling before `exit(1)`, so its exit cleanup keeps the Codex routing `connectClient` wrote
+instead of restoring native Codex; a standalone restart still restores. The standalone recycle
+waits for its replacement to answer, exits 1 when it never did, and falls back to `config.port`
+when the listener recorded none. A supervised process (`OCX_SERVICE=1`) never spawns and exits 1
+for its supervisor. Coverage: `tests/server/restart-replacement.test.ts`,
+`tests/cli/cli-restart-handoff.test.ts`, `tests/server/system-restart.test.ts` and
+`tests/clients/client-runtime.test.ts`.
+
+A process the desktop app spawned spawns no replacement at all. The app sets
+`OCX_DESKTOP_SUPERVISED=1` on its sidecar; `handleStart` consumes it with the other start markers and
+records the parent pid (`src/lib/system-restart-contract.ts`). While that parent is still this
+process's parent and alive, the drain-and-restart (completed and deadline paths alike) marks
+recycling and exits 75, the standalone recycle exits 75 once its cleanup ran, and the app starts the
+replacement itself ([desktop shell](../desktop-shell.md#keeping-the-runtime-alive)). This check runs before the service
+rule, because that app, not a service manager, is the parent. An app that crashed leaves the runtime
+re-parented or its parent dead, and the restart falls back to the detached replacement. Every
+detached replacement's environment drops the marker. Coverage:
+`tests/clients/desktop-supervised-restart.test.ts`.
+
+## Package cache refresh
+
+src/update/refresh-scheduler.ts owns the package cache timer and per-channel singleflight for the running proxy. Eligible npm, pnpm and Bun installs refresh missing or 20-hour-stale `version.json` after bind, check staleness hourly and retry failures with bounded backoff. Each server start owns one scheduler reference; the last matching stop disarms the timer. A stopped automatic lookup cannot write a late result, but an explicit check joining that lookup marks explicit interest and writes its successful result even if the last listener stops before it resolves. Source/mise installs and `OCX_DISABLE_UPDATE_CHECK=1` do not start automatic lookup; explicit requests remain available.
+
+src/update/async-check.ts uses the existing owner-bound registry target with a bounded asynchronous child; pnpm owner discovery runs in src/update/pnpm-owner-worker.ts off the request loop. Read-only pnpm owner and registry probes — in the scheduler, the synchronous updater, and the `bin/ocx.mjs` package-manager self-update — run from the installed update module directory via `src/update/pnpm-read-policy.mjs` with project pnpmfiles disabled, never from the caller's workspace. pnpm mutations (`add -g`, rollback) instead run in unique private temporary workspaces outside the package, with an explicit empty workspace boundary to stop parent-project discovery. Both npm_config_ and pnpm_config_ ignore-pnpmfile controls are set case-insensitively for pnpm 10/11. Cleanup removes only known files and an empty unchanged directory; unexpected contents remain for inspection. On Windows, this also avoids pinning the replaced package as cwd. `src/update/notify.ts` writes successful results atomically and preserves a dismissal only for the same channel and version. The interactive pre-bind prompt reads the cache and does not launch a second detached refresh. `src/update/badge.ts` only reads the cache and reports unknown at 40 hours.
+
+The desktop badge snapshot in src/update/desktop-badge.ts is process-local display state keyed by a Tauri session id. A 60-second shell heartbeat renews receipt time; entries expire after 180 seconds and the store retains at most 32 sessions. It is separate from the package version cache and from the updater job/ownership transaction. A proxy restart reports unknown until a bound desktop shell republishes; no update installation can be authorized by this snapshot.
+
+Desktop startup diagnostics use `src/service/desktop-startup.ts` to read the ownership record, the login registration (macOS: launchd; Linux: the `~/.config/autostart/OpenCodex.desktop` entry that auto-launch writes, credited only when `XDG_CONFIG_HOME` is unset or `~/.config`; it must launch an unquoted absolute `opencodex-desktop` with exactly `--autostart`, without conditional keys, and not be hidden or disabled) and exact parent/child executable paths (Linux: `/proc/<pid>/exe` and the parent pid from `/proc/<pid>/stat`) without mutating them. A durable desktop claim survives a failed identity or supervision check; only fresh matching identity, enabled login registration, and live supervision grant protection. On macOS, ownership and PID are re-read before crediting the result; on Linux, the complete evidence chain is read twice and both reads must agree. The startup-health subprocess uses `selfLaunchArgv` to support both source and compiled entrypoints.
+
+On Linux, a dashboard update worker started from the systemd user service is launched through an executable regular file at a trusted absolute path — `/usr/bin/systemd-run`, `/bin/systemd-run`, `/usr/local/bin/systemd-run` (local installs), or `/run/current-system/sw/bin/systemd-run` (the NixOS layout) — with `--user --scope --quiet --collect` (`src/update/worker-launch.ts`), so it leaves the service cgroup before the updater stops `opencodex-proxy.service`; the default `KillMode=control-group` otherwise kills it with the proxy (#5750). The inherited `PATH` is never searched, and each candidate's resolved target — plus every ancestor directory able to substitute it — must be root-owned and not group/world-writable: a trusted-path symlink into a user-replaceable directory is skipped, as is a group-writable `/usr/local/bin`, rather than exec'd under the service account. Candidates are tried in order and a path whose no-op scope probe fails falls through to the next trusted path; the probe applies only when `INVOCATION_ID` is set, and every other case keeps the plain detached spawn. The management route resolves the launcher with `resolveSystemdRunAsync` before spawning, so first-request probing overlaps other work instead of blocking the event loop for up to twenty seconds. `--scope` moves `systemd-run` itself into the scope and then execs the worker, so the recorded PID is the worker's (`tests/update/update-worker-launch.test.ts`).

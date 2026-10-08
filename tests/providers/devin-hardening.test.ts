@@ -5,7 +5,8 @@ import { parseDevinAuthPaste, refreshDevinToken } from "../../src/oauth/devin";
 import { DEVIN_DEFAULT_API_SERVER, resolveDevinApiBaseUrl, validateDevinApiBaseUrl } from "../../src/oauth/devin/api-base";
 import { registerUser } from "../../src/oauth/devin/register-user";
 import { anySignal } from "../../src/lib/abort";
-import { buildGetChatMessageRequestForTests } from "../../src/adapters/devin/cloud-direct/chat";
+import { buildGetChatMessageRequestForTests, streamChatEvents } from "../../src/adapters/devin/cloud-direct/chat";
+import { clearCachedCatalog } from "../../src/adapters/devin/cloud-direct/catalog";
 import { decodeModelUsageStats } from "../../src/adapters/devin/cloud-direct/chat";
 import { CloudChatError, decodeChatFrame } from "../../src/adapters/devin/cloud-direct/chat";
 import { connectTrailerHttpStatus } from "../../src/adapters/devin/cloud-direct/chat";
@@ -207,7 +208,7 @@ describe("anySignal", () => {
 
 describe("devin cloud request shape", () => {
   // The bug this guards: #2 and #3 were swapped, so a caller asking for 32
-  // output tokens wrote 32 into the context-window field and Cognition answered
+  // output tokens wrote 32 into #3 (max_newlines) and Cognition answered
   // every single turn with an opaque "an internal error occurred" - on free and
   // paid accounts alike. Verified on 2026-09-12 by building the same turn with a
   // working client and diffing the encoded messages field by field.
@@ -228,12 +229,12 @@ describe("devin cloud request shape", () => {
       ...(completionOpts ? { completionOpts } : {}),
     });
 
-  test("the output cap lands in #2 and the context window in #3", () => {
-    const outer = fields(build({ maxOutputTokens: 64, maxInputTokens: 200_000 }));
+  test("the output cap lands in #2 and max_newlines in #3", () => {
+    const outer = fields(build({ maxOutputTokens: 64 }));
     const completion = outer[8]?.value as Buffer;
     const inner = fields(completion);
     expect(inner[2]).toEqual({ wire: 0, value: 64n });
-    expect(inner[3]).toEqual({ wire: 0, value: 200_000n });
+    expect(inner[3]).toEqual({ wire: 0, value: 128_000n });
     // #6 and #11 are not part of the message the service accepts.
     expect(inner[6]).toBeUndefined();
     expect(inner[11]).toBeUndefined();
@@ -640,5 +641,156 @@ describe("devin reasoning replay", () => {
     const frame = lenDelim(10, Buffer.from("sig-from-cloud", "utf8"));
     const events = [...decodeChatFrame(frame)];
     expect(events).toEqual([{ kind: "reasoning_signature", signature: "sig-from-cloud" }]);
+  });
+});
+
+describe("devin cloud trailer errors", () => {
+  test("never exposes an upstream message or unrecognized code", async () => {
+    const credential = "devin-session-token$header.payload.signature";
+    const trailer = Buffer.from(JSON.stringify({
+      error: { code: credential, message: `reflected request credential: ${credential}` },
+    }));
+    const envelope = Buffer.alloc(5 + trailer.length);
+    envelope[0] = 0x02;
+    envelope.writeUInt32BE(trailer.length, 1);
+    trailer.copy(envelope, 5);
+
+    const originalFetch = globalThis.fetch;
+    clearCachedCatalog();
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response("catalog unavailable", { status: 503 })
+        : new Response(envelope, { status: 200 });
+    }) as typeof fetch;
+    try {
+      let caught: unknown;
+      try {
+        for await (const _event of streamChatEvents({
+          apiKey: credential,
+          modelUid: "swe-2-high",
+          messages: [{ role: "user", content: "hi" }],
+        })) { /* no data frames */ }
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toBe("Cognition chat failed (cloud trace ID: n/a)");
+      expect((caught as Error).message).not.toContain(credential);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearCachedCatalog();
+    }
+  });
+
+  test("carries our own retry-seconds wording without the raw trailer text", async () => {
+    const credential = "devin-session-token$header.payload.signature";
+    const trailer = Buffer.from(JSON.stringify({
+      error: {
+        code: "resource_exhausted",
+        message: `Your limit will reset in 35 seconds. ${credential}`,
+      },
+    }));
+    const envelope = Buffer.alloc(5 + trailer.length);
+    envelope[0] = 0x02;
+    envelope.writeUInt32BE(trailer.length, 1);
+    trailer.copy(envelope, 5);
+
+    const originalFetch = globalThis.fetch;
+    clearCachedCatalog();
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return calls === 1
+        ? new Response("catalog unavailable", { status: 503 })
+        : new Response(envelope, { status: 200 });
+    }) as typeof fetch;
+    try {
+      let caught: unknown;
+      try {
+        for await (const _event of streamChatEvents({
+          apiKey: credential,
+          modelUid: "swe-2-high",
+          messages: [{ role: "user", content: "hi" }],
+        })) { /* no data frames */ }
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toContain("retry after ~35s");
+      expect((caught as Error).message).not.toContain(credential);
+      expect((caught as Error).message).not.toContain("Your limit will reset");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearCachedCatalog();
+    }
+  });
+});
+
+describe("devin rejected HTTP response ownership", () => {
+  for (const status of [401, 429, 503]) {
+    for (const mode of ["resolve", "reject", "throw", "pending"] as const) {
+      test(`HTTP ${status}: cancel ${mode} preserves the original CloudChatError`, async () => {
+        const cancellations: unknown[] = [];
+        const pending = Promise.withResolvers<void>();
+        let pulls = 0;
+        const body = new ReadableStream<Uint8Array>({
+          pull() { pulls++; },
+          cancel(reason) {
+            cancellations.push(reason);
+            if (mode === "reject") return Promise.reject(new Error("cancel rejected"));
+            if (mode === "pending") return pending.promise;
+          },
+        }, { highWaterMark: 0 });
+        if (mode === "throw") {
+          // Real stream callbacks turn throws into rejected promises. Exercise
+          // the separate boundary for a transport that throws from cancel itself.
+          body.cancel = reason => {
+            cancellations.push(reason);
+            throw new Error("cancel threw");
+          };
+        }
+        const response = new Response(body, { status });
+        const events = streamChatEvents({
+          apiKey: "fixture-http-cancellation",
+          modelUid: "swe-2-high",
+          messages: [{ role: "user", content: "hi" }],
+          catalog: null,
+          executor: async () => response,
+        });
+        try {
+          const error = await events.next().catch(error => error);
+          expect(error).toBeInstanceOf(CloudChatError);
+          expect(error.message).toBe(`GetChatMessage failed (HTTP ${status})`);
+          expect(error.status).toBe(status);
+          expect(error.code).toBeUndefined();
+          expect(error.traceId).toBeUndefined();
+          expect(cancellations).toHaveLength(1);
+          expect(cancellations[0]).toBe(error);
+          expect(pulls).toBe(0);
+          expect(body.locked).toBe(false);
+          expect((await events.next()).done).toBe(true);
+          // Give a rejected cancel the chance to become an unhandled rejection.
+          await new Promise(resolve => setTimeout(resolve, 0));
+        } finally {
+          pending.resolve();
+          await events.return(undefined);
+        }
+      });
+    }
+  }
+
+  test("a bodyless HTTP error retains its status", async () => {
+    const events = streamChatEvents({
+      apiKey: "fixture-http-cancellation",
+      modelUid: "swe-2-high",
+      messages: [],
+      catalog: null,
+      executor: async () => new Response(null, { status: 403 }),
+    });
+    await expect(events.next()).rejects.toMatchObject({
+      name: "CloudChatError", status: 403, message: "GetChatMessage failed (HTTP 403)",
+    });
   });
 });

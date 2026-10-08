@@ -1,6 +1,8 @@
-import type { OcxProviderConfig } from "../types";
-import { getValidAccessToken, publicOAuthAuthenticationErrorMessage } from "../oauth";
+import type { OcxConfig, OcxProviderConfig } from "../types";
+import { publicOAuthAuthenticationErrorMessage } from "../oauth";
+import { getAnthropicSidecarAccessToken } from "../oauth/anthropic-routing";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../oauth/anthropic";
+import { sidecarThinkingOff } from "../adapters/anthropic-model-contract";
 import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "../adapters/client-fingerprint";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { sidecarEnter } from "../lib/sidecar-tracker";
@@ -152,7 +154,7 @@ export async function parseAnthropicSidecarSSE(res: Response): Promise<SidecarOu
 
 /**
  * Execute ONE web search via a Claude sidecar through the STORED anthropic OAuth credential — the
- * Anthropic-backed analog of runWebSearch. Authenticates with getValidAccessToken (refresh handled)
+ * Anthropic-backed analog of runWebSearch. Resolves the helper model's permitted account (refresh handled)
  * and reproduces the Claude Code OAuth fingerprint (identity system block first, oauth beta, client
  * headers, stable session id) so the request is first-party-shaped. Never throws — returns `{error}`
  * so the caller injects a graceful tool result.
@@ -163,12 +165,13 @@ export async function runAnthropicWebSearch(
   provider: OcxProviderConfig,
   settings: SidecarSettings,
   abortSignal?: AbortSignal,
+  config?: OcxConfig,
 ): Promise<SidecarOutcome> {
   const base = provider.baseUrl.replace(/\/v1\/?$/, "");
   const url = `${base}/v1/messages`;
   let token: string;
   try {
-    token = await getValidAccessToken(providerName);
+    token = await getAnthropicSidecarAccessToken(providerName, settings.model, config);
   } catch (e) {
     return { text: "", sources: [], error: `anthropic sidecar auth failed: ${publicOAuthAuthenticationErrorMessage(e)}` };
   }
@@ -189,8 +192,9 @@ export async function runAnthropicWebSearch(
   const body = {
     model: settings.model,
     max_tokens: ANTHROPIC_MAX_TOKENS,
-    // sonnet-5 defaults to adaptive thinking when omitted; keep the sidecar fast/cheap (audit F2).
-    thinking: { type: "disabled" },
+    // Sonnet 5 defaults to adaptive thinking when omitted; keep the sidecar fast/cheap (audit F2).
+    // The per-family off switch (disabled, between_tools or a low effort) lives in the model contract.
+    ...sidecarThinkingOff(settings.model),
     // OAuth fingerprint requires the Claude Code identity as the FIRST system block (audit F6/anthropic.ts).
     system: [
       { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },

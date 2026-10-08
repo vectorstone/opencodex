@@ -256,6 +256,7 @@ async function executeDescription(
       sidecar.provider,
       plan.settings,
       abortSignal,
+      sidecar.config,
     );
   }
   if (!plan.forwardSidecar) return { text: "", error: "OpenAI vision sidecar is unavailable" };
@@ -268,6 +269,7 @@ async function executeDescription(
     plan.settings,
     abortSignal,
     recordSidecarOutcome,
+    plan.forwardSidecar.beforeDispatch,
   );
 }
 

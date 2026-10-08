@@ -1,10 +1,11 @@
 /**
  * Shadow call intercept source-model matching (issue #311): Codex 0.145.0 moved
  * its hard-coded helper model from gpt-5.4-mini to gpt-5.6-luna. The current
- * default follows modern clients, while sourceModels keeps an escape hatch.
+ * default follows modern clients (gpt-6-luna since Codex 0.154.0, with gpt-5.6-luna
+ * kept for 0.145.0-0.153.x), while sourceModels keeps an escape hatch.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync} from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleResponses, isShadowSourceModel } from "../../src/server/responses";
@@ -15,6 +16,9 @@ import type { OcxConfig } from "../../src/types";
 import { catalogConvergenceFactory } from "../helpers/catalog-convergence";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { repoPath } from "../helpers/repo-root";
+import { createTestTranslatorBudget } from "../helpers/translator-budget";
+import { prepareResponsesRequest } from "../../src/server/responses/request-prepare";
 
 const originalFetch = globalThis.fetch;
 let releaseSpendHome: (() => void) | undefined;
@@ -30,6 +34,8 @@ afterEach(() => {
 
 describe("isShadowSourceModel", () => {
   test("matches default shadow source models by prefix", () => {
+    expect(isShadowSourceModel("gpt-6-luna")).toBe(true);
+    expect(isShadowSourceModel("gpt-6-luna-2026-09")).toBe(true);
     expect(isShadowSourceModel("gpt-5.6-luna")).toBe(true);
     expect(isShadowSourceModel("gpt-5.6-luna-2026-08")).toBe(true);
   });
@@ -43,6 +49,8 @@ describe("isShadowSourceModel", () => {
     expect(isShadowSourceModel("gpt-5.6-terra")).toBe(false);
     expect(isShadowSourceModel("gpt-5.5")).toBe(false);
     expect(isShadowSourceModel("gpt-5.6-sol")).toBe(false);
+    expect(isShadowSourceModel("gpt-6-sol")).toBe(false);
+    expect(isShadowSourceModel("gpt-6-astra")).toBe(false);
   });
 
   test("hard-excludes slash-prefixed routed ids, even for configured overrides", () => {
@@ -125,8 +133,9 @@ async function post(
   model: string,
   requestKind?: string,
   logCtx: RequestLogContext = { model: "", provider: "" },
+  extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
-  const headers: Record<string, string> = { "content-type": "application/json" };
+  const headers: Record<string, string> = { "content-type": "application/json", ...extraHeaders };
   if (requestKind) {
     headers["x-codex-turn-metadata"] = JSON.stringify({ request_kind: requestKind });
   }
@@ -208,6 +217,55 @@ describe("shadow call intercept request path (issue #311)", () => {
     expect(bodies.length).toBe(1);
     expect(String(bodies[0]?.model ?? "")).toContain("grok-4.5");
     expect(logCtx.shadowCallRewrittenFrom).toBe("gpt-5.6-luna");
+  });
+
+  test("rewrites a gpt-6-luna helper call from Codex 0.154.0+ and records that prefix", async () => {
+    takeSpendHome();
+    const bodies: Array<Record<string, unknown>> = [];
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+      return chatOk("ok");
+    }) as typeof fetch;
+
+    await post(interceptConfig(), "gpt-6-luna", "turn", logCtx);
+
+    expect(bodies.length).toBe(1);
+    expect(String(bodies[0]?.model ?? "")).toContain("grok-4.5");
+    expect(logCtx.shadowCallRewrittenFrom).toBe("gpt-6-luna");
+  });
+
+  // gpt-6-luna is both the helper slug and a default sub-agent model, so a spawned child that
+  // chose it must keep it. Both markers Codex puts on spawned children are honoured; other
+  // internal turns that reuse x-openai-subagent (compact, review) are still helpers.
+  for (const [label, headers] of [
+    ["x-openai-subagent: collab_spawn", { "x-openai-subagent": "collab_spawn" }],
+    ["subagent_kind thread_spawn metadata", { "x-codex-turn-metadata": JSON.stringify({ subagent_kind: "thread_spawn" }) }],
+  ] as const) {
+    test(`a spawned sub-agent turn is never intercepted (${label})`, async () => {
+      takeSpendHome();
+      const bodies: Array<Record<string, unknown>> = [];
+      const logCtx: RequestLogContext = { model: "", provider: "" };
+      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+        return chatOk("ok");
+      }) as typeof fetch;
+
+      await post(interceptConfig(), "gpt-6-luna", undefined, logCtx, headers);
+
+      expect(logCtx.shadowCallRewrittenFrom).toBeUndefined();
+      expect(bodies.some(body => String(body.model ?? "").includes("grok-4.5"))).toBe(false);
+    });
+  }
+
+  test("a maintenance turn tagged x-openai-subagent: compact is still intercepted", async () => {
+    takeSpendHome();
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    globalThis.fetch = (async () => chatOk("ok")) as typeof fetch;
+
+    await post(interceptConfig(), "gpt-6-luna", undefined, logCtx, { "x-openai-subagent": "compact" });
+
+    expect(logCtx.shadowCallRewrittenFrom).toBe("gpt-6-luna");
   });
 
   // The intercept matches by PREFIX, so a caller can append anything and still be intercepted.
@@ -307,6 +365,62 @@ function chatOk(text: string): Response {
 }
 
 describe("a combo shadow-call target enters the failover loop (#4129)", () => {
+  test("a combo child of a shadow-intercepted call gets Cursor conversation isolation", async () => {
+    const config = comboInterceptConfig([{ provider: "xai", model: "grok-4.5" }]);
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const mkreq = () => new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "grok-4.5",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+        stream: false,
+      }),
+    });
+    const dispatchers = {
+      handleResponses: () => Promise.reject(new Error("unexpected recursion")),
+      handleComboResponses: () => Promise.reject(new Error("unexpected combo dispatch")),
+    };
+    const admission = () => ({ pendingHostAdmissionLease: null, authCtx: { kind: "main", accountId: null } }) as never;
+
+    const intercepted = await prepareResponsesRequest(
+      { req: mkreq(), config, logCtx, options: { comboAttempt: true, shadowCallIntercepted: true, translatorBudget: createTestTranslatorBudget() } },
+      admission(),
+      dispatchers,
+    );
+    expect(intercepted).not.toBeInstanceOf(Response);
+    if (intercepted instanceof Response) throw new Error("expected a prepared request, got HTTP " + intercepted.status);
+    expect(intercepted.parsed._cursorIsolateConversation).toBe(true);
+
+    // A plain combo child (no interception marker) must not be isolated.
+    const plain = await prepareResponsesRequest(
+      { req: mkreq(), config, logCtx, options: { comboAttempt: true, translatorBudget: createTestTranslatorBudget() } },
+      admission(),
+      dispatchers,
+    );
+    expect(plain).not.toBeInstanceOf(Response);
+    if (plain instanceof Response) throw new Error("expected a prepared request, got HTTP " + plain.status);
+    expect(plain.parsed._cursorIsolateConversation).not.toBe(true);
+  });
+
+  test("carries helper conversation isolation into concrete combo children", () => {
+    const prepare = readFileSync(repoPath("src/server/responses/request-prepare.ts"), "utf8");
+    const comboDispatchStart = prepare.indexOf("return requestDispatchers.handleComboResponses(");
+    const comboDispatchEnd = prepare.indexOf("let unreadableEncryptedAgentTask", comboDispatchStart);
+    expect(comboDispatchStart).toBeGreaterThanOrEqual(0);
+    expect(comboDispatchEnd).toBeGreaterThan(comboDispatchStart);
+    const comboDispatch = prepare.slice(comboDispatchStart, comboDispatchEnd);
+    const parsedHandoff = prepare.slice(
+      prepare.indexOf("if (cursorClientThreadId) parsed._cursorClientThreadId"),
+      prepare.indexOf("} catch (err)", prepare.indexOf("if (cursorClientThreadId) parsed._cursorClientThreadId")),
+    );
+
+    expect(comboDispatch).toContain("shadowCallIntercepted,");
+    expect(parsedHandoff).toContain(
+      "if (options.shadowCallIntercepted === true) parsed._cursorIsolateConversation = true;",
+    );
+  });
+
   test("a helper call rewritten to a combo hops past a 429 to the second target", async () => {
     takeSpendHome();
     const urls: string[] = [];
@@ -337,6 +451,18 @@ describe("a combo shadow-call target enters the failover loop (#4129)", () => {
     expect(attempts).toHaveLength(2);
     expect(attempts.map(a => `${a.provider}/${a.model}`))
       .toEqual(["xai/grok-4.5", "alt/grok-4.5"]);
+  });
+
+  test("a spawned sub-agent turn never takes the early combo rewrite either", async () => {
+    takeSpendHome();
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    globalThis.fetch = (async () => chatOk("ok")) as typeof fetch;
+
+    const config = comboInterceptConfig([{ provider: "xai", model: "grok-4.5" }]);
+    await post(config, "gpt-6-luna", undefined, logCtx, { "x-openai-subagent": "collab_spawn" });
+
+    expect(logCtx.comboId).toBeUndefined();
+    expect(logCtx.shadowCallRewrittenFrom).toBeUndefined();
   });
 
   test("a combo whose first target intersects the source still routes as a combo", async () => {
@@ -446,10 +572,10 @@ async function shadowApiResponse(config: OcxConfig, body: unknown): Promise<Resp
 }
 
 describe("shadow-call settings API reports the intercepted source models", () => {
-  test("GET reports the 0.145.0+ helper-model default", async () => {
+  test("GET reports the helper-model defaults, GPT-6 Luna first", async () => {
     await withTempHome(async () => {
       const body = await shadowApi({ port: 0, defaultProvider: "xai", providers: {} } as OcxConfig, "GET");
-      expect(body.sourceModels).toEqual(["gpt-5.6-luna"]);
+      expect(body.sourceModels).toEqual(["gpt-6-luna", "gpt-5.6-luna"]);
     });
   });
 

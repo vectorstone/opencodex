@@ -1,4 +1,4 @@
-import { parseQuotaFailureCode, type QuotaFailureCode } from "../providers/quota-types";
+import { parseQuotaFailureCode, type QuotaFailureCode, type ProviderQuota, type AccountQuotaMode } from "../providers/quota-types";
 /**
  * Data-access layer for `ocx account` (issue #180) — live-proxy HTTP client and
  * per-family account readers. Kept separate from account.ts (command handlers)
@@ -10,6 +10,10 @@ import { isPublicOAuthProvider } from "../oauth/index";
 import { getProviderRegistryEntry, providerCodexAccountMode } from "../providers/registry";
 import type { OcxConfig } from "../types";
 import { projectCodexQuotaRefreshOutcome, type CodexQuotaRefreshOutcome } from "../codex/quota-refresh-outcome";
+
+import { projectApiKeyQuotaRows } from "./account-key-quota";
+import { projectAccountHealth } from "./account-next-actions";
+import type { OAuthHealthLabel } from "../oauth/health";
 
 export type AccountType = "codex" | "oauth" | "api-key";
 
@@ -27,13 +31,24 @@ export interface AccountRow {
   masked?: string;
   active: boolean;
   needsReauth?: boolean;
+  /** Validated server health label and locally generated recovery guidance. */
+  health?: OAuthHealthLabel;
+  healthAction?: string;
+  /** Explicit paid-credit consent, reported only when supplied by the Codex API. */
+  creditsAfterLimit?: boolean;
+  needsReauthReason?: "verify_account";
+  autoSelectable?: boolean;
+  skipReason?: "paused" | "needs_reauth" | "suspended" | "cooldown" | "quota_exhausted";
   selectionExcludedReason?: "plan_excluded";
   selectionExcludedPlan?: string;
   /** Registered credential that is still excluded from routing until validation completes. */
   validationPending?: boolean;
   /** Codex pool selection order, higher used earlier. Absent where ordering does not apply. */
   priority?: number;
-  quota?: CodexQuotaDto | null;
+  /** Null means the account inherits the global usage-switch threshold. */
+  autoSwitchThresholdOverride?: number | null;
+  quota?: (CodexQuotaDto & Partial<ProviderQuota>) | null;
+  quotaMode?: AccountQuotaMode;
   quotaRefresh?: CodexQuotaRefreshOutcome;
   quotaUnavailable?: boolean;
   quotaFailure?: QuotaFailureCode;
@@ -118,7 +133,7 @@ export async function apiJson(
   method: "GET" | "PUT" | "POST" | "DELETE",
   path: string,
   body?: unknown,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; redirect?: RequestRedirect } = {},
 ): Promise<ApiResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   try {
@@ -127,6 +142,7 @@ export async function apiJson(
       headers: runningProxyUpdateHeaders(),
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: options.signal,
+      ...(options.redirect ? { redirect: options.redirect } : {}),
     });
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     return { status: res.status, json };
@@ -251,7 +267,10 @@ interface CodexAccountDto {
   selectionExcludedReason?: "plan_excluded";
   selectionExcludedPlan?: string;
   health?: { reason?: string };
+  healthLabel?: unknown;
+  creditsAfterLimit?: unknown;
   priority?: number;
+  autoSwitchThresholdOverride?: number | null;
   quota?: CodexQuotaDto | null;
   quotaRefresh?: unknown;
   paused?: boolean;
@@ -316,12 +335,17 @@ export async function fetchCodexRows(
     plan: a.plan,
     active: a.id === activeId,
     needsReauth: a.needsReauth,
+    ...projectAccountHealth(a, "openai", a.id),
+    ...(typeof a.creditsAfterLimit === "boolean" ? { creditsAfterLimit: a.creditsAfterLimit } : {}),
     ...(a.selectionExcludedReason === "plan_excluded" ? {
       selectionExcludedReason: "plan_excluded" as const,
       ...(typeof a.selectionExcludedPlan === "string" ? { selectionExcludedPlan: a.selectionExcludedPlan } : {}),
     } : {}),
     ...(a.health?.reason === "validation_pending" ? { validationPending: true } : {}),
     priority: typeof a.priority === "number" ? a.priority : 0,
+    autoSwitchThresholdOverride: typeof a.autoSwitchThresholdOverride === "number"
+      ? a.autoSwitchThresholdOverride
+      : null,
     paused: a.paused === true,
     ...(includeQuota ? {
       quota: projectQuota(a.quota),
@@ -337,11 +361,23 @@ interface OAuthAccountDto {
   email?: string;
   active?: boolean;
   needsReauth?: boolean;
+  healthLabel?: unknown;
+  /** Present only for providers that support operator pause (generic OAuth pools). */
+  paused?: boolean;
+  autoSwitchThresholdOverride?: number | null;
+  needsReauthReason?: "verify_account";
+  autoSelectable?: boolean;
+  skipReason?: unknown;
   /** Always sent by the management route; explicitly `null` when the tier is unknown. */
   plan?: string | null;
   quota?: CodexQuotaDto | null;
   quotaUnavailable?: boolean;
   quotaFailure?: unknown;
+}
+
+function isKiroSkipReason(value: unknown): value is NonNullable<AccountRow["skipReason"]> {
+  return value === "paused" || value === "needs_reauth" || value === "suspended"
+    || value === "cooldown" || value === "quota_exhausted";
 }
 
 async function fetchOAuthRows(
@@ -370,6 +406,14 @@ async function fetchOAuthRows(
     email: a.email,
     active: a.active ?? a.id === activeId,
     needsReauth: a.needsReauth,
+    ...projectAccountHealth(a, name, a.id),
+    ...(a.paused === true ? { paused: true } : {}),
+    ...(name === "anthropic" && Object.hasOwn(a, "autoSwitchThresholdOverride") ? { autoSwitchThresholdOverride: a.autoSwitchThresholdOverride } : {}),
+    ...(a.needsReauthReason === "verify_account" ? { needsReauthReason: a.needsReauthReason } : {}),
+    ...(name === "kiro" && typeof a.autoSelectable === "boolean"
+      ? { autoSelectable: a.autoSelectable } : {}),
+    ...(name === "kiro" && a.autoSelectable === false && isKiroSkipReason(a.skipReason)
+      ? { skipReason: a.skipReason } : {}),
     // Forward the server's answer verbatim. An absent key means the proxy predates tier
     // reporting while `null` means it checked and found no tier — collapsing either
     // direction would destroy the one distinction this field exists to make.
@@ -389,12 +433,19 @@ interface ApiKeyDto {
   active?: boolean;
 }
 
-async function fetchKeyRows(deps: AccountDeps, baseUrl: string, name: string): Promise<FamilyRows> {
-  const res = await apiJson(deps, baseUrl, "GET", `/api/providers/keys?name=${encodeURIComponent(name)}`);
+async function fetchKeyRows(deps: AccountDeps, baseUrl: string, name: string, quota?: { refresh?: boolean }): Promise<FamilyRows> {
+  const query = `?name=${encodeURIComponent(name)}${quota ? `&quota=1${quota.refresh ? "&refresh=1" : ""}` : ""}`;
+  const res = await apiJson(deps, baseUrl, "GET", `/api/providers/keys${query}`, undefined, quota ? { redirect: "error" } : {});
   if (res.status === 0) {
     return { rows: [], activeId: null, status: 0, networkDown: true, transportError: res.transportError };
   }
   if (res.status !== 200) return { rows: [], activeId: null, status: res.status, errorJson: res.json };
+  if (quota) {
+    try { return projectApiKeyQuotaRows(res.json, name); }
+    catch (error) {
+      return { rows: [], activeId: null, status: 200, errorJson: { error: error instanceof Error ? error.message : "Malformed API-key quota response." } };
+    }
+  }
   const activeId = typeof res.json.activeId === "string" ? res.json.activeId : null;
   const keys = Array.isArray(res.json.keys) ? res.json.keys as ApiKeyDto[] : [];
   const rows = keys.map(k => ({
@@ -417,7 +468,7 @@ export function fetchRows(
 ): Promise<FamilyRows> {
   if (type === "codex") return fetchCodexRows(deps, baseUrl, Boolean(quota?.refresh), quota !== undefined);
   if (type === "oauth") return fetchOAuthRows(deps, baseUrl, name, quota);
-  return fetchKeyRows(deps, baseUrl, name);
+  return fetchKeyRows(deps, baseUrl, name, quota);
 }
 
 export async function fetchProviderQuotaReport(

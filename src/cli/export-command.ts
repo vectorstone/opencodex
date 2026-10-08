@@ -1,8 +1,8 @@
 /**
  * `ocx export --client <id>` — print a client config for the live proxy.
  *
- * Fourteen clients, five formats. The accepted list is `EXPORT_CLIENT_IDS`, not
- * this comment: OpenCode, Pi, Prime, Aside, ZCode and omo are JSON; OMP,
+ * The accepted clients span five formats. The accepted list is `EXPORT_CLIENT_IDS`, not
+ * this comment: OpenCode, Pi, Prime, Aside, ZCode, omo and Kilo are JSON; OMP,
  * Hermes, gjc, DSH, MiniMax Code and Raycast are YAML; OpenClaw is JSON5; Kimi
  * is TOML.
  *
@@ -66,12 +66,13 @@ export interface ExportCommandDeps extends RuntimeApiDeps {
  * `opencodeCatalogFromProxyRows` owns the visibility rules (drop `disabled`, drop dupes,
  * drop native under Codex Direct) — the export core does none of that, so a row filtered
  * here is the only thing keeping a disabled model out of a client's picker. It also carries
- * the effort ladder, so the ladder a client receives comes from the same filtered, deduped
- * row as the model itself: a second lookup over the raw rows would let a hidden or disabled
- * duplicate donate its ladder to the visible entry.
+ * the effort ladder and the effective custom-row projection, so every per-model field a
+ * client receives comes from the same filtered, deduped row as the model itself: a second
+ * lookup over the raw rows would let a hidden or disabled duplicate donate its ladder to
+ * the visible entry.
  *
- * Modalities need no such lookup: `opencodeCatalogFromProxyRows` carries them on the catalog
- * entry, so the clients that filter them are handed the same filtered, deduped row.
+ * The empty-vs-undefined ladder distinction survives the hop: a row declaring `[]` exports
+ * `[]` (explicit "no rungs"), a row declaring nothing exports nothing (unknown).
  */
 export function exportModelsFromProxyRows(
   rows: readonly OpencodeProxyModelRow[],
@@ -87,14 +88,20 @@ export function exportModelsFromProxyRows(
     if (entry.fastRowAvailable !== undefined) model.fastRowAvailable = entry.fastRowAvailable;
     if (entry.displayName) model.displayName = entry.displayName;
     if (entry.contextWindow !== undefined) model.contextWindow = entry.contextWindow;
-    // Fork F-004: carry the authoritative output capability through to every client serializer.
-    if (entry.maxOutputTokens !== undefined) model.maxOutputTokens = entry.maxOutputTokens;
-    if (entry.reasoningEfforts && entry.reasoningEfforts.length > 0) {
-      model.reasoningEfforts = [...entry.reasoningEfforts];
-    }
+    // The catalog row's own output limit; dropping it here is what once made every CLI
+    // export fall back to the generated-metadata guess the management path never used.
+    if (entry.maxTokens !== undefined) model.maxTokens = entry.maxTokens;
+    if (entry.maxInputTokens !== undefined) model.maxInputTokens = entry.maxInputTokens;
+    if (entry.reasoningEfforts !== undefined) model.reasoningEfforts = [...entry.reasoningEfforts];
     if (entry.defaultReasoningEffort) model.defaultReasoningEffort = entry.defaultReasoningEffort;
     if (entry.inputModalities && entry.inputModalities.length > 0) {
       model.inputModalities = [...entry.inputModalities];
+    }
+    // Explicit booleans survive, false included; nothing infers a negative from absence.
+    if (entry.supportsTools !== undefined) model.supportsTools = entry.supportsTools;
+    if (entry.supportsReasoning !== undefined) model.supportsReasoning = entry.supportsReasoning;
+    if (entry.supportsReasoningSummaries !== undefined) {
+      model.supportsReasoningSummaries = entry.supportsReasoningSummaries;
     }
     return model;
   });
@@ -161,16 +168,16 @@ export async function handleExportCommand(argv: string[], deps: ExportCommandDep
     const spec = EXPORT_CLIENTS[client];
     const root = await runtimeBaseUrl(deps);
     let built: { document: unknown; text: string };
-    if (client === "raycast") {
+    if (client === "raycast" || client === "droid") {
       // The dial address alone cannot distinguish a wildcard authenticated bind
       // from loopback. Let the live server resolve its admission/listener policy;
       // saved config can differ from the process serving this request.
       const exported = await runtimeRequest<{
         client: string; format: string; config: unknown; text: string;
-      }>("/api/client-config?client=raycast", {}, { ...deps, baseUrl: root });
-      if (!exported || exported.client !== "raycast" || exported.format !== "yaml"
+      }>(`/api/client-config?client=${client}`, {}, { ...deps, baseUrl: root });
+      if (!exported || exported.client !== client || exported.format !== spec.format
         || typeof exported.text !== "string" || exported.config === undefined) {
-        throw new RuntimeApiError("Management API returned an unexpected Raycast export payload.", 502, null);
+        throw new RuntimeApiError(`Management API returned an unexpected ${client} export payload.`, 502, null);
       }
       built = { document: exported.config, text: exported.text };
     } else {
@@ -196,7 +203,9 @@ export async function handleExportCommand(argv: string[], deps: ExportCommandDep
     // `--out` is the path that writes the selected client's native format.
     // Format metadata rides in the human lines below.
     printData(clientConfig, wantsJson, [
-      text.trimEnd(),
+      // `lines` entries print one console line each and are control-escaped, so
+      // the document goes in as individual lines rather than one multi-line blob.
+      ...text.trimEnd().split("\n"),
       "",
       ...(out !== undefined ? [`Wrote ${out}`] : []),
       `Destination: ${spec.destination(process.env)}`,

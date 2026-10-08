@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClientContribution, type ExportModel } from "../../src/clients/config-export";
@@ -93,6 +95,14 @@ function installOmp(): string {
   return configPath;
 }
 
+function installOmo(): string {
+  const spec = INTEGRATION_CLIENTS.omo;
+  mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
+  const configPath = spec.configPath(TEST_ENV, home);
+  mkdirSync(dirname(configPath), { recursive: true });
+  return configPath;
+}
+
 function installDsh(): string {
   const spec = INTEGRATION_CLIENTS.dsh;
   mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
@@ -149,6 +159,48 @@ function reverseJsonObjectKeys(value: unknown): unknown {
 }
 
 describe("apply", () => {
+  // The symlink regressions skip Windows: creating one there needs a privilege
+  // the hosted runners do not grant, and the boundary under test — lstat
+  // classification and rename-replacement of the named entry — is the shared
+  // code path every platform takes.
+  test.skipIf(process.platform === "win32")("refuses an omo catalog symlink without changing its target", () => {
+    const configPath = installOmo();
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    symlinkSync(victim, configPath);
+
+    expect(readIntegrationState(input({ clientId: "omo" })).state).toBe("unsafe");
+    const result = applyIntegration(input({ clientId: "omo" }));
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(victim, "utf8")).toBe(original);
+    expect(store.listOperations("omo")).toHaveLength(0);
+  });
+
+  test.skipIf(process.platform === "win32")("an omo symlink swap before commit cannot replace its target", () => {
+    const configPath = installOmo();
+    const checked = '{"notes":"client-owned"}\n';
+    writeFileSync(configPath, checked);
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    const captureSnapshot = store.captureSnapshot.bind(store);
+    store.captureSnapshot = (clientId, opId, before) => {
+      const snapshot = captureSnapshot(clientId, opId, before);
+      unlinkSync(configPath);
+      symlinkSync(victim, configPath);
+      return snapshot;
+    };
+
+    const result = applyIntegration(input({ clientId: "omo" }));
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(victim, "utf8")).toBe(original);
+    expect(store.readRecords().omo).toBeUndefined();
+  });
+
   test("refuses Kimi TOML date rewrites without changing the file or ownership store", () => {
     const spec = INTEGRATION_CLIENTS.kimi;
     mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
@@ -217,9 +269,11 @@ describe("apply", () => {
     };
     expect(doc.providers.opencodex.models["opencode-go/glm-5.3"]!.variants!.map(v => v.id))
       .toEqual(["low", "high", "max"]);
-    // The legacy block stays variant-free, and a model without a ladder gets no key at all.
-    expect(doc.provider.opencodex.models["opencode-go/glm-5.3"]).not.toHaveProperty("variants");
-    expect(doc.providers.opencodex.models["openai/gpt-5.5"]!.variants).toBeUndefined();
+    // The legacy map and native array describe the same choices; unknown ladders cannot synthesize rungs.
+    expect(doc.provider.opencodex.models["opencode-go/glm-5.3"]!.variants).toEqual({
+      low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" }, max: { reasoningEffort: "max" },
+    });
+    expect(doc.providers.opencodex.models["openai/gpt-5.5"]!.variants).toEqual([]);
 
     expect(readIntegrationState(request)).toMatchObject({ state: "current" });
     expect(applyIntegration(request).ok).toBe(true);
@@ -382,7 +436,7 @@ describe("apply", () => {
 
     const after = JSON.parse(readFileSync(configPath, "utf8")) as typeof document;
     expect(after.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.reasoning).toBeUndefined();
-    expect((after.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.limit as Record<string, unknown>).output).toBeUndefined();
+    expect((after.provider.opencodex!.models["anthropic/claude-opus-4-8"]!.limit as Record<string, unknown>).output).toBe(128_000);
     expect(after.provider.opencodex!.models["mystery/model"]!.limit).toBeUndefined();
   });
 
@@ -835,6 +889,24 @@ describe("apply", () => {
 });
 
 describe("disable", () => {
+  test.skipIf(process.platform === "win32")("refuses a symlinked managed target and leaves its target alone", () => {
+    const configPath = installOmo();
+    const applied = applyIntegration(input({ clientId: "omo" }));
+    expect(applied.ok).toBe(true);
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    unlinkSync(configPath);
+    symlinkSync(victim, configPath);
+
+    const result = disableIntegration(input({ clientId: "omo" }));
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(victim, "utf8")).toBe(original);
+    expect(store.readRecords().omo).toBeDefined();
+  });
+
   test("removes only our block and leaves the rest byte-identical", () => {
     const configPath = installHermes();
     const original = "providers:\n  other:\n    api: http://elsewhere\nunknown_top: keep-me\n";
@@ -1124,6 +1196,24 @@ describe("Hermes source preservation", () => {
 });
 
 describe("restore", () => {
+  test.skipIf(process.platform === "win32")("refuses a symlinked managed target and leaves its target alone", () => {
+    const configPath = installOmo();
+    const applied = applyIntegration(input({ clientId: "omo" }));
+    expect(applied.ok).toBe(true);
+    const opId = store.listOperations("omo")[0]!.opId;
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    unlinkSync(configPath);
+    symlinkSync(victim, configPath);
+
+    const result = restoreIntegration({ ...input({ clientId: "omo" }), opId });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(victim, "utf8")).toBe(original);
+  });
+
   test("undoes an apply back to the exact prior bytes", () => {
     const configPath = installHermes();
     const original = "providers:\n  other:\n    api: http://elsewhere\n";

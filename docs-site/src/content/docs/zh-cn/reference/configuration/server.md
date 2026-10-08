@@ -15,7 +15,7 @@ description: 监听、远程访问、准入密钥、超时、存储、侧车、�
 | `proxy?` | `string` | — | 出站 HTTP(S) 或 SOCKS5 代理 URL（`socks5://host:port`），或 `${ENV_VAR}`。HTTP URL 仅在未设置时写入 `HTTP_PROXY` / `HTTPS_PROXY`。SOCKS5 URL 使用内置的真实 SOCKS5 隧道，也会写入 `ALL_PROXY`（`ocx start --socks5`）；并清除本进程继承的 `HTTP(S)_PROXY`。回环地址始终保留在 `NO_PROXY` 中。 |
 | `emptyCompletionRetry?` | `boolean` | `false` | 显式启用：当 Responses turn 既无文本也无工具调用时，使用相同请求重试一次，包括流在终止事件之前结束的情况。重试可能产生费用。`OCX_EMPTY_COMPLETION_RETRY=0` 可在不修改配置的情况下禁用；combo 与 routed-compaction turn 不参与。 |
 | `dropCodexSafetyBuffering?` | `boolean` | `false` | 从 Codex Responses 透传响应中移除 Codex safety-buffering 提示：`x-codex-safety-buffering-enabled` / `x-codex-safety-buffering-faster-model` 响应头、类型为 `safety_buffering` 的 `response.metadata` SSE 事件，以及其他 SSE 事件中的 `safety_buffering` 字段。Codex TUI 会将这些提示显示为“使用更快模型重试”的提示框，其默认操作会把会话切换到较弱的模型。其他 `x-codex-*` 响应头和其他所有 SSE 事件内容均保持不变，但会移除该字段。默认关闭。 |
-| `stallTimeoutSec?` | `number` | `300` | 上游无有效进展的秒数，适用于 Responses 和原生 Chat；最小 1 秒。 |
+| `stallTimeoutSec?` | `number` | `300`（public）/ 禁用（local） | 上游无有效进展（Responses 和原生 Chat）多少秒后切断流。未设置时**本地**上游（loopback、private、`.local`/`.lan` 名称）默认禁用，公网上游默认 300 秒；正值对两者生效（最小 1 秒）；`0` 全面禁用静默 watchdog。对于把 canonical ChatGPT SSE 折叠为非流式 JSON 的 Responses 请求，即使 watchdog 已禁用，仍保留独立的 15 分钟整轮上限。`/v1/responses/compact` 的挂起响应体读取共享此预算，但即使本地上游也默认 300 秒；显式值（含 `0`）优先。 |
 | `connectTimeoutMs?` | `number` | `200000` | 每次尝试的 DNS/TCP/TLS/最终响应头截止时间；它在正文生成之前结束。 |
 | `shutdownTimeoutMs?` | `number` | `5000` | 优雅停机截止时间，超过后会中止仍在进行中的请求。 |
 | `websockets?` | `boolean` | `false` | 声明并允许面向客户端的 Responses WebSocket 路径。设为 false 时客户端使用 HTTP/SSE；它不会禁用符合条件的 canonical ChatGPT 上游 WS 优化。 |
@@ -27,7 +27,7 @@ description: 监听、远程访问、准入密钥、超时、存储、侧车、�
 | `codexAutoStart?` | `boolean` | `true` | 允许 Codex shim 在启动 Codex 之前运行 `ocx ensure`。设为 false 会让 ensure 变成无操作。 |
 | `codexShimAutoRestore?` | `boolean` | `true` | 在完成外部 Codex 更新并覆盖安装的 shim 之后恢复该 shim。环境退出开关：`OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`。 |
 | `syncResumeHistory?` | `boolean` | `true` | 可逆的 Codex App 历史兼容性。原始元数据会被备份，并由 `ocx stop` / `ocx restore` 恢复。 |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 将识别出的 Codex 辅助/影子调用重定向到选定模型，并保留为请求配置的推理强度。默认源前缀为 `gpt-5.6-luna`；0.144.x 及更早客户端使用 `gpt-5.4-mini`，可通过 `sourceModels` 恢复。 |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 将识别出的 Codex 辅助/影子调用重定向到选定模型，并保留为请求配置的推理强度。默认源前缀为 `gpt-6-luna`, `gpt-5.6-luna`；0.144.x 及更早客户端使用 `gpt-5.4-mini`，可通过 `sourceModels` 恢复。 |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | 在可用时启用 | Web 搜索侧车选项。 |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | 在可用时启用 | 图像描述侧车选项。 |
 | `images?` | `OcxImagesConfig` | 自动选择 OpenAI | 用于 Codex `image_gen` 的独立 Images 转发选项。 |
@@ -126,15 +126,23 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 Codex 会为标题、提交信息等任务使用较小的辅助模型。启用
 `shadowCallIntercept` 后，可将识别出的源模型前缀重定向到另一个已配置模型。替换后仍会保留为请求配置的推理强度。只有当客户端使用不同的辅助 ID 时，才设置 `sourceModels`。
 
+拦截依据模型进行：裸模型 ID 与 `sourceModels` 匹配的请求（包括普通的 `request_kind: "turn"` 请求）都可以被重定向。通过 `x-openai-subagent: collab_spawn` 或 `x-codex-turn-metadata` JSON 标头中的 `subagent_kind: "thread_spawn"` 标记为已生成子代理的请求不受拦截，因此显式生成的子代理会保留其模型。
+
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### 目标不可用时
+
+替换目标是操作者选定的唯一目的地，因此无法再解析的目标会让辅助调用失败，而不是把它发到别处。当目标的提供方被禁用或删除，或其组合已不存在时，被拦截的请求会在向上游发送任何内容之前返回 `409` 和错误代码 `intercept_target_unavailable`。请求日志记录同一代码。请求不会透传给原生辅助模型，也不会回退到默认提供方，因为两者都会在你未选择的情况下改变目的地、凭据和费用。组合或路由配置档目标仍会在自身成员之间故障转移。像 `provider/model` 这样的限定目标，如果其提供方部分未指向任何已配置项，也按同样方式处理，设置 API 会拒绝保存。通过默认提供方解析的不带前缀的模型 ID 仍然有效。
+
+禁用（带 `disabled: true` 的 `PATCH /api/providers?name=<provider>`）或删除目标所解析到的提供方仍会成功；响应会加入 `dependentShadowIntercept: { model, enabled }`，仪表板会显示警告。重新启用该提供方或选择其他目标即可恢复拦截。
 
 ## 侧车
 
@@ -151,7 +159,7 @@ Codex 会为标题、提交信息等任务使用较小的辅助模型。启用
 
 | 字段 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` | 在可用时启用 | 总开关。 |
+| `enabled?` | `boolean` | 在可用时启用 | 总开关。为 `false` 时，OpenCodex 停止拦截 `web_search`，并且 Codex 集成会把 `web_search = "disabled"` 写入 `~/.codex/config.toml`。 |
 | `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | 显式配置优先；省略时始终使用 `openai`。`anthropic` 和 `xai` 仅在显式配置时运行；`gemini` 和 `exa` 在 executor 发布前仍为保留值。 |
 | `model?` | `string` | 依后端而定 | OpenAI 使用 `gpt-5.6-luna`，Anthropic 使用 `claude-sonnet-5`，xAI 使用 `grok-4.6`。旧的显式 `gpt-5.4-mini` 会在启动时迁移。 |
 | `exaApiKey?` | `string` | 无 | `exa` 后端的操作员密钥。仅可写入：管理读取绝不会返回已存储的值。 |
@@ -190,6 +198,22 @@ Anthropic OAuth 侧车会复用 opencodex 现有的 Claude Code OAuth 指纹。�
 
 ## Codex 额度网络诊断
 
-主 Codex 账户行中的 `quotaRefresh` 描述额度查询结果，并不代表剩余额度或模型访问权限。读取缓存或未执行查询时，该字段可能省略。查询使用正在运行的代理服务的环境，而不是当前终端的环境。未设置 `proxy` 时保留现有环境；`"auto"` 只在启动时读取 Windows 静态代理设置，不自动处理 PAC/WPAD、仅 SOCKS 的设置或运行中的更改。TUN 测试成功并不能单独证明 HTTP 代理路径正常。命令和状态说明见[英文网络诊断章节](/reference/configuration/server/#codex-quota-network-diagnostics)。
+主 Codex 账户行中的 `quotaRefresh` 描述额度查询结果，并不代表剩余额度或模型访问权限。读取缓存或未执行查询时，该字段可能省略。查询使用正在运行的代理服务的环境，而不是当前终端的环境。未设置 `proxy` 时保留现有环境；`"auto"` 在启动时读取 Windows 或 macOS 静态 HTTP/HTTPS 设置；macOS 上若有继承代理则跳过读取。macOS 将有效的 `*.<domain>` 转为 `.<domain>`：`*.local` 使 `foo.local` 和裸域名 `local` 直连，但不匹配 `xlocal`。精确的 `169.254/16`、`169.254.0.0/16`、`fe80::/10` 网段会跳过并给出诊断，因此链路本地 IP 地址使用代理。IP 地址和 `*` 仍可用；其他 CIDR、通配形式和简单主机名例外会在修改环境前拒绝自动发现。不自动处理 PAC/WPAD、仅 SOCKS 的设置或运行中的更改。TUN 测试成功并不能单独证明 HTTP 代理路径正常。命令和状态说明见[英文网络诊断章节](/reference/configuration/server/#codex-quota-network-diagnostics)。
 
 `dropCodexSafetyBuffering`: 不会改变供应商安全策略或拒绝响应。原生 WebSocket `codex.response.metadata.headers` 和 `/responses/compact` 不在过滤范围内。
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.
+
+## 令牌预留与额度限制
+
+如果请求受 `spend.root.maxTokens`、`spend.identity.maxTokens` 或 `spend.pool.maxTokens` 限制，无法记录令牌预留时会拒绝发送，包括跟踪容量已满的情况。没有适用额度限制的请求仍保持仅观察模式。

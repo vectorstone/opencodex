@@ -7,6 +7,9 @@ export type ProviderOption = {
   authMode?: string;
   adapter?: string;
   baseUrl?: string;
+  /** Decision-service rows need a model; see jevDecisionRowIssue. */
+  defaultModel?: string;
+  models?: string[];
 };
 export type ModelOption = {
   provider: string;
@@ -16,7 +19,11 @@ export type ModelOption = {
   inputModalities?: string[];
 };
 
+export type ComboAddIntent = "blank" | "jev-auto";
+
 export interface ComboWorkspaceProps {
+  /** Management API target; enables the per-candidate path preview and JEV stats in the detail panel. */
+  apiBase?: string;
   combos: ComboItem[];
   providerQuotaStates: ProviderQuotaStates;
   providers: ProviderOption[];
@@ -27,8 +34,11 @@ export interface ComboWorkspaceProps {
   onRefresh: () => void;
   onSave: (item: ComboItem, isCreate: boolean, renameFrom?: string) => Promise<{ ok: boolean; error?: string }>;
   onRemove: (id: string) => Promise<{ ok: boolean; error?: string }>;
-  onAdd: () => void;
+  onAdd: (intent?: ComboAddIntent) => void;
   adding: boolean;
+  addIntent?: ComboAddIntent;
+  /** Decision service a `jev-auto` add pre-fills; null keeps canonical TypeSafe JEV. */
+  addDecisionProvider?: string | null;
   onCloseAdd: () => void;
   onCreated: (id: string) => void;
 }

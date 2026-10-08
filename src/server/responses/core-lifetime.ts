@@ -4,6 +4,8 @@ import {
   markNativePassthroughSseResponse,
   isEagerRelaySseResponse,
   markEagerRelaySseResponse,
+  isPreinspectedJsonResponse,
+  markPreinspectedJsonResponse,
 } from "../relay";
 
 // runTurn adapters own an event queue and perform their combo preflight before
@@ -77,7 +79,31 @@ export function finalizeOwnedTranslatorBudget(response: Response, budget: Transl
   if (isEagerRelaySseResponse(response)) {
     markEagerRelaySseResponse(finalizedResponse);
   }
+  if (isPreinspectedJsonResponse(response)) markPreinspectedJsonResponse(finalizedResponse);
   return finalizedResponse;
+}
+
+/** Release a serving-account slot when the client body ends, errors or is cancelled. */
+export function finalizeAccountLease(response: Response, release: () => void): Response {
+  if (!response.body) { release(); return response; }
+  const reader = response.body.getReader();
+  let done = false;
+  const finish = () => { if (!done) { done = true; release(); } };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) { finish(); controller.close(); }
+        else controller.enqueue(next.value);
+      } catch (error) { finish(); controller.error(error); }
+    },
+    async cancel(reason) { try { await reader.cancel(reason); } finally { finish(); } },
+  });
+  const wrapped = new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  if (isNativePassthroughSseResponse(response)) markNativePassthroughSseResponse(wrapped);
+  if (isEagerRelaySseResponse(response)) markEagerRelaySseResponse(wrapped);
+  if (isPreinspectedJsonResponse(response)) markPreinspectedJsonResponse(wrapped);
+  return wrapped;
 }
 
 

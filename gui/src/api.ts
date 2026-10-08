@@ -9,7 +9,9 @@ import { adminTokenPromptAllowed, standaloneApiTargets, type ApiPlane, type ApiT
 export const SESSION_UNAVAILABLE_EVENT = "opencodex:session-unavailable";
 
 const LEGACY_TOKEN_KEY = "opencodex-api-token";
-const ADMIN_TOKEN_VALIDATION_PATH = "/api/settings";
+// Any guarded route answers 401 for a bad token; this one is a cheap config read. /api/settings
+// also resolves the Codex runtime and startup health, which made the token prompt hang.
+const ADMIN_TOKEN_VALIDATION_PATH = "/api/combos";
 const SESSION_REBOOTSTRAP_TIMEOUT_MS = 10_000;
 const RESOLUTION_WATCHDOG_MS = 15_000;
 const MACHINE_SESSION_HEADER = "X-OpenCodex-Machine-Session";
@@ -318,7 +320,11 @@ export function installApiAuthFetch(): void {
     if (!classified) return originalFetch(input, init);
     const state = runtime(classified.plane);
     const token = state.session.token;
-    const [firstInput, firstInit] = withAuth(classified.plane, input, init);
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    // Pairing exchanges must not carry the old shared-plane credential. The relay's
+    // separate machine-session headers are still attached by sessionHeaders().
+    const pairingExchange = classified.bootstrap && method === "POST";
+    const [firstInput, firstInit] = withAuth(classified.plane, input, init, pairingExchange ? null : undefined);
     const response = await originalFetch(firstInput, firstInit);
     if (classified.bootstrap || response.status !== 401) return response;
     const refreshed = state.session.token;

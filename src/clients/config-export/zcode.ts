@@ -1,6 +1,6 @@
 // ZCode config export.
 import type { ExportContext, ManagedContribution } from "./contracts";
-import { normalizeExportModels, inputModalitiesForClient, exportModelLabel, authoritativeContextWindow, authoritativeMaxOutputTokens, singleFragment } from "./model-metadata";
+import { normalizeExportModels, inputModalitiesForClient, exportModelLabel, authoritativeContextWindow, outputBudgetFor, singleFragment } from "./model-metadata";
 import { sanitizeCodexReasoningEfforts } from "../../reasoning-effort";
 import { OPENCODE_PROVIDER_ID, LOOPBACK_API_KEY_PLACEHOLDER } from "./constants";
 
@@ -77,7 +77,7 @@ export function buildZcodeClientConfig(ctx: ExportContext): ZcodeGeneratedConfig
     // ZCode's schema and is emitted only from an authoritative capability — a stand-in budget is a
     // guessed capability, which the "no metadata is guessed" rule forbids.
     const context = authoritativeContextWindow(model.contextWindow);
-    const output = authoritativeMaxOutputTokens(model.maxOutputTokens, context);
+    const output = outputBudgetFor(context, model);
     if (context !== undefined) {
       entry.limit = { context, ...(output !== undefined ? { output } : {}) };
     }

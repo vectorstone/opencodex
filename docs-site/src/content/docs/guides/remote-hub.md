@@ -3,6 +3,8 @@ title: Remote Hub Deployment
 description: Run a one-port opencodex hub on Linux, macOS, or Docker with a loopback companion listener, a self-provisioned data token, ocx hub invite, a loopback-only management ingress, Tailscale Serve, and headless OAuth.
 ---
 
+For SSH machine links, see [Remote Link](/guides/remote-link/).
+
 An opencodex hub keeps provider credentials and usage state on one host while authenticated clients
 use its data plane remotely. The browser-facing management plane is separate: an optional listener
 binds only `127.0.0.1`, serves the dashboard and `/api/*`, and is intended to sit behind Tailscale
@@ -21,12 +23,20 @@ public-internet surface and is outside this deployment model.
 
 With management ingress enabled, the local dashboard command opens `http://127.0.0.1:<management port>` so the address matches the IPv4-only listener without resolving `localhost`.
 
+Client configurations exported or applied through that dashboard still target the inference
+listener, not the management port. Local clients use the configured loopback companion port
+(or the actual public listener port when the companion has no explicit port).
+
 ## Trust and consent boundaries
 
 - Provider and OAuth credentials stay on the hub. Never copy them into a client, image layer,
   service definition, support bundle, screenshot, or command line.
 - The data admission token is delivered through the owner-only `service-api-token` file or
   `OCX_API_TOKEN_FILE`. It is not a management credential.
+- A configured client's `allowedModels` must include both the executor and any separately billed
+  Advisor model used by managed native Anthropic Messages. Bare model IDs and the hub's configured
+  `provider/model` names are accepted. A disallowed or unnamed Advisor destination returns HTTP 403
+  before provider dispatch; provider-only and unrestricted keys retain their existing scope.
 - A raw management admin token can perform ordinary administration, but it cannot mint a browser
   session or authorize consent-bearing actions such as starring the repository. Those actions
   require a server-issued `gui-session`, matching browser origin, and CSRF token.
@@ -60,6 +70,16 @@ The hub automatically issues a per-client key. The client writes it to the exist
 `service-api-token` file, never `config.json`. While connected, usage comes from the hub usage store
 filtered to that client's stable `apiKeyId`. After disconnect, usage comes from the local store.
 OpenCodex does not mirror usage between the two stores.
+`ocx service uninstall` removes the local service but preserves an existing key when the client is
+connected, its connection metadata is invalid or mismatched, or a pending connection marker matches
+the current key. A valid marker for an older key does not retain an unrelated service key.
+If a marker is unsafe, malformed, or unreadable, token cleanup cannot be verified;
+the command warns instead of claiming the key was kept. Use `ocx disconnect` to remove a connected
+client's local key and state.
+
+If a client saved a remote `http://` Hub URL before the secure transport rule, its Hub
+operations now return `insecure_http_refused`. Run `ocx disconnect` locally, then reconnect
+to the Hub with `https://` (or use loopback HTTP when both sides are on the same machine).
 
 Rotate a connected client with a fresh transient authority:
 
@@ -76,7 +96,7 @@ authority; recovery probes both files before committing or restoring. Never dele
 recovery reports that both candidates were rejected.
 
 `ocx disconnect` is local and works while the hub is offline. It restores local client state and
-does not revoke the hub key. After disconnect, revoke that key from **Integrations → API Keys** on
+does not revoke the hub key. After disconnect, revoke that key from **Connect → API Keys** on
 the hub. `ocx connect revoke --admin-token-stdin` is available only while still connected and uses
 the persisted `apiKeyId`; it accepts no id override. Browser session logout/expiry is separate from
 data-key rotation, revocation, and disconnect.
@@ -110,6 +130,18 @@ the request and shows matching cached hub state, or `unavailable` if no matching
 Bind the data listener to the hub's Tailscale address, enable the loopback companion so the hub's
 own processes reach that same port without a credential, and publish management separately. The
 values below are examples:
+
+:::danger[Use a dedicated single-tenant host]
+The loopback companion is unauthenticated: every process and OS user on this machine can use the
+hub's provider credentials and account quota, and can exhaust the shared turn capacity that
+authenticated remote clients depend on. Do not enable it on a shared or multi-tenant host. If the
+host is shared, leave the `unauthenticatedLoopbackListener` setting disabled and do not run the hub's local
+integrations.
+
+Binding to `127.0.0.1` means the kernel refuses remote connections, but it does not stop a browser:
+a page you visit can make your browser connect to `127.0.0.1`. The listener therefore applies the
+same `Host` and `Origin` checks as an ordinary loopback bind.
+:::
 
 ```bash
 ocx config set runtimeRole hub
@@ -215,6 +247,9 @@ separate ports:
 ```bash
 ocx config set unauthenticatedLoopbackListener '{"enabled":true,"port":10104}'
 ```
+
+The ported form is the same unauthenticated surface: the dedicated-host warning above applies to
+this command too.
 
 With a `port` set, the local integrations follow the listener and write `http://127.0.0.1:10104`
 instead. The port must differ from the proxy port and is never OS-assigned: an ephemeral port would
@@ -757,7 +792,7 @@ For a service rollback, stop the branch service and repair the prior release aga
   bound to loopback behind a TLS frontend. See [Giving the data listener TLS](#giving-the-data-listener-tls).
 - **Remote session ended:** sign in or pair again. Logout and expiry invalidate only the browser
   session, not a client data key.
-- **Outstanding revocation after disconnect:** use the hub dashboard's **Integrations → API Keys**
+- **Outstanding revocation after disconnect:** use the hub dashboard's **Connect → API Keys**
   page. It is the sole post-disconnect revocation path.
 ### Usage from a connected client
 

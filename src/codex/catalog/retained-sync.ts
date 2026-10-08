@@ -1,23 +1,27 @@
+import { projectAntigravitySelectedModels } from "../../providers/antigravity-effort-families";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig, websocketsEnabled } from "../../config";
+import { initializeConfigOwnership } from "../../lib/config-ownership";
+import { getConfigDir, loadConfig, websocketsEnabled, withConfigMutationLockSync } from "../../config";
 import { shouldSyncCodexOnStart } from "../desired-state";
 import { legacyCustomModelCatalogSlugs } from "../custom-model-catalog-migration";
 import { getCodexHome } from "../paths";
 import type { OcxConfig } from "../../types";
 import { pendingModelSelectionProviders } from "../../providers/initial-model-selection";
+import { captureModelDiscoveryBaseline, finalizeModelDiscovery } from "../../providers/new-model-policy-runtime";
 import { OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { COMBO_NAMESPACE } from "../../combos";
 import { codexAccountNamespaceEntries, isMainCodexAccountTarget } from "../account-namespaces";
 import { MAIN_CODEX_ACCOUNT_ID } from "../main-account";
+import { applyNativeAccessPrograms } from "./access-programs";
 import {
   availableAccountGatedNativeModels,
   codexModelEntitlementStateForAccount,
   isCodexModelEntitlementSnapshotCurrent,
-  resolveCodexModelEntitlements,
   type CodexModelEntitlementSnapshot,
 } from "../model-entitlements";
+import { resolveAdmittedCodexModelEntitlements } from "../model-entitlement-admission";
 import { isAccountNeedsReauth } from "../account-runtime-state";
 import { codexRuntimeStatePath } from "../runtime";
 import {
@@ -36,6 +40,8 @@ import {
   nativeMultiAgentDefaults,
 } from "./parsing";
 import type { CatalogModel, MultiAgentMode, RawCatalog, RawEntry } from "./parsing";
+import { ocxRoutedNamespaceCounts, routedRemovalBackedByConfigFile, unconfiguredRoutedRemoval } from "./routed-removal";
+import { ConfigMutationLockError } from "../../config/mutation-lock";
 import {
   accountBoundNativeOpenAiSlugsBySelector,
   desktopAllowlistSuppressedNativeSlugs,
@@ -60,11 +66,13 @@ import {
 } from "../catalog-write-serialization";
 import {
   preparedBytesDifferFromDisk,
+  auditRefusedCatalogReplacement,
   publishHashedCodexCatalogBackup,
   publishLegacyCodexCatalogBackup,
   replaceActiveCodexCatalog,
   replaceCodexModelsCache,
   type PreparedCatalogFileWrite,
+  type CatalogFileReplacement,
 } from "../internal/catalog-writer";
 import { visibleCodexAccountSelectors } from "./account-models";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS, NATIVE_OPENAI_MODELS, NATIVE_RESERVE_MODEL } from "./native-models";
@@ -101,8 +109,15 @@ interface RetainedCatalogSyncResult {
   comboOmissions: ComboCatalogOmission[];
   /** Validated catalog commit (including identical bytes), or a refused refresh. */
   refreshOutcome?: "committed" | "refused";
-  /** `desired_disabled` observed under K after the provider await; nothing was written. */
-  skippedReason?: "desired_disabled";
+  /**
+   * `desired_disabled`: observed under K after the provider await. `unbacked_routed_removal`: the
+   * catalog would lose routed namespaces config.json still enables, or config.json is missing or
+   * unreadable (#6529). `foreign_owner`: this Codex home is bound to another OPENCODEX_HOME. Nothing
+   * was written in any of these cases.
+   */
+  skippedReason?: "desired_disabled" | "unbacked_routed_removal" | "foreign_owner" | "owner_unknown";
+  /** With `unbacked_routed_removal`: how many routed namespaces the refused write would have emptied. */
+  protectedRoutedNamespaces?: number;
 }
 
 /**
@@ -265,6 +280,7 @@ function catalogModelsForMergeWithNativeRecovery(
   ]);
 }
 
+/** Merge retained rows, project confirmed account metadata, and publish only changed catalog bytes. */
 function writeRetainedCatalogSync({
   config,
   goModels,
@@ -289,6 +305,8 @@ function writeRetainedCatalogSync({
     // (later syncs would otherwise overwrite it with featured-modified priorities).
     const pristine = pristineCatalogBytes(read);
     if (pristine !== null) {
+      // Initialize metadata while the root is empty; never pre-claim the hashed path.
+      initializeConfigOwnership(getConfigDir());
       publishHashedCodexCatalogBackup(permit, owningCodexHome, {
         path: catalogBackupPathFor(catalogPath),
         content: pristine,
@@ -459,7 +477,7 @@ function writeRetainedCatalogSync({
       provider.disabled !== true
         && Array.isArray(provider.selectedModels)
         && provider.selectedModels.length > 0
-        ? [[name, new Set(provider.selectedModels)] as const]
+        ? [[name, new Set(projectAntigravitySelectedModels(name, provider.selectedModels, goModels))] as const]
         : []
     )),
   );
@@ -523,6 +541,7 @@ function writeRetainedCatalogSync({
       warningPolicy: "emit",
     },
   });
+  applyNativeAccessPrograms(catalog.models, modelEntitlements, accountTargets);
   clampCatalogModelsToCodexSupport(catalog.models);
   finalizeAutoReviewModelOverride(catalog.models, catalogModelsForMerge, config);
   // Last mutation before serialization; see `enforceCatalogSlugUniqueness` for why the ordering
@@ -546,12 +565,46 @@ function writeRetainedCatalogSync({
   if (!preparedBytesDifferFromDisk(preparedCatalog)) {
     return { added, path: catalogPath, catalogWritten: false, comboOmissions };
   }
-
-  replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
+  // A refresh may drop a provider's rows only when config.json on disk agrees the provider is gone.
+  // Without that, a config that is not the user's (missing or unreadable file read as defaults,
+  // another OPENCODEX_HOME) would publish a native-only catalog and exit cleanly (#6529).
+  const refused = (protectedRoutedNamespaces: number): RetainedCatalogSyncResult => ({
+    added: 0,
+    path: catalogPath,
+    catalogWritten: false,
+    comboOmissions,
+    skippedReason: "unbacked_routed_removal",
+    protectedRoutedNamespaces,
+  });
+  let replacement: CatalogFileReplacement | undefined;
+  const removal = unconfiguredRoutedRemoval(onDiskCatalog, catalog, config);
+  if (removal !== null) {
+    // Hold C (K -> C) from the config read through the replacement, so a save that enables one of
+    // these providers cannot land between the check and the write. A held C is a refusal too.
+    let backed = false;
+    try {
+      backed = withConfigMutationLockSync(() => {
+        if (!routedRemovalBackedByConfigFile(removal)) return false;
+        replacement = replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
+        return replacement.kind !== "refused";
+      });
+    } catch (error) {
+      if (!(error instanceof ConfigMutationLockError)) throw error;
+    }
+    if (!backed) {
+      if (replacement?.kind !== "refused") {
+        auditRefusedCatalogReplacement(permit, owningCodexHome, preparedCatalog, "unbacked-routed-removal");
+      }
+      return refused(removal.namespaces.length);
+    }
+  } else {
+    replacement = replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
+    if (replacement.kind === "refused") return refused(ocxRoutedNamespaceCounts(onDiskCatalog).size);
+  }
   return {
     added,
     path: catalogPath,
-    catalogWritten: true,
+    catalogWritten: replacement?.kind === "written",
     comboOmissions,
   };
 }
@@ -596,12 +649,15 @@ export async function syncCatalogModels(
     evidence: retainedCatalogSyncEvidence(config, preflightRead.catalogPath, preflightRead.catalog),
     processEvidence: retainedCatalogProcessEvidence(),
   };
+  const discoveryBaseline = captureModelDiscoveryBaseline(config);
+  const providerContentRevisions = new Map<string, string>();
   const [goModels, modelEntitlements] = await Promise.all([
     gatherRoutedModels(config, {
       comboOmissions,
       providerModelOutcomes,
+      providerContentRevisions,
     }),
-    resolveCodexModelEntitlements(config),
+    resolveAdmittedCodexModelEntitlements(config),
   ]);
   const committed = withCatalogWriteSerialization(owningCodexHome, permit => {
     // Desired state can flip OFF during the provider await above. The catalog
@@ -623,6 +679,11 @@ export async function syncCatalogModels(
     const current = revalidateRetainedCatalogSync(config, prepared);
     if (current === null) return null;
     if (!isCodexModelEntitlementSnapshotCurrent(modelEntitlements)) return null;
+    // Revalidate before adopting discovery: its scoped config mutation would otherwise
+    // invalidate our own evidence. K -> C is the catalog/config lock order.
+    if (!finalizeModelDiscovery(config, discoveryBaseline, goModels,
+      providerModelOutcomes.filter(outcome => outcome.state === "authoritative").map(outcome => outcome.provider),
+      providerContentRevisions)) return null;
     return writeRetainedCatalogSync({
       config,
       goModels,
@@ -633,7 +694,7 @@ export async function syncCatalogModels(
       owningCodexHome,
       modelEntitlements,
     });
-  });
+  }, { intent: "refresh", writer: "retained-sync" });
   if (committed.kind === "completed" && committed.value !== null) {
     return {
       ...committed.value,
@@ -646,14 +707,20 @@ export async function syncCatalogModels(
     catalogWritten: false,
     comboOmissions,
     refreshOutcome: "refused",
+    ...(committed.kind === "unavailable" && committed.reason === "foreign-owner"
+      ? { skippedReason: "foreign_owner" as const } : {}),
+    ...(committed.kind === "unavailable" && committed.reason === "owner-unknown"
+      ? { skippedReason: "owner_unknown" as const } : {}),
   };
 }
 
-export function invalidateCodexModelsCacheWithPermit(
+export type CodexCacheInvalidationOutcome = "written" | "unchanged" | "missing_catalog" | "desired_disabled" | "failed";
+
+export function invalidateCodexModelsCacheWithPermitOutcome(
   permit: CatalogWritePermit,
   owningCodexHome: string,
   options?: CodexCatalogSyncOptions,
-): boolean {
+): CodexCacheInvalidationOutcome {
   try {
     // This permit is a REACQUISITION: refreshCodexModelCatalog's commit released
     // K before this rewrite runs, so the commit-path desired-state check cannot
@@ -661,9 +728,9 @@ export function invalidateCodexModelsCacheWithPermit(
     // routed cache write — re-read intent under this permit, same as the commit.
     // The catalog-only sync override applies here too so an explicit refresh
     // keeps the cache consistent with the catalog it just wrote.
-    if (!shouldSyncCodexOnStart(loadConfig()) && options?.allowWhenDesiredDisabled !== true) return false;
+    if (!shouldSyncCodexOnStart(loadConfig()) && options?.allowWhenDesiredDisabled !== true) return "desired_disabled";
     const catalogPath = readCodexCatalogPathForHome(owningCodexHome);
-    if (!existsSync(catalogPath)) return false;
+    if (!existsSync(catalogPath)) return "missing_catalog";
     const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
     const models = catalog.models ?? catalog;
     const cachePath = join(owningCodexHome, "models_cache.json");
@@ -711,12 +778,18 @@ export function invalidateCodexModelsCacheWithPermit(
     // `cacheSynced` mean what its name and its consumers already assume, and what
     // `pullRemoteCatalog` and the early returns in `refreshCodexModelCatalog`
     // already assert: a write happened.
-    if (!preparedBytesDifferFromDisk(preparedCache)) return false;
-    replaceCodexModelsCache(permit, owningCodexHome, preparedCache);
-    return true;
+    return replaceCodexModelsCache(permit, owningCodexHome, preparedCache).kind;
   } catch {
-    return false;
+    return "failed";
   }
+}
+
+export function invalidateCodexModelsCacheWithPermit(
+  permit: CatalogWritePermit,
+  owningCodexHome: string,
+  options?: CodexCatalogSyncOptions,
+): boolean {
+  return invalidateCodexModelsCacheWithPermitOutcome(permit, owningCodexHome, options) === "written";
 }
 
 export function invalidateCodexModelsCache(options?: CodexCatalogSyncOptions): boolean {
@@ -724,6 +797,7 @@ export function invalidateCodexModelsCache(options?: CodexCatalogSyncOptions): b
   const outcome = withCatalogWriteSerialization(
     owningCodexHome,
     permit => invalidateCodexModelsCacheWithPermit(permit, owningCodexHome, options),
+    { intent: "cache", writer: "cache-invalidate" },
   );
   return outcome.kind === "completed" && outcome.value;
 }

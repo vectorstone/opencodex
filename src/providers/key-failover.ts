@@ -12,8 +12,8 @@ import { commitProviderApiKeySelection } from "./api-key-selection";
 import type { ProviderApiKeySelection } from "../types/provider";
 import { routedProviderConfig } from "../router";
 import { getProviderRegistryEntry } from "./registry";
-import { normalizedBaseUrl } from "./quota/vendor-probes-key";
-import type { OcxConfig, OcxProviderConfig, RateLimitRetryPolicy, TransientRetryPolicy } from "../types";
+import { isCanonicalCommandCodeBaseUrl, normalizedBaseUrl } from "./quota/vendor-probes-key";
+import type { OcxConfig, OcxProviderConfig, RateLimitRetryPolicy, ResetReplayPolicy, TransientRetryPolicy } from "../types";
 import { OPENCODE_GO_SESSION_HEADER } from "./opencode-go-transport";
 import { resolveProviderTransport, type OcxProviderTransport } from "./xai-transport";
 import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
@@ -326,6 +326,16 @@ const DEFAULT_TRANSIENT_RETRY = {
   attempts: 3,
 } as const satisfies Required<TransientRetryPolicy>;
 
+/**
+ * Default used when a provider opts in with a bare `retryOnReset: {}`: one replacement for
+ * the whole logical request. `replacements` counts duplicate inferences the operator accepts,
+ * not retries and not sends.
+ */
+const DEFAULT_RESET_REPLAY = {
+  enabled: true,
+  replacements: 1,
+} as const satisfies Required<ResetReplayPolicy>;
+
 /** Map<`${providerName}\0${keyId}`, KeyCooldown> */
 const keyCooldowns = new Map<string, KeyCooldown>();
 
@@ -556,7 +566,8 @@ export function selectProactiveApiKeyTransport(
  * `enabled: false` to opt out). When the knob is absent, the OpenCode Go destination
  * (subscription traffic such as Muse Spark) falls back to a patient same-key policy so a
  * burst 429 waits and replays instead of surfacing to the client and aborting a long
- * session; every other provider without the knob keeps today's fail-fast behavior.
+ * session; key-auth Command Code at its canonical endpoints gets the same fallback (#5180), and
+ * every other provider without the knob keeps today's fail-fast behavior.
  * OAuth/forward/local credentials are never replayed on the same token. The returned
  * policy is fully defaulted so callers never re-check fields.
  */
@@ -580,10 +591,17 @@ export function rateLimitRetryPolicyFor(
       respectRetryAfter: policy.respectRetryAfter ?? DEFAULT_RATE_LIMIT_RETRY.respectRetryAfter,
     };
   }
-  // No explicit knob: patient fallback for the OpenCode Go destination only.
+  // No explicit knob: patient fallback for OpenCode Go and canonical Command Code only.
   if (provider.authMode !== undefined && provider.authMode !== "key") return null;
-  if (!isOpenCodeGoDestination(provider)) return null;
-  return { ...OPENCODE_GO_RATE_LIMIT_RETRY };
+  if (isOpenCodeGoDestination(provider)) return { ...OPENCODE_GO_RATE_LIMIT_RETRY };
+  // Command Code's Provider API rate-limits long muse-spark turns the same way (#5180): a single
+  // key cannot fail over, and the Codex client does not retry a 429, so the turn aborts. The key
+  // endpoint gets the same patient same-key policy. A row repointed at a custom relay is not the
+  // canonical endpoint and keeps fail-fast unless it sets `retryOn429`.
+  if (typeof provider.baseUrl === "string" && isCanonicalCommandCodeBaseUrl(provider.baseUrl.trim())) {
+    return { ...OPENCODE_GO_RATE_LIMIT_RETRY };
+  }
+  return null;
 }
 
 /**
@@ -613,6 +631,26 @@ export function transientRetryPolicyFor(
   return {
     enabled: policy.enabled ?? DEFAULT_TRANSIENT_RETRY.enabled,
     attempts: policy.attempts ?? DEFAULT_TRANSIENT_RETRY.attempts,
+  };
+}
+
+/**
+ * Normalize a provider's `retryOnReset` policy, or return null when it is absent or explicitly
+ * disabled.
+ *
+ * No auth-mode gate: the canonical ChatGPT backend is `forward` auth and is the send this
+ * policy exists for. Whether a given REQUEST may be replaced is a per-body decision made in
+ * src/server/responses/reset-replay.ts, and how many replacements the request gets is the
+ * shared allowance on its execution budget. This function only reads the operator's intent.
+ */
+export function resetReplayPolicyFor(
+  provider: Pick<OcxProviderConfig, "retryOnReset">,
+): Required<ResetReplayPolicy> | null {
+  const policy = provider.retryOnReset;
+  if (!policy || policy.enabled === false) return null;
+  return {
+    enabled: policy.enabled ?? DEFAULT_RESET_REPLAY.enabled,
+    replacements: policy.replacements ?? DEFAULT_RESET_REPLAY.replacements,
   };
 }
 

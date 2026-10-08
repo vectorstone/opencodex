@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteFile } from "../config";
+import { assertCodexHomeOwner, CODEX_HOME_JOURNAL_FILE, CodexHomeOwnerRefusal, opencodexHomeForInjection, readCodexHomeJournal, type CodexHomeOwnerRefusalReason } from "./codex-home-owner";
 import { hasInjectedCodexRouting } from "./injected-marker";
 import { CODEX_HOME, CODEX_CONFIG_PATH, CODEX_PROFILE_PATH } from "./paths";
 
@@ -14,7 +15,7 @@ import { CODEX_HOME, CODEX_CONFIG_PATH, CODEX_PROFILE_PATH } from "./paths";
  * agreed with the producer, and the pair stayed green. One exported constant
  * removes the opportunity.
  */
-export const JOURNAL_PATH = join(CODEX_HOME, "opencodex-journal.json");
+export const JOURNAL_PATH = join(CODEX_HOME, CODEX_HOME_JOURNAL_FILE);
 
 export type JournalOwner =
   | { kind: "process"; pid: number }
@@ -43,6 +44,26 @@ interface Journal {
    */
   injectedRealtimeWsBaseUrl?: string | null;
   /**
+   * The root `web_search` value this injection wrote, when it wrote one.
+   *
+   * Same reasoning as {@link injectedOpenaiBaseUrl}, for the one other root key whose value is a
+   * mode Codex reads: the marker comment above `web_search = "disabled"` does not survive a Codex
+   * app reserialize, and without value evidence the next injection cannot tell our line from the
+   * operator's. The failure that buys is quiet: a re-enabled sidecar whose client still has the
+   * native tool switched off has nothing to intercept, which is the empty state the switch exists
+   * to avoid.
+   */
+  injectedRootWebSearch?: string | null;
+  /**
+   * The user-owned root `web_search` line this injection REMOVED while the sidecar was off.
+   *
+   * Two root keys of the same name are invalid TOML, so the operator's mode has to leave the file
+   * for as long as the switch is off. Recording the exact line is what puts it back when the
+   * sidecar is switched on again — including for a line the snapshot predates, which is the case
+   * `ocx restore` alone cannot cover.
+   */
+  replacedRootWebSearch?: string | null;
+  /**
    * The catalog path this injection actually wrote to.
    *
    * #1798: restore re-resolves the catalog from the CURRENT config, so a Codex app rewrite
@@ -51,14 +72,22 @@ interface Journal {
    * file we actually touched.
    */
   injectedCatalogPath?: string | null;
+  /** Injection binding survives native snapshot replacement and is released by native restore. */
+  opencodexHome?: string;
   pid: number;
   owner?: JournalOwner;
   timestamp: string;
 }
 
 export interface RestoreJournalResult {
+  /** An unchanged generated profile could not be restored; distinct from a preserved user edit. */
+  profileRestoreFailed?: true;
+  ownershipRefusal?: CodexHomeOwnerRefusalReason;
   configRestored: boolean;
   profileRestored: boolean;
+  /** True only when restore rewrote or removed a file (not when state was already original). */
+  configRewritten: boolean;
+  profileRewritten: boolean;
   configChanged: boolean;
   profileChanged: boolean;
   complete: boolean;
@@ -126,6 +155,7 @@ export interface WriteJournalOptions {
  * plugins, model choice, and trusted projects.
  */
 export function writeJournal(options: WriteJournalOptions = {}): void {
+  assertCodexHomeOwner(CODEX_HOME);
   if (!existsSync(CODEX_CONFIG_PATH)) return;
   const config = options.configContent ?? readFileSync(CODEX_CONFIG_PATH, "utf-8");
   // Ownership is decided HERE, from the bytes about to be journaled — never taken
@@ -135,7 +165,12 @@ export function writeJournal(options: WriteJournalOptions = {}): void {
   // The caller's verdict only authorizes REPLACEMENT. It is weaker evidence than
   // the check above (it may describe bytes read a moment earlier), so an
   // unclassified call creates a first snapshot but never overwrites one.
-  if (existsSync(JOURNAL_PATH) && readJournal() && options.currentStateIsNative !== true) return;
+  const inspection = readCodexHomeJournal(JOURNAL_PATH);
+  if (inspection.kind === "unknown") {
+    throw new CodexHomeOwnerRefusal("owner-unknown");
+  }
+  const previous = inspection.kind === "read" ? inspection.journal as unknown as Journal : null;
+  if (previous && options.currentStateIsNative !== true) return;
   const profile = existsSync(CODEX_PROFILE_PATH)
     ? readFileSync(CODEX_PROFILE_PATH, "utf-8")
     : null;
@@ -143,6 +178,7 @@ export function writeJournal(options: WriteJournalOptions = {}): void {
     version: 1,
     originalConfig: Buffer.from(config).toString("base64"),
     originalProfile: profile !== null ? Buffer.from(profile).toString("base64") : null,
+    opencodexHome: opencodexHomeForInjection(previous?.opencodexHome),
     pid: process.pid,
     owner: options.owner?.kind === "client"
       ? { kind: "client", apiKeyId: options.owner.apiKeyId }
@@ -156,6 +192,10 @@ export interface InjectedJournalOwnership {
   injectedOpenaiBaseUrl: string | null;
   injectedRealtimeWsBaseUrl: string | null;
   injectedCatalogPath: string | null;
+  /** Omitted by callers that inject no `web_search` line, which is the value it then records. */
+  injectedRootWebSearch?: string | null;
+  /** Omitted by callers that removed no user `web_search` line. */
+  replacedRootWebSearch?: string | null;
 }
 
 export function markJournalInjectedState(
@@ -163,7 +203,10 @@ export function markJournalInjectedState(
   profile: string | null,
   ownership: InjectedJournalOwnership,
 ): void {
-  const journal = readJournal();
+  assertCodexHomeOwner(CODEX_HOME);
+  const inspection = readCodexHomeJournal(JOURNAL_PATH);
+  if (inspection.kind === "unknown") throw new CodexHomeOwnerRefusal("owner-unknown");
+  const journal = inspection.kind === "read" ? inspection.journal as unknown as Journal : null;
   if (!journal) return;
   // The first exact injected config is the only safe whole-snapshot restore boundary for
   // the first native snapshot. A later reinjection may preserve user edits made while routed;
@@ -177,7 +220,10 @@ export function markJournalInjectedState(
   // would mistake a preserved user override for injected routing.
   journal.injectedOpenaiBaseUrl = ownership.injectedOpenaiBaseUrl;
   journal.injectedRealtimeWsBaseUrl = ownership.injectedRealtimeWsBaseUrl;
+  journal.injectedRootWebSearch = ownership.injectedRootWebSearch ?? null;
+  journal.replacedRootWebSearch = ownership.replacedRootWebSearch ?? null;
   journal.injectedCatalogPath = ownership.injectedCatalogPath;
+  journal.opencodexHome = opencodexHomeForInjection(journal.opencodexHome);
   atomicWriteFile(JOURNAL_PATH, JSON.stringify(journal));
 }
 
@@ -198,29 +244,48 @@ export function journaledInjectedRealtimeWsBaseUrl(options: { readOnly?: boolean
   return readJournal(options.readOnly !== true)?.injectedRealtimeWsBaseUrl ?? null;
 }
 
+/** The root `web_search` value the last injection wrote, or null when it wrote none. */
+export function journaledInjectedRootWebSearch(options: { readOnly?: boolean } = {}): string | null {
+  return readJournal(options.readOnly !== true)?.injectedRootWebSearch ?? null;
+}
+
+/** The user-owned root `web_search` line the last injection removed, or null when there was none. */
+export function journaledReplacedRootWebSearch(options: { readOnly?: boolean } = {}): string | null {
+  return readJournal(options.readOnly !== true)?.replacedRootWebSearch ?? null;
+}
+
 /** The catalog path the last injection wrote to, or null when none was recorded. */
 export function journaledInjectedCatalogPath(): string | null {
   return readJournal()?.injectedCatalogPath ?? null;
 }
 
 export function removeJournal(): void {
+  assertCodexHomeOwner(CODEX_HOME);
   try { unlinkSync(JOURNAL_PATH); } catch { /* ignore */ }
 }
 
-function readJournal(cleanInvalid = true): Journal | null {
-  if (!existsSync(JOURNAL_PATH)) return null;
-  try {
-    const journal = JSON.parse(readFileSync(JOURNAL_PATH, "utf-8")) as Journal;
-    if (journal.version !== 1) throw new Error("unknown version");
-    return journal;
-  } catch {
-    if (cleanInvalid) removeJournal();
-    return null;
-  }
+/** Successful field-level native restore releases ownership while retaining recovery evidence. */
+export function releaseJournalHomeBinding(): void {
+  assertCodexHomeOwner(CODEX_HOME);
+  const inspection = readCodexHomeJournal(JOURNAL_PATH);
+  if (inspection.kind === "unknown") throw new CodexHomeOwnerRefusal("owner-unknown");
+  if (inspection.kind === "missing" || inspection.journal.opencodexHome === undefined) return;
+  delete inspection.journal.opencodexHome;
+  atomicWriteFile(JOURNAL_PATH, JSON.stringify(inspection.journal));
 }
 
-export function journalOwner(): JournalOwner | null {
-  const journal = readJournal();
+// Kept compatible with existing read-only callers; invalid evidence is never cleanup authority.
+function readJournal(_cleanInvalid = true): Journal | null {
+  const inspected = readCodexHomeJournal(JOURNAL_PATH);
+  return inspected.kind === "read" ? inspected.journal as unknown as Journal : null;
+}
+
+/**
+ * Who owns the journal. `readOnly` never deletes an unreadable journal: a background reader (the
+ * routing healer, `routing-healer.ts`) must not destroy recovery evidence it only looked at.
+ */
+export function journalOwner(options: { readOnly?: boolean } = {}): JournalOwner | null {
+  const journal = readJournal(options.readOnly !== true);
   if (!journal) return null;
   if (journal.owner?.kind === "client" && typeof journal.owner.apiKeyId === "string" && journal.owner.apiKeyId) {
     return { kind: "client", apiKeyId: journal.owner.apiKeyId };
@@ -234,9 +299,16 @@ export function journalOwner(): JournalOwner | null {
 }
 
 export function restoreJournalState(): RestoreJournalResult {
+  try { assertCodexHomeOwner(CODEX_HOME); }
+  catch (error) {
+    if (!(error instanceof CodexHomeOwnerRefusal)) throw error;
+    return { configRestored: false, profileRestored: false, configRewritten: false, profileRewritten: false,
+      configChanged: false, profileChanged: false, complete: false, unverified: true, ownershipRefusal: error.reason };
+  }
   const journal = readJournal();
   if (!journal) {
-    return { configRestored: false, profileRestored: false, configChanged: false, profileChanged: false, complete: false, unverified: false };
+    return { configRestored: false, profileRestored: false, configRewritten: false, profileRewritten: false,
+      configChanged: false, profileChanged: false, complete: false, unverified: false };
   }
   const currentConfig = existsSync(CODEX_CONFIG_PATH) ? readFileSync(CODEX_CONFIG_PATH, "utf-8") : null;
   const currentProfile = existsSync(CODEX_PROFILE_PATH) ? readFileSync(CODEX_PROFILE_PATH, "utf-8") : null;
@@ -248,6 +320,8 @@ export function restoreJournalState(): RestoreJournalResult {
     return {
       configRestored: comparison.configAlreadyOriginal,
       profileRestored: comparison.profileAlreadyOriginal,
+      configRewritten: false,
+      profileRewritten: false,
       configChanged: !configUnchanged,
       profileChanged: !profileUnchanged,
       complete: false,
@@ -255,16 +329,21 @@ export function restoreJournalState(): RestoreJournalResult {
     };
   }
 
+  assertCodexHomeOwner(CODEX_HOME);
   let configRestored = comparison.configAlreadyOriginal;
   let profileRestored = comparison.profileAlreadyOriginal;
+  let configRewritten = false;
+  let profileRewritten = false;
   if (configUnchanged && !configRestored) {
     atomicWriteFile(CODEX_CONFIG_PATH, comparison.originalConfig);
     configRestored = true;
+    configRewritten = true;
   }
   if (profileUnchanged && !profileRestored) {
     if (comparison.originalProfile !== null) {
       atomicWriteFile(CODEX_PROFILE_PATH, comparison.originalProfile);
       profileRestored = true;
+      profileRewritten = true;
     } else if (existsSync(CODEX_PROFILE_PATH)) {
       // "There was no profile before, so remove the one we generated." Claiming success
       // without checking is how a caller ends up deleting the journal, reporting a clean
@@ -274,6 +353,7 @@ export function restoreJournalState(): RestoreJournalResult {
       try {
         unlinkSync(CODEX_PROFILE_PATH);
         profileRestored = true;
+        profileRewritten = true;
       } catch (error) {
         profileRestored = (error as NodeJS.ErrnoException).code === "ENOENT";
       }
@@ -286,10 +366,13 @@ export function restoreJournalState(): RestoreJournalResult {
   return {
     configRestored,
     profileRestored,
+    configRewritten,
+    profileRewritten,
     configChanged: !configUnchanged,
     profileChanged: !profileUnchanged,
     complete,
     unverified: false,
+    ...(profileUnchanged && !profileRestored ? { profileRestoreFailed: true as const } : {}),
   };
 }
 
@@ -297,11 +380,22 @@ export function restoreJournal(): boolean {
   return restoreJournalState().complete;
 }
 
+/** A no-rewrite recovery is quiet only when the stale journal is actually gone. */
+function warnIfJournalRetained(): void {
+  if (existsSync(JOURNAL_PATH)) console.error("⚠️ Codex journal recovery found nothing to restore, but the journal could not be removed; it will be retried on the next start.");
+}
+
 export interface ReconcileJournalOptions {
   activeClientApiKeyId?: string;
 }
 
 export function reconcileJournal(options: ReconcileJournalOptions = {}): boolean {
+  try { assertCodexHomeOwner(CODEX_HOME); }
+  catch (error) {
+    if (!(error instanceof CodexHomeOwnerRefusal)) throw error;
+    console.error(error.message);
+    return false;
+  }
   const journal = readJournal();
   if (!journal) return false;
   const owner = journalOwner();
@@ -312,7 +406,13 @@ export function reconcileJournal(options: ReconcileJournalOptions = {}): boolean
       console.error("⚠️ Codex journal recovery was not verified; current configuration files and the journal were preserved.");
       return false;
     }
-    if (!restored.configRestored && !restored.profileRestored) return false;
+    if (!restored.complete) {
+      console.error("⚠️ Codex journal recovery was incomplete; the journal was preserved — check the Codex files.");
+      return false;
+    }
+    // Warn only when restore actually rewrote state; an already-original
+    // snapshot still cleans itself up but has nothing to report.
+    if (!restored.configRewritten && !restored.profileRewritten) { warnIfJournalRetained(); return false; }
     console.error(`⚠️  Uncommitted or mismatched client routing (${owner.apiKeyId}) was restored from the Codex journal.`);
     return true;
   }
@@ -330,7 +430,14 @@ export function reconcileJournal(options: ReconcileJournalOptions = {}): boolean
     console.error("⚠️ Codex journal recovery was not verified; current configuration files and the journal were preserved.");
     return false;
   }
-  if (!restored.configRestored && !restored.profileRestored) return false;
+  if (!restored.complete) {
+    console.error("⚠️ Codex journal recovery was incomplete; the journal was preserved — check the Codex files.");
+    return false;
+  }
+  // Warn only when restore actually rewrote state. A stale journal whose
+  // artifacts are already original still cleans itself up (complete removes
+  // it) but has nothing to report — claiming a restore then cries wolf.
+  if (!restored.configRewritten && !restored.profileRewritten) { warnIfJournalRetained(); return false; }
   console.error(`⚠️  Previous session (PID ${pid}) did not shut down cleanly. Codex state restored from journal.`);
   return true;
 }

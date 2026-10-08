@@ -1,16 +1,20 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { repoPath, repoRoot } from "../helpers/repo-root";
 import { withInstalledShim } from "../helpers/codex-shim-install-fixture";
+import { setCodexShimProbeObservationMsForTests } from "../../src/codex/shim";
+
+afterEach(() => setCodexShimProbeObservationMsForTests(null));
 
 describe("version-manager shim destruction (#2412)", () => {
   test("a destroyed shim diagnostic does not open a non-file launcher", () => {
     if (process.platform === "win32") return;
-    withInstalledShim(({ home, wrappers, backups }) => {
+    setCodexShimProbeObservationMsForTests(20);
+    withInstalledShim(({ home, wrappers, launchers }) => {
       rmSync(wrappers[0]);
       expect(spawnSync("mkfifo", [wrappers[0]]).status).toBe(0);
-      rmSync(backups[0]);
+      rmSync(launchers[0]);
       const shimModule = repoPath("src", "codex", "shim.ts");
       const script = `
         const { autoRestoreCodexShim } = await import(${JSON.stringify(shimModule)});

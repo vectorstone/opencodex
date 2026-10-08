@@ -7,6 +7,7 @@ import { isQuotaExhaustedBody, retryableGoogleStatus, safeGoogleHttpErrorMessage
 import { repairGoogleInvalidRequestBodyWithReport } from "./google-wire-compiler";
 import type { GoogleToolSchemaPolicy, GoogleToolSchemaProfile } from "./google-tool-schema";
 import { normalizeUpstreamHttpErrorResponse, readDisplaySafeErrorPayloadText } from "./upstream-http-error";
+import { readBoundedResponseBody } from "../lib/bounded-body";
 import {
   abortError,
   cancelResponseBodyBestEffort,
@@ -14,10 +15,10 @@ import {
   retryBackoffDelayMs,
   sleepWithAbort,
   SendBudgetExhaustedError,
+  TRANSIENT_RETRY_MAX_ATTEMPTS,
   isConnectionResetError,
 } from "../lib/upstream-retry";
 
-const GOOGLE_RETRY_ATTEMPTS = 3;
 const GOOGLE_RETRY_BASE_MS = 250;
 const GOOGLE_RETRY_MAX_MS = 2_000;
 
@@ -29,6 +30,19 @@ export interface GoogleRetryOptions {
 }
 
 async function normalizeFinalGoogleError(label: string, res: Response, signal?: AbortSignal): Promise<Response> {
+  if (label === "Antigravity" && res.status === 403) {
+    const body = await readBoundedResponseBody(res, {
+      maxBytes: 4096, totalTimeoutMs: 2000, firstByteTimeoutMs: 2000,
+      inactivityTimeoutMs: 2000, signal,
+    });
+    const headers = new Headers(res.headers);
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    return new Response(safeGoogleHttpErrorMessage(label, res.status,
+      body.displaySafe && !body.truncated ? body.text : ""), {
+      status: res.status, statusText: res.statusText, headers,
+    });
+  }
   return normalizeUpstreamHttpErrorResponse(res, {
     signal,
     formatMessage: payloadText => safeGoogleHttpErrorMessage(label, res.status, payloadText),
@@ -60,7 +74,7 @@ export async function fetchGoogleWithRetry(
   let retryDelayMs = 0;
   let sendClass: SendClass = "transient";
   let recovery: AttemptRecoveryKind | undefined;
-  for (let attempt = 0; attempt < GOOGLE_RETRY_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < TRANSIENT_RETRY_MAX_ATTEMPTS; attempt++) {
     if (ctx.abortSignal?.aborted) throw abortError(ctx.abortSignal);
     try {
       const res = await send({ url: activeRequest.url, sendClass, recovery,
@@ -105,7 +119,7 @@ export async function fetchGoogleWithRetry(
           continue;
         }
       }
-      if (!retryableGoogleStatus(res.status) || attempt === GOOGLE_RETRY_ATTEMPTS - 1) {
+      if (!retryableGoogleStatus(res.status) || attempt === TRANSIENT_RETRY_MAX_ATTEMPTS - 1) {
         return ctx.returnRawErrors ? res : normalizeFinalGoogleError(label, res, ctx.abortSignal);
       }
       // A 429 may be a transient rate limit (retry) or hard quota exhaustion (do NOT retry —
@@ -141,7 +155,7 @@ export async function fetchGoogleWithRetry(
         throw err;
       }
       lastError = err;
-      if (attempt === GOOGLE_RETRY_ATTEMPTS - 1) throw err;
+      if (attempt === TRANSIENT_RETRY_MAX_ATTEMPTS - 1) throw err;
       sendClass = "transient";
       recovery = isConnectionResetError(err) ? "connection-reset" : undefined;
       retryDelayMs = retryBackoffDelayMs(attempt, {

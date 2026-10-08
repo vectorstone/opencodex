@@ -1,9 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { atomicWriteFile, getConfigDir } from "../config";
 import { codexExecInvocation, isSpawnableCodexCandidate } from "./exec-invocation";
+import { resolveCodexHomeDir } from "./home";
+import { decodeOverlayState } from "./shim-state-file";
 import { redactSecretString, redactUserPath } from "../lib/redact";
 
 export type CodexRuntimeSource =
@@ -69,11 +71,18 @@ export type RuntimeExecFile = (
   },
 ) => string;
 
+/** Async twin of RuntimeExecFile, used by resolveCodexRuntimeAsync; resolves with stdout. */
+export type RuntimeExecFileAsync = (
+  ...args: Parameters<RuntimeExecFile>
+) => Promise<string>;
+
 export interface ResolveCodexRuntimeDeps {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   configDir?: string;
   execFileSync?: RuntimeExecFile;
+  /** Probe exec for resolveCodexRuntimeAsync. Injected impls bypass the process memo like execFileSync. */
+  execFile?: RuntimeExecFileAsync;
   existsSync?: (path: string) => boolean;
   readFileSync?: (path: string, encoding: "utf8") => string;
   now?: () => number;
@@ -396,10 +405,10 @@ export function clearPersistedCodexRuntime(deps: ResolveCodexRuntimeDeps = {}): 
   }
 }
 
-function probeVersion(
-  command: string,
-  deps: ResolveCodexRuntimeDeps,
-): { ok: true; version: string | null } | { ok: false; reason: string } {
+type VersionProbeResult = { ok: true; version: string | null } | { ok: false; reason: string };
+
+/** Checks that need no exec; a non-null answer settles the candidate without running `--version`. */
+function versionProbePrecheck(command: string, deps: ResolveCodexRuntimeDeps): VersionProbeResult | null {
   const platform = deps.platform ?? process.platform;
   if (command.includes("/") || command.includes("\\") || /^[A-Za-z]:/.test(command)) {
     const exists = deps.existsSync ?? existsSync;
@@ -413,7 +422,54 @@ function probeVersion(
   // dashboard probe that cost made Windows report Codex as missing even when
   // the App install was sitting under LOCALAPPDATA/OpenAI/Codex/bin (issue 4458).
   if (deps.probeVersion === false) return { ok: true, version: null };
-  const execFile = deps.execFileSync ?? (execFileSync as unknown as RuntimeExecFile);
+  return null;
+}
+
+function versionProbeInvocation(command: string, deps: ResolveCodexRuntimeDeps, probeHome: string) {
+  const invocation = codexExecInvocation(command, ["--version"], deps.platform ?? process.platform, {
+    env: deps.env,
+    exists: deps.existsSync,
+  });
+  return {
+    file: invocation.file,
+    args: invocation.args,
+    options: {
+      encoding: "utf8" as const,
+      stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"],
+      timeout: 8_000,
+      windowsHide: true,
+      env: { ...(deps.env ?? process.env), CODEX_HOME: probeHome },
+      ...invocation.options,
+    },
+  };
+}
+
+function versionProbeOutput(output: string): VersionProbeResult {
+  const version = parseCodexVersionOutput(output);
+  if (!version) return { ok: false, reason: "unrecognized --version output" };
+  return { ok: true, version };
+}
+
+function versionProbeError(error: unknown, probeHome: string | undefined): VersionProbeResult {
+  if (!probeHome) return { ok: false, reason: "probe sandbox unavailable" };
+  if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+    return { ok: false, reason: CODEX_PROGRAM_NOT_FOUND_REASON };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const redacted = redactUserPath(redactSecretString(message)).slice(0, 160);
+  return { ok: false, reason: `failed --version (${redacted})` };
+}
+
+function removeProbeHome(probeHome: string | undefined): void {
+  if (!probeHome) return;
+  // Nested catch: a transient Windows EBUSY must never mask the probe result.
+  try { rmSync(probeHome, { recursive: true, force: true }); } catch { /* best effort */ }
+}
+
+function probeVersion(command: string, deps: ResolveCodexRuntimeDeps): VersionProbeResult {
+  const settled = versionProbePrecheck(command, deps);
+  if (settled) return settled;
+  const exec = deps.execFileSync ?? (execFileSync as unknown as RuntimeExecFile);
   // Sandbox the probe's CODEX_HOME: a real Codex CLI creates state (tmp/, logs) under
   // CODEX_HOME even for `--version`, and the probe inherits the caller's env — so a
   // read-only `ocx status` would dirty the user's CODEX_HOME. Redirect it to a
@@ -422,36 +478,36 @@ function probeVersion(
   let probeHome: string | undefined;
   try {
     probeHome = mkdtempSync(join(tmpdir(), "ocx-codex-probe-"));
-    const invocation = codexExecInvocation(command, ["--version"], platform, {
-      env: deps.env,
-      exists: deps.existsSync,
-    });
-    const output = execFile(invocation.file, invocation.args, {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 8_000,
-      windowsHide: true,
-      env: { ...(deps.env ?? process.env), CODEX_HOME: probeHome },
-      ...invocation.options,
-    });
-    const version = parseCodexVersionOutput(output);
-    if (!version) {
-      return { ok: false, reason: "unrecognized --version output" };
-    }
-    return { ok: true, version };
+    const { file, args, options } = versionProbeInvocation(command, deps, probeHome);
+    return versionProbeOutput(exec(file, args, options));
   } catch (error) {
-    if (!probeHome) return { ok: false, reason: "probe sandbox unavailable" };
-    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return { ok: false, reason: CODEX_PROGRAM_NOT_FOUND_REASON };
-    }
-    const message = error instanceof Error ? error.message : String(error);
-    const redacted = redactUserPath(redactSecretString(message)).slice(0, 160);
-    return { ok: false, reason: `failed --version (${redacted})` };
+    return versionProbeError(error, probeHome);
   } finally {
-    if (probeHome) {
-      // Nested catch: a transient Windows EBUSY must never mask the probe result.
-      try { rmSync(probeHome, { recursive: true, force: true }); } catch { /* best effort */ }
-    }
+    removeProbeHome(probeHome);
+  }
+}
+
+const defaultExecFileAsync: RuntimeExecFileAsync = (file, args, options) =>
+  new Promise((resolve, reject) => {
+    // execFile always pipes stdout/stderr; it takes no stdio option.
+    const { stdio: _stdio, ...execOptions } = options;
+    execFile(file, args, execOptions, (error, stdout) => (error ? reject(error) : resolve(String(stdout))));
+  });
+
+/** probeVersion with the same sandbox and outcomes, but the exec never holds the event loop. */
+async function probeVersionAsync(command: string, deps: ResolveCodexRuntimeDeps): Promise<VersionProbeResult> {
+  const settled = versionProbePrecheck(command, deps);
+  if (settled) return settled;
+  const exec = deps.execFile ?? defaultExecFileAsync;
+  let probeHome: string | undefined;
+  try {
+    probeHome = mkdtempSync(join(tmpdir(), "ocx-codex-probe-"));
+    const { file, args, options } = versionProbeInvocation(command, deps, probeHome);
+    return versionProbeOutput(await exec(file, args, options));
+  } catch (error) {
+    return versionProbeError(error, probeHome);
+  } finally {
+    removeProbeHome(probeHome);
   }
 }
 
@@ -461,13 +517,18 @@ function shimCandidates(deps: ResolveCodexRuntimeDeps): string[] {
   const platform = deps.platform ?? process.platform;
   try {
     const state = JSON.parse(read(join(configDir, "codex-shim.json"), "utf8")) as {
+      schema?: unknown;
+      mode?: unknown;
       wrapperPath?: unknown;
       originalPath?: unknown;
       backupPath?: unknown;
       wrappers?: Array<{ wrapperPath?: unknown; originalPath?: unknown; backupPath?: unknown }>;
     };
+    const overlay = decodeOverlayState(state, configDir);
+    if ((state.schema !== undefined || state.mode !== undefined) && !overlay) return [];
     const files = Array.isArray(state.wrappers) && state.wrappers.length > 0 ? state.wrappers : [state];
-    const out: string[] = [];
+    const out: string[] = overlay && isSpawnableCodexCandidate(overlay.launcherPath, platform)
+      ? [overlay.launcherPath] : [];
     for (const file of files) {
       for (const value of [file.backupPath, file.originalPath, file.wrapperPath]) {
         if (typeof value !== "string" || value.length === 0) continue;
@@ -508,16 +569,13 @@ function pathCandidates(deps: ResolveCodexRuntimeDeps): string[] {
 function installedCodexCandidates(deps: ResolveCodexRuntimeDeps): string[] {
   const platform = deps.platform ?? process.platform;
   const env = deps.env ?? process.env;
-  if (platform === "win32") {
-    const localAppData = env.LOCALAPPDATA?.trim();
-    if (!localAppData) return [];
-    const root = join(localAppData, "OpenAI", "Codex", "bin");
-    const readDir = deps.readdirSync ?? ((path: string) => readdirSync(path));
-    const stat = deps.statSync ?? ((path: string) => statSync(path));
+  const readDir = deps.readdirSync ?? ((path: string) => readdirSync(path));
+  const stat = deps.statSync ?? ((path: string) => statSync(path));
+  /** Version directories directly under root, newest first; unreadable roots yield nothing. */
+  const versionDirectories = (root: string): string[] => {
     try {
-      const names = readDir(root);
       const dirs: Array<{ name: string; directory: string; mtimeMs: number }> = [];
-      for (const name of names) {
+      for (const name of readDir(root)) {
         const directory = join(root, name);
         try {
           const st = stat(directory);
@@ -528,40 +586,44 @@ function installedCodexCandidates(deps: ResolveCodexRuntimeDeps): string[] {
         }
       }
       dirs.sort((a, b) => b.mtimeMs - a.mtimeMs || a.name.localeCompare(b.name));
-      return dirs.map(entry => join(entry.directory, "codex.exe"));
+      return dirs.map(entry => entry.directory);
     } catch {
       return [];
     }
+  };
+  if (platform === "win32") {
+    const localAppData = env.LOCALAPPDATA?.trim();
+    if (!localAppData) return [];
+    return versionDirectories(join(localAppData, "OpenAI", "Codex", "bin"))
+      .map(directory => join(directory, "codex.exe"));
   }
   const home = env.HOME?.trim() || env.USERPROFILE?.trim() || homedir();
-  return [
+  const posix = [
     join(home, ".codex", "packages", "standalone", "current", "bin", "codex"),
     join(home, ".local", "bin", "codex"),
     "/usr/local/bin/codex",
     "/opt/homebrew/bin/codex",
   ];
+  if (platform !== "linux") return posix;
+  // Windows Codex Desktop in WSL app-server mode ships its Linux binary under the
+  // effective Codex home as bin/wsl/<version-hash>/codex, and a Desktop update replaces
+  // that hash directory. The service PATH usually has no codex (issue 5635), so these
+  // rank after PATH and the ordinary locations and are re-enumerated on every resolve
+  // rather than trusted from a remembered hash.
+  let codexHome: string;
+  try {
+    codexHome = resolveCodexHomeDir({ env });
+  } catch {
+    return posix;
+  }
+  const desktopWsl = versionDirectories(join(codexHome, "bin", "wsl"))
+    .map(directory => join(directory, "codex"));
+  return [...posix, ...desktopWsl];
 }
 
 interface RankedCandidate {
   command: string;
   source: CodexRuntimeSource;
-}
-
-function tryCandidate(
-  candidate: RankedCandidate,
-  failures: RuntimeProbeFailure[],
-  deps: ResolveCodexRuntimeDeps,
-): ResolvedCodexRuntime | null {
-  const probed = probeVersion(candidate.command, deps);
-  if (!probed.ok) {
-    failures.push({ command: candidate.command, source: candidate.source, reason: probed.reason });
-    return null;
-  }
-  return {
-    command: candidate.command,
-    version: probed.version,
-    source: candidate.source,
-  };
 }
 
 function sameRuntimeCommand(a: string, b: string): boolean {
@@ -685,10 +747,26 @@ export function clearCodexRuntimeResolveCache(): void {
   clearResolveCache();
 }
 
-/** Observe only an unexpired successful process memo; never resolves or probes. */
+/**
+ * Observe the successful process memo; never resolves or probes.
+ *
+ * An expired memo stays observable while an async refresh for the same inputs is in flight
+ * and nothing has invalidated it since. The sync resolver used to hold the event loop for the
+ * whole probe, so nothing could read in that window; with the refresh off the loop, dropping
+ * the memo there would send catalog gather to the persisted runtime (or none) and have
+ * convergence reject its process-local candidate every expiry. A published result or a clear
+ * still retires it; the deferred selection never enters this memo (#4458).
+ */
 export function peekCodexRuntimeProcessCache(): CodexRuntimeProcessCachePeek {
   const memo = resolveCache;
-  if (!memo || Date.now() - memo.at >= RESOLVE_CACHE_MS) {
+  const refreshing = memo !== null
+    && asyncResolveInflight !== null
+    && asyncResolveInflight.key === memo.key
+    && asyncResolveInflight.epoch === resolveCacheEpoch
+    // An expired memo only stands in for a refresh of the same selection; an out-of-process
+    // runtime switch changes the key without bumping the epoch.
+    && resolveCacheKey({}) === memo.key;
+  if (!memo || (Date.now() - memo.at >= RESOLVE_CACHE_MS && !refreshing)) {
     return Object.freeze({ kind: "unavailable" as const, epoch: resolveCacheEpoch });
   }
   return Object.freeze({
@@ -716,6 +794,7 @@ function resolveCacheKey(deps: ResolveCodexRuntimeDeps): string | null {
   // Only memoize uninjected process-env resolves (settings/status hot paths).
   if (
     deps.execFileSync
+    || deps.execFile
     || deps.existsSync
     || deps.readFileSync
     || deps.readdirSync
@@ -735,6 +814,8 @@ function resolveCacheKey(deps: ResolveCodexRuntimeDeps): string | null {
     localAppData: env.LOCALAPPDATA?.trim() ?? "",
     homeDir: env.HOME?.trim() ?? "",
     userProfile: env.USERPROFILE?.trim() ?? "",
+    // Linux discovery enumerates <CODEX_HOME>/bin/wsl, so the home is part of the key.
+    codexHome: env.CODEX_HOME?.trim() ?? "",
     home: process.env.OPENCODEX_HOME ?? "",
     persisted: persistedRuntimeCacheStamp(deps),
   });
@@ -778,6 +859,59 @@ export function resolveCodexRuntime(deps: ResolveCodexRuntimeDeps = {}): Resolve
   return cloneAndDeepFreeze(result);
 }
 
+let asyncResolveInflight: { key: string; epoch: number; promise: Promise<ResolveCodexRuntimeResult> } | null = null;
+
+/**
+ * resolveCodexRuntime for server request paths: same selection and process memo, but every
+ * `codex --version` runs through async exec. The sync resolver blocked the whole proxy for
+ * ~0.6s per memo expiry while the dashboard polled settings, stalling unrelated requests.
+ */
+export async function resolveCodexRuntimeAsync(
+  deps: ResolveCodexRuntimeDeps = {},
+): Promise<ResolveCodexRuntimeResult> {
+  // A deferred selection never execs, so the sync path is already nonblocking.
+  if (deps.probeVersion === false) return resolveCodexRuntime(deps);
+  const cacheKey = resolveCacheKey(deps);
+  if (cacheKey && resolveCache && resolveCache.key === cacheKey && Date.now() - resolveCache.at < RESOLVE_CACHE_MS) {
+    return cloneAndDeepFreeze(resolveCache.value);
+  }
+  if (!cacheKey) return cloneAndDeepFreeze(await resolveCodexRuntimeUncachedAsync(deps));
+  const startedEpoch = resolveCacheEpoch;
+  if (asyncResolveInflight?.key === cacheKey && asyncResolveInflight.epoch === startedEpoch) {
+    return cloneAndDeepFreeze(await asyncResolveInflight.promise);
+  }
+  const promise = resolveCodexRuntimeUncachedAsync(deps).then(result => {
+    // A persist or clear while the probes ran makes this answer the previous selection's;
+    // publishing it would resurrect authority the write just revoked. Another process can also
+    // rewrite codex-runtime.json without touching this epoch, so the key is read again too.
+    if (resolveCacheEpoch === startedEpoch && resolveCacheKey(deps) === cacheKey) {
+      publishResolveCache(cacheKey, Date.now(), result);
+    }
+    return result;
+  }).finally(() => {
+    if (asyncResolveInflight?.promise === promise) asyncResolveInflight = null;
+  });
+  asyncResolveInflight = { key: cacheKey, epoch: startedEpoch, promise };
+  return cloneAndDeepFreeze(await promise);
+}
+
+/**
+ * Stale-while-revalidate runtime read for hot UI paths; never waits on a probe.
+ *
+ * Returns the process memo when fresh, otherwise the last memo for the same inputs, and kicks
+ * resolveCodexRuntimeAsync to refresh it. With no memo yet (cold start, or right after a runtime
+ * switch cleared it) the answer is the exec-free deferred selection, so a version and
+ * newerAvailable appear once the first background refresh lands.
+ */
+export function getCodexRuntimeSnapshot(): ResolveCodexRuntimeResult {
+  const cacheKey = resolveCacheKey({});
+  const memo = resolveCache?.key === cacheKey ? resolveCache : null;
+  if (memo && Date.now() - memo.at < RESOLVE_CACHE_MS) return cloneAndDeepFreeze(memo.value);
+  resolveCodexRuntimeAsync().catch(() => { /* the next read retries */ });
+  if (memo) return cloneAndDeepFreeze(memo.value);
+  return resolveCodexRuntime({ discoverAlternatives: false, probeVersion: false });
+}
+
 /** Test-only: drop the short-lived process resolve cache. */
 export function resetCodexRuntimeResolveCacheForTests(): void {
   clearCodexRuntimeResolveCache();
@@ -793,7 +927,14 @@ export function setCodexRuntimeResolveCacheForTests(
   publishResolveCache(key, Date.now(), value);
 }
 
-function resolveCodexRuntimeUncached(deps: ResolveCodexRuntimeDeps = {}): ResolveCodexRuntimeResult {
+/**
+ * Candidate ranking and selection, written once for both drivers: each yield hands a candidate to
+ * the caller, which sends back its `--version` outcome. The sync driver keeps CLI behavior; the
+ * async one lets a server path resolve without blocking every other request on the probes.
+ */
+function* resolveCodexRuntimeSteps(
+  deps: ResolveCodexRuntimeDeps,
+): Generator<RankedCandidate, ResolveCodexRuntimeResult, VersionProbeResult> {
   const env = deps.env ?? process.env;
   const failures: RuntimeProbeFailure[] = [];
   const ordered: RankedCandidate[] = [];
@@ -847,9 +988,12 @@ function resolveCodexRuntimeUncached(deps: ResolveCodexRuntimeDeps = {}): Resolv
     ) {
       continue;
     }
-    const resolved = tryCandidate(candidate, failures, deps);
-    if (!resolved) continue;
-    valid.push(resolved);
+    const probed: VersionProbeResult = yield candidate;
+    if (!probed.ok) {
+      failures.push({ command: candidate.command, source: candidate.source, reason: probed.reason });
+      continue;
+    }
+    valid.push({ command: candidate.command, version: probed.version, source: candidate.source });
   }
 
   if (valid.length === 0) {
@@ -931,6 +1075,20 @@ function resolveCodexRuntimeUncached(deps: ResolveCodexRuntimeDeps = {}): Resolv
     supersededDiscovered,
     newerAvailable: newer,
   };
+}
+
+function resolveCodexRuntimeUncached(deps: ResolveCodexRuntimeDeps = {}): ResolveCodexRuntimeResult {
+  const steps = resolveCodexRuntimeSteps(deps);
+  let step = steps.next();
+  while (!step.done) step = steps.next(probeVersion(step.value.command, deps));
+  return step.value;
+}
+
+async function resolveCodexRuntimeUncachedAsync(deps: ResolveCodexRuntimeDeps): Promise<ResolveCodexRuntimeResult> {
+  const steps = resolveCodexRuntimeSteps(deps);
+  let step = steps.next();
+  while (!step.done) step = steps.next(await probeVersionAsync(step.value.command, deps));
+  return step.value;
 }
 
 /** Resolve and persist a successful selection (unless source is ephemeral fallback-only with no path). */

@@ -14,7 +14,7 @@ exécute des fonctionnalités d'assistance autour des demandes du fournisseur.
 | `hostname?` | `string` | `"127.0.0.1"` | Adresse de liaison. Les liaisons hors bouclage nécessitent `OPENCODEX_API_AUTH_TOKEN`. |
 | `proxy?` | `string` | — | URL du proxy HTTP(S) ou SOCKS5 sortant (`socks5://host:port`) ou `${ENV_VAR}`. Les URL HTTP s’appliquent à `HTTP_PROXY` / `HTTPS_PROXY` si elles sont vides. Les URL SOCKS5 utilisent le tunnel SOCKS5 intégré et sont aussi exposées via `ALL_PROXY` (`ocx start --socks5`); `HTTP(S)_PROXY` héritées sont effacées dans ce processus. Le bouclage reste dans `NO_PROXY`. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Active une nouvelle tentative Responses identique lorsqu’une réponse ne contient ni texte ni appel d’outil. Cette tentative peut être facturée. `OCX_EMPTY_COMPLETION_RETRY=0` la désactive sans modifier la configuration ; les combinaisons et les tours de compactage routés restent exclus. |
-| `stallTimeoutSec?` | `number` | `300` | Secondes sans progression utile en amont, pour Responses et le Chat natif. Minimum : 1. |
+| `stallTimeoutSec?` | `number` | `300` (public) / désactivé (local) | Secondes sans progression utile en amont (Responses et Chat natif) avant la coupure du flux. Sans réglage, un amont **local** (loopback, privé ou nom `.local`/`.lan`) est désactivé par défaut et un amont public vaut 300 s ; une valeur positive s'applique aux deux (minimum 1 s) ; `0` désactive partout le watchdog de silence. Pour Responses qui replie le SSE canonique ChatGPT en JSON non-streaming, un plafond total indépendant de 15 minutes subsiste même lorsque ce watchdog est désactivé. Les lectures de corps en attente de `/v1/responses/compact` partagent ce budget mais valent 300 s par défaut même pour un amont local ; une valeur explicite, y compris `0`, prime. |
 | `connectTimeoutMs?` | `number` | `200000` | Délai maximal par tentative pour DNS/TCP/TLS et les en-têtes finaux ; il prend fin avant la génération du corps. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Délai de vidange gracieux avant l’annulation des tours actifs. |
 | `websockets?` | `boolean` | `false` | Annonce et autorise la route WebSocket Responses destinée aux clients. La valeur false maintient les clients sur HTTP/SSE ; elle ne désactive pas une optimisation WebSocket canonique admissible vers ChatGPT en amont. |
@@ -26,7 +26,7 @@ exécute des fonctionnalités d'assistance autour des demandes du fournisseur.
 | `codexAutoStart?` | `boolean` | `true` | Autorise le lanceur intermédiaire Codex à exécuter `ocx ensure` avant de démarrer Codex. Avec la valeur false, cette vérification ne fait rien. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Restaure le lanceur intermédiaire installé après son remplacement par une mise à jour externe de Codex terminée. Désactivation par variable d'environnement : `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Compatibilité historique Codex App réversible. Les métadonnées originales sont sauvegardées et restaurées par `ocx stop` / `ocx restore`. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | désactivé | Redirigez les appels Codex helper/shadow reconnus vers un modèle choisi tout en conservant l'effort de raisonnement configuré pour la requête. Le préfixe source par défaut est `gpt-5.6-luna` ; les clients plus anciens via 0.144.x utilisaient `gpt-5.4-mini`, que `sourceModels` peut restaurer. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | désactivé | Redirigez les appels Codex helper/shadow reconnus vers un modèle choisi tout en conservant l'effort de raisonnement configuré pour la requête. Le préfixe source par défaut est `gpt-6-luna`, `gpt-5.6-luna` ; les clients plus anciens via 0.144.x utilisaient `gpt-5.4-mini`, que `sourceModels` peut restaurer. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | activé lorsqu'il est utilisable | Options du service auxiliaire de recherche Web. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | activé lorsqu'il est utilisable | Options du service auxiliaire de description d'images. |
 | `images?` | `OcxImagesConfig` | sélection automatique OpenAI | Options de relais d'images autonomes pour Codex `image_gen`. |
@@ -185,18 +185,25 @@ Codex utilise de petits modèles auxiliaires pour des tâches telles que les tit
 `shadowCallIntercept` pour rediriger les préfixes de modèle source reconnus vers un autre modèle configuré. Le
 modèle de remplacement conserve l'effort de raisonnement configuré pour la requête. Définissez `sourceModels` uniquement lorsqu'un client utilise d'autres identifiants de modèles auxiliaires.
 L'interception dépend du modèle : toute requête dont l'identifiant de modèle nu correspond à `sourceModels`
-peut être redirigée, y compris une requête normale portant `request_kind: "turn"`.
-`x-codex-turn-metadata` n'exempte pas une requête correspondante.
+peut être redirigée, y compris une requête normale portant `request_kind: "turn"`. Les requêtes marquées
+comme enfants générés par `x-openai-subagent: collab_spawn` ou par `subagent_kind: "thread_spawn"` dans
+l'en-tête JSON `x-codex-turn-metadata` sont exemptées, afin qu'un sous-agent explicitement généré conserve son modèle.
 
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### Quand la cible est indisponible
+
+Le remplacement est la seule destination choisie par l'opérateur : une cible qui ne se résout plus fait échouer l'appel auxiliaire au lieu de l'envoyer ailleurs. Lorsque le fournisseur de la cible est désactivé ou supprimé, ou que son combo n'existe plus, une requête interceptée renvoie `409` avec le code d'erreur `intercept_target_unavailable` avant tout envoi en amont. Le journal des requêtes enregistre le même code. La requête n'est pas transmise au modèle auxiliaire natif et ne se replie pas sur le fournisseur par défaut, car l'un comme l'autre changerait la destination, les identifiants et le coût sans votre choix. Une cible combo ou profil de routage continue de basculer entre ses propres membres. Une cible qualifiée comme `provider/model` dont le segment fournisseur ne désigne rien de configuré est traitée de la même façon, et l'API des réglages refuse de l'enregistrer. Un identifiant de modèle nu résolu via le fournisseur par défaut reste valide.
+
+Désactiver (`PATCH /api/providers?name=<provider>` avec `disabled: true`) ou supprimer un fournisseur vers lequel la cible se résout réussit toujours ; la réponse ajoute `dependentShadowIntercept: { model, enabled }` et le tableau de bord affiche un avertissement. Réactiver le fournisseur, ou choisir une autre cible, rétablit l'interception.
 
 ## Services auxiliaires
 
@@ -215,7 +222,7 @@ l'API Images d'OpenAI et la forme de réponse attendue par Codex.
 
 | Champ | Type | Par défaut | Signification |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` | activé lorsqu'il est utilisable | Interrupteur principal. |
+| `enabled?` | `boolean` | activé lorsqu'il est utilisable | Interrupteur principal. Avec `false`, OpenCodex cesse d'intercepter `web_search` et l'intégration Codex écrit `web_search = "disabled"` dans `~/.codex/config.toml`. |
 | `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Une valeur explicite est prioritaire ; l'absence de valeur sélectionne toujours `openai`. `anthropic` et `xai` ne s'exécutent que s'ils sont configurés explicitement ; `gemini` et `exa` restent réservés jusqu'à la livraison de leur executor. |
 | `model?` | `string` | dépendant du backend | `gpt-5.6-luna` pour OpenAI, `claude-sonnet-5` pour Anthropic ou `grok-4.6` pour xAI. L'héritage explicite `gpt-5.4-mini` migre au démarrage. |
 | `exaApiKey?` | `string` | aucun | Clé opérateur pour le backend `exa`. Écriture seule : les lectures de gestion ne renvoient jamais la valeur stockée. |
@@ -266,4 +273,16 @@ compte et la charge de travail prévus.
 
 ## Diagnostic réseau des quotas Codex
 
-Le champ `quotaRefresh` de la ligne du compte Codex principal décrit la récupération du quota, pas le quota restant ni les droits d’accès au modèle. Il peut être absent lorsque les données sont en cache ou qu’aucune récupération n’a eu lieu. La requête utilise l’environnement du service proxy en cours d’exécution, pas celui du terminal interactif. Sans `proxy`, l’environnement existant est conservé ; `"auto"` lit uniquement le proxy statique Windows au démarrage. PAC/WPAD, les paramètres SOCKS seuls et les changements à chaud ne sont pas pris en compte automatiquement. Un succès avec TUN ne valide pas à lui seul le chemin du proxy HTTP. Consultez [les commandes et les états en anglais](/reference/configuration/server/#codex-quota-network-diagnostics).
+Le champ `quotaRefresh` de la ligne du compte Codex principal décrit la récupération du quota, pas le quota restant ni les droits d’accès au modèle. Il peut être absent lorsque les données sont en cache ou qu’aucune récupération n’a eu lieu. La requête utilise l’environnement du service proxy en cours d’exécution, pas celui du terminal interactif. Sans `proxy`, l’environnement existant est conservé ; `"auto"` lit les paramètres HTTP/HTTPS statiques de Windows ou macOS au démarrage. Sur macOS, un proxy hérité empêche cette lecture. Sur macOS, un motif valide `*.<domain>` devient `.<domain>` : `foo.local` contourne le proxy pour `*.local`, `xlocal` non, et le nom racine `local` le contourne aussi. Les plages exactes `169.254/16`, `169.254.0.0/16` et `fe80::/10` sont ignorées avec un diagnostic : les adresses IP link-local passent par le proxy. Les autres plages CIDR, motifs glob et exceptions de noms simples refusent la découverte sans modifier l’environnement. Les adresses IP et `*` restent acceptés. PAC/WPAD, les paramètres SOCKS seuls et les changements à chaud ne sont pas pris en compte automatiquement. Un succès avec TUN ne valide pas à lui seul le chemin du proxy HTTP. Consultez [les commandes et les états en anglais](/reference/configuration/server/#codex-quota-network-diagnostics).
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

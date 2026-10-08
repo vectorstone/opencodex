@@ -15,7 +15,7 @@ description: Listener, удалённый доступ, admission key, тайм�
 | `proxy?` | `string` | — | URL исходящего HTTP(S) или SOCKS5-прокси (`socks5://host:port`) или `${ENV_VAR}`. HTTP URL пишутся в `HTTP_PROXY` / `HTTPS_PROXY`, если те не заданы. SOCKS5 используют встроенный SOCKS5-туннель и также пишутся в `ALL_PROXY` (`ocx start --socks5`); унаследованные `HTTP(S)_PROXY` сбрасываются в этом процессе. Loopback всегда остаётся в `NO_PROXY`. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Явно включает один идентичный повтор Responses, если в turn нет ни текста, ни tool call, включая случай, когда stream завершается до terminal event. Повтор может тарифицироваться. `OCX_EMPTY_COMPLETION_RETRY=0` отключает его без изменения config; combo и routed-compaction turn исключены. |
 | `dropCodexSafetyBuffering?` | `boolean` | `false` | Удаляет подсказки Codex safety-buffering из passthrough-ответов Codex Responses: заголовки `x-codex-safety-buffering-enabled` / `x-codex-safety-buffering-faster-model`, SSE-события `response.metadata` типа `safety_buffering` и поле `safety_buffering` в других SSE-событиях. Codex TUI отображает их как предложение повторить запрос с более быстрой моделью, действие по умолчанию в котором переключает сессию на более слабую модель. Остальные заголовки `x-codex-*` и содержимое других SSE-событий передаются без изменений, кроме удаления этого поля. По умолчанию выключено. |
-| `stallTimeoutSec?` | `number` | `300` | Секунды без полезного прогресса upstream для Responses и нативного Chat. Минимум 1. |
+| `stallTimeoutSec?` | `number` | `300` (public) / выкл. (local) | Секунды без полезного прогресса upstream (Responses и нативный Chat) до обрыва потока. Без настройки **локальный** upstream (loopback, private, имя `.local`/`.lan`) по умолчанию выключен, публичный — 300 с; положительное значение действует на оба (минимум 1 с); `0` отключает watchdog тишины везде. Для Responses, которые сворачивают canonical ChatGPT SSE в непотоковый JSON, даже при выключенном watchdog остаётся отдельный общий предел 15 минут. Ожидающие чтения тела `/v1/responses/compact` используют этот же бюджет, но по умолчанию 300 с даже для локального upstream; явное значение, включая `0`, имеет приоритет. |
 | `connectTimeoutMs?` | `number` | `200000` | Дедлайн одной попытки DNS/TCP/TLS/final-header; он завершается до генерации тела ответа. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Дедлайн graceful-drain до принудительного прерывания активных turn'ов. |
 | `websockets?` | `boolean` | `false` | Объявляет и разрешает клиентский WebSocket-путь Responses. При false клиенты используют HTTP/SSE; это не отключает подходящую upstream WS-оптимизацию canonical ChatGPT. |
@@ -27,7 +27,7 @@ description: Listener, удалённый доступ, admission key, тайм�
 | `codexAutoStart?` | `boolean` | `true` | Разрешает shim'у Codex запускать `ocx ensure` перед стартом Codex. При false `ensure` становится no-op. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Восстанавливает установленный shim после завершённого внешнего обновления Codex, которое заменило его. Для отключения через окружение: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Обратимый режим совместимости истории Codex App. Исходные metadata резервируются и восстанавливаются через `ocx stop` / `ocx restore`. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | Перенаправляет распознанные helper/shadow-call'ы Codex на выбранную модель с сохранением настроенного для запроса reasoning effort. Source-prefix по умолчанию: `gpt-5.6-luna`; клиенты до 0.144.x включительно использовали `gpt-5.4-mini`, который можно восстановить через `sourceModels`. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | Перенаправляет распознанные helper/shadow-call'ы Codex на выбранную модель с сохранением настроенного для запроса reasoning effort. Source-prefix по умолчанию: `gpt-6-luna`, `gpt-5.6-luna`; клиенты до 0.144.x включительно использовали `gpt-5.4-mini`, который можно восстановить через `sourceModels`. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | on when usable | Настройки sidecar'а web-search. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | on when usable | Настройки sidecar'а описания изображений. |
 | `images?` | `OcxImagesConfig` | automatic OpenAI selection | Настройки standalone Images relay для Codex `image_gen`. |
@@ -141,15 +141,23 @@ Codex использует маленькие helper-model'и для задач 
 модель. Замещающая модель сохраняет настроенный для запроса reasoning effort. `sourceModels` задавайте только если клиент
 использует другие helper-id.
 
+Перехват определяется моделью: любой запрос, чей полный идентификатор модели совпадает с `sourceModels`, включая обычные запросы с `request_kind: "turn"`, может быть перенаправлен. Запросы, помеченные как порождённые дочерние через `x-openai-subagent: collab_spawn` или `subagent_kind: "thread_spawn"` в JSON-заголовке `x-codex-turn-metadata`, освобождаются от перехвата, поэтому явно порождённый субагент сохраняет свою модель.
+
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### Когда цель недоступна
+
+Замена — это единственная точка назначения, выбранная оператором, поэтому цель, которая перестала разрешаться, приводит к ошибке вспомогательного вызова, а не к отправке в другое место. Если провайдер цели отключён или удалён либо её комбо больше не существует, перехваченный запрос возвращает `409` с кодом ошибки `intercept_target_unavailable` до какой-либо отправки в апстрим. Журнал запросов записывает тот же код. Запрос не передаётся нативной вспомогательной модели и не уходит к провайдеру по умолчанию: и то и другое сменило бы точку назначения, учётные данные и стоимость без вашего выбора. Цель-комбо или цель профиля маршрутизации по-прежнему переключается между своими участниками. Полная цель вида `provider/model`, у которой часть провайдера не указывает ни на что настроенное, обрабатывается так же, и API настроек отказывается её сохранять. Голый идентификатор модели, разрешаемый через провайдера по умолчанию, остаётся допустимым.
+
+Отключение (`PATCH /api/providers?name=<provider>` с `disabled: true`) или удаление провайдера, к которому разрешается цель, по-прежнему выполняется успешно; в ответ добавляется `dependentShadowIntercept: { model, enabled }`, а панель показывает предупреждение. Повторное включение провайдера или выбор другой цели восстанавливает перехват.
 
 ## Sidecar'ы
 
@@ -168,7 +176,7 @@ Codex использует маленькие helper-model'и для задач 
 
 | Поле | Тип | По умолчанию | Значение |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` | on when usable | Главный переключатель. |
+| `enabled?` | `boolean` | on when usable | Главный переключатель. При `false` OpenCodex перестаёт перехватывать `web_search`, а интеграция Codex записывает `web_search = "disabled"` в `~/.codex/config.toml`. |
 | `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Явный выбор выигрывает; отсутствие значения всегда означает `openai`. `anthropic` и `xai` запускаются только при явной настройке; `gemini` и `exa` зарезервированы до появления executor. |
 | `model?` | `string` | backend-dependent | `gpt-5.6-luna` для OpenAI, `claude-sonnet-5` для Anthropic или `grok-4.6` для xAI. Старый явный `gpt-5.4-mini` мигрирует при старте. |
 | `exaApiKey?` | `string` | отсутствует | Ключ оператора для backend `exa`. Только для записи: management-read никогда не возвращает сохранённое значение. |
@@ -224,6 +232,22 @@ opencodex. Перед использованием прогоните soak-test 
 
 ## Сетевая диагностика квоты Codex
 
-Поле `quotaRefresh` в строке основного аккаунта Codex описывает получение квоты, а не её остаток или право доступа к модели. Оно может отсутствовать при чтении кэша или если запрос не выполнялся. Используется окружение работающего прокси-сервиса, а не текущего терминала. Если `proxy` не задан, существующее окружение сохраняется; `"auto"` читает только статические настройки прокси Windows при запуске. PAC/WPAD, настройки только SOCKS и изменения во время работы автоматически не учитываются. Успех через TUN сам по себе не подтверждает исправность пути HTTP-прокси. См. [команды и состояния на английском](/reference/configuration/server/#codex-quota-network-diagnostics).
+Поле `quotaRefresh` в строке основного аккаунта Codex описывает получение квоты, а не её остаток или право доступа к модели. Оно может отсутствовать при чтении кэша или если запрос не выполнялся. Используется окружение работающего прокси-сервиса, а не текущего терминала. Если `proxy` не задан, существующее окружение сохраняется; `"auto"` при запуске читает статические настройки HTTP/HTTPS Windows или macOS. На macOS унаследованный прокси отменяет это чтение. На macOS допустимый шаблон `*.<domain>` преобразуется в `.<domain>`: для `*.local` прямое соединение получают `foo.local` и само имя `local`, но не `xlocal`. Точные диапазоны `169.254/16`, `169.254.0.0/16` и `fe80::/10` пропускаются с диагностикой: link-local IP-адреса используют прокси. IP-адреса и `*` принимаются; прочие CIDR, glob-шаблоны и исключения простых имён отменяют обнаружение без изменения окружения. PAC/WPAD, настройки только SOCKS и изменения во время работы автоматически не учитываются. Успех через TUN сам по себе не подтверждает исправность пути HTTP-прокси. См. [команды и состояния на английском](/reference/configuration/server/#codex-quota-network-diagnostics).
 
 `dropCodexSafetyBuffering`: не меняет проверки безопасности провайдера или отказы. Native WebSocket `codex.response.metadata.headers` и `/responses/compact` не входят в область фильтра.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.
+
+## Резервирование токенов и лимиты
+
+Если к запросу применяется `spend.root.maxTokens`, `spend.identity.maxTokens` или `spend.pool.maxTokens`, отправка отклоняется, когда резерв токенов нельзя учесть, в том числе из-за заполнения хранилища отслеживаемых записей. Запросы без применимого лимита остаются в режиме наблюдения.

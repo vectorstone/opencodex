@@ -3,6 +3,7 @@ import { useDataSurface } from "../../data-surface";
 import { navigateHash } from "../../hash-routing";
 import { useT, type TKey } from "../../i18n/shared";
 import { Notice } from "../../ui";
+import LazyCodexRoleModels from "./LazyCodexRoleModels";
 import {
   loadNativeIntegrations,
   setCodexIntegrationMode,
@@ -98,6 +99,7 @@ export default function CodexIntegrationPage({
       <button type="button" className="btn btn-ghost" onClick={() => navigateHash("startup")}>
         {t("integrations.codex.openService")}
       </button>
+      <LazyCodexRoleModels apiBase={apiBase} active={active} />
     </section>
   );
 }

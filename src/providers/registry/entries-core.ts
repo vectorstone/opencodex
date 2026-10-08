@@ -14,15 +14,18 @@ import { cursorFastCapableBases } from "../../adapters/cursor/catalog";
 import { COMMAND_CODE_MODEL_REASONING_EFFORTS } from "../command-code-efforts";
 import { isCanonicalOpenRouterTarget } from "../openrouter-routing";
 import type { ProviderRegistryEntry } from "./types";
+import { ANTHROPIC_FAST_MODE_BETA } from "../anthropic-fast";
 import {
   ANTHROPIC_MODELS,
   ANTHROPIC_MODEL_CONTEXT_WINDOWS,
   ANTHROPIC_MODEL_INPUT_MODALITIES,
   ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+  ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS,
   ANTHROPIC_MODEL_REASONING_EFFORTS,
   ZAI_GLM_52_REASONING_EFFORTS,
   ZAI_GLM_53_REASONING_EFFORTS,
   OPENAI_GPT56_MODELS,
+  OPENAI_GPT6_MODELS,
   OPENAI_GPT56_PRO_MODELS,
   OPENAI_API_GPT56_CONTEXT_WINDOWS,
   OPENAI_API_GPT56_MAX_INPUT_TOKENS,
@@ -51,11 +54,12 @@ import {
   DEEPSEEK_NATIVE_THINKING_MODELS,
   DEEPSEEK_GATEWAY_THINKING_MODELS,
   DEEPSEEK_VISION_PREVIEW_MODEL,
+  COMMAND_CODE_MIMO_CONTEXT_WINDOWS,
   COMMAND_CODE_MODEL_INPUT_MODALITIES,
   deepseekThinkingEffortsFor,
   deepseekReasoningMapFor,
   KIMI_K3_STANDARD_CONTEXT_WINDOW,
-  KIMI_CODING_MODELS,
+  KIMI_CODING_LIVE_MODELS,
   KIMI_THINKING_MODELS,
   KIMI_CODING_NO_REASONING_MODELS,
   KIMI_CODING_K3_REASONING_EFFORTS,
@@ -83,6 +87,27 @@ import {
   CLINE_PASS_TEXT_ONLY_MODELS,
   CLINE_PASS_MODEL_INPUT_MODALITIES,
 } from "./model-seeds";
+
+/**
+ * Claude fast mode (`speed: "fast"` + beta), shared by the OAuth and API-key Anthropic entries.
+ * Only the models Anthropic documents for the lane are classified; Opus 4.6 silently runs
+ * standard and Opus 4.7, Sonnet, Haiku and Fable reject `speed`, so they and future ids stay
+ * unclassified. Source: https://platform.claude.com/docs/en/build-with-claude/fast-mode
+ * (2026-09-23) and the live probe in devlog/_plan/260923_anthropic_fast_speed.
+ */
+const ANTHROPIC_FAST_WIRE = Object.freeze({
+  kind: "anthropic-speed" as const,
+  canonicalToWire: Object.freeze({ priority: "fast" }),
+  foreignCallerTiers: "drop" as const,
+  betas: Object.freeze([ANTHROPIC_FAST_MODE_BETA]),
+});
+const ANTHROPIC_FAST_MODELS: Readonly<Record<string, boolean>> = Object.freeze({
+  "claude-opus-5-5": true,
+  "claude-opus-5": true,
+  "claude-opus-4-8": true,
+});
+const ANTHROPIC_FAST_TIER_DESCRIPTION =
+  "Claude fast mode: faster output at 2x price; needs usage credits (subscription) or fast-mode access (API)";
 
 export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
   {
@@ -133,6 +158,24 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     noVisionModels: [...CURSOR_NO_VISION_MODELS],
   },
   {
+    id: "zed",
+    label: "Zed Hosted AI (experimental)",
+    adapter: "zed",
+    baseUrl: "https://cloud.zed.dev",
+    authKind: "oauth",
+    featured: false,
+    dashboardPreset: true,
+    models: [],
+    liveModels: true,
+    defaultModel: "auto",
+    modelDiscovery: {
+      url: "https://cloud.zed.dev/models",
+      maxResponseBytes: 4 * 1024 * 1024,
+      maxModels: 2_000,
+    },
+    note: "Experimental and unofficial Zed Hosted AI bridge, not endorsed by Zed. Use at your own risk: it consumes the signed-in Zed account's hosted-model entitlement and may be outside Zed's terms, and Zed may limit or suspend the account.",
+  },
+  {
     // The canonical Cognition account provider, after absorbing `devin-cli`
     // (devlog/_plan/260913_devin_provider_merge). The two ids were the same
     // `devin` adapter, the same server.codeium.com api-server, and the same
@@ -166,7 +209,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // (it is the current catalog, so its default ordering wins), then the ids
     // only the old devin entry carried. Degraded-mode seed only either way —
     // `liveModels` discovers the account's real roster.
-    models: ["swe-2", "swe-1-7", "gpt-5-6-sol", "gpt-6-astra", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5", "glm-5-3", "kimi-k3", "gemini-3-8-flash", "grok-4-6", "swe-1-7-lightning", "gpt-5-6-luna", "gpt-5-6-terra", "claude-opus-4-8", "glm-5-2", "kimi-k2-7", "grok-4-5"],
+    models: ["swe-2", "swe-1-7", "gpt-5-6-sol", "gpt-6-astra", "gpt-6-1-sol", "gpt-6-sol", "gpt-6-luna", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-sonnet-5", "glm-5-3", "kimi-k3", "gemini-3-8-flash", "grok-4-6", "grok-4-7", "swe-1-7-lightning", "gpt-5-6-luna", "gpt-5-6-terra", "claude-opus-4-8", "glm-5-2", "kimi-k2-7", "grok-4-5"],
     liveModels: true,
     defaultModel: "swe-2",
     modelContextWindows: DEVIN_MODEL_CONTEXT_WINDOWS,
@@ -197,7 +240,10 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // the OAuth lane. grok-4.20-multi-agent-0309 is deliberately absent: the gateway accepts
     // the field but answers service_tier "default" — a live downgrade, not a fast tier.
     // Unlisted and future-discovered ids stay unclassified.
+    // grok-4.7 applied and confirmed priority on OAuth Responses in the 2026-09-23
+    // live probe: devlog/_plan/260923_grok47_parity/010_probe-evidence.md.
     modelSupportsServiceTier: {
+      "grok-4.7": true,
       "grok-4.6": true,
       "grok-4.5": true,
       "grok-4.3": true,
@@ -240,6 +286,31 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // 260813: grok-4.6 added per docs.x.ai/developers/grok-4-6. Context/vision still match
     // grok-4.5; the reasoning ladder does not — 4.6 adds the documented xhigh rung.
     models: XAI_MODELS,
+    // grok-4.7-build-fast arrives only through OAuth discovery: xAI's Grok 4.7 Fast, "the same model
+    // served on faster infrastructure" (docs.x.ai/developers/grok-4-7). Probed 2026-09-30
+    // (devlog/_plan/260930_grok47_build_unify/010_probe-evidence.md): identical effort ladder, image
+    // input, 500k limit and advertised defaults, 1.5-1.7x faster, ~2x the ticks per output token. It is
+    // not a second model row: shouldExposeProviderModel hides it, and grok-4.7's Fast selection on OAuth
+    // serializes it (src/providers/xai-fast-model.ts). It keeps grok-4.7's facts in the lists below so an
+    // explicit legacy request still works, plus the probed OAuth Responses wire. No service-tier claim:
+    // priority multiplied its ticks ~5.9x for no measured gain.
+    // Live 2026-09-20: Chat Completions rejects `stop` on grok-4.6
+    // (`400 invalid-argument "Model grok-4.6 does not support parameter stop."`).
+    // xAI documents `stop` as unsupported for reasoning models. Claude Code
+    // auto-mode always sends stop_sequences; forwarding that as `stop` makes
+    // the classifier treat Grok as temporarily unavailable while chat turns
+    // still work. Keep caller stop sequences on non-reasoning ids.
+    // Live 2026-09-23: grok-4.7 answers the same 400.
+    noStopModels: [
+      "grok-4.7",
+      "grok-4.7-build-fast",
+      "grok-4.6",
+      "grok-4.5",
+      "grok-4.3",
+      "grok-4.20-multi-agent-0309",
+      "grok-4.20-0309-reasoning",
+      "grok-build-0.1",
+    ],
     // Measured only on grok-4.6 against cli-chat-proxy.grok.com: even an invalid
     // `text.verbosity` value is accepted and low/high/omitted output length is non-monotonic.
     // Apply the resulting opt-out to the whole xAI lineup because `text.verbosity` is an OpenAI
@@ -251,15 +322,39 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // absent from xAI's documented API, so a model discovered later has no more support for it
     // than the seeded ones do.
     supportsVerbosity: false,
+    // docs.x.ai/docs/guides/reasoning: presencePenalty and frequencyPenalty "cannot be used with
+    // reasoning models. Requests that include them return an error." Live 2026-09-23: grok-4.7
+    // answers 400 invalid-argument "Model grok-4.7 does not support parameter presencePenalty."
+    // Non-reasoning ids keep caller penalties.
+    noPenaltyModels: [
+      "grok-4.7",
+      "grok-4.7-build-fast",
+      "grok-4.6",
+      "grok-4.5",
+      "grok-4.3",
+      "grok-4.20-multi-agent-0309",
+      "grok-4.20-0309-reasoning",
+      "grok-build-0.1",
+    ],
     defaultModel: "grok-4.5",
-    // Grok 4.6/4.5 subscription Responses callers use the native wire with the existing
+    // Grok 4.7/4.6/4.5 subscription Responses callers use the native wire with the existing
     // namespace/web-search/replay normalization. Chat remains an explicit modelAdapters
     // opt-in. Multi-agent has no Chat wire and uses Responses under both auth modes.
-    // grok-4.6/4.5 are classified OAuth fast-tier models (modelSupportsServiceTier above),
+    // grok-4.7/4.6/4.5 are classified OAuth fast-tier models (modelSupportsServiceTier above),
     // so a caller-sent service_tier:"priority" forwards on this lane — the Codex fast-toggle
     // path. Multi-agent keeps its pin: probed 2026-09-13, the gateway downgrades its tier to
     // "default", so forwarding a caller tier would advertise a tier it does not get.
     modelWireDefaults: {
+      "grok-4.7": {
+        wire: "openai-responses",
+        inbound: ["responses"],
+        authModes: ["oauth"],
+      },
+      "grok-4.7-build-fast": {
+        wire: "openai-responses",
+        inbound: ["responses"],
+        authModes: ["oauth"],
+      },
       "grok-4.6": {
         wire: "openai-responses",
         inbound: ["responses"],
@@ -302,6 +397,8 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // the app blocks attachments client-side. grok-build-0.1 / grok-composer-2.5-fast stay out
     // (they are already listed in noVisionModels below).
     modelInputModalities: {
+      "grok-4.7": ["text", "image"],
+      "grok-4.7-build-fast": ["text", "image"],
       "grok-4.6": ["text", "image"],
       "grok-4.5": ["text", "image"],
       "grok-4.3": ["text", "image"],
@@ -314,18 +411,26 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // reasoning_content as the top cause of prompt-cache misses on multi-turn conversations
     // (docs.x.ai prompt-caching/multi-turn, verified 2026-07-13 — devlog/_plan/260713_grok_caching).
     // Models that never emit reasoning simply have no thinking parts to replay (no-op).
-    preserveReasoningContentModels: ["grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"],
+    preserveReasoningContentModels: ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"],
     // grok-4.5 reasoning is always-on with low/medium/high (no off tier, no xhigh).
     // grok-4.6 adds xhigh per docs.x.ai/developers/model-capabilities/text/reasoning;
     // multi-agent accepts the same four wire values to select 4 or 16 collaborators. xAI
     // documents high as the 4.6 default but no multi-agent default, so do not invent one.
     modelReasoningEfforts: {
+      // 2026-09-23 live probe accepted low..xhigh and rejected max on both wires;
+      // devlog/_plan/260923_grok47_parity/010_probe-evidence.md.
+      "grok-4.7": ["low", "medium", "high", "xhigh"],
+      "grok-4.7-build-fast": ["low", "medium", "high", "xhigh"],
       "grok-4.6": ["low", "medium", "high", "xhigh"],
       "grok-4.5": ["low", "medium", "high"],
       "grok-4.20-multi-agent-0309": ["low", "medium", "high", "xhigh"],
     },
-    modelDefaultReasoningEfforts: { "grok-4.6": "high" },
+    modelDefaultReasoningEfforts: { "grok-4.7": "high", "grok-4.7-build-fast": "high", "grok-4.6": "high" },
     modelContextWindows: {
+      // 500k confirmed by context_length_exceeded:
+      // devlog/_plan/260923_grok47_parity/010_probe-evidence.md.
+      "grok-4.7": 500_000,
+      "grok-4.7-build-fast": 500_000,
       "grok-4.6": 500_000,
       "grok-4.5": 500_000,
       "grok-4.3": 1_000_000,
@@ -362,6 +467,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // merge into deepseek-v4-flash later.
     modelContextWindows: {
       [`deepseek/${DEEPSEEK_VISION_PREVIEW_MODEL}`]: 1_048_576,
+      ...COMMAND_CODE_MIMO_CONTEXT_WINDOWS,
     },
     modelInputModalities: COMMAND_CODE_MODEL_INPUT_MODALITIES,
     defaultMaxOutputTokens: 64_000,
@@ -402,7 +508,16 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // Codex omits max_output_tokens; without a provider budget the Anthropic adapter
     // falls back to 8192, which truncates long answers with stop_reason=max_tokens.
     defaultMaxOutputTokens: ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+    modelMaxOutputTokens: { ...ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS },
     defaultModel: "claude-sonnet-5",
+    // Claude fast mode on the subscription lane (Claude Code `/fast`): the OAuth route accepts
+    // `speed` and gates it on account entitlement (usage credits / org enablement), probed live
+    // 2026-09-23 (devlog/_plan/260923_anthropic_fast_speed/020_probe-evidence.md).
+    // Off until the operator opts in: fast mode draws usage credits at 2x price.
+    fastWire: ANTHROPIC_FAST_WIRE,
+    modelSupportsServiceTier: { ...ANTHROPIC_FAST_MODELS },
+    fastTierDescription: ANTHROPIC_FAST_TIER_DESCRIPTION,
+    fastOptIn: true,
   },
   {
     id: "anthropic-apikey",
@@ -421,7 +536,12 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     modelInputModalities: { ...ANTHROPIC_MODEL_INPUT_MODALITIES },
     modelReasoningEfforts: { ...ANTHROPIC_MODEL_REASONING_EFFORTS },
     defaultMaxOutputTokens: ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
+    modelMaxOutputTokens: { ...ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS },
     defaultModel: "claude-sonnet-5",
+    fastWire: ANTHROPIC_FAST_WIRE,
+    modelSupportsServiceTier: { ...ANTHROPIC_FAST_MODELS },
+    fastTierDescription: ANTHROPIC_FAST_TIER_DESCRIPTION,
+    fastOptIn: true,
   },
   {
     id: "kimi",
@@ -444,11 +564,52 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     oauthId: "kimi",
     jawcodeBundle: "moonshot",
     note: "Log in with your Kimi account",
-    models: KIMI_CODING_MODELS,
-    defaultModel: "kimi-k2.7-code",
+    // 260921: the retired k2.x ids stay out of the picker — live /coding/v1/models lists
+    // only kimi-for-coding[-highspeed], k3, k3-256k. Saved rows still naming kimi-k2.7-code
+    // are repaired by MODEL_RENAMES in model-rename-migration.ts.
+    models: KIMI_CODING_LIVE_MODELS,
+    // 260921: kimi-k2.7-code was retired from the subscription endpoint (live /models lists
+    // only kimi-for-coding[-highspeed], k3, k3-256k). The kimi-for-coding alias is the
+    // stable ID and currently routes to K2.8 Preview.
+    defaultModel: "kimi-for-coding",
     modelContextWindows: KIMI_CODING_MODEL_CONTEXT_WINDOWS,
     modelInputModalities: KIMI_CODING_MODEL_INPUT_MODALITIES,
     // K3 accepts low/high/max; Codex aliases are normalized by the model-scoped wire map.
+    noReasoningModels: KIMI_CODING_NO_REASONING_MODELS,
+    modelReasoningEfforts: KIMI_CODING_REASONING_EFFORTS,
+    modelDefaultReasoningEfforts: KIMI_CODING_DEFAULT_REASONING_EFFORTS,
+    modelReasoningEffortMap: KIMI_CODING_REASONING_EFFORT_MAPS,
+    noTemperatureModels: KIMI_LOCKED_PARAMETER_MODELS,
+    noTopPModels: KIMI_LOCKED_PARAMETER_MODELS,
+    noPenaltyModels: KIMI_LOCKED_PARAMETER_MODELS,
+    autoToolChoiceOnlyModels: KIMI_AUTO_TOOL_CHOICE_ONLY_MODELS,
+    preserveReasoningContentModels: KIMI_THINKING_MODELS,
+  },
+  {
+    id: "kimi-responses",
+    label: "Kimi (Responses)",
+    adapter: "openai-responses",
+    baseUrl: "https://api.kimi.com/coding/v1",
+    authKind: "oauth",
+    modelSuffixBracketStrip: true,
+    // Same wire-capability defaults as the Chat preset. promptCacheKey is copied here
+    // deliberately even though only the Chat adapter reads it today: the field is a
+    // stable session/task key Kimi documents for cache affinity, and the Responses
+    // endpoint already accepts it (live probe 260921: prompt_cache_key round-trips 200).
+    promptCacheKey: true,
+    // Kimi's Responses endpoint rejects hook-provided context between a tool call and
+    // its matching result (#4726); the flag is live on this wire.
+    requiresAdjacentResponsesToolResults: true,
+    featured: false,
+    // Shares the kimi OAuth account: the login flow and credential store are keyed by
+    // oauthId, so adding this preset after logging into kimi needs no second login.
+    oauthId: "kimi",
+    jawcodeBundle: "moonshot",
+    note: "Same Kimi account login, routed over the OpenAI Responses wire. Thinking content stays encrypted server-side; tool calls and results stay visible. Chat wire remains the default preset for transparency.",
+    models: KIMI_CODING_LIVE_MODELS,
+    defaultModel: "kimi-for-coding",
+    modelContextWindows: KIMI_CODING_MODEL_CONTEXT_WINDOWS,
+    modelInputModalities: KIMI_CODING_MODEL_INPUT_MODALITIES,
     noReasoningModels: KIMI_CODING_NO_REASONING_MODELS,
     modelReasoningEfforts: KIMI_CODING_REASONING_EFFORTS,
     modelDefaultReasoningEfforts: KIMI_CODING_DEFAULT_REASONING_EFFORTS,
@@ -529,13 +690,19 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     featured: true,
     dashboardUrl: "https://platform.openai.com/api-keys",
     defaultModel: "gpt-5.5",
-    models: ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS, "gpt-6-astra"],
+    models: ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS, "gpt-6-astra", ...OPENAI_GPT6_MODELS],
     liveModels: true,
-    modelContextWindows: { ...OPENAI_API_GPT56_CONTEXT_WINDOWS, ...OPENAI_DAYBREAK_CONTEXT_WINDOWS, "gpt-6-astra": 1_050_000 },
-    modelMaxInputTokens: { ...OPENAI_API_GPT56_MAX_INPUT_TOKENS, ...OPENAI_DAYBREAK_MAX_INPUT_TOKENS, "gpt-6-astra": 922_000 },
-    modelMaxOutputTokens: { "gpt-6-astra": 128_000 },
+    modelContextWindows: {
+      ...OPENAI_API_GPT56_CONTEXT_WINDOWS, ...OPENAI_DAYBREAK_CONTEXT_WINDOWS, "gpt-6-astra": 1_050_000,
+      ...Object.fromEntries(OPENAI_GPT6_MODELS.map(id => [id, 1_050_000])),
+    },
+    modelMaxInputTokens: {
+      ...OPENAI_API_GPT56_MAX_INPUT_TOKENS, ...OPENAI_DAYBREAK_MAX_INPUT_TOKENS, "gpt-6-astra": 922_000,
+      ...Object.fromEntries(OPENAI_GPT6_MODELS.map(id => [id, 922_000])),
+    },
+    modelMaxOutputTokens: { "gpt-6-astra": 128_000, ...Object.fromEntries(OPENAI_GPT6_MODELS.map(id => [id, 128_000])) },
     modelInputModalities: Object.fromEntries(
-      ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS, "gpt-6-astra"]
+      ["gpt-5.5", ...OPENAI_GPT56_MODELS, ...OPENAI_GPT56_PRO_MODELS, ...OPENAI_DAYBREAK_MODELS, "gpt-6-astra", ...OPENAI_GPT6_MODELS]
         .map(id => [id, ["text", "image"]]),
     ),
     modelReasoningEfforts: {
@@ -544,6 +711,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
       ),
       ...OPENAI_DAYBREAK_REASONING_EFFORTS,
       "gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+      ...Object.fromEntries(OPENAI_GPT6_MODELS.map(id => [id, ["low", "medium", "high", "xhigh", "max"]])),
     },
     virtualModels: OPENAI_API_GPT56_VIRTUAL_MODELS,
   },
@@ -666,7 +834,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // Use explicit replay history and the existing stateless Responses policy.
     statelessResponses: true,
     /* [Decision Log]
-    - 목적과 의도: Route the exact models OpenCode Go documents on the Responses endpoint — GPT 5.6 Luna, Grok 4.6, and Muse Spark Contributor (#2617).
+    - 목적과 의도: Route the exact models OpenCode Go documents on the Responses endpoint — GPT 5.6 Luna, Grok 4.6/4.7, and Muse Spark Contributor (#2617; opencode.ai/docs/go).
     - 기존 구현 및 제약 조건: The provider is mixed-wire but its provider-wide `openai-chat` adapter sent Luna to `/chat/completions`; explicit user `modelAdapters` entries must remain authoritative.
     - 검토한 주요 대안: Change the whole provider to Responses; infer the wire from model-family names; add one registry-only exact-model default.
     - 선택한 방식: Declare only the named models as `openai-responses` through the existing registry default mechanism; the map stays an exact-model allowlist rather than a family or provider-wide rule.
@@ -676,6 +844,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     modelWireDefaults: {
       "gpt-5.6-luna": "openai-responses",
       "grok-4.6": "openai-responses",
+      "grok-4.7": "openai-responses",
       "muse-spark-1.3-contributor": "openai-responses",
       "muse-spark-1.2-contributor": "openai-responses",
     },
@@ -736,6 +905,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     modelReasoningEfforts: {
       "gpt-5.6-luna": OPENAI_API_GPT56_REASONING_EFFORTS,
       "grok-4.6": ["low", "medium", "high", "xhigh"],
+      "grok-4.7": ["low", "medium", "high", "xhigh"],
       "glm-5.3": ZAI_GLM_53_REASONING_EFFORTS,
       "glm-5.3-flash": ZAI_GLM_53_REASONING_EFFORTS,
       "glm-5.2": ZAI_GLM_52_REASONING_EFFORTS,
@@ -747,7 +917,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
       ...Object.fromEntries(OPENCODE_GO_THINKING_BUDGET_MODELS.map(id => [id, THINKING_BUDGET_EFFORTS])),
       ...Object.fromEntries(DEEPSEEK_GATEWAY_THINKING_MODELS.map(id => [id, deepseekThinkingEffortsFor(id)])),
     },
-    modelDefaultReasoningEfforts: { "grok-4.6": "high", "kimi-k3": "max" },
+    modelDefaultReasoningEfforts: { "grok-4.6": "high", "grok-4.7": "high", "kimi-k3": "max" },
     // glm-5.2 uses identity labels now that `max` is a native Codex level (no alias map);
     // the thinking-toggle map is a REAL wire alias (effort -> enabled/disabled) and stays.
     modelReasoningEffortMap: {
@@ -783,6 +953,9 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
       // deepseek-v4-flash stays listed — that route rejects image_url upstream.
       "deepseek-v4-flash",
       "mimo-v2-pro", "mimo-v2.5-pro",
+      // V2.6 is multimodal first-party, but image forwarding on this gateway is unprobed:
+      // the sidecar describes images until a route probe proves native input.
+      "mimo-v2.6-pro", "mimo-v2.6-flash",
       "minimax-m2.5", "minimax-m2.7",
       "qwen3.7-max",
     ],
@@ -864,7 +1037,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     featured: true,
     dashboardUrl: "https://openrouter.ai/keys",
     jawcodeBundle: "openrouter",
-    models: ["anthropic/claude-sonnet-5", ...OPENROUTER_GPT56_MODELS],
+    models: ["anthropic/claude-sonnet-5", ...OPENROUTER_GPT56_MODELS, ...OPENAI_GPT6_MODELS.map(id => `openai/${id}`)],
     modelContextWindows: {
       "anthropic/claude-sonnet-5": 1_000_000,
       ...OPENROUTER_GPT56_CONTEXT_WINDOWS,
@@ -877,6 +1050,11 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
       "openai/gpt-5.6-sol": true,
       "openai/gpt-5.6-terra": true,
       "openai/gpt-5.6-luna": true,
+      // 260923 preemptive: GPT-6 Sol/Luna are OpenAI-backed routes like the GPT-5.6 rows above.
+      "openai/gpt-6-sol": true,
+      "openai/gpt-6-luna": true,
+      // Listed 2026-09-29 as an OpenAI-backed route like GPT-6 Sol.
+      "openai/gpt-6.1-sol": true,
     },
     // Deliberately no OpenRouter route pin: it bills the endpoint actually used and reports the
     // actual service_tier. B0 confirmation therefore owns downgrade safety. Forcing `only` plus
@@ -979,7 +1157,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     id: "bizrouter", label: "BizRouter", adapter: "openai-chat", baseUrl: "https://api.bizrouter.ai/v1",
     authKind: "key", dashboardUrl: "https://bizrouter.ai/settings/keys",
     defaultModel: "openai/gpt-5.6-sol",
-    models: ["openai/gpt-5.6-sol", "anthropic/claude-sonnet-5", "google/gemini-3.5-flash"],
+    models: ["openai/gpt-5.6-sol", "openai/gpt-6-sol", "openai/gpt-6-luna", "anthropic/claude-sonnet-5", "google/gemini-3.5-flash"],
     note: "Korean enterprise LLM gateway. Per-key allowed models are discovered live from /v1/models. Full catalog: https://bizrouter.ai/models",
   },
   { id: "groq", label: "Groq", adapter: "openai-chat", baseUrl: "https://api.groq.com/openai/v1", authKind: "key", featured: true, dashboardUrl: "https://console.groq.com/keys" },
@@ -1115,7 +1293,12 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     modelReasoningEfforts: Object.fromEntries(DEEPSEEK_NATIVE_THINKING_MODELS.map(id => [id, deepseekThinkingEffortsFor(id)])),
     modelReasoningEffortMap: Object.fromEntries(DEEPSEEK_NATIVE_THINKING_MODELS.map(id => [id, deepseekReasoningMapFor(id)])),
     modelSupportsReasoningSummaries: Object.fromEntries(DEEPSEEK_NATIVE_THINKING_MODELS.map(id => [id, true])),
-    preserveReasoningContentModels: DEEPSEEK_NATIVE_THINKING_MODELS,
+    // deepseek-v4-pro is absent from the live sets on purpose (retired upstream, requests
+    // route to V4.1-Flash — see model-seeds.ts), but it stays SELECTABLE in configs that
+    // already carry it, and what serves it is a thinking-mode model. A saved config with
+    // the alias selected would otherwise serialize a bare continuation the upstream 400s
+    // on (#5421). The preserve list governs replay, not advertisement.
+    preserveReasoningContentModels: [...DEEPSEEK_NATIVE_THINKING_MODELS, "deepseek-v4-pro"],
     // #4436: first-party deepseek-flash accepts native images on Chat and Responses.
     // Keep unprobed compatibility aliases on the #88 sidecar path. This must be fixed
     // here: router enrichment unions this list with saved config, so config cannot remove it.
@@ -1258,4 +1441,3 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     note: "Serverless Inference subscription API. Live discovery exposes only kimi-k2-instruct because Vultr documents it as the sole tool-calling model.",
   },
 ];
-

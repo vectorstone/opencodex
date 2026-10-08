@@ -10,8 +10,14 @@ import type { GenerationContext } from "../lib/state-store-sweeper";
  * a login that has started and not yet settled, and none of it reads or writes a stored
  * credential. `index.ts` re-exports the two public names, so existing importers are unaffected.
  */
-export const loginState = new Map<string, { error?: string; done: boolean }>();
-export const loginAbort = new Map<string, AbortController>();
+/** Human-facing continuation only: never retain credentials or provider response objects. */
+export interface OAuthLoginHint {
+  url: string;
+  instructions?: string;
+  deviceCode?: string;
+}
+export const loginState = new Map<string, { error?: string; done: boolean; hint?: OAuthLoginHint }>();
+export const loginAbort = new Map<string, { controller: AbortController; flowId?: string }>();
 export const kiroLoginSettling = new Set<string>();
 
 /** Pending paste for a login in progress: either a waiter or a stashed early submission. */
@@ -97,13 +103,13 @@ export function submitManualLoginCode(provider: string, input: string): { ok: tr
   // stashed and re-validated by the callback loop.
   const parsed = parseCallbackInput(trimmed);
   // Command Code's manual fallback accepts a pasted JSON callback payload
-  // (`{ apiKey, state, ... }`) which has no `code` param. Let it through the
-  // shared gate so the provider-specific parser can validate it.
-  const isCommandCodeJson = provider === "command-code" && trimmed.startsWith("{") && !parsed.code;
+  // (`{ apiKey, state, ... }`). Keep that opaque to the generic raw parser so
+  // hashes in JSON strings do not become a fake state suffix; its provider parser validates state.
+  const isCommandCodeJson = provider === "command-code" && trimmed.startsWith("{");
   if (!parsed.code && !isCommandCodeJson) return { ok: false, error: "no authorization code found in input" };
   // A raw paste carrying an explicit code#state suffix is state-bearing too: it
   // must match the expected state rather than bypass validation.
-  const stateBearing = parsed.kind !== "raw" || parsed.state !== undefined;
+  const stateBearing = !isCommandCodeJson && (parsed.kind !== "raw" || parsed.state !== undefined);
   if (stateBearing && slot.expectedState !== undefined) {
     if (parsed.state === undefined) return { ok: false, error: "redirect URL is missing the state parameter" };
     if (parsed.state !== slot.expectedState) {

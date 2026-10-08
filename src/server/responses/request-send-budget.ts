@@ -60,6 +60,7 @@ export function createResponsesSendBudget(
   const noteTransientSends = (used: number): void => {
     const charged = Math.max(0, used);
     sendBudget.used += charged;
+    options.onCompactionRecoverySendsReported?.(charged);
     chargeWorkflowSends(workflowRootId, charged);
   };
   // Refused before any dispatch, and deliberately not by evicting the root's ledger entry:
@@ -140,13 +141,23 @@ export function createResponsesSendBudget(
   const sendBudgetExhausted = (cap: number = TRANSIENT_RETRY_MAX_ATTEMPTS): boolean =>
     remainingTransientSendBudget(cap) === 0;
   /**
+   * Spend one operator-granted replacement for an ambiguous failure of THIS logical request.
+   *
+   * The counter is the execution budget's, so a combo child that derives its own scope draws on
+   * the same grant. A budget that predates it -- a stub, or a caller that passed the narrow
+   * holder -- cannot grant anything, and refusing is the fail-closed answer for a send whose
+   * upstream state is unknown.
+   */
+  const claimAmbiguousResend = (limit: number): boolean =>
+    isRequestExecutionBudget(sendBudget) && sendBudget.claimAmbiguousResend?.(limit) === true;
+  /**
    * A credential hop reserves the send its own replay will make, and that replay is a recovery
    * leg. The leg must SPEND the hop's reservation instead of taking a second one: the
    * final-recovery reserve is single, so a rebuild that reserved on top of a hop would be
    * refused and the request would answer with a synthetic 502 in place of the real 429 the hop
    * was recovering from.
    */
-  let pendingHopPermit: SingleUseDispatchPermit | undefined;
+  let pendingHopPermit: SingleUseDispatchPermit | undefined = options.compactionRecoveryPermit;
   /**
    * The budget an adapter's OWN dispatch ladder reserves against.
    *
@@ -190,7 +201,9 @@ export function createResponsesSendBudget(
     options: { allowFinalRecoveryReserve?: boolean } = {},
   ): { attempts: number; permit?: SingleUseDispatchPermit } => {
     const base = remainingTransientSendBudget(cap);
-    if (base > 0) return { attempts: base };
+    // The hop already paid for this leg's first send. Include it in the helper's total
+    // attempts without charging it again, or the final account loses one transient attempt.
+    if (base > 0) return { attempts: Math.min(cap, base + (pendingHopPermit ? 1 : 0)) };
     // A provider-configured transient total is an exact physical-send ceiling. Once it is
     // exhausted, the request-wide recovery reserve must not silently widen it. The default stays
     // permissive so unconfigured providers retain the guarded profile's fourth recovery send.
@@ -207,8 +220,8 @@ export function createResponsesSendBudget(
   /**
    * One credential hop of this logical request, admitted by the INTERSECTION of two bounds.
    *
-   * `GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST` and `ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST`
-   * stay exactly as they are: they bound rotation within one credential roster. What neither
+   * The snapshotted generic OAuth roster cap and `ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST`
+   * bound rotation within one credential roster. What neither
    * can see is everything else this request already sent, so three hops layered on a spent
    * budget still reached upstream three more times. A hop now happens only when its own layer
    * cap AND the shared budget both permit it, and the smaller of the two wins.
@@ -235,7 +248,13 @@ export function createResponsesSendBudget(
     countedExternally = false,
   ): { allowed: boolean; permit?: SingleUseDispatchPermit } => {
     if (!isRequestExecutionBudget(sendBudget)) return { allowed: true };
-    const decision = sendBudget.reserveDispatch({ sendClass, targetKey, countedExternally });
+    const decision = sendBudget.reserveDispatch({
+      sendClass,
+      // A same-provider credential hop is not a model/endpoint transition. Its diagnostic
+      // label must not replace the physical target used by the adapter's next retry.
+      targetKey: sendClass === "auth-recovery" ? sendBudget.lastTargetKey ?? targetKey : targetKey,
+      countedExternally,
+    });
     return decision.allowed ? { allowed: true, permit: decision.permit } : { allowed: false };
   };
   /**
@@ -263,6 +282,10 @@ export function createResponsesSendBudget(
     noteAdapterPhysicalSend,
     noteAdapterRecoveryWithheld,
     sendBudgetExhausted,
+    claimAmbiguousResend,
+    get ambiguousResendSpent(): boolean {
+      return isRequestExecutionBudget(sendBudget) && sendBudget.ambiguousResendSpent === true;
+    },
     get pendingHopPermit(): SingleUseDispatchPermit | undefined {
       return pendingHopPermit;
     },
@@ -301,11 +324,20 @@ function adapterDispatchBudgetView(
     get targetTransitions(): number { return budget.targetTransitions; },
     get lastTargetKey(): string | undefined { return budget.lastTargetKey; },
     remainingBaseSends: (cap: number): number => budget.remainingBaseSends(cap),
+    claimAmbiguousResend: (limit: number): boolean => budget.claimAmbiguousResend?.(limit) === true,
+    get ambiguousResendSpent(): boolean { return budget.ambiguousResendSpent === true; },
     reserveDispatch(intent: DispatchIntent): DispatchDecision {
       // A dispatch whose upstream state is unknown is refused on its own merits. A hop that
       // already paid does not make an unsafe replay safe, so that check stays with the budget.
       if (intent.replaySafe !== false) {
         const hopPermit = hop.claimHopPermit();
+        if (hopPermit && intent.targetKey !== budget.lastTargetKey) {
+          // The rotated credential can select a different regional endpoint. Replace the
+          // provisional booking synchronously so the actual destination obeys transition
+          // limits, while the physical send is still charged only once.
+          hopPermit.release();
+          return budget.reserveDispatch({ ...intent, sendClass: hopPermit.sendClass });
+        }
         // Confirmed here rather than in `use()`: the adapter reserves immediately before it
         // opens the transport, which is the same boundary the hop's own confirmation uses.
         // A permit some other leg already settled returns false, and this falls through to a

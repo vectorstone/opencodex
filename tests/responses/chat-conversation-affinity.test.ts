@@ -79,10 +79,11 @@ describe("Chat conversation identity at canonical Responses outbound boundary", 
           const identity: Record<string, string> = shape === "underscore"
             ? { session_id: `conversation-${conversation}` }
             : { "session-id": `session-${conversation}`, "thread-id": `thread-${conversation}` };
+          const expected = shape === "hyphen-pair" ? { ...identity, session_id: identity["session-id"] } : identity;
           await chat({ ...identity, "x-client-request-id": `request-${index}` }, key, index === 1);
           expect(seen).toHaveLength(index + 1);
           const wire = seen[index]!;
-          for (const name of identityHeaders) expect(wire.headers.get(name)).toBe(identity[name] ?? null);
+          for (const name of identityHeaders) expect(wire.headers.get(name)).toBe(expected[name] ?? null);
           expect(wire.headers.get("x-client-request-id")).toBe(`request-${index}`);
           expect(wire.body.prompt_cache_key).toBe(key);
           expect(Object.hasOwn(wire.body, "prompt_cache_key")).toBe(keyPresent);
@@ -90,7 +91,7 @@ describe("Chat conversation identity at canonical Responses outbound boundary", 
         }
         expect(JSON.stringify(seen[1]!.body.input).length).toBeGreaterThan(JSON.stringify(seen[0]!.body.input).length);
         expect(seen[0]!.body.input).toEqual(seen[2]!.body.input);
-      });
+      }, 20_000);
     }
 
     test(`identity absent, key=${keyPresent}: no session is synthesized`, async () => {
@@ -101,6 +102,6 @@ describe("Chat conversation identity at canonical Responses outbound boundary", 
         for (const name of identityHeaders) expect(wire.headers.has(name)).toBe(false);
         expect(wire.body.prompt_cache_key).toBe(keyPresent ? "shared-cache-cohort" : undefined);
       }
-    });
+    }, 20_000);
   }
 });

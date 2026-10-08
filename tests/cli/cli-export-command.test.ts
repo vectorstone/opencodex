@@ -233,6 +233,16 @@ describe("ocx export --json (accept criterion 1)", () => {
     expect(ids).not.toContain("banned/hidden");
     expect(ids).toEqual(["anthropic/claude-opus-5", "custom/no-context", "gpt-5.6-luna"]);
   });
+
+  test("Pi uses the selected catalog without changing its provenance", async () => {
+    const proxy = fakeProxy();
+    const pi = await run(["--client", "pi", "--json"], { baseUrl: proxy.baseUrl });
+    expect(pi.code).toBe(0);
+    const piRows = JSON.parse(pi.stdout) as { providers: { opencodex: { models: Array<{ id: string }> } } };
+    expect(piRows.providers.opencodex.models.map(row => row.id)).toEqual([
+      "anthropic/claude-opus-5", "custom/no-context", "gpt-5.6-luna",
+    ]);
+  });
 });
 
 describe("ocx export human output (accept criterion 2)", () => {
@@ -242,6 +252,10 @@ describe("ocx export human output (accept criterion 2)", () => {
 
     expect(result.code).toBe(0);
     expect(result.stdout.startsWith("{\n")).toBe(true);
+    logs.length = 0;
+    const structured = await run(["--client", "opencode", "--json"], { baseUrl: proxy.baseUrl });
+    expect(structured.code).toBe(0);
+    expect(JSON.parse(result.stdout.split("\n\n")[0]!)).toEqual(JSON.parse(structured.stdout));
     expect(result.stdout).toContain(join("opencode", "opencode.json"));
     expect(result.stdout).toContain("Merge this generated configuration into that file; do not replace it.");
     expect(result.stdout).toContain("export OPENCODEX_OPENCODE_API_KEY=");
@@ -565,9 +579,9 @@ describe("export allowlist parity", () => {
   });
 });
 
-describe("Raycast export uses the live management admission policy", () => {
-  for (const secondary of [false, true]) {
-    test(`live wildcard bind with secondary=${secondary} wins over saved loopback config`, async () => {
+describe("keyless exports use the live management admission policy", () => {
+  for (const client of ["raycast", "droid"] as const) for (const secondary of [false, true]) {
+    test(`${client} live wildcard bind with secondary=${secondary} wins over saved loopback config`, async () => {
       const oldHome = process.env.OPENCODEX_HOME;
       const oldCodexHome = process.env.CODEX_HOME;
       const root = tempDir();
@@ -586,15 +600,16 @@ describe("Raycast export uses the live management admission policy", () => {
         const proxy = managementProxy(liveConfig);
         const out = join(root, "providers.yaml");
         writeFileSync(out, "keep existing export\n");
-        const result = await run(["--client", "raycast", "--json", "--out", out, "--force"], {
+        const result = await run(["--client", client, "--json", "--out", out, "--force"], {
           baseUrl: proxy.baseUrl,
           // Deliberately contradict both live bind and secondary port.
           config: config({ unauthenticatedLoopbackListener: { enabled: true, port: 10999 } }),
         });
         if (secondary) {
           expect(result.code).toBe(0);
-          const document = JSON.parse(result.stdout) as { providers: Array<{ base_url: string }> };
-          expect(document.providers[0]!.base_url).toBe("http://127.0.0.1:10237/v1");
+          const document = JSON.parse(result.stdout) as { providers?: Array<{ base_url: string }>; customModels?: Array<{ baseUrl: string }> };
+          expect(client === "raycast" ? document.providers?.[0]?.base_url : document.customModels?.[0]?.baseUrl)
+            .toBe("http://127.0.0.1:10237/v1");
           expect(readFileSync(out, "utf8")).toContain("10237/v1");
           expect(readFileSync(out, "utf8")).not.toContain("10999");
         } else {

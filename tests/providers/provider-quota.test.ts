@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as authApi from "../../src/codex/auth-api";
 import { clearAccountNeedsReauth, markAccountNeedsReauth } from "../../src/codex/account-runtime-state";
-import { clearMainAccountInfoCache } from "../../src/codex/main-account-cache";
+import { captureMainAccountIdentityGeneration, clearMainAccountInfoCache } from "../../src/codex/main-account-cache";
 import { clearAccountQuota, updateAccountQuota, type StoredAccountQuota } from "../../src/codex/quota";
 import { clearCodexUpstreamHealth } from "../../src/codex/routing";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
@@ -118,6 +118,27 @@ afterEach(() => {
 });
 
 describe("fetchProviderQuotaReports", () => {
+  test("direct main omits unpublished usage but reports a published snapshot", async () => {
+    const config = testConfig();
+    config.providers = { openai: { ...config.providers.openai!, codexAccountMode: "direct" } };
+    const info = { email: null, plan: "plus", quota: { weeklyPercent: 64 } };
+    const snapshot = { info, mainIdentityGeneration: captureMainAccountIdentityGeneration() };
+    const probe = spyOn(authApi, "fetchMainAccountInfoSnapshot")
+      .mockImplementation(async () => snapshot);
+    try {
+      const published = await fetchProviderQuotaReports(config, true);
+      expect(published.reports.find(row => row.provider === "openai")?.quota.weeklyPercent).toBe(64);
+      probe.mockImplementation(async () => ({ ...snapshot, infoUnpublished: true as const }));
+      const stale = await fetchProviderQuotaReports(config, true);
+      expect(stale.reports.find(row => row.provider === "openai")).toBeUndefined();
+      probe.mockImplementation(async () => snapshot);
+      const refreshed = await fetchProviderQuotaReports(config, true);
+      expect(refreshed.reports.find(row => row.provider === "openai")?.quota.weeklyPercent).toBe(64);
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
   test("provider quota probes have no direct Response.json calls", () => {
     // Probes live in leaves now; the facade alone no longer holds one.
     for (const p of ["quota.ts", "quota/vendor-probes-key.ts", "quota/vendor-probes-oauth.ts", "quota/antigravity.ts"]) expect(readFileSync(repoPath(`src/providers/${p}`), "utf8")).not.toMatch(/\.\s*json\s*\(/);
@@ -365,8 +386,8 @@ describe("fetchProviderQuotaReports", () => {
     expect(byProvider.anthropic?.quota.fiveHourPercent).toBe(41.5);
     expect(byProvider.anthropic?.quota.fiveHourResetAt).toBe(Date.parse("2026-07-05T12:00:00Z"));
     expect(byProvider.anthropic?.quota.customWindows).toEqual([
-      { label: "Opus", percent: 88 },
-      { label: "Sonnet", percent: 19 },
+      { label: "Opus", scope: "model", percent: 88 },
+      { label: "Sonnet", scope: "model", percent: 19 },
     ]);
     expect(byProvider["google-antigravity"]?.quota.customWindows).toEqual([
       { label: "Gem", percent: 36, resetAt: Date.parse("2026-07-05T14:00:00Z") },
@@ -785,11 +806,11 @@ describe("fetchProviderQuotaReports", () => {
   });
 
   test("routing quota scope keeps a key-bound display-only report out of model selection", async () => {
-    // MiniMax publishes its Token Plan countdown through the display-only path. The provider
+    // MiniMax publishes its Token Plan windows through the display-only path. The provider
     // is single-key `key` auth, so ownership alone would resolve a routing binding; without
     // an inference projection the exhausted row must still not rank or veto the target.
     globalThis.fetch = (async () => Response.json({
-      success: true, data: { remains_time: 0, total_time: 1_000_000_000 },
+      base_resp: { status_code: 0 }, model_remains: [{ model_name: "general", current_interval_remaining_percent: 0 }],
     })) as typeof fetch;
     const config = quotaCombo(keyQuotaConfig("minimax", "https://api.minimax.io/v1"));
     const reports = await fetchProviderQuotaReports(config, true);
@@ -1130,7 +1151,7 @@ describe("fetchProviderQuotaReports", () => {
     expect(result.reports).toHaveLength(1);
     expect(result.reports[0]?.source).toBe("deepseek:balance");
     expect(result.reports[0]?.quota.customWindows).toEqual([{
-      label: "API balance ($6.00 total, $4.00 granted)",
+      label: "API balance (¥6.00 total, ¥4.00 granted)",
       percent: 0,
     }]);
     expect(seen).toHaveLength(1);
@@ -1669,61 +1690,6 @@ describe("fetchProviderQuotaReports", () => {
       weeklyPercent: 0,
     });
     expect(result.reports[0]?.quota.monthlyPercent).toBeUndefined();
-  });
-
-  test("MiniMax quota drops the row when the API omits the plan total after having it", async () => {
-    // A valid row (with total) exists; a later valid response omitting the
-    // total is a DELIBERATE contract change — the stale row must be dropped
-    // (terminal), not preserved as a transient last-good.
-    let withTotal = true;
-    const seen: Array<{ url: string; authorization?: string; redirect?: RequestRedirect }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      const headers = init?.headers as Record<string, string> | undefined;
-      seen.push({ url, authorization: headers?.Authorization, redirect: init?.redirect });
-      return new Response(JSON.stringify(withTotal
-        ? { success: true, data: { remains_time: 750_000_000, total_time: 1_000_000_000 } }
-        : { success: true, data: { remains_time: 1_000_000_000 } }), { status: 200 });
-    }) as typeof fetch;
-    const config = keyQuotaConfig("minimax", "https://api.minimax.io/v1");
-
-    const valid = await fetchProviderQuotaReports(config, true);
-    withTotal = false;
-    const noTotal = await fetchProviderQuotaReports(config, true);
-
-    expect(valid.reports).toHaveLength(1);
-    expect(noTotal.reports).toEqual([]);
-    expect(seen[0]?.url).toBe("https://www.minimax.io/v1/token_plan/remains");
-    expect(seen[0]?.authorization).toBe("Bearer minimax-secret");
-    expect(seen[0]?.redirect).toBe("error");
-  });
-
-  test("MiniMax quota derives a consumed share when the API reports the plan total", async () => {
-    globalThis.fetch = (async () => new Response(JSON.stringify({
-      success: true,
-      data: { remains_time: 750_000_000, total_time: 1_000_000_000 },
-    }), { status: 200 })) as typeof fetch;
-
-    const result = await fetchProviderQuotaReports(keyQuotaConfig("minimax", "https://api.minimax.io/v1"), true);
-
-    expect(result.reports).toHaveLength(1);
-    expect(result.reports[0]?.quota.customWindows?.[0]?.percent).toBe(25);
-  });
-
-  test("MiniMax CN quota probes the minimaxi.com host", async () => {
-    const seen: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      seen.push(String(input));
-      return new Response(JSON.stringify({
-        success: true,
-        data: { remains_time: 750_000_000, total_time: 1_000_000_000 },
-      }), { status: 200 });
-    }) as typeof fetch;
-
-    const result = await fetchProviderQuotaReports(keyQuotaConfig("minimax-cn", "https://api.minimaxi.com/v1"), true);
-
-    expect(result.reports).toHaveLength(1);
-    expect(seen[0]).toBe("https://api.minimaxi.com/v1/token_plan/remains");
   });
 
   test("MiniMax quota never sends the key to a non-canonical base URL", async () => {
@@ -2399,7 +2365,7 @@ describe("fetchProviderQuotaReports", () => {
         includedAccounts: 0,
         staleQuotaAccounts: 1,
         missingQuotaAccounts: 1,
-        unknownPlanAccounts: 1,
+        unknownPlanAccounts: 0, // A failed main read retains its previously observed Plus plan.
         incomplete: true,
         currentAccount: { plan: "prolite", quota: null },
       });
@@ -3612,7 +3578,7 @@ describe("fetchProviderQuotaReports", () => {
           pinnedPost: async url => { posted.push(url); return new Response(null, { status, headers: { location: modelsUrl } }); },
         });
         expect((await fetchProviderQuotaReports(config(), true)).reports).toEqual([]);
-        expect(posted).toEqual([summaryUrl]);
+        expect(posted).toEqual(status === 403 ? [summaryUrl, summaryUrl] : [summaryUrl]);
         expect(plainFetchCalls).toEqual([]);
       });
     }

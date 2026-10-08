@@ -62,6 +62,8 @@ export type OAuthCredentials = {
   email?: string;
   accountId?: string;
   source?: OAuthCredentialSource;
+  /** Private authenticated account proof; never projected into account summaries. */
+  anthropicIdentity?: { v: 1; accountUuid: string; bearerSha256: string };
   /** Google Antigravity (Cloud Code Assist) discovered project id; injected into the CCA envelope. */
   projectId?: string;
   /**
@@ -79,11 +81,26 @@ export type OAuthCredentials = {
 export interface ProviderAccount {
   /** Stable short id, generated once at append time; never re-derived after rotation. */
   id: string;
+  /** Rotated on each explicit login and retained across token refreshes. */
+  loginId?: string;
+  /** Native Kiro device accounts cannot use the kiro-cli reauth path. */
+  loginOrigin?: "kiro-device";
   /** User-owned display label; never participates in auth identity or routing. */
   alias?: string;
   credential: OAuthCredentials;
   /** Terminal refresh failure (invalid_grant / reused / revoked) — re-login required. */
   needsReauth?: boolean;
+  /** Operator exclusion from generic OAuth account selection until explicitly resumed. */
+  paused?: boolean;
+  /** Anthropic-only usage-switch override; absent inherits its pool default, zero disables it. */
+  autoSwitchThresholdOverride?: number;
+  /**
+   * Why the account needs reauthentication. `verify_account` means the grant is
+   * alive but the provider blocks the account until the human verifies it
+   * (Antigravity 403 PERMISSION_DENIED) — a plain re-login without that
+   * verification will not help. Absent means an ordinary credential failure.
+   */
+  needsReauthReason?: "verify_account";
   addedAt?: number;
 }
 

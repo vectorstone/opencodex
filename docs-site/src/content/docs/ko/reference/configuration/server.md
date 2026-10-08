@@ -14,7 +14,7 @@ description: 리스너, 원격 접근, admission 키, 타임아웃, 저장소, �
 | `proxy?` | `string` | — | 송신용 HTTP(S) 또는 SOCKS5 프록시 URL(`socks5://host:port`) 또는 `${ENV_VAR}`입니다. HTTP URL은 해당 변수가 비어 있을 때 `HTTP_PROXY` / `HTTPS_PROXY`에 적용됩니다. SOCKS5 URL은 내장 SOCKS5 터널을 사용하고 `ALL_PROXY`에도 적용되며(`ocx start --socks5`), 이 프로세스에서 상속된 `HTTP(S)_PROXY`를 지웁니다. 루프백은 `NO_PROXY`에 그대로 남습니다. |
 | `emptyCompletionRetry?` | `boolean` | `false` | 텍스트나 도구 호출이 없는 Responses 턴을, 터미널 이벤트 전에 스트림이 종료된 경우를 포함해 동일한 요청으로 한 번 재시도하도록 선택합니다. 재시도에는 비용이 발생할 수 있습니다. `OCX_EMPTY_COMPLETION_RETRY=0`은 설정을 바꾸지 않고 비활성화하며, combo 및 routed-compaction turn은 제외됩니다. |
 | `dropCodexSafetyBuffering?` | `boolean` | `false` | Canonical Codex Responses 응답의 선택적 safety-buffering 헤더 두 개와 SSE 힌트를 제거합니다. 공급자의 안전 정책이나 거절 응답은 바뀌지 않습니다. Native WS 메타데이터와 compact는 제외됩니다. |
-| `stallTimeoutSec?` | `number` | `300` | Responses 및 네이티브 Chat에서 유효한 업스트림 진행이 없는 시간(초). 최소 1초. |
+| `stallTimeoutSec?` | `number` | `300`(public) / 비활성(local) | 스트림이 끊기기까지 유효한 업스트림 진행이 없는 시간(초, Responses 및 네이티브 Chat). 미설정 시 **로컬** 업스트림(loopback, private, `.local`/`.lan` 이름)은 비활성이 기본이고 공개 업스트림은 300초. 양수 값은 둘 다에 적용(최소 1초), `0`은 무응답 watchdog을 전면 비활성화한다. canonical ChatGPT SSE를 비스트리밍 JSON으로 접는 Responses 요청에는 이 watchdog이 꺼져도 별도의 15분 전체 상한이 남는다. `/v1/responses/compact`의 보류 바디 읽기도 이 예산을 공유하지만 로컬 업스트림에서도 기본은 300초. 명시 값(`0` 포함)이 우선한다. |
 | `connectTimeoutMs?` | `number` | `200000` | 시도별 DNS/TCP/TLS/최종 헤더 기한입니다. 본문 생성 전에 끝납니다. |
 | `shutdownTimeoutMs?` | `number` | `5000` | 진행 중인 turn을 중단하기 전에 허용하는 정상 종료 드레인 기한입니다. |
 | `websockets?` | `boolean` | `false` | 클라이언트용 Responses WebSocket 경로를 광고하고 허용합니다. `false`이면 클라이언트는 HTTP/SSE를 사용하며, 적격 canonical ChatGPT 업스트림 WS 최적화는 비활성화하지 않습니다. |
@@ -26,7 +26,7 @@ description: 리스너, 원격 접근, admission 키, 타임아웃, 저장소, �
 | `codexAutoStart?` | `boolean` | `true` | Codex shim이 Codex를 실행하기 전에 `ocx ensure`를 돌리도록 허용합니다. `false`이면 ensure는 아무 작업도 하지 않습니다. |
 | `codexShimAutoRestore?` | `boolean` | `true` | 완료된 외부 Codex 업데이트가 설치된 shim을 교체한 뒤 복원합니다. 환경 변수로 끌 수 있습니다: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | 되돌릴 수 있는 Codex App history 호환성입니다. 원래 메타데이터는 `ocx stop` / `ocx restore`가 백업하고 복원합니다. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 인식된 Codex 보조/섀도 호출을 요청에 설정된 reasoning effort를 유지한 채 선택한 모델로 다시 보냅니다. 기본 source prefix는 `gpt-5.6-luna`입니다. 0.144.x 이하의 이전 클라이언트는 `gpt-5.4-mini`를 사용했으며 `sourceModels`로 복원할 수 있습니다. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | off | 인식된 Codex 보조/섀도 호출을 요청에 설정된 reasoning effort를 유지한 채 선택한 모델로 다시 보냅니다. 기본 source prefix는 `gpt-6-luna`, `gpt-5.6-luna`입니다. 0.144.x 이하의 이전 클라이언트는 `gpt-5.4-mini`를 사용했으며 `sourceModels`로 복원할 수 있습니다. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | on when usable | 웹 검색 사이드카 옵션입니다. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | on when usable | 이미지 설명 사이드카 옵션입니다. |
 | `images?` | `OcxImagesConfig` | automatic OpenAI selection | Codex `image_gen`용 독립형 Images 릴레이 옵션입니다. |
@@ -162,15 +162,23 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 
 Codex는 제목과 커밋 메시지 같은 작업에 작은 보조 모델을 사용합니다. 인식된 source-model prefix를 다른 구성된 모델로 돌리려면 `shadowCallIntercept`를 활성화합니다. 대체 호출은 요청에 설정된 reasoning effort를 유지합니다. 클라이언트가 다른 helper id를 사용할 때만 `sourceModels`를 설정합니다.
 
+가로채기는 모델을 기준으로 합니다. 모델 ID가 `sourceModels`와 일치하는 모든 요청은 일반 `request_kind: "turn"` 요청을 포함해 다시 보낼 수 있습니다. `x-openai-subagent: collab_spawn` 또는 `x-codex-turn-metadata` JSON 헤더의 `subagent_kind: "thread_spawn"`로 생성된 자식으로 표시된 요청은 예외이므로, 명시적으로 생성된 서브에이전트는 모델을 유지합니다.
+
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### 대상을 쓸 수 없을 때
+
+대체 대상은 운영자가 고른 단 하나의 목적지이므로, 더 이상 해석되지 않는 대상은 다른 곳으로 보내지 않고 보조 호출을 실패시킵니다. 대상의 프로바이더가 비활성화되거나 삭제되었거나 콤보가 사라졌다면, 가로챈 요청은 업스트림에 아무것도 보내기 전에 `409`와 오류 코드 `intercept_target_unavailable`을 반환합니다. 요청 로그에도 같은 코드가 남습니다. 요청은 네이티브 보조 모델로 그대로 넘어가지 않고 기본 프로바이더로 폴백하지도 않습니다. 둘 다 사용자가 고르지 않은 목적지, 자격 증명, 비용으로 바꾸기 때문입니다. 콤보나 라우팅 프로필 대상은 계속 자기 멤버 사이에서 페일오버합니다. `provider/model`처럼 한정된 대상인데 프로바이더 부분이 설정된 어떤 것도 가리키지 않으면 같은 방식으로 처리하고, 설정 API는 이를 저장하지 않습니다. 기본 프로바이더를 통해 해석되는 한정되지 않은 모델 ID는 그대로 유효합니다.
+
+대상이 해석되는 프로바이더를 비활성화(`disabled: true`를 담은 `PATCH /api/providers?name=<provider>`)하거나 삭제해도 작업은 성공하며, 응답에 `dependentShadowIntercept: { model, enabled }`가 추가되고 대시보드에 경고가 표시됩니다. 프로바이더를 다시 켜거나 다른 대상을 고르면 가로채기가 다시 동작합니다.
 
 ## Sidecars
 
@@ -187,7 +195,7 @@ Codex는 제목과 커밋 메시지 같은 작업에 작은 보조 모델을 사
 
 | 필드 | 형식 | 기본값 | 의미 |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` | on when usable | 주 스위치입니다. |
+| `enabled?` | `boolean` | on when usable | 주 스위치입니다. `false`이면 OpenCodex는 `web_search` 가로채기를 멈추고 Codex 통합이 `~/.codex/config.toml`에 `web_search = "disabled"`를 씁니다. |
 | `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | 명시값이 우선입니다. 생략하면 항상 `openai`입니다. `anthropic`과 `xai`는 명시적으로 설정할 때만 실행되며, `gemini`와 `exa`는 executor가 제공될 때까지 예약 상태입니다. |
 | `model?` | `string` | backend-dependent | OpenAI는 `gpt-5.6-luna`, Anthropic은 `claude-sonnet-5`, xAI는 `grok-4.6`입니다. 레거시로 명시된 `gpt-5.4-mini`는 시작 시 마이그레이션됩니다. |
 | `exaApiKey?` | `string` | 없음 | `exa` 백엔드용 운영자 키입니다. 쓰기 전용이며 관리 API 조회에서는 저장된 값을 반환하지 않습니다. |
@@ -235,4 +243,20 @@ Anthropic OAuth 사이드카는 opencodex의 기존 Claude Code OAuth fingerprin
 
 ## Codex 할당량 네트워크 진단
 
-메인 Codex 계정 행의 `quotaRefresh`는 할당량 조회 결과를 분류하는 진단값입니다. 남은 할당량이나 모델 접근 권한을 뜻하지 않으며, 캐시를 쓰거나 조회하지 않았다면 생략될 수 있습니다. 요청은 명령을 입력한 터미널이 아니라 실행 중인 프록시 서비스의 환경을 따릅니다. `proxy`를 지정하지 않으면 기존 환경을 유지하고, `"auto"`는 시작할 때 Windows의 정적 프록시 설정만 읽습니다. PAC/WPAD, SOCKS 전용 설정과 실행 중 변경은 자동으로 반영하지 않습니다. TUN에서 성공했다고 HTTP 프록시 경로도 정상이라는 뜻은 아닙니다. 명령과 상태값은 [네트워크 진단(영문)](/reference/configuration/server/#codex-quota-network-diagnostics)에서 확인하세요.
+메인 Codex 계정 행의 `quotaRefresh`는 할당량 조회 결과를 분류하는 진단값입니다. 남은 할당량이나 모델 접근 권한을 뜻하지 않으며, 캐시를 쓰거나 조회하지 않았다면 생략될 수 있습니다. 요청은 명령을 입력한 터미널이 아니라 실행 중인 프록시 서비스의 환경을 따릅니다. `proxy`를 지정하지 않으면 기존 환경을 유지하고, `"auto"`는 시작 시 Windows 또는 macOS의 정적 HTTP/HTTPS 설정을 읽습니다. macOS에서는 상속된 프록시가 있으면 읽지 않습니다. macOS에서는 유효한 `*.<domain>`을 `.<domain>`으로 바꿉니다. `*.local`은 `foo.local`과 최상위 이름 `local`을 직접 연결하지만 `xlocal`은 제외합니다. `169.254/16`, `169.254.0.0/16`, `fe80::/10`은 진단 메시지와 함께 생략하므로 링크 로컬 IP 주소는 프록시를 사용합니다. IP 주소와 `*`는 허용하지만 다른 CIDR, glob, 단순 호스트명 예외는 환경 변경 전에 탐색을 거부합니다. PAC/WPAD, SOCKS 전용 설정과 실행 중 변경은 자동으로 반영하지 않습니다. TUN에서 성공했다고 HTTP 프록시 경로도 정상이라는 뜻은 아닙니다. 명령과 상태값은 [네트워크 진단(영문)](/reference/configuration/server/#codex-quota-network-diagnostics)에서 확인하세요.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.
+
+## 토큰 예약과 한도
+
+요청에 `spend.root.maxTokens`, `spend.identity.maxTokens`, `spend.pool.maxTokens` 중 하나가 적용되면 추적 용량 부족 등으로 토큰 예약을 기록할 수 없을 때 전송을 거부합니다. 적용되는 한도가 없는 요청은 계속 관측만 합니다.
